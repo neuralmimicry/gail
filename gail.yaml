@@ -1,0 +1,83 @@
+server:
+  bind_addr: "0.0.0.0:8080"
+  public_base_url: "${GAIL_PUBLIC_BASE_URL}"
+
+security:
+  allow_unauthenticated_health: true
+  api_tokens:
+    - client_id: "refiner"
+      token: "${GAIL_REFINER_API_TOKEN}"
+      scopes: ["llm", "neuromorphic", "aer", "status", "health"]
+    - client_id: "tracey"
+      token: "${GAIL_TRACEY_API_TOKEN}"
+      scopes: ["llm", "neuromorphic", "aer", "status", "health"]
+    - client_id: "continuum"
+      token: "${GAIL_CONTINUUM_API_TOKEN}"
+      scopes: ["llm", "neuromorphic", "aer", "status", "health"]
+
+orchestration:
+  enabled: true
+  selection_mode: best
+  max_parallel_candidates: 3
+  include_configured_candidates: true
+  health_ttl_seconds: 1800
+  early_success_enabled: true
+  early_success_settle_seconds: 0.75
+  early_success_min_quality: 0.5
+  candidate_timeout_cap_seconds: 45
+  always_route_specialists: false
+
+providers:
+  - name: "OpenAIPrimary"
+    provider: openai
+    model: "${GAIL_OPENAI_MODEL}"
+    api_key: "${OPENAI_API_KEY}"
+    roles: ["planner", "reviewer", "assistant"]
+    specialties: ["planning", "json", "review", "code"]
+    preferred: true
+    weight: 0.3
+    source: "example"
+  - name: "GeminiResearch"
+    provider: gemini
+    model: "${GAIL_GEMINI_MODEL}"
+    api_key: "${GEMINI_API_KEY}"
+    access_token: "${GOOGLE_ACCESS_TOKEN}"
+    roles: ["researcher", "assistant"]
+    specialties: ["research", "citations", "long_context"]
+    weight: 0.25
+    source: "example"
+  - name: "OllamaLocal"
+    provider: ollama
+    model: "${GAIL_OLLAMA_MODEL}"
+    base_url: "${GAIL_OLLAMA_BASE_URL}"
+    roles: ["planner", "assistant"]
+    specialties: ["local", "privacy", "code"]
+    weight: 0.15
+    source: "example"
+
+specialists:
+  - name: "AARNN"
+    type: aarnn
+    endpoint: "${GAIL_AARNN_ENDPOINT}"
+    socket_path: "${GAIL_AARNN_SOCKET_PATH}"
+    repo_root: "${GAIL_AARNN_REPO_ROOT}"
+    allow_offline_heuristic: true
+    sensory_size: 32
+    output_size: 16
+    aer_sensory_base: 4096
+    aer_output_base: 16384
+    timeout_seconds: 2.0
+    health_ttl_seconds: 300
+    spike_threshold: 0.5
+    roles: ["planner", "reviewer", "researcher", "assistant"]
+    specialties: ["aarnn", "snn", "neuromorphic", "aer"]
+    keyword_hints: ["aarnn", "aer", "snn", "spiking", "neuromorphic"]
+    guidance_lines:
+      - "Prefer AARNN-grown SNN designs when the task explicitly calls for spiking or neuromorphic networks."
+      - "Use AER1 payloads for spike exchange with the attached runtime."
+    weight: 0.2
+    prefer_aarnn_designs: true
+
+storage:
+  metrics_path: "./data/provider_metrics.json"
+  ollama_model_store_path: "./data/ollama_model_inventory.json"
