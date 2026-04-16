@@ -130,6 +130,71 @@ pub struct CompletionRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OpenAIReasoningConfig {
+    pub effort: Option<String>,
+    pub summary: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OpenAIResponseFormat {
+    #[serde(rename = "type")]
+    pub format_type: Option<String>,
+    pub json_schema: Option<Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OpenAITextConfig {
+    pub format: Option<OpenAIResponseFormat>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OpenAIChatCompletionRequest {
+    pub model: String,
+    #[serde(default)]
+    pub messages: Vec<ChatMessage>,
+    pub instructions: Option<String>,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    pub stream: Option<bool>,
+    pub response_format: Option<OpenAIResponseFormat>,
+    pub reasoning: Option<OpenAIReasoningConfig>,
+    pub workflow: Option<String>,
+    pub role: Option<String>,
+    pub provider: Option<String>,
+    pub api_key: Option<String>,
+    pub access_token: Option<String>,
+    pub base_url: Option<String>,
+    pub include_configured: Option<bool>,
+    pub selection_mode: Option<SelectionMode>,
+    pub max_candidates: Option<usize>,
+    pub request_category: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OpenAIResponseRequest {
+    pub model: String,
+    pub input: Value,
+    pub instructions: Option<String>,
+    pub temperature: Option<f32>,
+    pub max_output_tokens: Option<u32>,
+    pub stream: Option<bool>,
+    pub text: Option<OpenAITextConfig>,
+    pub reasoning: Option<OpenAIReasoningConfig>,
+    pub workflow: Option<String>,
+    pub role: Option<String>,
+    pub provider: Option<String>,
+    pub api_key: Option<String>,
+    pub access_token: Option<String>,
+    pub base_url: Option<String>,
+    pub include_configured: Option<bool>,
+    pub selection_mode: Option<SelectionMode>,
+    pub max_candidates: Option<usize>,
+    pub request_category: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CandidateSummary {
     pub candidate_id: String,
     pub provider: String,

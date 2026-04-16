@@ -1,14 +1,12 @@
-use std::{
-    collections::HashSet,
-    env,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, env, sync::Arc, time::Duration};
 
 use axum::http::{HeaderMap, header::AUTHORIZATION};
 use reqwest::Client;
 use serde_json::{Value, json};
-use tokio::{task::JoinSet, time::{Instant, sleep}};
+use tokio::{
+    task::JoinSet,
+    time::{Instant, sleep},
+};
 use tracing::info;
 use uuid::Uuid;
 
@@ -25,8 +23,8 @@ use crate::{
         SpecialistAnalysisResponse, TranscriptionResponse,
     },
     providers::{
-        build_adapter, normalize_provider_type, provider_request_from_profile, ProviderHealth,
-        ProviderInvocationResponse, TranscriptionInput,
+        ProviderHealth, ProviderInvocationResponse, TranscriptionInput, build_adapter,
+        normalize_provider_type, provider_request_from_profile,
     },
     specialists::{
         SpecialistEngine, analyze_specialist_engines, build_specialist_engines,
@@ -93,26 +91,97 @@ const WORKFLOW_ROUTING_PROFILES: &[(&str, &[(&str, &[&str])])] = &[
     (
         "playground_plan",
         &[
-            ("general", &["requirements", "education", "json", "planning"]),
-            ("planner", &["requirements", "education", "planning", "json"]),
+            (
+                "general",
+                &["requirements", "education", "json", "planning"],
+            ),
+            (
+                "planner",
+                &["requirements", "education", "planning", "json"],
+            ),
         ],
     ),
 ];
 
 const KEYWORD_TAGS: &[(&str, &[&str])] = &[
     ("json", &["json", "schema", "field_id", "structured_data"]),
-    ("code", &["code", "implement", "refactor", "bug", "pytest", "test", "module", "api"]),
-    ("research", &["research", "reference", "citation", "source", "evidence", "confluence", "jira"]),
-    ("review", &["review", "audit", "risk", "security", "quality", "critique", "policy"]),
-    ("planning", &["plan", "steps", "roadmap", "requirements", "workflow", "milestone"]),
-    ("education", &["school", "pupil", "classroom", "reading quiz", "spelling", "child-friendly"]),
-    ("neuromorphic", &["aarnn", "aer", "snn", "spiking", "neuromorphic", "celegans", "drosophila"]),
+    (
+        "code",
+        &[
+            "code",
+            "implement",
+            "refactor",
+            "bug",
+            "pytest",
+            "test",
+            "module",
+            "api",
+        ],
+    ),
+    (
+        "research",
+        &[
+            "research",
+            "reference",
+            "citation",
+            "source",
+            "evidence",
+            "confluence",
+            "jira",
+        ],
+    ),
+    (
+        "review",
+        &[
+            "review", "audit", "risk", "security", "quality", "critique", "policy",
+        ],
+    ),
+    (
+        "planning",
+        &[
+            "plan",
+            "steps",
+            "roadmap",
+            "requirements",
+            "workflow",
+            "milestone",
+        ],
+    ),
+    (
+        "education",
+        &[
+            "school",
+            "pupil",
+            "classroom",
+            "reading quiz",
+            "spelling",
+            "child-friendly",
+        ],
+    ),
+    (
+        "neuromorphic",
+        &[
+            "aarnn",
+            "aer",
+            "snn",
+            "spiking",
+            "neuromorphic",
+            "celegans",
+            "drosophila",
+        ],
+    ),
 ];
 
 const PROVIDER_SPECIALTIES: &[(&str, &[&str])] = &[
     ("openai", &["planning", "json", "review", "code"]),
-    ("gemini", &["research", "long_context", "summary", "citations"]),
-    ("google", &["research", "long_context", "summary", "citations"]),
+    (
+        "gemini",
+        &["research", "long_context", "summary", "citations"],
+    ),
+    (
+        "google",
+        &["research", "long_context", "summary", "citations"],
+    ),
     ("ollama", &["local", "privacy", "draft", "code"]),
 ];
 
@@ -197,7 +266,10 @@ impl GailService {
         }
     }
 
-    pub async fn direct_complete(&self, request: ProviderCompletionRequest) -> Result<CompletionResponse> {
+    pub async fn direct_complete(
+        &self,
+        request: ProviderCompletionRequest,
+    ) -> Result<CompletionResponse> {
         let mut profile = ProviderProfile::default();
         profile.name = request.provider.clone();
         profile.provider_type = request.provider.clone();
@@ -230,7 +302,9 @@ impl GailService {
         let include_configured = request
             .include_configured
             .unwrap_or_else(|| self.include_configured_candidates());
-        let max_candidates = request.max_candidates.unwrap_or_else(|| self.max_parallel_candidates());
+        let max_candidates = request
+            .max_candidates
+            .unwrap_or_else(|| self.max_parallel_candidates());
         let timeout_cap = self.candidate_timeout_cap(&workflow, &role);
         let early_success_enabled = self.early_success_enabled(&workflow, &role, &selection_mode);
         let early_success_settle_seconds =
@@ -238,7 +312,10 @@ impl GailService {
         let early_success_min_quality = self.early_success_min_quality();
 
         let mut provider_request = ProviderCompletionRequest {
-            provider: request.preferred_provider.clone().unwrap_or_else(|| "openai".to_string()),
+            provider: request
+                .preferred_provider
+                .clone()
+                .unwrap_or_else(|| "openai".to_string()),
             model: request.preferred_model.clone(),
             api_key: request.preferred_api_key.clone(),
             access_token: request.preferred_access_token.clone(),
@@ -252,8 +329,23 @@ impl GailService {
             request_category: request.request_category.clone(),
         };
 
-        let prompt_text = flatten_prompt_text(&provider_request.messages, provider_request.system.as_deref());
+        let prompt_text = flatten_prompt_text(
+            &provider_request.messages,
+            provider_request.system.as_deref(),
+        );
         let mut task_tags = workflow_tags(&workflow, &role, &prompt_text);
+        if let Some(category) = request
+            .request_category
+            .as_deref()
+            .or(provider_request.request_category.as_deref())
+        {
+            for tag in category.split(|ch: char| !ch.is_ascii_alphanumeric()) {
+                let normalized = normalize_key(tag, "");
+                if !normalized.is_empty() {
+                    task_tags.insert(normalized);
+                }
+            }
+        }
         let mut specialist_meta = None;
         if !self.inner.specialists.is_empty()
             && (task_tags.contains("neuromorphic") || self.always_route_specialists())
@@ -263,7 +355,8 @@ impl GailService {
                 workflow: Some(workflow.clone()),
                 role: Some(role.clone()),
             };
-            let analysis = analyze_specialist_engines(&self.inner.specialists, &analyze_request).await;
+            let analysis =
+                analyze_specialist_engines(&self.inner.specialists, &analyze_request).await;
             if analysis.relevant {
                 task_tags.insert("neuromorphic".to_string());
                 task_tags.insert("aer".to_string());
@@ -294,7 +387,9 @@ impl GailService {
         }
         let mut ranked = Vec::new();
         for candidate in candidates.drain(..) {
-            let score = self.rank_candidate(&candidate, &workflow, &role, &task_tags).await;
+            let score = self
+                .rank_candidate(&candidate, &workflow, &role, &task_tags)
+                .await;
             ranked.push((score, candidate));
         }
         ranked.sort_by(|left, right| {
@@ -309,7 +404,9 @@ impl GailService {
             .map(|(_, candidate)| candidate)
             .collect::<Vec<_>>();
         if selected.is_empty() {
-            return Err(GailError::bad_request("no provider candidates were selected"));
+            return Err(GailError::bad_request(
+                "no provider candidates were selected",
+            ));
         }
 
         info!(
@@ -320,7 +417,10 @@ impl GailService {
             "dispatching Gail orchestration"
         );
 
-        let expected_json = expected_json(&provider_request.messages, provider_request.system.as_deref());
+        let expected_json = expected_json(
+            &provider_request.messages,
+            provider_request.system.as_deref(),
+        );
         let mut results = if selected.len() == 1 {
             vec![
                 self.invoke_candidate(
@@ -386,7 +486,12 @@ impl GailService {
                         result.error.as_deref(),
                     )
                     .await?;
-                failures.push(result.error.clone().unwrap_or_else(|| "unknown error".to_string()));
+                failures.push(
+                    result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "unknown error".to_string()),
+                );
             }
         }
 
@@ -413,29 +518,38 @@ impl GailService {
         let selected_summary = chosen
             .candidate
             .summary(Some(chosen_response.model.as_str()));
-        let candidate_summaries = std::iter::once((selected_summary.clone(), chosen.latency_ms, chosen.quality, chosen.score, chosen.error.clone(), true))
-            .chain(results.into_iter().map(|result| {
-                let summary = result
-                    .candidate
-                    .summary(result.response.as_ref().map(|value| value.model.as_str()));
-                (
-                    summary,
-                    result.latency_ms,
-                    result.quality,
-                    result.score,
-                    result.error,
-                    result.response.is_some(),
-                )
-            }))
-            .map(|(summary, latency_ms, quality, score, error, ok)| CandidateInvocationSummary {
+        let candidate_summaries = std::iter::once((
+            selected_summary.clone(),
+            chosen.latency_ms,
+            chosen.quality,
+            chosen.score,
+            chosen.error.clone(),
+            true,
+        ))
+        .chain(results.into_iter().map(|result| {
+            let summary = result
+                .candidate
+                .summary(result.response.as_ref().map(|value| value.model.as_str()));
+            (
+                summary,
+                result.latency_ms,
+                result.quality,
+                result.score,
+                result.error,
+                result.response.is_some(),
+            )
+        }))
+        .map(
+            |(summary, latency_ms, quality, score, error, ok)| CandidateInvocationSummary {
                 summary,
                 latency_ms,
                 quality,
                 score,
                 status: if ok { "ok" } else { "error" }.to_string(),
                 error,
-            })
-            .collect::<Vec<_>>();
+            },
+        )
+        .collect::<Vec<_>>();
 
         info!(
             workflow = %workflow,
@@ -528,7 +642,11 @@ impl GailService {
         let events = if let Some(events) = request.events {
             events
         } else {
-            aer::spikes_to_events(ts_us, request.base_addr, &request.spikes.unwrap_or_default())
+            aer::spikes_to_events(
+                ts_us,
+                request.base_addr,
+                &request.spikes.unwrap_or_default(),
+            )
         };
         let payload = aer::encode_events(&events);
         Ok(AerEncodeResponse {
@@ -562,9 +680,7 @@ impl GailService {
         probe_engines: bool,
         probe_providers: bool,
     ) -> Value {
-        let providers = self
-            .provider_summaries(probe_providers)
-            .await;
+        let providers = self.provider_summaries(probe_providers).await;
         let engines = specialist_engine_summaries(
             &self.inner.config,
             self.inner.client.clone(),
@@ -593,10 +709,12 @@ impl GailService {
             let provider_type = normalize_provider_type(profile.provider_type.as_str());
             let health = if probe_health {
                 match build_adapter(self.inner.client.clone(), profile) {
-                    Ok(adapter) => match adapter.health(Some(PROVIDER_HEALTH_TIMEOUT_SECONDS)).await {
-                        Ok(status) => json!(status),
-                        Err(error) => json!({"ok": false, "message": error.to_string()}),
-                    },
+                    Ok(adapter) => {
+                        match adapter.health(Some(PROVIDER_HEALTH_TIMEOUT_SECONDS)).await {
+                            Ok(status) => json!(status),
+                            Err(error) => json!({"ok": false, "message": error.to_string()}),
+                        }
+                    }
                     Err(error) => json!({"ok": false, "message": error.to_string()}),
                 }
             } else {
@@ -632,7 +750,11 @@ impl GailService {
         Value::Null
     }
 
-    fn matching_token<'a>(&'a self, headers: &HeaderMap, required_scope: &str) -> Option<&'a ApiTokenConfig> {
+    fn matching_token<'a>(
+        &'a self,
+        headers: &HeaderMap,
+        required_scope: &str,
+    ) -> Option<&'a ApiTokenConfig> {
         let header = headers.get(AUTHORIZATION)?.to_str().ok()?;
         let token = header.strip_prefix("Bearer ")?.trim();
         if token.is_empty() {
@@ -648,7 +770,11 @@ impl GailService {
         })
     }
 
-    fn build_candidates(&self, request: &CompletionRequest, include_configured: bool) -> Vec<ProviderCandidate> {
+    fn build_candidates(
+        &self,
+        request: &CompletionRequest,
+        include_configured: bool,
+    ) -> Vec<ProviderCandidate> {
         let mut candidates = Vec::new();
         if let Some(provider) = request.preferred_provider.as_ref() {
             candidates.push(self.request_candidate(
@@ -733,7 +859,12 @@ impl GailService {
             .metrics
             .score_bonus(candidate.candidate_id().as_str(), workflow, role)
             .await;
-        candidate.weight + (overlap * 0.85) + role_score + health_score + preferred_score + metrics_bonus
+        candidate.weight
+            + (overlap * 0.85)
+            + role_score
+            + health_score
+            + preferred_score
+            + metrics_bonus
     }
 
     async fn probe_health(&self, candidate: &ProviderCandidate) -> ProviderHealth {
@@ -850,7 +981,8 @@ impl GailService {
                 },
             };
             info!(candidate = %result.candidate.label(result.response.as_ref().map(|value| value.model.as_str())), status = if result.response.is_some() { "ok" } else { "error" }, latency_ms = ?result.latency_ms, quality = result.quality, error = ?result.error, "Gail candidate completed");
-            let accepts_early = result.response.is_some() && result.quality >= early_success_min_quality;
+            let accepts_early =
+                result.response.is_some() && result.quality >= early_success_min_quality;
             results.push(result);
             if !early_success_enabled || !accepts_early {
                 continue;
@@ -860,7 +992,9 @@ impl GailService {
                 break;
             }
             if early_deadline.is_none() {
-                early_deadline = Some(Instant::now() + Duration::from_secs_f64(early_success_settle_seconds.max(0.0)));
+                early_deadline = Some(
+                    Instant::now() + Duration::from_secs_f64(early_success_settle_seconds.max(0.0)),
+                );
             }
         }
         Ok(results)
@@ -877,13 +1011,17 @@ impl GailService {
         let timeout_retries = env_int_any(&["LLM_TIMEOUT_RETRIES"], 1) as usize;
         let quota_backoff_base = env_float_any(&["LLM_RATE_LIMIT_BACKOFF_BASE"], 1.0).max(0.1);
         let timeout_backoff_base = env_float_any(&["LLM_TIMEOUT_BACKOFF_BASE"], 1.0).max(0.1);
-        let retry_empty = env_bool_any(&["REFINER_AI_RETRY_EMPTY_OUTPUT", "GAIL_RETRY_EMPTY_OUTPUT"], true);
+        let retry_empty = env_bool_any(
+            &["REFINER_AI_RETRY_EMPTY_OUTPUT", "GAIL_RETRY_EMPTY_OUTPUT"],
+            true,
+        );
         let mut quota_attempts = 0usize;
         let mut timeout_attempts = 0usize;
         let mut attempts = 0usize;
         loop {
             attempts += 1;
-            let mut effective = provider_request_from_profile(&candidate.profile, &provider_request);
+            let mut effective =
+                provider_request_from_profile(&candidate.profile, &provider_request);
             if effective.timeout_seconds.is_none() {
                 effective.timeout_seconds = timeout_cap;
             }
@@ -898,7 +1036,7 @@ impl GailService {
                         latency_ms: None,
                         quality: -1.0,
                         score: f64::NEG_INFINITY,
-                    }
+                    };
                 }
             };
             match adapter.complete(&effective).await {
@@ -961,14 +1099,23 @@ impl GailService {
 
     fn include_configured_candidates(&self) -> bool {
         env_bool_any(
-            &["GAIL_INCLUDE_CONFIGURED_CANDIDATES", "REFINER_AI_INCLUDE_CONFIGURED_CANDIDATES"],
-            self.inner.config.orchestration.include_configured_candidates,
+            &[
+                "GAIL_INCLUDE_CONFIGURED_CANDIDATES",
+                "REFINER_AI_INCLUDE_CONFIGURED_CANDIDATES",
+            ],
+            self.inner
+                .config
+                .orchestration
+                .include_configured_candidates,
         )
     }
 
     fn max_parallel_candidates(&self) -> usize {
         env_int_any(
-            &["GAIL_MAX_PARALLEL_CANDIDATES", "REFINER_AI_MAX_CONCURRENT_CANDIDATES"],
+            &[
+                "GAIL_MAX_PARALLEL_CANDIDATES",
+                "REFINER_AI_MAX_CONCURRENT_CANDIDATES",
+            ],
             self.inner.config.orchestration.max_parallel_candidates as u64,
         ) as usize
     }
@@ -993,7 +1140,12 @@ impl GailService {
         }
     }
 
-    fn early_success_enabled(&self, workflow: &str, role: &str, selection_mode: &SelectionMode) -> bool {
+    fn early_success_enabled(
+        &self,
+        workflow: &str,
+        role: &str,
+        selection_mode: &SelectionMode,
+    ) -> bool {
         if *selection_mode == SelectionMode::Fastest {
             return true;
         }
@@ -1023,7 +1175,10 @@ impl GailService {
             0.0
         };
         env_float_any(
-            &["GAIL_EARLY_SUCCESS_SETTLE_SECONDS", "REFINER_AI_EARLY_SUCCESS_SETTLE_SECONDS"],
+            &[
+                "GAIL_EARLY_SUCCESS_SETTLE_SECONDS",
+                "REFINER_AI_EARLY_SUCCESS_SETTLE_SECONDS",
+            ],
             if self.inner.config.orchestration.early_success_settle_seconds > 0.0 {
                 self.inner.config.orchestration.early_success_settle_seconds
             } else {
@@ -1035,7 +1190,10 @@ impl GailService {
 
     fn early_success_min_quality(&self) -> f64 {
         env_float_any(
-            &["GAIL_EARLY_SUCCESS_MIN_QUALITY", "REFINER_AI_EARLY_SUCCESS_MIN_QUALITY"],
+            &[
+                "GAIL_EARLY_SUCCESS_MIN_QUALITY",
+                "REFINER_AI_EARLY_SUCCESS_MIN_QUALITY",
+            ],
             self.inner.config.orchestration.early_success_min_quality,
         )
     }
@@ -1051,14 +1209,13 @@ impl GailService {
                 .unwrap_or_default() as i64
         };
         let value = env_int_any(
-            &["GAIL_CANDIDATE_TIMEOUT_CAP_SECONDS", "REFINER_AI_CANDIDATE_TIMEOUT_CAP_SECONDS"],
+            &[
+                "GAIL_CANDIDATE_TIMEOUT_CAP_SECONDS",
+                "REFINER_AI_CANDIDATE_TIMEOUT_CAP_SECONDS",
+            ],
             default.max(0) as u64,
         );
-        if value == 0 {
-            None
-        } else {
-            Some(value.max(1))
-        }
+        if value == 0 { None } else { Some(value.max(1)) }
     }
 
     fn always_route_specialists(&self) -> bool {
@@ -1205,18 +1362,30 @@ fn infer_specialties(
     }
     let lowered_model = model.to_ascii_lowercase();
     if lowered_model.contains("codex") {
-        specialties.extend(["code", "planning", "review"].into_iter().map(ToOwned::to_owned));
+        specialties.extend(
+            ["code", "planning", "review"]
+                .into_iter()
+                .map(ToOwned::to_owned),
+        );
     }
-    if lowered_model.contains("flash") || lowered_model.contains("mini") || lowered_model.contains("small") {
+    if lowered_model.contains("flash")
+        || lowered_model.contains("mini")
+        || lowered_model.contains("small")
+    {
         specialties.insert("fast".to_string());
     }
-    if lowered_model.contains("pro") || lowered_model.contains("o3") || lowered_model.contains("o4") {
+    if lowered_model.contains("pro") || lowered_model.contains("o3") || lowered_model.contains("o4")
+    {
         specialties.insert("reasoning".to_string());
     }
     if lowered_model.contains("embed") {
         specialties.insert("retrieval".to_string());
     }
-    if source.unwrap_or_default().to_ascii_lowercase().contains("local") {
+    if source
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .contains("local")
+    {
         specialties.insert("local".to_string());
     }
     specialties.extend(
@@ -1407,7 +1576,11 @@ mod tests {
 
     #[test]
     fn workflow_tags_include_keyword_and_profile_tags() {
-        let tags = workflow_tags("assistant_requirements", "assistant", "Need JSON schema for a reading quiz");
+        let tags = workflow_tags(
+            "assistant_requirements",
+            "assistant",
+            "Need JSON schema for a reading quiz",
+        );
         assert!(tags.contains("json"));
         assert!(tags.contains("requirements"));
     }
