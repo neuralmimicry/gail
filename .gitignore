@@ -1,1 +1,25 @@
-/target
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo lock file for libraries (keep it for binaries)
+# Cargo.lock is already tracked, so not ignoring it
+
+# Debug and release builds
+debug/
+target/
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# System files
+Thumbs.db
+
+# Backup files
+*.orig
