@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "workflow_profiles": {
+    "project_solver": {
+      "general": ["planning", "json", "code", "safety"],
+      "planner": ["planning", "code", "json"],
+      "reviewer": ["review", "safety", "json"],
+      "researcher": ["research", "docs", "citations"]
+    },
+    "topic_research": {
+      "general": ["research", "citations", "long_context"],
+      "planner": ["planning", "query_planning", "research"],
+      "reviewer": ["review", "citations", "fact_check"],
+      "researcher": ["research", "citations", "long_context"]
+    },
+    "jira_analysis": {
+      "general": ["analysis", "summary", "action_plan"],
+      "reviewer": ["review", "analysis", "action_plan"]
+    },
+    "confluence_analysis": {
+      "general": ["analysis", "summary", "long_context"],
+      "reviewer": ["review", "analysis", "action_plan"]
+    },
+    "assistant_requirements": {
+      "general": ["requirements", "json", "clarity"],
+      "assistant": ["requirements", "json", "clarity"]
+    },
+    "assistant_form_fill": {
+      "general": ["json", "structured_data"],
+      "assistant": ["json", "structured_data"]
+    },
+    "assistant_rag_mcp": {
+      "general": ["research", "json", "citations"],
+      "assistant": ["research", "citations"]
+    },
+    "playground_plan": {
+      "general": ["requirements", "education", "json", "planning"],
+      "planner": ["requirements", "education", "planning", "json"]
+    }
+  },
+  "keyword_tags": {
+    "json": ["json", "schema", "field_id", "structured_data"],
+    "code": ["code", "implement", "refactor", "bug", "pytest", "test", "module", "api"],
+    "research": ["research", "reference", "citation", "source", "evidence", "confluence", "jira"],
+    "review": ["review", "audit", "risk", "security", "quality", "critique", "policy"],
+    "planning": ["plan", "steps", "roadmap", "requirements", "workflow", "milestone"],
+    "education": ["school", "pupil", "classroom", "reading quiz", "spelling", "child-friendly"],
+    "neuromorphic": ["aarnn", "aer", "snn", "spiking", "neuromorphic", "celegans", "drosophila"]
+  },
+  "provider_specialties": {
+    "openai": ["planning", "json", "review", "code"],
+    "gemini": ["research", "long_context", "summary", "citations"],
+    "google": ["research", "long_context", "summary", "citations"],
+    "ollama": ["local", "privacy", "draft", "code"]
+  }
+}

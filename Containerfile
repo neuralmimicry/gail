@@ -27,6 +27,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=builder /src/target/release/gail /usr/local/bin/gail
 COPY gail.yaml /app/config/gail.yaml
+COPY config/ai-routing-profiles.json /app/config/ai-routing-profiles.json
 ENV GAIL_CONFIG=/app/config/gail.yaml \
     GAIL_HEALTHCHECK_TOKEN= \
     RUST_LOG=info

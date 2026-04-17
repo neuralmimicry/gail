@@ -26,6 +26,7 @@ use crate::{
         ProviderHealth, ProviderInvocationResponse, TranscriptionInput, build_adapter,
         normalize_provider_type, provider_request_from_profile,
     },
+    routing::{default_routing_profiles, resolve_routing_profiles_path},
     specialists::{
         SpecialistEngine, analyze_specialist_engines, build_specialist_engines,
         specialist_engine_summaries,
@@ -33,157 +34,6 @@ use crate::{
 };
 
 const PROVIDER_HEALTH_TIMEOUT_SECONDS: u64 = 4;
-
-const WORKFLOW_ROUTING_PROFILES: &[(&str, &[(&str, &[&str])])] = &[
-    (
-        "project_solver",
-        &[
-            ("general", &["planning", "json", "code", "safety"]),
-            ("planner", &["planning", "code", "json"]),
-            ("reviewer", &["review", "safety", "json"]),
-            ("researcher", &["research", "docs", "citations"]),
-        ],
-    ),
-    (
-        "topic_research",
-        &[
-            ("general", &["research", "citations", "long_context"]),
-            ("planner", &["planning", "query_planning", "research"]),
-            ("reviewer", &["review", "citations", "fact_check"]),
-            ("researcher", &["research", "citations", "long_context"]),
-        ],
-    ),
-    (
-        "jira_analysis",
-        &[
-            ("general", &["analysis", "summary", "action_plan"]),
-            ("reviewer", &["review", "analysis", "action_plan"]),
-        ],
-    ),
-    (
-        "confluence_analysis",
-        &[
-            ("general", &["analysis", "summary", "long_context"]),
-            ("reviewer", &["review", "analysis", "action_plan"]),
-        ],
-    ),
-    (
-        "assistant_requirements",
-        &[
-            ("general", &["requirements", "json", "clarity"]),
-            ("assistant", &["requirements", "json", "clarity"]),
-        ],
-    ),
-    (
-        "assistant_form_fill",
-        &[
-            ("general", &["json", "structured_data"]),
-            ("assistant", &["json", "structured_data"]),
-        ],
-    ),
-    (
-        "assistant_rag_mcp",
-        &[
-            ("general", &["research", "json", "citations"]),
-            ("assistant", &["research", "citations"]),
-        ],
-    ),
-    (
-        "playground_plan",
-        &[
-            (
-                "general",
-                &["requirements", "education", "json", "planning"],
-            ),
-            (
-                "planner",
-                &["requirements", "education", "planning", "json"],
-            ),
-        ],
-    ),
-];
-
-const KEYWORD_TAGS: &[(&str, &[&str])] = &[
-    ("json", &["json", "schema", "field_id", "structured_data"]),
-    (
-        "code",
-        &[
-            "code",
-            "implement",
-            "refactor",
-            "bug",
-            "pytest",
-            "test",
-            "module",
-            "api",
-        ],
-    ),
-    (
-        "research",
-        &[
-            "research",
-            "reference",
-            "citation",
-            "source",
-            "evidence",
-            "confluence",
-            "jira",
-        ],
-    ),
-    (
-        "review",
-        &[
-            "review", "audit", "risk", "security", "quality", "critique", "policy",
-        ],
-    ),
-    (
-        "planning",
-        &[
-            "plan",
-            "steps",
-            "roadmap",
-            "requirements",
-            "workflow",
-            "milestone",
-        ],
-    ),
-    (
-        "education",
-        &[
-            "school",
-            "pupil",
-            "classroom",
-            "reading quiz",
-            "spelling",
-            "child-friendly",
-        ],
-    ),
-    (
-        "neuromorphic",
-        &[
-            "aarnn",
-            "aer",
-            "snn",
-            "spiking",
-            "neuromorphic",
-            "celegans",
-            "drosophila",
-        ],
-    ),
-];
-
-const PROVIDER_SPECIALTIES: &[(&str, &[&str])] = &[
-    ("openai", &["planning", "json", "review", "code"]),
-    (
-        "gemini",
-        &["research", "long_context", "summary", "citations"],
-    ),
-    (
-        "google",
-        &["research", "long_context", "summary", "citations"],
-    ),
-    ("ollama", &["local", "privacy", "draft", "code"]),
-];
 
 #[derive(Clone)]
 pub struct GailService {
@@ -689,8 +539,14 @@ impl GailService {
         .await;
         let metrics = self.inner.metrics.summary(candidate_limit.max(1)).await;
         let model_inventory = self.first_ollama_inventory().await;
+        let routing_profiles_path = resolve_routing_profiles_path(None::<&std::path::Path>)
+            .ok()
+            .map(|path| path.display().to_string());
+        let routing_profiles_version = default_routing_profiles().version;
         json!({
             "enabled": self.inner.config.orchestration.enabled,
+            "routing_profiles_path": routing_profiles_path,
+            "routing_profiles_version": routing_profiles_version,
             "selection_mode": self.selection_mode(),
             "max_parallel_candidates": self.max_parallel_candidates(),
             "health_ttl_seconds": self.health_ttl_seconds(),
@@ -1353,13 +1209,7 @@ fn infer_specialties(
     source: Option<&str>,
     configured: &[String],
 ) -> HashSet<String> {
-    let mut specialties = HashSet::new();
-    if let Some(defaults) = PROVIDER_SPECIALTIES
-        .iter()
-        .find_map(|(name, tags)| (*name == provider_type).then_some(*tags))
-    {
-        specialties.extend(defaults.iter().map(|item| (*item).to_string()));
-    }
+    let mut specialties = default_routing_profiles().base_provider_specialties(provider_type);
     let lowered_model = model.to_ascii_lowercase();
     if lowered_model.contains("codex") {
         specialties.extend(
@@ -1398,26 +1248,7 @@ fn infer_specialties(
 }
 
 fn workflow_tags(workflow: &str, role: &str, text: &str) -> HashSet<String> {
-    let mut tags = HashSet::new();
-    let workflow = normalize_key(workflow, "general");
-    let role = normalize_key(role, "general");
-    if let Some(entries) = WORKFLOW_ROUTING_PROFILES
-        .iter()
-        .find_map(|(name, entries)| (*name == workflow).then_some(*entries))
-    {
-        for (profile_role, values) in entries {
-            if *profile_role == "general" || *profile_role == role {
-                tags.extend(values.iter().map(|item| (*item).to_string()));
-            }
-        }
-    }
-    let lowered = text.to_ascii_lowercase();
-    for (tag, keywords) in KEYWORD_TAGS {
-        if keywords.iter().any(|keyword| lowered.contains(keyword)) {
-            tags.insert((*tag).to_string());
-        }
-    }
-    tags
+    default_routing_profiles().workflow_tags(workflow, role, text)
 }
 
 fn expected_json(messages: &[crate::models::ChatMessage], system: Option<&str>) -> bool {

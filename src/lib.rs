@@ -7,4 +7,5 @@ pub mod metrics;
 pub mod models;
 pub mod orchestration;
 pub mod providers;
+pub mod routing;
 pub mod specialists;

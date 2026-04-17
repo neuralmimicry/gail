@@ -1,0 +1,46 @@
+{
+  "candidates": {
+    "ollama/llama3.2": {
+      "provider": "ollama",
+      "model": "llama3.2",
+      "configured_model": "llama3.2",
+      "resolved_model": "llama3.2",
+      "specialties": [
+        "code",
+        "draft",
+        "local",
+        "privacy"
+      ],
+      "stats": {
+        "successes": 2,
+        "failures": 0,
+        "total": 2,
+        "ewma_latency_ms": 0.0,
+        "ewma_quality": 0.26249999999999996,
+        "last_status": "success",
+        "last_error": null,
+        "updated_at": 1776439936.5624151
+      },
+      "roles": {
+        "general:general": {
+          "successes": 2,
+          "failures": 0,
+          "total": 2,
+          "ewma_latency_ms": 0.0,
+          "ewma_quality": 0.26249999999999996,
+          "last_status": "success",
+          "last_error": null,
+          "updated_at": 1776439936.562417
+        }
+      },
+      "health": {
+        "ok": true,
+        "mode": "http",
+        "checked_at": 1776439936.5607245,
+        "latency_ms": 5,
+        "message": "ok"
+      }
+    }
+  },
+  "updated_at": 1776439936.562417
+}

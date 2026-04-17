@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    convert::Infallible,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -7,9 +8,13 @@ use axum::{
     Json, Router,
     extract::{Multipart, Query, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, Sse},
+    },
     routing::{get, post},
 };
+use futures::stream;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::signal;
@@ -101,9 +106,14 @@ async fn openai_chat_completions(
     if let Err(error) = service.authorize(&headers, "llm") {
         return openai_error_response(error);
     }
+    let stream_response = request.stream.unwrap_or(false);
     match dispatch_openai_chat_completion(&service, request).await {
         Ok((public_model, response)) => {
-            Json(openai_chat_completion_body(&public_model, &response)).into_response()
+            if stream_response {
+                openai_chat_completion_stream(public_model, response).into_response()
+            } else {
+                Json(openai_chat_completion_body(&public_model, &response)).into_response()
+            }
         }
         Err(error) => openai_error_response(error),
     }
@@ -117,9 +127,14 @@ async fn openai_responses(
     if let Err(error) = service.authorize(&headers, "llm") {
         return openai_error_response(error);
     }
+    let stream_response = request.stream.unwrap_or(false);
     match dispatch_openai_responses(&service, request).await {
         Ok((public_model, response)) => {
-            Json(openai_responses_body(&public_model, &response)).into_response()
+            if stream_response {
+                openai_responses_stream(public_model, response).into_response()
+            } else {
+                Json(openai_responses_body(&public_model, &response)).into_response()
+            }
         }
         Err(error) => openai_error_response(error),
     }
@@ -444,12 +459,6 @@ async fn dispatch_openai_chat_completion(
     service: &GailService,
     request: OpenAIChatCompletionRequest,
 ) -> Result<(String, CompletionResponse)> {
-    if request.stream.unwrap_or(false) {
-        return Err(GailError::bad_request(
-            "stream=true is not supported by Gail's OpenAI-compatible chat endpoint",
-        ));
-    }
-
     let route = resolve_openai_route(service, &request.model, request.provider.as_deref())?;
     let public_model = match &route {
         OpenAIResolvedRoute::Orchestrated { public_model, .. }
@@ -489,12 +498,6 @@ async fn dispatch_openai_responses(
     service: &GailService,
     request: OpenAIResponseRequest,
 ) -> Result<(String, CompletionResponse)> {
-    if request.stream.unwrap_or(false) {
-        return Err(GailError::bad_request(
-            "stream=true is not supported by Gail's OpenAI-compatible responses endpoint",
-        ));
-    }
-
     let route = resolve_openai_route(service, &request.model, request.provider.as_deref())?;
     let public_model = match &route {
         OpenAIResolvedRoute::Orchestrated { public_model, .. }
@@ -1378,6 +1381,146 @@ fn current_unix_timestamp() -> u64 {
         .unwrap_or_default()
 }
 
+fn chunk_text_for_streaming(text: &str, target_chars: usize) -> Vec<String> {
+    let chunk_size = target_chars.max(1);
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut count = 0usize;
+    for ch in text.chars() {
+        current.push(ch);
+        count += 1;
+        if count >= chunk_size {
+            chunks.push(std::mem::take(&mut current));
+            count = 0;
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn openai_chat_completion_stream(
+    public_model: String,
+    response: CompletionResponse,
+) -> Sse<impl futures::Stream<Item = std::result::Result<Event, Infallible>>> {
+    let id = format!("chatcmpl_{}", response.request_id);
+    let created = current_unix_timestamp();
+    let chunks = chunk_text_for_streaming(&response.text, 56);
+    let mut events: Vec<std::result::Result<Event, Infallible>> = Vec::new();
+
+    let role_chunk = json!({
+        "id": id.clone(),
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": public_model.clone(),
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant"},
+                "finish_reason": Value::Null,
+            }
+        ]
+    });
+    events.push(Ok(Event::default().data(role_chunk.to_string())));
+
+    for chunk in chunks {
+        let content_chunk = json!({
+            "id": id.clone(),
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": public_model.clone(),
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": chunk},
+                    "finish_reason": Value::Null,
+                }
+            ]
+        });
+        events.push(Ok(Event::default().data(content_chunk.to_string())));
+    }
+
+    let terminal_chunk = json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": public_model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": openai_usage_body(response.usage.as_ref()),
+        "gail": gail_response_body(&response),
+    });
+    events.push(Ok(Event::default().data(terminal_chunk.to_string())));
+    events.push(Ok(Event::default().data("[DONE]")));
+
+    Sse::new(stream::iter(events))
+}
+
+fn openai_responses_stream(
+    public_model: String,
+    response: CompletionResponse,
+) -> Sse<impl futures::Stream<Item = std::result::Result<Event, Infallible>>> {
+    let id = format!("resp_{}", response.request_id);
+    let created = current_unix_timestamp();
+    let chunks = chunk_text_for_streaming(&response.text, 56);
+    let mut events: Vec<std::result::Result<Event, Infallible>> = Vec::new();
+
+    let created_event = json!({
+        "id": id.clone(),
+        "object": "response",
+        "created_at": created,
+        "status": "in_progress",
+        "model": public_model.clone(),
+    });
+    events.push(Ok(
+        Event::default()
+            .event("response.created")
+            .data(created_event.to_string()),
+    ));
+
+    for chunk in chunks {
+        let delta_event = json!({
+            "id": id,
+            "delta": chunk,
+            "output_index": 0,
+            "content_index": 0,
+        });
+        events.push(Ok(
+            Event::default()
+                .event("response.output_text.delta")
+                .data(delta_event.to_string()),
+        ));
+    }
+
+    let output_done = json!({
+        "id": id,
+        "text": response.text.clone(),
+        "output_index": 0,
+        "content_index": 0,
+    });
+    events.push(Ok(
+        Event::default()
+            .event("response.output_text.done")
+            .data(output_done.to_string()),
+    ));
+
+    let completed = openai_responses_body(&public_model, &response);
+    events.push(Ok(
+        Event::default()
+            .event("response.completed")
+            .data(completed.to_string()),
+    ));
+    events.push(Ok(Event::default().data("[DONE]")));
+
+    Sse::new(stream::iter(events))
+}
+
 fn openai_chat_completion_body(public_model: &str, response: &CompletionResponse) -> Value {
     json!({
         "id": format!("chatcmpl_{}", response.request_id),
@@ -1605,6 +1748,15 @@ mod tests {
         serde_json::from_slice(&bytes).expect("json")
     }
 
+    async fn read_text(response: Response) -> String {
+        let status = response.status();
+        assert!(status.is_success(), "unexpected status: {status}");
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        String::from_utf8(bytes.to_vec()).expect("utf8")
+    }
+
     #[tokio::test]
     async fn health_requires_auth_when_configured() {
         let app = build_router(test_service_with_config(GailConfig::default()).await);
@@ -1779,5 +1931,123 @@ mod tests {
         assert_eq!(payload["output_text"], "mocked answer");
         assert_eq!(payload["output"][0]["type"], "text");
         assert_eq!(payload["output"][0]["text"], "mocked answer");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_stream_route_returns_sse_chunks() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "mocked answer",
+                "prompt_eval_count": 8,
+                "eval_count": 5
+            })))
+            .mount(&server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/llama3.2",
+                            "base_url": server.uri(),
+                            "stream": true,
+                            "messages": [
+                                {"role": "user", "content": "hello"}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream"))
+        );
+        let body = read_text(response).await;
+        assert!(body.contains("\"object\":\"chat.completion.chunk\""));
+        assert!(body.contains("mocked answer"));
+        assert!(body.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn openai_responses_stream_route_returns_sse_events() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "mocked answer",
+                "prompt_eval_count": 4,
+                "eval_count": 3
+            })))
+            .mount(&server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/llama3.2",
+                            "base_url": server.uri(),
+                            "stream": true,
+                            "input": [
+                                {"type": "input_text", "text": "hello"}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream"))
+        );
+        let body = read_text(response).await;
+        assert!(body.contains("event: response.created"));
+        assert!(body.contains("event: response.output_text.delta"));
+        assert!(body.contains("event: response.completed"));
+        assert!(body.contains("mocked answer"));
+        assert!(body.contains("[DONE]"));
     }
 }

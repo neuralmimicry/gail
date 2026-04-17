@@ -79,6 +79,8 @@ The image expects a config file at `/app/config/gail.yaml` unless `GAIL_CONFIG` 
 
 - `providers`: shared LLM backends Gail can orchestrate.
 - `specialists`: explicit neuromorphic engines. Use this when you have named SNN/AARNN backends to register.
+- `config/ai-routing-profiles.json`: shared workflow/keyword/provider routing contract used by Gail and mirrored in Refiner for offline fallback.
+- `GAIL_ROUTING_PROFILES_PATH`: optional override for the routing contract path.
 - `GAIL_AARNN_*` env vars: optional legacy auto-attach path for an AARNN backend, mirroring Refiner's previous automatic fallback behavior.
 - `storage.metrics_path`: persisted provider quality/latency metrics.
 - `storage.ollama_model_store_path`: cached Ollama model inventory summary.
@@ -104,6 +106,7 @@ The Ansible role in `swarmhpc/swarmhpc/ansible/roles/continuum_tenant_gail`:
 - builds or syncs the Gail source tree,
 - builds and pushes the container image,
 - renders the Gail config into a Kubernetes Secret,
+- ships the shared AI-routing contract with the Gail runtime image,
 - persists Gail metrics on shared storage,
 - exposes Gail via ingress/TLS, and
 - injects a matching bearer-token configuration into Refiner.
