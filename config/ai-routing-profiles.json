@@ -49,6 +49,7 @@
   },
   "provider_specialties": {
     "openai": ["planning", "json", "review", "code"],
+    "nvidia": ["reasoning", "agentic", "long_context", "code"],
     "gemini": ["research", "long_context", "summary", "citations"],
     "google": ["research", "long_context", "summary", "citations"],
     "ollama": ["local", "privacy", "draft", "code"]

@@ -10,6 +10,7 @@ The service is designed so Refiner can delegate immediately, while Tracey and Co
 - Keep high-level workflow logic in each product and move cross-cutting provider/service routing into one Rust service.
 - Preserve Refiner features such as concurrent provider selection, persisted metrics, Ollama inventory visibility, transcription, and neuromorphic specialist routing.
 - Improve latency and efficiency centrally so optimisations benefit every Gail client.
+- Allow additional OpenAI-compatible providers, including NVIDIA NIM-hosted model families, without changing client integrations.
 
 ## Runtime Surface
 
@@ -78,6 +79,7 @@ The image expects a config file at `/app/config/gail.yaml` unless `GAIL_CONFIG` 
 ## Configuration Notes
 
 - `providers`: shared LLM backends Gail can orchestrate.
+- `providers` can include `openai`, `gemini`, `ollama`, and OpenAI-compatible `nvidia` profiles backed by custom `base_url` values.
 - `specialists`: explicit neuromorphic engines. Use this when you have named SNN/AARNN backends to register.
 - `config/ai-routing-profiles.json`: shared workflow/keyword/provider routing contract used by Gail and mirrored in Refiner for offline fallback.
 - `GAIL_ROUTING_PROFILES_PATH`: optional override for the routing contract path.

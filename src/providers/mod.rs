@@ -4,7 +4,10 @@ pub mod openai;
 
 use std::{collections::HashSet, env, time::Duration};
 
-use http::{HeaderMap, HeaderValue, StatusCode, header::{AUTHORIZATION, CONTENT_TYPE}};
+use http::{
+    header::{AUTHORIZATION, CONTENT_TYPE},
+    HeaderMap, HeaderValue, StatusCode,
+};
 use rand::Rng;
 use reqwest::Client;
 use serde_json::Value;
@@ -51,6 +54,7 @@ pub struct TranscriptionInput {
 #[derive(Clone)]
 pub enum ProviderAdapter {
     OpenAI(OpenAIProvider),
+    Nvidia(OpenAIProvider),
     Gemini(GeminiProvider),
     Ollama(OllamaProvider),
 }
@@ -59,6 +63,7 @@ impl ProviderAdapter {
     pub fn provider_type(&self) -> &'static str {
         match self {
             Self::OpenAI(_) => "openai",
+            Self::Nvidia(_) => "nvidia",
             Self::Gemini(_) => "gemini",
             Self::Ollama(_) => "ollama",
         }
@@ -67,22 +72,31 @@ impl ProviderAdapter {
     pub fn model(&self) -> &str {
         match self {
             Self::OpenAI(provider) => provider.model(),
+            Self::Nvidia(provider) => provider.model(),
             Self::Gemini(provider) => provider.model(),
             Self::Ollama(provider) => provider.model(),
         }
     }
 
-    pub async fn complete(&self, request: &ProviderCompletionRequest) -> Result<ProviderInvocationResponse> {
+    pub async fn complete(
+        &self,
+        request: &ProviderCompletionRequest,
+    ) -> Result<ProviderInvocationResponse> {
         match self {
             Self::OpenAI(provider) => provider.complete(request).await,
+            Self::Nvidia(provider) => provider.complete(request).await,
             Self::Gemini(provider) => provider.complete(request).await,
             Self::Ollama(provider) => provider.complete(request).await,
         }
     }
 
-    pub async fn transcribe(&self, input: &TranscriptionInput) -> Result<ProviderInvocationResponse> {
+    pub async fn transcribe(
+        &self,
+        input: &TranscriptionInput,
+    ) -> Result<ProviderInvocationResponse> {
         match self {
             Self::OpenAI(provider) => provider.transcribe(input).await,
+            Self::Nvidia(provider) => provider.transcribe(input).await,
             Self::Gemini(provider) => provider.transcribe(input).await,
             Self::Ollama(provider) => provider.transcribe(input).await,
         }
@@ -91,6 +105,7 @@ impl ProviderAdapter {
     pub async fn health(&self, timeout_seconds: Option<u64>) -> Result<ProviderHealth> {
         match self {
             Self::OpenAI(provider) => provider.health(timeout_seconds).await,
+            Self::Nvidia(provider) => provider.health(timeout_seconds).await,
             Self::Gemini(provider) => provider.health(timeout_seconds).await,
             Self::Ollama(provider) => provider.health(timeout_seconds).await,
         }
@@ -106,10 +121,21 @@ impl ProviderAdapter {
 
 pub fn build_adapter(client: Client, profile: &ProviderProfile) -> Result<ProviderAdapter> {
     match normalize_provider_type(profile.provider_type.as_str()).as_str() {
-        "openai" => Ok(ProviderAdapter::OpenAI(OpenAIProvider::new(client, profile)?)),
-        "gemini" => Ok(ProviderAdapter::Gemini(GeminiProvider::new(client, profile)?)),
-        "ollama" => Ok(ProviderAdapter::Ollama(OllamaProvider::new(client, profile))),
-        other => Err(GailError::bad_request(format!("unsupported provider type: {other}"))),
+        "openai" => Ok(ProviderAdapter::OpenAI(OpenAIProvider::new(
+            client, profile,
+        )?)),
+        "nvidia" => Ok(ProviderAdapter::Nvidia(OpenAIProvider::new_nvidia(
+            client, profile,
+        )?)),
+        "gemini" => Ok(ProviderAdapter::Gemini(GeminiProvider::new(
+            client, profile,
+        )?)),
+        "ollama" => Ok(ProviderAdapter::Ollama(OllamaProvider::new(
+            client, profile,
+        ))),
+        other => Err(GailError::bad_request(format!(
+            "unsupported provider type: {other}"
+        ))),
     }
 }
 
@@ -118,17 +144,27 @@ pub fn normalize_provider_type(raw: &str) -> String {
     match cleaned.as_str() {
         "chatgpt" | "gpt" => "openai".to_string(),
         "google" => "gemini".to_string(),
+        "nim" | "nvidia_nim" => "nvidia".to_string(),
         other => other.to_string(),
     }
 }
 
-pub fn provider_request_from_profile(profile: &ProviderProfile, request: &ProviderCompletionRequest) -> ProviderCompletionRequest {
+pub fn provider_request_from_profile(
+    profile: &ProviderProfile,
+    request: &ProviderCompletionRequest,
+) -> ProviderCompletionRequest {
     ProviderCompletionRequest {
         provider: normalize_provider_type(profile.provider_type.as_str()),
         model: profile.model.clone().or_else(|| request.model.clone()),
         api_key: request.api_key.clone().or_else(|| profile.api_key.clone()),
-        access_token: request.access_token.clone().or_else(|| profile.access_token.clone()),
-        base_url: request.base_url.clone().or_else(|| profile.base_url.clone()),
+        access_token: request
+            .access_token
+            .clone()
+            .or_else(|| profile.access_token.clone()),
+        base_url: request
+            .base_url
+            .clone()
+            .or_else(|| profile.base_url.clone()),
         messages: request.messages.clone(),
         system: request.system.clone(),
         max_tokens: request.max_tokens,
@@ -141,14 +177,21 @@ pub fn provider_request_from_profile(profile: &ProviderProfile, request: &Provid
 
 pub fn total_input_chars(messages: &[crate::models::ChatMessage], system: Option<&str>) -> usize {
     let system_chars = system.unwrap_or_default().len();
-    system_chars + messages.iter().map(|message| message.flattened_text().len()).sum::<usize>()
+    system_chars
+        + messages
+            .iter()
+            .map(|message| message.flattened_text().len())
+            .sum::<usize>()
 }
 
 pub fn estimate_tokens_from_chars(chars: usize) -> u32 {
     ((chars.max(1) / 4) as u32).max(1)
 }
 
-pub fn flatten_prompt_text(messages: &[crate::models::ChatMessage], system: Option<&str>) -> String {
+pub fn flatten_prompt_text(
+    messages: &[crate::models::ChatMessage],
+    system: Option<&str>,
+) -> String {
     let mut parts = Vec::new();
     if let Some(system) = system {
         if !system.trim().is_empty() {
@@ -164,7 +207,10 @@ pub fn flatten_prompt_text(messages: &[crate::models::ChatMessage], system: Opti
     parts.join("\n")
 }
 
-pub fn looks_like_json_request(messages: &[crate::models::ChatMessage], system: Option<&str>) -> bool {
+pub fn looks_like_json_request(
+    messages: &[crate::models::ChatMessage],
+    system: Option<&str>,
+) -> bool {
     let combined = flatten_prompt_text(messages, system).to_ascii_lowercase();
     [
         "return only valid json",
@@ -178,7 +224,11 @@ pub fn looks_like_json_request(messages: &[crate::models::ChatMessage], system: 
 }
 
 pub fn prompt_cache_key(system: Option<&str>, model: Option<&str>, kind: &str) -> Option<String> {
-    if env_bool("OPENAI_PROMPT_CACHE_KEY_AUTO", env_bool("PROMPT_CACHE_KEY_AUTO", true)) == false {
+    if env_bool(
+        "OPENAI_PROMPT_CACHE_KEY_AUTO",
+        env_bool("PROMPT_CACHE_KEY_AUTO", true),
+    ) == false
+    {
         return None;
     }
     let mode = env::var("OPENAI_PROMPT_CACHE_KEY_MODE").unwrap_or_else(|_| "system".to_string());
@@ -191,7 +241,10 @@ pub fn prompt_cache_key(system: Option<&str>, model: Option<&str>, kind: &str) -
     }
     let mut digest = Sha256::new();
     digest.update(format!("{kind}:{basis}"));
-    Some(format!("pcache:{}", hex::encode(digest.finalize())[..16].to_string()))
+    Some(format!(
+        "pcache:{}",
+        hex::encode(digest.finalize())[..16].to_string()
+    ))
 }
 
 pub fn env_bool(name: &str, default: bool) -> bool {
@@ -264,7 +317,9 @@ pub async fn post_json_with_retries(
             .await;
         match response {
             Ok(response) if response.status().is_success() => return Ok(response),
-            Ok(response) if !should_retry_status(response.status()) || attempt >= max_retries => return Ok(response),
+            Ok(response) if !should_retry_status(response.status()) || attempt >= max_retries => {
+                return Ok(response)
+            }
             Ok(response) => {
                 let delay = retry_after_seconds(response.headers()).unwrap_or_else(|| {
                     let jitter = rand::rng().random_range(0.0..0.2);
@@ -306,7 +361,9 @@ pub async fn get_with_retries(
             .await;
         match response {
             Ok(response) if response.status().is_success() => return Ok(response),
-            Ok(response) if !should_retry_status(response.status()) || attempt >= max_retries => return Ok(response),
+            Ok(response) if !should_retry_status(response.status()) || attempt >= max_retries => {
+                return Ok(response)
+            }
             Ok(response) => {
                 let delay = retry_after_seconds(response.headers()).unwrap_or_else(|| {
                     let jitter = rand::rng().random_range(0.0..0.2);
@@ -339,30 +396,45 @@ pub fn error_message(payload: &Value) -> String {
                     .get("message")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned)
-                    .or_else(|| error.get("code").and_then(Value::as_str).map(ToOwned::to_owned))
+                    .or_else(|| {
+                        error
+                            .get("code")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })
             }
         })
-        .or_else(|| payload.get("message").and_then(Value::as_str).map(ToOwned::to_owned))
+        .or_else(|| {
+            payload
+                .get("message")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
         .unwrap_or_else(|| payload.to_string())
 }
 
 pub fn is_model_not_found(status: StatusCode, message: &str) -> bool {
-    matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::UNPROCESSABLE_ENTITY)
-        && {
-            let lowered = message.to_ascii_lowercase();
-            lowered.contains("model_not_found")
-                || (lowered.contains("model")
-                    && (lowered.contains("not found")
-                        || lowered.contains("does not exist")
-                        || lowered.contains("unknown")))
-        }
+    matches!(
+        status,
+        StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::UNPROCESSABLE_ENTITY
+    ) && {
+        let lowered = message.to_ascii_lowercase();
+        lowered.contains("model_not_found")
+            || (lowered.contains("model")
+                && (lowered.contains("not found")
+                    || lowered.contains("does not exist")
+                    || lowered.contains("unknown")))
+    }
 }
 
 pub fn auth_headers(api_key: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     let value = format!("Bearer {api_key}");
-    headers.insert(AUTHORIZATION, HeaderValue::from_str(&value).expect("authorization header"));
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&value).expect("authorization header"),
+    );
     headers
 }
 
@@ -374,23 +446,35 @@ pub fn extract_cost(usage: &TokenUsage, provider: &str, model: &str) -> Option<C
         .or_else(|| payload.get(format!("{provider}:{model}")))
         .or_else(|| payload.get(model))
         .or_else(|| payload.get("default"))?;
-    let unit = entry.get("unit").and_then(Value::as_str).unwrap_or("per_1m_tokens");
+    let unit = entry
+        .get("unit")
+        .and_then(Value::as_str)
+        .unwrap_or("per_1m_tokens");
     let denominator = if matches!(unit, "per_1k_tokens" | "per_1k" | "1k") {
         1_000.0
     } else {
         1_000_000.0
     };
     let prompt_rate = entry.get("prompt").and_then(Value::as_f64).unwrap_or(0.0);
-    let completion_rate = entry.get("completion").and_then(Value::as_f64).unwrap_or(0.0);
+    let completion_rate = entry
+        .get("completion")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     let cached_rate = entry
         .get("cached")
         .and_then(Value::as_f64)
         .or_else(|| entry.get("prompt_cached").and_then(Value::as_f64))
         .unwrap_or(prompt_rate);
-    let prompt = usage.prompt.unwrap_or(0).saturating_sub(usage.cached.unwrap_or(0));
+    let prompt = usage
+        .prompt
+        .unwrap_or(0)
+        .saturating_sub(usage.cached.unwrap_or(0));
     let completion = usage.completion.unwrap_or(0);
     let cached = usage.cached.unwrap_or(0);
-    let amount = ((prompt as f64 * prompt_rate) + (completion as f64 * completion_rate) + (cached as f64 * cached_rate)) / denominator;
+    let amount = ((prompt as f64 * prompt_rate)
+        + (completion as f64 * completion_rate)
+        + (cached as f64 * cached_rate))
+        / denominator;
     Some(CostInfo {
         amount: (amount * 100_000_000.0).round() / 100_000_000.0,
         currency: entry
@@ -407,13 +491,18 @@ pub fn infer_capabilities_from_text(prompt: &str) -> HashSet<String> {
     if lowered.contains("image") || lowered.contains("vision") || lowered.contains("diagram") {
         capabilities.insert("vision".to_string());
     }
-    if lowered.contains("code") || lowered.contains("refactor") || lowered.contains("python") || lowered.contains("rust") {
+    if lowered.contains("code")
+        || lowered.contains("refactor")
+        || lowered.contains("python")
+        || lowered.contains("rust")
+    {
         capabilities.insert("code".to_string());
     }
     if lowered.contains("json") || lowered.contains("schema") {
         capabilities.insert("json".to_string());
     }
-    if lowered.contains("research") || lowered.contains("citation") || lowered.contains("evidence") {
+    if lowered.contains("research") || lowered.contains("citation") || lowered.contains("evidence")
+    {
         capabilities.insert("research".to_string());
     }
     if capabilities.is_empty() {

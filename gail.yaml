@@ -46,6 +46,42 @@ providers:
     specialties: ["research", "citations", "long_context"]
     weight: 0.25
     source: "example"
+  - name: "NVIDIAKimiResearch"
+    provider: nvidia
+    model: "${GAIL_NVIDIA_KIMI_MODEL}"
+    api_key: "${NVIDIA_API_KEY}"
+    base_url: "${GAIL_NVIDIA_BASE_URL}"
+    roles: ["researcher", "assistant"]
+    specialties: ["research", "long_context", "reasoning", "code"]
+    weight: 0.22
+    source: "example"
+  - name: "NVIDIAMiniMaxPlanner"
+    provider: nvidia
+    model: "${GAIL_NVIDIA_MINIMAX_MODEL}"
+    api_key: "${NVIDIA_API_KEY}"
+    base_url: "${GAIL_NVIDIA_BASE_URL}"
+    roles: ["planner", "assistant"]
+    specialties: ["planning", "reasoning", "agentic", "code"]
+    weight: 0.2
+    source: "example"
+  - name: "NVIDIADeepSeekReasoner"
+    provider: nvidia
+    model: "${GAIL_NVIDIA_DEEPSEEK_MODEL}"
+    api_key: "${NVIDIA_API_KEY}"
+    base_url: "${GAIL_NVIDIA_BASE_URL}"
+    roles: ["planner", "reviewer", "assistant"]
+    specialties: ["reasoning", "analysis", "review", "code"]
+    weight: 0.18
+    source: "example"
+  - name: "NVIDIAGLMGeneralist"
+    provider: nvidia
+    model: "${GAIL_NVIDIA_GLM_MODEL}"
+    api_key: "${NVIDIA_API_KEY}"
+    base_url: "${GAIL_NVIDIA_BASE_URL}"
+    roles: ["reviewer", "assistant"]
+    specialties: ["summary", "reasoning", "long_context", "analysis"]
+    weight: 0.16
+    source: "example"
   - name: "OllamaLocal"
     provider: ollama
     model: "${GAIL_OLLAMA_MODEL}"

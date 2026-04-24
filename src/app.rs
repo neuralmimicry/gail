@@ -5,18 +5,18 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
     extract::{Multipart, Query, State},
     http::{HeaderMap, StatusCode},
     response::{
-        IntoResponse, Response,
         sse::{Event, Sse},
+        IntoResponse, Response,
     },
     routing::{get, post},
+    Json, Router,
 };
 use futures::stream;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::signal;
 
 use crate::{
@@ -31,7 +31,7 @@ use crate::{
         TranscriptionResponse,
     },
     orchestration::GailService,
-    providers::{TranscriptionInput, normalize_provider_type},
+    providers::{normalize_provider_type, TranscriptionInput},
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -1183,7 +1183,7 @@ fn infer_provider_from_model(model: &str) -> Option<String> {
 }
 
 fn is_supported_provider(provider: &str) -> bool {
-    matches!(provider, "openai" | "gemini" | "ollama")
+    matches!(provider, "openai" | "nvidia" | "gemini" | "ollama")
 }
 
 fn is_specialist_prefix(prefix: &str) -> bool {
@@ -1478,11 +1478,9 @@ fn openai_responses_stream(
         "status": "in_progress",
         "model": public_model.clone(),
     });
-    events.push(Ok(
-        Event::default()
-            .event("response.created")
-            .data(created_event.to_string()),
-    ));
+    events.push(Ok(Event::default()
+        .event("response.created")
+        .data(created_event.to_string())));
 
     for chunk in chunks {
         let delta_event = json!({
@@ -1491,11 +1489,9 @@ fn openai_responses_stream(
             "output_index": 0,
             "content_index": 0,
         });
-        events.push(Ok(
-            Event::default()
-                .event("response.output_text.delta")
-                .data(delta_event.to_string()),
-        ));
+        events.push(Ok(Event::default()
+            .event("response.output_text.delta")
+            .data(delta_event.to_string())));
     }
 
     let output_done = json!({
@@ -1504,18 +1500,14 @@ fn openai_responses_stream(
         "output_index": 0,
         "content_index": 0,
     });
-    events.push(Ok(
-        Event::default()
-            .event("response.output_text.done")
-            .data(output_done.to_string()),
-    ));
+    events.push(Ok(Event::default()
+        .event("response.output_text.done")
+        .data(output_done.to_string())));
 
     let completed = openai_responses_body(&public_model, &response);
-    events.push(Ok(
-        Event::default()
-            .event("response.completed")
-            .data(completed.to_string()),
-    ));
+    events.push(Ok(Event::default()
+        .event("response.completed")
+        .data(completed.to_string())));
     events.push(Ok(Event::default().data("[DONE]")));
 
     Sse::new(stream::iter(events))
@@ -1723,8 +1715,8 @@ mod tests {
     use axum::{body::to_bytes, http::Request};
     use tower::ServiceExt;
     use wiremock::{
-        Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
     };
 
     use crate::config::{ApiTokenConfig, GailConfig, ProviderProfile, SpecialistProfile};
@@ -1799,6 +1791,13 @@ mod tests {
             ..ProviderProfile::default()
         });
         config.providers.push(ProviderProfile {
+            name: "NVIDIAKimi".to_string(),
+            provider_type: "nvidia".to_string(),
+            model: Some("moonshotai/kimi-k2-instruct-0905".to_string()),
+            base_url: Some("https://integrate.api.nvidia.com/v1".to_string()),
+            ..ProviderProfile::default()
+        });
+        config.providers.push(ProviderProfile {
             name: "LocalOllama".to_string(),
             provider_type: "ollama".to_string(),
             model: Some("llama3.2".to_string()),
@@ -1829,6 +1828,8 @@ mod tests {
         assert!(ids.contains(&"gail-auto"));
         assert!(ids.contains(&"openai/gpt-4o-mini"));
         assert!(ids.contains(&"gpt-4o-mini"));
+        assert!(ids.contains(&"nvidia/moonshotai/kimi-k2-instruct-0905"));
+        assert!(ids.contains(&"moonshotai/kimi-k2-instruct-0905"));
         assert!(ids.contains(&"ollama/llama3.2"));
         assert!(ids.iter().any(|id| id.starts_with("aarnn/")));
     }
@@ -1881,6 +1882,66 @@ mod tests {
         assert_eq!(payload["choices"][0]["message"]["content"], "mocked answer");
         assert_eq!(payload["gail"]["provider"], "ollama");
         assert_eq!(payload["gail"]["resolved_model"], "llama3.2");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_route_explicit_nvidia_models() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-nvidia",
+                "model": "moonshotai/kimi-k2-instruct-0905",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "nvidia answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 7,
+                    "total_tokens": 18
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = GailConfig::default();
+        config.providers.push(ProviderProfile {
+            name: "NVIDIAKimi".to_string(),
+            provider_type: "nvidia".to_string(),
+            model: Some("moonshotai/kimi-k2-instruct-0905".to_string()),
+            api_key: Some("nvapi-test".to_string()),
+            base_url: Some(format!("{}/v1", server.uri())),
+            ..ProviderProfile::default()
+        });
+        let app = build_router(test_service_with_config(config).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "nvidia/moonshotai/kimi-k2-instruct-0905",
+                            "messages": [{"role": "user", "content": "hello"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+        assert_eq!(payload["model"], "nvidia/moonshotai/kimi-k2-instruct-0905");
+        assert_eq!(payload["choices"][0]["message"]["content"], "nvidia answer");
+        assert_eq!(payload["gail"]["provider"], "nvidia");
+        assert_eq!(
+            payload["gail"]["resolved_model"],
+            "moonshotai/kimi-k2-instruct-0905"
+        );
     }
 
     #[tokio::test]
@@ -1978,13 +2039,11 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(
-            response
-                .headers()
-                .get("content-type")
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.starts_with("text/event-stream"))
-        );
+        assert!(response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream")));
         let body = read_text(response).await;
         assert!(body.contains("\"object\":\"chat.completion.chunk\""));
         assert!(body.contains("mocked answer"));
@@ -2036,13 +2095,11 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(
-            response
-                .headers()
-                .get("content-type")
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.starts_with("text/event-stream"))
-        );
+        assert!(response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream")));
         let body = read_text(response).await;
         assert!(body.contains("event: response.created"));
         assert!(body.contains("event: response.output_text.delta"));
