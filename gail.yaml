@@ -114,6 +114,21 @@ specialists:
     weight: 0.2
     prefer_aarnn_designs: true
 
+aarnn_bridge:
+  enabled: true
+  endpoint: "${GAIL_AARNN_BRIDGE_ENDPOINT}"
+  access_token: "${GAIL_AARNN_BRIDGE_ACCESS_TOKEN}"
+  timeout_seconds: 4.0
+  mirror_input: true
+  mirror_output: true
+  request_candidate_reply: true
+  response_preference: llm_preferred
+  candidate_confidence_threshold: 0.98
+  candidate_min_reply_chars: 24
+  network_id: "${GAIL_AARNN_BRIDGE_NETWORK_ID}"
+  node_id: "${GAIL_AARNN_BRIDGE_NODE_ID}"
+  max_text_chars: 8192
+
 storage:
   metrics_path: "./data/provider_metrics.json"
   ollama_model_store_path: "./data/ollama_model_inventory.json"

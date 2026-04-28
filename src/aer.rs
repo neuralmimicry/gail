@@ -118,7 +118,11 @@ pub fn encode_spikes(ts_us: u64, base_addr: u32, spikes: &[u8]) -> Vec<u8> {
     encode_events(&spikes_to_events(ts_us, base_addr, spikes))
 }
 
-pub fn apply_events_to_spikes(events: &[AerEvent], base_addr: u32, destination: &mut [u8]) -> usize {
+pub fn apply_events_to_spikes(
+    events: &[AerEvent],
+    base_addr: u32,
+    destination: &mut [u8],
+) -> usize {
     let mut count = 0usize;
     for event in events {
         if event.value == 0 {
@@ -170,8 +174,16 @@ mod tests {
     #[test]
     fn aer_round_trip_preserves_events() {
         let payload = encode_events(&[
-            AerEvent { ts_us: 100, addr: 4096, value: 1 },
-            AerEvent { ts_us: 130, addr: 4099, value: 1 },
+            AerEvent {
+                ts_us: 100,
+                addr: 4096,
+                value: 1,
+            },
+            AerEvent {
+                ts_us: 130,
+                addr: 4099,
+                value: 1,
+            },
         ]);
         let decoded = decode_events(&payload).expect("decode");
         assert_eq!(decoded.len(), 2);

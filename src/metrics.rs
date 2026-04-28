@@ -1,4 +1,9 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
 use tokio::{fs, sync::Mutex};
@@ -134,9 +139,16 @@ impl MetricsStore {
             .unwrap_or_default()
     }
 
-    pub async fn record_health(&self, summary: &CandidateSummary, health: HealthBucket) -> Result<()> {
+    pub async fn record_health(
+        &self,
+        summary: &CandidateSummary,
+        health: HealthBucket,
+    ) -> Result<()> {
         let mut data = self.inner.lock().await;
-        let bucket = data.candidates.entry(summary.candidate_id.clone()).or_default();
+        let bucket = data
+            .candidates
+            .entry(summary.candidate_id.clone())
+            .or_default();
         bucket.provider = Some(summary.provider.clone());
         bucket.model = Some(summary.model.clone());
         bucket.configured_model = Some(summary.configured_model.clone());
@@ -152,7 +164,13 @@ impl MetricsStore {
         self.save(&snapshot).await
     }
 
-    fn merge_stats(bucket: &mut StatsBucket, success: bool, latency_ms: Option<u64>, quality: f64, error: Option<&str>) {
+    fn merge_stats(
+        bucket: &mut StatsBucket,
+        success: bool,
+        latency_ms: Option<u64>,
+        quality: f64,
+        error: Option<&str>,
+    ) {
         if success {
             bucket.successes += 1;
         } else {
@@ -182,7 +200,10 @@ impl MetricsStore {
         error: Option<&str>,
     ) -> Result<()> {
         let mut data = self.inner.lock().await;
-        let bucket = data.candidates.entry(summary.candidate_id.clone()).or_default();
+        let bucket = data
+            .candidates
+            .entry(summary.candidate_id.clone())
+            .or_default();
         bucket.provider = Some(summary.provider.clone());
         bucket.model = Some(summary.model.clone());
         bucket.configured_model = Some(summary.configured_model.clone());
@@ -226,7 +247,10 @@ impl MetricsStore {
                 provider: bucket.provider.clone(),
                 model: bucket.model.clone(),
                 configured_model: bucket.configured_model.clone(),
-                resolved_model: bucket.resolved_model.clone().or_else(|| bucket.model.clone()),
+                resolved_model: bucket
+                    .resolved_model
+                    .clone()
+                    .or_else(|| bucket.model.clone()),
                 specialties: bucket.specialties.clone(),
                 successes: bucket.stats.successes,
                 failures: bucket.stats.failures,
@@ -251,18 +275,43 @@ impl MetricsStore {
                 .health_ok
                 .unwrap_or(false)
                 .cmp(&left.health_ok.unwrap_or(false))
-                .then_with(|| right.success_rate.partial_cmp(&left.success_rate).unwrap_or(std::cmp::Ordering::Equal))
-                .then_with(|| right.ewma_quality.partial_cmp(&left.ewma_quality).unwrap_or(std::cmp::Ordering::Equal))
-                .then_with(|| left.ewma_latency_ms.partial_cmp(&right.ewma_latency_ms).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| {
+                    right
+                        .success_rate
+                        .partial_cmp(&left.success_rate)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| {
+                    right
+                        .ewma_quality
+                        .partial_cmp(&left.ewma_quality)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| {
+                    left.ewma_latency_ms
+                        .partial_cmp(&right.ewma_latency_ms)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
         });
-        let limited = candidates.into_iter().take(limit.max(1)).collect::<Vec<_>>();
+        let limited = candidates
+            .into_iter()
+            .take(limit.max(1))
+            .collect::<Vec<_>>();
         MetricsSummary {
             path: self.path(),
             exists: self.path.exists(),
             updated_at: data.updated_at,
             candidate_count: data.candidates.len(),
-            healthy_candidates: data.candidates.values().filter(|bucket| bucket.health.ok == Some(true)).count(),
-            degraded_candidates: data.candidates.values().filter(|bucket| bucket.health.ok == Some(false)).count(),
+            healthy_candidates: data
+                .candidates
+                .values()
+                .filter(|bucket| bucket.health.ok == Some(true))
+                .count(),
+            degraded_candidates: data
+                .candidates
+                .values()
+                .filter(|bucket| bucket.health.ok == Some(false))
+                .count(),
             candidates: limited,
         }
     }

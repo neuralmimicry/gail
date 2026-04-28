@@ -5,18 +5,18 @@ use std::{
 };
 
 use axum::{
+    Json, Router,
     extract::{Multipart, Query, State},
     http::{HeaderMap, StatusCode},
     response::{
-        sse::{Event, Sse},
         IntoResponse, Response,
+        sse::{Event, Sse},
     },
     routing::{get, post},
-    Json, Router,
 };
 use futures::stream;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::signal;
 
 use crate::{
@@ -31,7 +31,7 @@ use crate::{
         TranscriptionResponse,
     },
     orchestration::GailService,
-    providers::{normalize_provider_type, TranscriptionInput},
+    providers::{TranscriptionInput, normalize_provider_type},
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -1715,8 +1715,8 @@ mod tests {
     use axum::{body::to_bytes, http::Request};
     use tower::ServiceExt;
     use wiremock::{
-        matchers::{method, path},
         Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
     };
 
     use crate::config::{ApiTokenConfig, GailConfig, ProviderProfile, SpecialistProfile};
@@ -2039,11 +2039,13 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("text/event-stream")));
+        assert!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream"))
+        );
         let body = read_text(response).await;
         assert!(body.contains("\"object\":\"chat.completion.chunk\""));
         assert!(body.contains("mocked answer"));
@@ -2095,11 +2097,13 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("text/event-stream")));
+        assert!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream"))
+        );
         let body = read_text(response).await;
         assert!(body.contains("event: response.created"));
         assert!(body.contains("event: response.output_text.delta"));

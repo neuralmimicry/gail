@@ -5,7 +5,7 @@ use std::{
 
 use http::{HeaderMap, StatusCode};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::time::sleep;
 
 use crate::{
@@ -15,9 +15,9 @@ use crate::{
 };
 
 use super::{
-    auth_headers, env_bool, env_int, error_message, get_with_retries, is_model_not_found,
-    post_json_with_retries, prompt_cache_key, response_with_usage, total_input_chars,
-    ProviderHealth, ProviderInvocationResponse, TranscriptionInput,
+    ProviderHealth, ProviderInvocationResponse, TranscriptionInput, auth_headers, env_bool,
+    env_int, error_message, get_with_retries, is_model_not_found, post_json_with_retries,
+    prompt_cache_key, response_with_usage, total_input_chars,
 };
 
 #[derive(Clone)]

@@ -48,6 +48,7 @@ Gail exposes the following endpoints:
 - Bearer-token authentication with per-client IDs.
 - Route scopes: `health`, `llm`, `neuromorphic`, `aer`, `status`.
 - `/healthz` can be configured to allow or deny unauthenticated probes.
+- When `aarnn_bridge` is enabled, Gail should call AARNN with its own Customers-issued service-account bearer token rather than a browser-style session.
 - The supplied Ansible role publishes Gail behind TLS ingress and injects per-client bearer tokens for Refiner, Tracey, and Continuum/NMC.
 
 ## Local Development
@@ -81,11 +82,21 @@ The image expects a config file at `/app/config/gail.yaml` unless `GAIL_CONFIG` 
 - `providers`: shared LLM backends Gail can orchestrate.
 - `providers` can include `openai`, `gemini`, `ollama`, and OpenAI-compatible `nvidia` profiles backed by custom `base_url` values.
 - `specialists`: explicit neuromorphic engines. Use this when you have named SNN/AARNN backends to register.
+- `aarnn_bridge`: mirrored Gail-to-AARNN LLM I/O bridge. Gail mirrors prompt-side and response-side text plus translated AER payloads to `POST /api/llm/mirror` and can optionally promote a future AARNN reply.
 - `config/ai-routing-profiles.json`: shared workflow/keyword/provider routing contract used by Gail and mirrored in Refiner for offline fallback.
 - `GAIL_ROUTING_PROFILES_PATH`: optional override for the routing contract path.
-- `GAIL_AARNN_*` env vars: optional legacy auto-attach path for an AARNN backend, mirroring Refiner's previous automatic fallback behavior.
+- `GAIL_AARNN_*` env vars: optional legacy auto-attach path for an AARNN backend, mirroring Refiner's previous automatic fallback behaviour.
 - `storage.metrics_path`: persisted provider quality/latency metrics.
 - `storage.ollama_model_store_path`: cached Ollama model inventory summary.
+
+## AARNN Bridge
+
+Use `aarnn_bridge` when Gail should mirror every LLM input and output into an AARNN instance.
+
+- `endpoint` points at the AARNN web UI base URL; Gail appends `POST /api/llm/mirror`.
+- `access_token` should be the Gail Customers-issued service-account bearer token.
+- `response_preference` defaults to `llm_preferred`.
+- `prefer_aarnn_when_confident` is available, but the current AARNN candidate reply is a deliberately low-confidence bootstrap echo until network-output decoding is mature.
 
 ## Product Integration
 
@@ -100,6 +111,10 @@ Tracey can consume Gail's neuromorphic and AER endpoints as a stable HTTP contra
 ### Continuum / NMC
 
 NMC already owns AARNN and cloud-control orchestration concerns. Gail sits alongside that stack as the shared AI middleware layer for LLM, neuromorphic scoring, and AER translation so Continuum-facing tooling can call one service contract instead of product-specific glue.
+
+### AARNN
+
+The AARNN bridge lets Gail mirror both prompt-side and response-side LLM traffic into AARNN so the attached network can be stimulated over time and, later, provide a candidate reply back into Gail's selection logic.
 
 ## Deployment
 

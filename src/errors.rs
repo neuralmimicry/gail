@@ -1,6 +1,9 @@
 use std::borrow::Cow;
 
-use axum::{Json, response::{IntoResponse, Response}};
+use axum::{
+    Json,
+    response::{IntoResponse, Response},
+};
 use http::StatusCode;
 use serde::Serialize;
 
@@ -95,11 +98,16 @@ impl GailError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::InvalidConfig(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Upstream { status: Some(status), .. } => *status,
+            Self::Upstream {
+                status: Some(status),
+                ..
+            } => *status,
             Self::Upstream { quota: true, .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::Upstream { timeout: true, .. } => StatusCode::GATEWAY_TIMEOUT,
             Self::Upstream { .. } => StatusCode::BAD_GATEWAY,
-            Self::Io(_) | Self::Json(_) | Self::Yaml(_) | Self::Reqwest(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Io(_) | Self::Json(_) | Self::Yaml(_) | Self::Reqwest(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         }
     }
 }
@@ -128,13 +136,15 @@ impl IntoResponse for GailError {
                 quota: *quota,
                 timeout: *timeout,
             },
-            Self::BadRequest(message) | Self::NotFound(message) | Self::InvalidConfig(message) => ErrorBody {
-                error: "request_error",
-                message: message.to_string(),
-                provider: None,
-                quota: false,
-                timeout: false,
-            },
+            Self::BadRequest(message) | Self::NotFound(message) | Self::InvalidConfig(message) => {
+                ErrorBody {
+                    error: "request_error",
+                    message: message.to_string(),
+                    provider: None,
+                    quota: false,
+                    timeout: false,
+                }
+            }
             Self::Multipart(message) => ErrorBody {
                 error: "multipart_error",
                 message: message.clone(),

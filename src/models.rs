@@ -11,6 +11,21 @@ pub enum SelectionMode {
     Best,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AarnnResponsePreference {
+    #[default]
+    LlmPreferred,
+    PreferAarnnWhenConfident,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AarnnMirrorDirection {
+    Input,
+    Output,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImageUrlValue {
     pub url: String,
@@ -230,6 +245,10 @@ pub struct CompletionTrace {
     pub candidates: Vec<CandidateInvocationSummary>,
     pub metrics_store_path: String,
     pub specialist_engines: Option<serde_json::Value>,
+    pub final_source: String,
+    pub final_provider: String,
+    pub final_model: String,
+    pub aarnn_mirroring: Option<AarnnMirrorTrace>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -242,6 +261,118 @@ pub struct CompletionResponse {
     pub usage: Option<TokenUsage>,
     pub trace: Option<CompletionTrace>,
     pub raw: Option<Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AarnnMirrorRequest {
+    pub request_id: String,
+    pub conversation_id: String,
+    pub workflow: String,
+    pub role: String,
+    pub direction: AarnnMirrorDirection,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub request_category: Option<String>,
+    pub system: Option<String>,
+    pub prompt_text: Option<String>,
+    pub text: String,
+    #[serde(default)]
+    pub message_roles: Vec<String>,
+    pub aer_base: u32,
+    pub output_base: u32,
+    pub aer_payload_hex: String,
+    #[serde(default)]
+    pub sensory_spikes: Vec<u8>,
+    pub network_id: Option<String>,
+    pub node_id: Option<String>,
+    pub request_candidate_reply: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct AarnnMirrorCandidate {
+    pub reply_text: Option<String>,
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub usable: bool,
+    pub source: Option<String>,
+    #[serde(default)]
+    pub output_spike_indices: Vec<u32>,
+    pub output_aer_payload_hex: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct AarnnMirrorStimulus {
+    #[serde(default)]
+    pub attempted: bool,
+    #[serde(default)]
+    pub accepted_batches: usize,
+    pub target: Option<String>,
+    pub network_id: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct AarnnMirrorResponse {
+    #[serde(default)]
+    pub accepted: bool,
+    pub request_id: Option<String>,
+    pub conversation_id: Option<String>,
+    pub direction: Option<AarnnMirrorDirection>,
+    #[serde(default)]
+    pub text_chars: usize,
+    #[serde(default)]
+    pub spike_count: usize,
+    pub aer_payload_hex: Option<String>,
+    pub candidate: Option<AarnnMirrorCandidate>,
+    pub stimulation: Option<AarnnMirrorStimulus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AarnnMirrorInvocationTrace {
+    pub direction: AarnnMirrorDirection,
+    pub accepted: bool,
+    pub endpoint: String,
+    pub latency_ms: u64,
+    pub text_chars: usize,
+    pub spike_count: usize,
+    pub candidate: Option<AarnnMirrorCandidate>,
+    pub stimulation: Option<AarnnMirrorStimulus>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AarnnMirrorTrace {
+    pub enabled: bool,
+    pub endpoint: String,
+    pub mirror_input: bool,
+    pub mirror_output: bool,
+    pub response_preference: AarnnResponsePreference,
+    pub candidate_confidence_threshold: f64,
+    pub candidate_min_reply_chars: usize,
+    pub input: Option<AarnnMirrorInvocationTrace>,
+    pub output: Option<AarnnMirrorInvocationTrace>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AarnnBridgeStatus {
+    pub enabled: bool,
+    pub available: bool,
+    pub endpoint: Option<String>,
+    pub timeout_seconds: f64,
+    pub mirror_input: bool,
+    pub mirror_output: bool,
+    pub request_candidate_reply: bool,
+    pub response_preference: AarnnResponsePreference,
+    pub candidate_confidence_threshold: f64,
+    pub candidate_min_reply_chars: usize,
+    pub network_id: Option<String>,
+    pub node_id: Option<String>,
+    pub sensory_size: usize,
+    pub output_size: usize,
+    pub aer_sensory_base: u32,
+    pub aer_output_base: u32,
+    pub max_text_chars: usize,
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

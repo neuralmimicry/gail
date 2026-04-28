@@ -1,4 +1,8 @@
-use std::{collections::HashSet, env, time::{Duration, Instant}};
+use std::{
+    collections::HashSet,
+    env,
+    time::{Duration, Instant},
+};
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -12,10 +16,9 @@ use crate::{
 };
 
 use super::{
-    ProviderHealth, ProviderInvocationResponse, TranscriptionInput,
-    data_url_parts, env_bool, env_int, error_message,
-    infer_capabilities_from_model, infer_capabilities_from_text, is_model_not_found,
-    post_json_with_retries, response_with_usage,
+    ProviderHealth, ProviderInvocationResponse, TranscriptionInput, data_url_parts, env_bool,
+    env_int, error_message, infer_capabilities_from_model, infer_capabilities_from_text,
+    is_model_not_found, post_json_with_retries, response_with_usage,
 };
 
 #[derive(Clone)]
@@ -43,8 +46,12 @@ struct ModelResolution {
 
 impl OllamaProvider {
     pub fn new(client: Client, profile: &ProviderProfile) -> Self {
-        let default_model = env::var("OLLAMA_DEFAULT_MODEL").unwrap_or_else(|_| "llama3.2".to_string());
-        let model = profile.model.clone().unwrap_or_else(|| default_model.clone());
+        let default_model =
+            env::var("OLLAMA_DEFAULT_MODEL").unwrap_or_else(|_| "llama3.2".to_string());
+        let model = profile
+            .model
+            .clone()
+            .unwrap_or_else(|| default_model.clone());
         let base_url = profile
             .base_url
             .clone()
@@ -64,12 +71,21 @@ impl OllamaProvider {
         &self.model
     }
 
-    pub async fn complete(&self, request: &ProviderCompletionRequest) -> Result<ProviderInvocationResponse> {
+    pub async fn complete(
+        &self,
+        request: &ProviderCompletionRequest,
+    ) -> Result<ProviderInvocationResponse> {
         self.complete_once(request).await
     }
 
-    async fn complete_once(&self, request: &ProviderCompletionRequest) -> Result<ProviderInvocationResponse> {
-        let base_url = request.base_url.clone().unwrap_or_else(|| self.base_url.clone());
+    async fn complete_once(
+        &self,
+        request: &ProviderCompletionRequest,
+    ) -> Result<ProviderInvocationResponse> {
+        let base_url = request
+            .base_url
+            .clone()
+            .unwrap_or_else(|| self.base_url.clone());
         let mut model = request.model.clone().unwrap_or_else(|| self.model.clone());
         let prompt = collapse_messages(request);
         let images = request
@@ -89,7 +105,9 @@ impl OllamaProvider {
             })
             .collect::<Vec<_>>();
         for attempt in 0..2 {
-            let resolution = self.resolve_model_for_request(&base_url, &model, &prompt).await?;
+            let resolution = self
+                .resolve_model_for_request(&base_url, &model, &prompt)
+                .await?;
             let selected_model = resolution
                 .selected_model
                 .clone()
@@ -111,40 +129,72 @@ impl OllamaProvider {
                 &format!("{base_url}/api/generate"),
                 &json_headers(),
                 &payload,
-                Duration::from_secs(request.timeout_seconds.unwrap_or(env_int("LLM_TIMEOUT_SECONDS", 180)).max(1)),
+                Duration::from_secs(
+                    request
+                        .timeout_seconds
+                        .unwrap_or(env_int("LLM_TIMEOUT_SECONDS", 180))
+                        .max(1),
+                ),
                 env_int("LLM_MAX_RETRIES", 2) as usize,
             )
             .await?;
             let latency_ms = started.elapsed().as_millis() as u64;
             let status = response.status();
             let body = response.text().await?;
-            let data: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({"message": body}));
+            let data: Value =
+                serde_json::from_str(&body).unwrap_or_else(|_| json!({"message": body}));
             if !status.is_success() {
                 let message = error_message(&data);
-                if attempt == 0 && is_model_not_found(status, &message) && model != self.default_model {
+                if attempt == 0
+                    && is_model_not_found(status, &message)
+                    && model != self.default_model
+                {
                     model = self.default_model.clone();
                     continue;
                 }
                 return Err(GailError::upstream("ollama", Some(status), message));
             }
-            let text = data.get("response").and_then(Value::as_str).unwrap_or_default().to_string();
+            let text = data
+                .get("response")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             let usage = Some(TokenUsage {
-                prompt: data.get("prompt_eval_count").and_then(Value::as_u64).map(|value| value as u32),
-                completion: data.get("eval_count").and_then(Value::as_u64).map(|value| value as u32),
+                prompt: data
+                    .get("prompt_eval_count")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as u32),
+                completion: data
+                    .get("eval_count")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as u32),
                 total: Some(
-                    data.get("prompt_eval_count").and_then(Value::as_u64).unwrap_or(0) as u32
+                    data.get("prompt_eval_count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as u32
                         + data.get("eval_count").and_then(Value::as_u64).unwrap_or(0) as u32,
                 ),
                 cached: None,
                 cost: None,
             });
-            return Ok(response_with_usage(text, data, latency_ms, "ollama", &model, usage));
+            return Ok(response_with_usage(
+                text, data, latency_ms, "ollama", &model, usage,
+            ));
         }
-        Err(GailError::upstream("ollama", None, "Ollama retries exhausted"))
+        Err(GailError::upstream(
+            "ollama",
+            None,
+            "Ollama retries exhausted",
+        ))
     }
 
-    pub async fn transcribe(&self, _input: &TranscriptionInput) -> Result<ProviderInvocationResponse> {
-        Err(GailError::bad_request("Ollama transcription is not supported by Gail"))
+    pub async fn transcribe(
+        &self,
+        _input: &TranscriptionInput,
+    ) -> Result<ProviderInvocationResponse> {
+        Err(GailError::bad_request(
+            "Ollama transcription is not supported by Gail",
+        ))
     }
 
     pub async fn health(&self, timeout_seconds: Option<u64>) -> Result<ProviderHealth> {
@@ -152,7 +202,11 @@ impl OllamaProvider {
         let response = self
             .client
             .get(format!("{}/api/tags", self.base_url))
-            .timeout(Duration::from_secs(timeout_seconds.unwrap_or(env_int("LLM_TIMEOUT_SECONDS", 60)).max(1)))
+            .timeout(Duration::from_secs(
+                timeout_seconds
+                    .unwrap_or(env_int("LLM_TIMEOUT_SECONDS", 60))
+                    .max(1),
+            ))
             .send()
             .await?;
         let latency_ms = started.elapsed().as_millis() as u64;
@@ -180,7 +234,8 @@ impl OllamaProvider {
         let latency_ms = started.elapsed().as_millis() as u64;
         let status = response.status();
         let body = response.text().await?;
-        let payload: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({"message": body}));
+        let payload: Value =
+            serde_json::from_str(&body).unwrap_or_else(|_| json!({"message": body}));
         let models = payload
             .get("models")
             .and_then(Value::as_array)
@@ -193,7 +248,12 @@ impl OllamaProvider {
             .ollama_model_store_path
             .clone()
             .or_else(|| env::var("OLLAMA_MODELS").ok())
-            .unwrap_or_else(|| format!("{}/.ollama/models", env::var("HOME").unwrap_or_else(|_| "/root".to_string())));
+            .unwrap_or_else(|| {
+                format!(
+                    "{}/.ollama/models",
+                    env::var("HOME").unwrap_or_else(|_| "/root".to_string())
+                )
+            });
         let disk_available = disks
             .iter()
             .find(|disk| model_store.starts_with(disk.mount_point().to_string_lossy().as_ref()))
@@ -227,7 +287,12 @@ impl OllamaProvider {
         })
     }
 
-    async fn resolve_model_for_request(&self, base_url: &str, requested_model: &str, prompt_text: &str) -> Result<ModelResolution> {
+    async fn resolve_model_for_request(
+        &self,
+        base_url: &str,
+        requested_model: &str,
+        prompt_text: &str,
+    ) -> Result<ModelResolution> {
         let tags = fetch_ollama_tags(&self.client, base_url).await?;
         let models = tags
             .get("models")
@@ -241,10 +306,17 @@ impl OllamaProvider {
             entry
                 .get("name")
                 .and_then(Value::as_str)
-                .map(|name| aliases_for_model(name).iter().any(|alias| requested_aliases.contains(alias)))
+                .map(|name| {
+                    aliases_for_model(name)
+                        .iter()
+                        .any(|alias| requested_aliases.contains(alias))
+                })
                 .unwrap_or(false)
         }) {
-            let model = installed.get("name").and_then(Value::as_str).unwrap_or(requested_model);
+            let model = installed
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(requested_model);
             return Ok(ModelResolution {
                 selected_model: Some(model.to_string()),
                 requested_model: requested_model.to_string(),
@@ -262,9 +334,19 @@ impl OllamaProvider {
                 .cloned()
                 .collect::<HashSet<_>>();
             let overlap = capabilities.intersection(&wanted).count() as i32;
-            let bonus = if name.to_ascii_lowercase().contains("coder") && prompt_capabilities.contains("code") { 2 } else { 0 };
+            let bonus = if name.to_ascii_lowercase().contains("coder")
+                && prompt_capabilities.contains("code")
+            {
+                2
+            } else {
+                0
+            };
             let score = overlap + bonus;
-            if best.as_ref().map(|(best_score, _)| score > *best_score).unwrap_or(true) {
+            if best
+                .as_ref()
+                .map(|(best_score, _)| score > *best_score)
+                .unwrap_or(true)
+            {
                 best = Some((score, name.to_string()));
             }
         }
@@ -308,7 +390,10 @@ fn aliases_for_model(model: &str) -> Vec<String> {
 
 fn json_headers() -> http::HeaderMap {
     let mut headers = http::HeaderMap::new();
-    headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
     headers
 }
 
@@ -322,7 +407,11 @@ async fn fetch_ollama_tags(client: &Client, base_url: &str) -> Result<Value> {
     let body = response.text().await?;
     let payload: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({"message": body}));
     if !status.is_success() {
-        return Err(GailError::upstream("ollama", Some(status), error_message(&payload)));
+        return Err(GailError::upstream(
+            "ollama",
+            Some(status),
+            error_message(&payload),
+        ));
     }
     Ok(payload)
 }

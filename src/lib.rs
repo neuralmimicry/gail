@@ -1,3 +1,4 @@
+pub mod aarnn_bridge;
 pub mod aer;
 pub mod app;
 pub mod client;

@@ -3,7 +3,10 @@ use std::{fs, path::Path};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::{errors::{GailError, Result}, models::SelectionMode};
+use crate::{
+    errors::{GailError, Result},
+    models::{AarnnResponsePreference, SelectionMode},
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -11,6 +14,7 @@ pub struct GailConfig {
     pub server: ServerConfig,
     pub security: SecurityConfig,
     pub orchestration: OrchestrationConfig,
+    pub aarnn_bridge: AarnnBridgeConfig,
     pub providers: Vec<ProviderProfile>,
     pub specialists: Vec<SpecialistProfile>,
     pub storage: StorageConfig,
@@ -51,6 +55,24 @@ pub struct OrchestrationConfig {
     pub early_success_min_quality: f64,
     pub candidate_timeout_cap_seconds: Option<u64>,
     pub always_route_specialists: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AarnnBridgeConfig {
+    pub enabled: bool,
+    pub endpoint: Option<String>,
+    pub access_token: Option<String>,
+    pub timeout_seconds: f64,
+    pub mirror_input: bool,
+    pub mirror_output: bool,
+    pub request_candidate_reply: bool,
+    pub response_preference: AarnnResponsePreference,
+    pub candidate_confidence_threshold: f64,
+    pub candidate_min_reply_chars: usize,
+    pub network_id: Option<String>,
+    pub node_id: Option<String>,
+    pub max_text_chars: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -109,6 +131,7 @@ impl Default for GailConfig {
             server: ServerConfig::default(),
             security: SecurityConfig::default(),
             orchestration: OrchestrationConfig::default(),
+            aarnn_bridge: AarnnBridgeConfig::default(),
             providers: Vec::new(),
             specialists: Vec::new(),
             storage: StorageConfig::default(),
@@ -170,6 +193,26 @@ impl Default for StorageConfig {
     }
 }
 
+impl Default for AarnnBridgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            access_token: None,
+            timeout_seconds: 4.0,
+            mirror_input: true,
+            mirror_output: true,
+            request_candidate_reply: true,
+            response_preference: AarnnResponsePreference::LlmPreferred,
+            candidate_confidence_threshold: 0.98,
+            candidate_min_reply_chars: 24,
+            network_id: None,
+            node_id: None,
+            max_text_chars: 8192,
+        }
+    }
+}
+
 impl Default for ProviderProfile {
     fn default() -> Self {
         Self {
@@ -204,8 +247,18 @@ impl Default for SpecialistProfile {
             timeout_seconds: 2.0,
             health_ttl_seconds: 300.0,
             spike_threshold: 0.5,
-            roles: vec!["planner".to_string(), "reviewer".to_string(), "researcher".to_string(), "assistant".to_string()],
-            specialties: vec!["aarnn".to_string(), "snn".to_string(), "neuromorphic".to_string(), "aer".to_string()],
+            roles: vec![
+                "planner".to_string(),
+                "reviewer".to_string(),
+                "researcher".to_string(),
+                "assistant".to_string(),
+            ],
+            specialties: vec![
+                "aarnn".to_string(),
+                "snn".to_string(),
+                "neuromorphic".to_string(),
+                "aer".to_string(),
+            ],
             keyword_hints: Vec::new(),
             guidance_lines: Vec::new(),
             description: None,
@@ -231,7 +284,9 @@ impl GailConfig {
 
     fn normalize(&mut self) -> Result<()> {
         if self.server.bind_addr.trim().is_empty() {
-            return Err(GailError::invalid_config("server.bind_addr must not be empty"));
+            return Err(GailError::invalid_config(
+                "server.bind_addr must not be empty",
+            ));
         }
         if self.orchestration.max_parallel_candidates == 0 {
             self.orchestration.max_parallel_candidates = 1;
@@ -239,6 +294,20 @@ impl GailConfig {
         if self.orchestration.health_ttl_seconds < 30.0 {
             self.orchestration.health_ttl_seconds = 30.0;
         }
+        self.aarnn_bridge.endpoint = normalize_optional_url(self.aarnn_bridge.endpoint.as_deref());
+        self.aarnn_bridge.access_token =
+            normalize_optional_string(self.aarnn_bridge.access_token.as_deref());
+        self.aarnn_bridge.network_id =
+            normalize_optional_string(self.aarnn_bridge.network_id.as_deref());
+        self.aarnn_bridge.node_id = normalize_optional_string(self.aarnn_bridge.node_id.as_deref());
+        self.aarnn_bridge.timeout_seconds = self.aarnn_bridge.timeout_seconds.max(0.2);
+        self.aarnn_bridge.candidate_confidence_threshold = self
+            .aarnn_bridge
+            .candidate_confidence_threshold
+            .clamp(0.0, 1.0);
+        self.aarnn_bridge.candidate_min_reply_chars =
+            self.aarnn_bridge.candidate_min_reply_chars.max(1);
+        self.aarnn_bridge.max_text_chars = self.aarnn_bridge.max_text_chars.clamp(128, 65_536);
         if self.storage.metrics_path.trim().is_empty() {
             self.storage.metrics_path = "data/provider_metrics.json".to_string();
         }
@@ -259,6 +328,22 @@ impl GailConfig {
             }
         }
         Ok(())
+    }
+}
+
+fn normalize_optional_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn normalize_optional_url(value: Option<&str>) -> Option<String> {
+    let value = normalize_optional_string(value)?;
+    if value.contains("://") {
+        Some(value.trim_end_matches('/').to_string())
+    } else {
+        Some(format!("http://{}", value.trim_end_matches('/')))
     }
 }
 

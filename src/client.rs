@@ -73,7 +73,8 @@ impl GailClient {
     }
 
     pub async fn orchestration_status(&self, limit: usize) -> Result<Value> {
-        self.get_json(&format!("/v1/status/orchestration?limit={limit}")).await
+        self.get_json(&format!("/v1/status/orchestration?limit={limit}"))
+            .await
     }
 
     pub async fn transcribe_bytes(
@@ -98,7 +99,11 @@ impl GailClient {
         }
         let mut builder = self
             .client
-            .post(format!("{}{path}", self.base_url, path = "/v1/llm/transcribe"))
+            .post(format!(
+                "{}{path}",
+                self.base_url,
+                path = "/v1/llm/transcribe"
+            ))
             .multipart(form);
         if let Some(token) = self.bearer_token.as_deref() {
             builder = builder.bearer_auth(token);
@@ -112,7 +117,10 @@ impl GailClient {
         T: serde::Serialize + ?Sized,
         R: DeserializeOwned,
     {
-        let mut builder = self.client.post(format!("{}{}", self.base_url, path)).json(payload);
+        let mut builder = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .json(payload);
         if let Some(token) = self.bearer_token.as_deref() {
             builder = builder.bearer_auth(token);
         }
@@ -149,7 +157,11 @@ impl GailClient {
             .and_then(Value::as_str)
             .or_else(|| payload.get("error").and_then(Value::as_str))
             .unwrap_or("Gail request failed");
-        Err(GailError::upstream("gail", Some(status), message.to_string()))
+        Err(GailError::upstream(
+            "gail",
+            Some(status),
+            message.to_string(),
+        ))
     }
 }
 
@@ -164,7 +176,10 @@ fn normalize_base_url(base_url: String) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::{method, path}};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     #[tokio::test]
     async fn orchestration_status_fetches_json() {

@@ -11,16 +11,18 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::{
+    aarnn_bridge::{AarnnMirrorClient, AarnnMirrorExchange},
     aer,
     config::{ApiTokenConfig, GailConfig, ProviderProfile},
     errors::{GailError, Result},
     metrics::{HealthBucket, MetricsStore},
     models::{
-        AerDecodeRequest, AerDecodeResponse, AerEncodeRequest, AerEncodeResponse, AuthContext,
-        CandidateInvocationSummary, CandidateSummary, CompletionRequest, CompletionResponse,
-        CompletionTrace, HealthResponse, NeuromorphicAnalyzeRequest, NeuromorphicPredictRequest,
-        NeuromorphicPredictResponse, ProviderCompletionRequest, SelectionMode,
-        SpecialistAnalysisResponse, TranscriptionResponse,
+        AarnnMirrorDirection, AerDecodeRequest, AerDecodeResponse, AerEncodeRequest,
+        AerEncodeResponse, AuthContext, CandidateInvocationSummary, CandidateSummary,
+        CompletionRequest, CompletionResponse, CompletionTrace, HealthResponse,
+        NeuromorphicAnalyzeRequest, NeuromorphicPredictRequest, NeuromorphicPredictResponse,
+        ProviderCompletionRequest, SelectionMode, SpecialistAnalysisResponse,
+        TranscriptionResponse,
     },
     providers::{
         ProviderHealth, ProviderInvocationResponse, TranscriptionInput, build_adapter,
@@ -46,6 +48,7 @@ struct GailServiceInner {
     client: Client,
     metrics: MetricsStore,
     specialists: Vec<SpecialistEngine>,
+    aarnn_bridge: Option<AarnnMirrorClient>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,18 +84,24 @@ impl GailService {
             .build()?;
         let metrics = MetricsStore::new(config.storage.metrics_path.clone()).await?;
         let specialists = build_specialist_engines(&config, client.clone());
+        let aarnn_bridge = AarnnMirrorClient::from_config(&config, client.clone(), &specialists);
         Ok(Self {
             inner: Arc::new(GailServiceInner {
                 config,
                 client,
                 metrics,
                 specialists,
+                aarnn_bridge,
             }),
         })
     }
 
     pub fn config(&self) -> &GailConfig {
         &self.inner.config
+    }
+
+    fn aarnn_bridge(&self) -> Option<&AarnnMirrorClient> {
+        self.inner.aarnn_bridge.as_ref()
     }
 
     pub fn authorize(&self, headers: &HeaderMap, required_scope: &str) -> Result<AuthContext> {
@@ -120,6 +129,9 @@ impl GailService {
         &self,
         request: ProviderCompletionRequest,
     ) -> Result<CompletionResponse> {
+        let request_id = Uuid::new_v4().to_string();
+        let prompt_text = flatten_prompt_text(&request.messages, request.system.as_deref());
+        let expected_json = expected_json(&request.messages, request.system.as_deref());
         let mut profile = ProviderProfile::default();
         profile.name = request.provider.clone();
         profile.provider_type = request.provider.clone();
@@ -128,21 +140,110 @@ impl GailService {
         profile.access_token = request.access_token.clone();
         profile.base_url = request.base_url.clone();
         profile.source = Some("request_direct".to_string());
+        let candidate = ProviderCandidate::from_profile(profile.clone());
+        let mirror_input = self.spawn_aarnn_mirror(self.build_aarnn_exchange(
+            request_id.as_str(),
+            request_id.as_str(),
+            "direct",
+            "assistant",
+            AarnnMirrorDirection::Input,
+            Some(request.provider.as_str()),
+            request.model.as_deref(),
+            request.request_category.as_deref(),
+            request.system.as_deref(),
+            None,
+            prompt_text.as_str(),
+            &request.messages,
+        ));
         let adapter = build_adapter(self.inner.client.clone(), &profile)?;
         let response = adapter.complete(&request).await?;
+        let quality = quality_score(response.text.as_str(), expected_json);
+        let mirror_output = self
+            .run_aarnn_output_mirror(
+                request_id.as_str(),
+                request_id.as_str(),
+                "direct",
+                "assistant",
+                Some(response.provider.as_str()),
+                Some(response.model.as_str()),
+                request.request_category.as_deref(),
+                request.system.as_deref(),
+                Some(prompt_text.as_str()),
+                response.text.as_str(),
+                &request.messages,
+            )
+            .await;
+        let mirror_input = self.await_aarnn_mirror_task(mirror_input).await;
+        let mut text = response.text.clone();
+        let mut provider = response.provider.clone();
+        let mut model = response.model.clone();
+        let mut latency_ms = response.latency_ms;
+        let mut usage = response.usage.clone();
+        let mut raw = response.raw.clone();
+        let mut final_source = "llm".to_string();
+        if let (Some(bridge), Some(output_trace)) = (self.aarnn_bridge(), mirror_output.as_ref()) {
+            if bridge.should_promote_candidate(output_trace, response.text.as_str()) {
+                if let Some(reply_text) = bridge.promoted_reply(output_trace) {
+                    text = reply_text;
+                    provider = "aarnn".to_string();
+                    model = bridge.response_model().to_string();
+                    latency_ms = latency_ms.saturating_add(output_trace.latency_ms);
+                    usage = None;
+                    raw = Some(json!({
+                        "selected_source": "aarnn",
+                        "aarnn_candidate": output_trace.candidate.clone(),
+                        "llm_provider": response.provider,
+                        "llm_model": response.model,
+                        "llm_raw": response.raw,
+                    }));
+                    final_source = "aarnn".to_string();
+                }
+            }
+        }
+        let trace = if mirror_input.is_some() || mirror_output.is_some() {
+            Some(CompletionTrace {
+                workflow: "direct".to_string(),
+                role: "assistant".to_string(),
+                task_tags: vec!["direct".to_string()],
+                selection_mode: SelectionMode::Fastest,
+                returned_early: false,
+                early_success_enabled: false,
+                early_success_settle_seconds: 0.0,
+                selected: candidate.summary(Some(response.model.as_str())),
+                candidates: vec![CandidateInvocationSummary {
+                    summary: candidate.summary(Some(response.model.as_str())),
+                    latency_ms: Some(response.latency_ms),
+                    quality,
+                    score: quality,
+                    status: "ok".to_string(),
+                    error: None,
+                }],
+                metrics_store_path: self.inner.metrics.path(),
+                specialist_engines: None,
+                final_source,
+                final_provider: provider.clone(),
+                final_model: model.clone(),
+                aarnn_mirroring: self
+                    .aarnn_bridge()
+                    .map(|bridge| bridge.build_trace(mirror_input.clone(), mirror_output.clone())),
+            })
+        } else {
+            None
+        };
         Ok(CompletionResponse {
-            request_id: Uuid::new_v4().to_string(),
-            text: response.text,
-            provider: response.provider,
-            model: response.model,
-            latency_ms: response.latency_ms,
-            usage: response.usage,
-            trace: None,
-            raw: response.raw,
+            request_id,
+            text,
+            provider,
+            model,
+            latency_ms,
+            usage,
+            trace,
+            raw,
         })
     }
 
     pub async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+        let request_id = Uuid::new_v4().to_string();
         let workflow = normalize_key(request.workflow.as_deref().unwrap_or("general"), "general");
         let role = normalize_key(request.role.as_deref().unwrap_or("general"), "general");
         let selection_mode = request
@@ -228,6 +329,24 @@ impl GailService {
             }
             specialist_meta = Some(analysis);
         }
+        let mirrored_prompt_text = flatten_prompt_text(
+            &provider_request.messages,
+            provider_request.system.as_deref(),
+        );
+        let mirror_input = self.spawn_aarnn_mirror(self.build_aarnn_exchange(
+            request_id.as_str(),
+            request_id.as_str(),
+            workflow.as_str(),
+            role.as_str(),
+            AarnnMirrorDirection::Input,
+            Some(provider_request.provider.as_str()),
+            provider_request.model.as_deref(),
+            provider_request.request_category.as_deref(),
+            provider_request.system.as_deref(),
+            None,
+            mirrored_prompt_text.as_str(),
+            &provider_request.messages,
+        ));
 
         let mut candidates = self.build_candidates(&request, include_configured);
         if candidates.is_empty() {
@@ -368,6 +487,22 @@ impl GailService {
         let selected_summary = chosen
             .candidate
             .summary(Some(chosen_response.model.as_str()));
+        let mirror_output = self
+            .run_aarnn_output_mirror(
+                request_id.as_str(),
+                request_id.as_str(),
+                workflow.as_str(),
+                role.as_str(),
+                Some(chosen_response.provider.as_str()),
+                Some(chosen_response.model.as_str()),
+                provider_request.request_category.as_deref(),
+                provider_request.system.as_deref(),
+                Some(mirrored_prompt_text.as_str()),
+                chosen_response.text.as_str(),
+                &provider_request.messages,
+            )
+            .await;
+        let mirror_input = self.await_aarnn_mirror_task(mirror_input).await;
         let candidate_summaries = std::iter::once((
             selected_summary.clone(),
             chosen.latency_ms,
@@ -410,6 +545,33 @@ impl GailService {
             "selected Gail orchestration result"
         );
 
+        let mut text = chosen_response.text.clone();
+        let mut provider = chosen_response.provider.clone();
+        let mut model = chosen_response.model.clone();
+        let mut latency_ms = chosen_response.latency_ms;
+        let mut usage = chosen_response.usage.clone();
+        let mut raw = chosen_response.raw.clone();
+        let mut final_source = "llm".to_string();
+        if let (Some(bridge), Some(output_trace)) = (self.aarnn_bridge(), mirror_output.as_ref()) {
+            if bridge.should_promote_candidate(output_trace, chosen_response.text.as_str()) {
+                if let Some(reply_text) = bridge.promoted_reply(output_trace) {
+                    text = reply_text;
+                    provider = "aarnn".to_string();
+                    model = bridge.response_model().to_string();
+                    latency_ms = latency_ms.saturating_add(output_trace.latency_ms);
+                    usage = None;
+                    raw = Some(json!({
+                        "selected_source": "aarnn",
+                        "aarnn_candidate": output_trace.candidate.clone(),
+                        "llm_provider": chosen_response.provider,
+                        "llm_model": chosen_response.model,
+                        "llm_raw": chosen_response.raw,
+                    }));
+                    final_source = "aarnn".to_string();
+                }
+            }
+        }
+
         let trace = CompletionTrace {
             workflow: workflow.clone(),
             role: role.clone(),
@@ -424,17 +586,23 @@ impl GailService {
             specialist_engines: specialist_meta
                 .as_ref()
                 .and_then(|value| serde_json::to_value(value).ok()),
+            final_source,
+            final_provider: provider.clone(),
+            final_model: model.clone(),
+            aarnn_mirroring: self
+                .aarnn_bridge()
+                .map(|bridge| bridge.build_trace(mirror_input.clone(), mirror_output.clone())),
         };
 
         Ok(CompletionResponse {
-            request_id: Uuid::new_v4().to_string(),
-            text: chosen_response.text,
-            provider: chosen_response.provider,
-            model: chosen_response.model,
-            latency_ms: chosen_response.latency_ms,
-            usage: chosen_response.usage,
+            request_id,
+            text,
+            provider,
+            model,
+            latency_ms,
+            usage,
             trace: Some(trace),
-            raw: chosen_response.raw,
+            raw,
         })
     }
 
@@ -543,6 +711,7 @@ impl GailService {
             .ok()
             .map(|path| path.display().to_string());
         let routing_profiles_version = default_routing_profiles().version;
+        let aarnn_bridge = AarnnMirrorClient::status(&self.inner.config, &self.inner.specialists);
         json!({
             "enabled": self.inner.config.orchestration.enabled,
             "routing_profiles_path": routing_profiles_path,
@@ -554,6 +723,7 @@ impl GailService {
             "providers": providers,
             "engine_count": engines.len(),
             "engines": engines,
+            "aarnn_bridge": aarnn_bridge,
             "metrics": metrics,
             "model_inventory": model_inventory,
         })
@@ -604,6 +774,107 @@ impl GailService {
             }
         }
         Value::Null
+    }
+
+    fn spawn_aarnn_mirror(
+        &self,
+        exchange: AarnnMirrorExchange,
+    ) -> Option<tokio::task::JoinHandle<crate::models::AarnnMirrorInvocationTrace>> {
+        let bridge = self.inner.aarnn_bridge.clone()?;
+        let should_mirror = match exchange.direction {
+            AarnnMirrorDirection::Input => bridge.should_mirror_input(),
+            AarnnMirrorDirection::Output => bridge.should_mirror_output(),
+        };
+        if !should_mirror {
+            return None;
+        }
+        Some(tokio::spawn(async move { bridge.mirror(exchange).await }))
+    }
+
+    async fn await_aarnn_mirror_task(
+        &self,
+        task: Option<tokio::task::JoinHandle<crate::models::AarnnMirrorInvocationTrace>>,
+    ) -> Option<crate::models::AarnnMirrorInvocationTrace> {
+        let task = task?;
+        match task.await {
+            Ok(trace) => Some(trace),
+            Err(error) => {
+                tracing::warn!(error = %error, "AARNN mirror task join failed");
+                None
+            }
+        }
+    }
+
+    async fn run_aarnn_output_mirror(
+        &self,
+        request_id: &str,
+        conversation_id: &str,
+        workflow: &str,
+        role: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+        request_category: Option<&str>,
+        system: Option<&str>,
+        prompt_text: Option<&str>,
+        text: &str,
+        messages: &[crate::models::ChatMessage],
+    ) -> Option<crate::models::AarnnMirrorInvocationTrace> {
+        let bridge = self.aarnn_bridge()?;
+        if !bridge.should_mirror_output() {
+            return None;
+        }
+        Some(
+            bridge
+                .mirror(self.build_aarnn_exchange(
+                    request_id,
+                    conversation_id,
+                    workflow,
+                    role,
+                    AarnnMirrorDirection::Output,
+                    provider,
+                    model,
+                    request_category,
+                    system,
+                    prompt_text,
+                    text,
+                    messages,
+                ))
+                .await,
+        )
+    }
+
+    fn build_aarnn_exchange(
+        &self,
+        request_id: &str,
+        conversation_id: &str,
+        workflow: &str,
+        role: &str,
+        direction: AarnnMirrorDirection,
+        provider: Option<&str>,
+        model: Option<&str>,
+        request_category: Option<&str>,
+        system: Option<&str>,
+        prompt_text: Option<&str>,
+        text: &str,
+        messages: &[crate::models::ChatMessage],
+    ) -> AarnnMirrorExchange {
+        AarnnMirrorExchange {
+            request_id: request_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            workflow: workflow.to_string(),
+            role: role.to_string(),
+            direction,
+            provider: provider.map(ToOwned::to_owned),
+            model: model.map(ToOwned::to_owned),
+            request_category: request_category.map(ToOwned::to_owned),
+            system: system.map(ToOwned::to_owned),
+            prompt_text: prompt_text.map(ToOwned::to_owned),
+            text: text.to_string(),
+            message_roles: messages
+                .iter()
+                .map(|message| message.role.clone())
+                .collect(),
+        }
     }
 
     fn matching_token<'a>(

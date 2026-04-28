@@ -1,4 +1,9 @@
-use std::{collections::HashMap, env, sync::{Mutex, OnceLock}, time::{Duration, Instant}};
+use std::{
+    collections::HashMap,
+    env,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use base64::Engine;
 use http::StatusCode;
@@ -34,7 +39,10 @@ pub struct GeminiProvider {
 
 impl GeminiProvider {
     pub fn new(client: Client, profile: &ProviderProfile) -> Result<Self> {
-        let api_key = profile.api_key.clone().or_else(|| env::var("GEMINI_API_KEY").ok());
+        let api_key = profile
+            .api_key
+            .clone()
+            .or_else(|| env::var("GEMINI_API_KEY").ok());
         let access_token = profile
             .access_token
             .clone()
@@ -45,8 +53,12 @@ impl GeminiProvider {
                 "GEMINI_API_KEY or GEMINI_ACCESS_TOKEN/GOOGLE_ACCESS_TOKEN must be configured",
             ));
         }
-        let default_model = env::var("GEMINI_DEFAULT_MODEL").unwrap_or_else(|_| "gemini-2.5-flash".to_string());
-        let model = profile.model.clone().unwrap_or_else(|| default_model.clone());
+        let default_model =
+            env::var("GEMINI_DEFAULT_MODEL").unwrap_or_else(|_| "gemini-2.5-flash".to_string());
+        let model = profile
+            .model
+            .clone()
+            .unwrap_or_else(|| default_model.clone());
         Ok(Self {
             client,
             model,
@@ -60,30 +72,56 @@ impl GeminiProvider {
         &self.model
     }
 
-    pub async fn complete(&self, request: &ProviderCompletionRequest) -> Result<ProviderInvocationResponse> {
+    pub async fn complete(
+        &self,
+        request: &ProviderCompletionRequest,
+    ) -> Result<ProviderInvocationResponse> {
         let mut model = request.model.clone().unwrap_or_else(|| self.model.clone());
         let api_key = request.api_key.clone().or_else(|| self.api_key.clone());
-        let access_token = request.access_token.clone().or_else(|| self.access_token.clone());
+        let access_token = request
+            .access_token
+            .clone()
+            .or_else(|| self.access_token.clone());
         let headers = gemini_headers(api_key.as_deref(), access_token.as_deref())?;
-        let timeout = Duration::from_secs(request.timeout_seconds.unwrap_or(env_int("LLM_TIMEOUT_SECONDS", 180)).max(1));
+        let timeout = Duration::from_secs(
+            request
+                .timeout_seconds
+                .unwrap_or(env_int("LLM_TIMEOUT_SECONDS", 180))
+                .max(1),
+        );
         let max_retries = env_int("LLM_MAX_RETRIES", 2) as usize;
         let mut skip_cache = false;
         for attempt in 0..2 {
-            let url = format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent");
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            );
             let payload = build_payload(request, &model, skip_cache).await?;
             let started = Instant::now();
-            let response = post_json_with_retries("gemini", &self.client, &url, &headers, &payload, timeout, max_retries).await?;
+            let response = post_json_with_retries(
+                "gemini",
+                &self.client,
+                &url,
+                &headers,
+                &payload,
+                timeout,
+                max_retries,
+            )
+            .await?;
             let latency_ms = started.elapsed().as_millis() as u64;
             let status = response.status();
             let body = response.text().await?;
-            let data: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({"message": body}));
+            let data: Value =
+                serde_json::from_str(&body).unwrap_or_else(|_| json!({"message": body}));
             if !status.is_success() {
                 let message = error_message(&data);
                 if attempt == 0 && cached_content_error(status, &message) {
                     skip_cache = true;
                     continue;
                 }
-                if attempt == 0 && is_model_not_found(status, &message) && model != self.default_model {
+                if attempt == 0
+                    && is_model_not_found(status, &message)
+                    && model != self.default_model
+                {
                     model = self.default_model.clone();
                     continue;
                 }
@@ -105,16 +143,26 @@ impl GeminiProvider {
                 })
                 .unwrap_or_default();
             let usage = extract_gemini_usage(&data);
-            return Ok(response_with_usage(text, data, latency_ms, "gemini", &model, usage));
+            return Ok(response_with_usage(
+                text, data, latency_ms, "gemini", &model, usage,
+            ));
         }
-        Err(GailError::upstream("gemini", None, "Gemini retries exhausted"))
+        Err(GailError::upstream(
+            "gemini",
+            None,
+            "Gemini retries exhausted",
+        ))
     }
 
-    pub async fn transcribe(&self, input: &TranscriptionInput) -> Result<ProviderInvocationResponse> {
-        let mime_type = input
-            .mime_type
-            .clone()
-            .unwrap_or_else(|| mime_guess::from_path(&input.filename).first_or_octet_stream().to_string());
+    pub async fn transcribe(
+        &self,
+        input: &TranscriptionInput,
+    ) -> Result<ProviderInvocationResponse> {
+        let mime_type = input.mime_type.clone().unwrap_or_else(|| {
+            mime_guess::from_path(&input.filename)
+                .first_or_octet_stream()
+                .to_string()
+        });
         let request = ProviderCompletionRequest {
             provider: "gemini".to_string(),
             model: Some(self.model.clone()),
@@ -155,7 +203,11 @@ impl GeminiProvider {
             &self.client,
             "https://generativelanguage.googleapis.com/v1beta/models",
             &headers,
-            Duration::from_secs(timeout_seconds.unwrap_or(env_int("LLM_TIMEOUT_SECONDS", 60)).max(1)),
+            Duration::from_secs(
+                timeout_seconds
+                    .unwrap_or(env_int("LLM_TIMEOUT_SECONDS", 60))
+                    .max(1),
+            ),
             env_int("LLM_MAX_RETRIES", 1) as usize,
         )
         .await?;
@@ -176,18 +228,33 @@ impl GeminiProvider {
 
 fn gemini_headers(api_key: Option<&str>, access_token: Option<&str>) -> Result<http::HeaderMap> {
     let mut headers = http::HeaderMap::new();
-    headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
     if let Some(api_key) = api_key {
-        headers.insert("x-goog-api-key", http::HeaderValue::from_str(api_key).map_err(|error| GailError::bad_request(error.to_string()))?);
+        headers.insert(
+            "x-goog-api-key",
+            http::HeaderValue::from_str(api_key)
+                .map_err(|error| GailError::bad_request(error.to_string()))?,
+        );
     } else if let Some(access_token) = access_token {
-        headers.insert(http::header::AUTHORIZATION, http::HeaderValue::from_str(&format!("Bearer {access_token}")).map_err(|error| GailError::bad_request(error.to_string()))?);
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_str(&format!("Bearer {access_token}"))
+                .map_err(|error| GailError::bad_request(error.to_string()))?,
+        );
     } else {
         return Err(GailError::bad_request("Gemini credentials not configured"));
     }
     Ok(headers)
 }
 
-async fn build_payload(request: &ProviderCompletionRequest, model: &str, skip_cache: bool) -> Result<Value> {
+async fn build_payload(
+    request: &ProviderCompletionRequest,
+    model: &str,
+    skip_cache: bool,
+) -> Result<Value> {
     let contents = request
         .messages
         .iter()
@@ -212,7 +279,8 @@ async fn build_payload(request: &ProviderCompletionRequest, model: &str, skip_ca
         "generationConfig": generation_config,
     });
     if !skip_cache && env_bool("GEMINI_EXPLICIT_CACHE", true) {
-        if let Some(cached_content) = maybe_cached_content(model, request.system.as_deref()).await? {
+        if let Some(cached_content) = maybe_cached_content(model, request.system.as_deref()).await?
+        {
             payload["cachedContent"] = json!(cached_content);
         } else if let Some(system) = request.system.as_ref() {
             payload["systemInstruction"] = json!({"parts": [{"text": system}]});
@@ -240,7 +308,12 @@ fn message_parts(content: &MessageContent) -> Vec<Value> {
 
 async fn maybe_cached_content(model: &str, system: Option<&str>) -> Result<Option<String>> {
     let cache_key = format!("{}::{}", model, system.unwrap_or("gemini-default-cache"));
-    if let Some(existing) = cache_store().lock().expect("gemini cache lock").get(&cache_key).cloned() {
+    if let Some(existing) = cache_store()
+        .lock()
+        .expect("gemini cache lock")
+        .get(&cache_key)
+        .cloned()
+    {
         return Ok(Some(existing));
     }
     if system.unwrap_or_default().trim().is_empty() {
@@ -252,7 +325,13 @@ async fn maybe_cached_content(model: &str, system: Option<&str>) -> Result<Optio
         "contents": [{"role": "user", "parts": [{"text": seed}]}],
         "systemInstruction": {"parts": [{"text": system.unwrap_or_default()}]},
     });
-    let headers = gemini_headers(env::var("GEMINI_API_KEY").ok().as_deref(), env::var("GEMINI_ACCESS_TOKEN").ok().or_else(|| env::var("GOOGLE_ACCESS_TOKEN").ok()).as_deref())?;
+    let headers = gemini_headers(
+        env::var("GEMINI_API_KEY").ok().as_deref(),
+        env::var("GEMINI_ACCESS_TOKEN")
+            .ok()
+            .or_else(|| env::var("GOOGLE_ACCESS_TOKEN").ok())
+            .as_deref(),
+    )?;
     let client = Client::builder().build()?;
     let response = client
         .post("https://generativelanguage.googleapis.com/v1beta/cachedContents")
@@ -265,28 +344,48 @@ async fn maybe_cached_content(model: &str, system: Option<&str>) -> Result<Optio
         return Ok(None);
     }
     let data: Value = response.json().await?;
-    let name = data.get("name").and_then(Value::as_str).map(ToOwned::to_owned);
+    let name = data
+        .get("name")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
     if let Some(name) = name.clone() {
-        cache_store().lock().expect("gemini cache lock").insert(cache_key, name);
+        cache_store()
+            .lock()
+            .expect("gemini cache lock")
+            .insert(cache_key, name);
     }
     Ok(name)
 }
 
 fn cached_content_error(status: StatusCode, message: &str) -> bool {
-    matches!(status, StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND)
-        && {
-            let lowered = message.to_ascii_lowercase();
-            lowered.contains("cachedcontent") || lowered.contains("cached content")
-        }
+    matches!(
+        status,
+        StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+    ) && {
+        let lowered = message.to_ascii_lowercase();
+        lowered.contains("cachedcontent") || lowered.contains("cached content")
+    }
 }
 
 fn extract_gemini_usage(data: &Value) -> Option<TokenUsage> {
     let usage = data.get("usageMetadata")?;
     Some(TokenUsage {
-        prompt: usage.get("promptTokenCount").and_then(Value::as_u64).map(|value| value as u32),
-        completion: usage.get("candidatesTokenCount").and_then(Value::as_u64).map(|value| value as u32),
-        total: usage.get("totalTokenCount").and_then(Value::as_u64).map(|value| value as u32),
-        cached: usage.get("cachedContentTokenCount").and_then(Value::as_u64).map(|value| value as u32),
+        prompt: usage
+            .get("promptTokenCount")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32),
+        completion: usage
+            .get("candidatesTokenCount")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32),
+        total: usage
+            .get("totalTokenCount")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32),
+        cached: usage
+            .get("cachedContentTokenCount")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32),
         cost: None,
     })
 }

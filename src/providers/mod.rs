@@ -5,8 +5,8 @@ pub mod openai;
 use std::{collections::HashSet, env, time::Duration};
 
 use http::{
-    header::{AUTHORIZATION, CONTENT_TYPE},
     HeaderMap, HeaderValue, StatusCode,
+    header::{AUTHORIZATION, CONTENT_TYPE},
 };
 use rand::Rng;
 use reqwest::Client;
@@ -318,7 +318,7 @@ pub async fn post_json_with_retries(
         match response {
             Ok(response) if response.status().is_success() => return Ok(response),
             Ok(response) if !should_retry_status(response.status()) || attempt >= max_retries => {
-                return Ok(response)
+                return Ok(response);
             }
             Ok(response) => {
                 let delay = retry_after_seconds(response.headers()).unwrap_or_else(|| {
@@ -362,7 +362,7 @@ pub async fn get_with_retries(
         match response {
             Ok(response) if response.status().is_success() => return Ok(response),
             Ok(response) if !should_retry_status(response.status()) || attempt >= max_retries => {
-                return Ok(response)
+                return Ok(response);
             }
             Ok(response) => {
                 let delay = retry_after_seconds(response.headers()).unwrap_or_else(|| {

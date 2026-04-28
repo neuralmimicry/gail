@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    env,
-    fs,
+    env, fs,
     path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -87,7 +86,11 @@ impl SpecialistEngine {
             return false;
         }
         self.profile.name.trim().eq_ignore_ascii_case(&normalized)
-            || self.profile.engine_type.trim().eq_ignore_ascii_case(&normalized)
+            || self
+                .profile
+                .engine_type
+                .trim()
+                .eq_ignore_ascii_case(&normalized)
     }
 
     pub fn supports_role(&self, role: &str) -> bool {
@@ -101,7 +104,10 @@ impl SpecialistEngine {
     }
 
     pub fn is_available(&self) -> bool {
-        self.profile.endpoint.as_deref().is_some_and(|value| !value.trim().is_empty())
+        self.profile
+            .endpoint
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
             || self
                 .profile
                 .socket_path
@@ -120,7 +126,9 @@ impl SpecialistEngine {
             match self
                 .client
                 .get(format!("{endpoint}/healthz"))
-                .timeout(Duration::from_secs_f64(self.profile.timeout_seconds.max(0.2)))
+                .timeout(Duration::from_secs_f64(
+                    self.profile.timeout_seconds.max(0.2),
+                ))
                 .send()
                 .await
             {
@@ -185,7 +193,11 @@ impl SpecialistEngine {
         })
     }
 
-    pub async fn summary_from_profile(client: Client, profile: SpecialistProfile, probe_health: bool) -> Value {
+    pub async fn summary_from_profile(
+        client: Client,
+        profile: SpecialistProfile,
+        probe_health: bool,
+    ) -> Value {
         let engine = Self::new(client, profile);
         if engine.is_available() {
             return engine.summary(probe_health).await;
@@ -215,7 +227,10 @@ impl SpecialistEngine {
         })
     }
 
-    pub async fn predict_request(&self, request: &NeuromorphicPredictRequest) -> Result<NeuromorphicPredictResponse> {
+    pub async fn predict_request(
+        &self,
+        request: &NeuromorphicPredictRequest,
+    ) -> Result<NeuromorphicPredictResponse> {
         let prediction = self.predict_inputs(&request.inputs).await?;
         Ok(NeuromorphicPredictResponse {
             score: round_to(prediction.score, 6),
@@ -243,7 +258,10 @@ impl SpecialistEngine {
         let feature_inputs = vec![
             (cleaned.len() as f64 / 1200.0).min(1.0) as f32,
             (hits.values().sum::<usize>() as f64 / 6.0).min(1.0) as f32,
-            if matches!(workflow, "project_solver" | "playground_plan" | "assistant_requirements") {
+            if matches!(
+                workflow,
+                "project_solver" | "playground_plan" | "assistant_requirements"
+            ) {
                 1.0
             } else {
                 0.4
@@ -336,7 +354,9 @@ impl SpecialistEngine {
                 .specialties
                 .iter()
                 .any(|item| item.eq_ignore_ascii_case("aarnn"))
-            && !lines.iter().any(|line| line.to_ascii_uppercase().contains("AARNN"))
+            && !lines
+                .iter()
+                .any(|line| line.to_ascii_uppercase().contains("AARNN"))
         {
             lines.push(
                 "- Prefer AARNN-grown SNN designs when the task explicitly calls for spiking or neuromorphic networks.".to_string(),
@@ -360,13 +380,17 @@ impl SpecialistEngine {
         if let Some(endpoint) = normalized_url(self.profile.endpoint.as_deref()) {
             match self.predict_http(&endpoint, inputs).await {
                 Ok(prediction) => return Ok(prediction),
-                Err(error) => tracing::debug!(engine = %self.profile.name, error = %error, "specialist HTTP predict failed; falling back"),
+                Err(error) => {
+                    tracing::debug!(engine = %self.profile.name, error = %error, "specialist HTTP predict failed; falling back")
+                }
             }
         }
         if let Some(socket_path) = self.profile.socket_path.as_ref() {
             match self.predict_socket(socket_path.clone(), inputs).await {
                 Ok(prediction) => return Ok(prediction),
-                Err(error) => tracing::debug!(engine = %self.profile.name, error = %error, "specialist UDS predict failed; falling back"),
+                Err(error) => {
+                    tracing::debug!(engine = %self.profile.name, error = %error, "specialist UDS predict failed; falling back")
+                }
             }
         }
         Ok(self.predict_heuristic(inputs))
@@ -376,7 +400,9 @@ impl SpecialistEngine {
         let response = self
             .client
             .post(format!("{endpoint}/predict"))
-            .timeout(Duration::from_secs_f64(self.profile.timeout_seconds.max(0.2)))
+            .timeout(Duration::from_secs_f64(
+                self.profile.timeout_seconds.max(0.2),
+            ))
             .json(&json!({"inputs": inputs}))
             .send()
             .await?;
@@ -435,7 +461,8 @@ impl SpecialistEngine {
             output_spikes = decode_spikes_auto(&response, output_base).unwrap_or(output_spikes);
         }
         let spike_total = output_spikes.iter().filter(|value| **value > 0).count();
-        let score = spike_total as f64 / output_spikes.len().max(self.profile.output_size).max(1) as f64;
+        let score =
+            spike_total as f64 / output_spikes.len().max(self.profile.output_size).max(1) as f64;
         Ok(AarnnPrediction {
             score,
             fired: spike_total > 0,
@@ -545,9 +572,11 @@ impl SpecialistEngine {
         let sensory_size = self.profile.sensory_size;
         let output_size = self.profile.output_size;
         let timeout = self.profile.timeout_seconds.max(0.2);
-        task::spawn_blocking(move || socket_handshake(socket_path, sensory_size, output_size, timeout))
-            .await
-            .map_err(|error| GailError::upstream("specialist", None, error.to_string()))?
+        task::spawn_blocking(move || {
+            socket_handshake(socket_path, sensory_size, output_size, timeout)
+        })
+        .await
+        .map_err(|error| GailError::upstream("specialist", None, error.to_string()))?
     }
 }
 
@@ -578,12 +607,10 @@ pub async fn specialist_engine_summaries(
 ) -> Vec<Value> {
     let mut summaries = Vec::new();
     for profile in &config.specialists {
-        summaries.push(SpecialistEngine::summary_from_profile(
-            client.clone(),
-            profile.clone(),
-            probe_health,
-        )
-        .await);
+        summaries.push(
+            SpecialistEngine::summary_from_profile(client.clone(), profile.clone(), probe_health)
+                .await,
+        );
     }
     if !config
         .specialists
@@ -658,7 +685,12 @@ pub async fn analyze_specialist_engines(
                     .get("relevant")
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
-                    .cmp(&left.get("relevant").and_then(Value::as_bool).unwrap_or(false))
+                    .cmp(
+                        &left
+                            .get("relevant")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    )
             })
             .then_with(|| right_engine.name().cmp(left_engine.name()))
     });
@@ -669,7 +701,12 @@ pub async fn analyze_specialist_engines(
         .collect::<Vec<_>>();
     let relevant = analyses
         .iter()
-        .filter(|analysis| analysis.get("relevant").and_then(Value::as_bool).unwrap_or(false))
+        .filter(|analysis| {
+            analysis
+                .get("relevant")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
         .cloned()
         .collect::<Vec<_>>();
     let mut context_blocks = Vec::new();
@@ -710,7 +747,10 @@ pub async fn analyze_specialist_engines(
         relevant: !relevant.is_empty(),
         engine_count: analyses.len(),
         engines: analyses.clone(),
-        selected: relevant.first().cloned().or_else(|| analyses.first().cloned()),
+        selected: relevant
+            .first()
+            .cloned()
+            .or_else(|| analyses.first().cloned()),
         combined_specialties,
         context_blocks: context_blocks.clone(),
         context: context_blocks.join("\n\n"),
@@ -900,27 +940,57 @@ fn legacy_aarnn_engine(client: Client) -> Option<SpecialistEngine> {
     let repo_root = env::var("GAIL_AARNN_REPO_ROOT")
         .ok()
         .or_else(|| env::var("REFINER_AARNN_REPO_ROOT").ok())
-        .or_else(|| Path::new(DEFAULT_AARNN_REPO_ROOT).exists().then(|| DEFAULT_AARNN_REPO_ROOT.to_string()));
+        .or_else(|| {
+            Path::new(DEFAULT_AARNN_REPO_ROOT)
+                .exists()
+                .then(|| DEFAULT_AARNN_REPO_ROOT.to_string())
+        });
     let endpoint = env::var("GAIL_AARNN_ENDPOINT")
         .ok()
         .or_else(|| env::var("REFINER_AARNN_ENDPOINT").ok());
     let socket_path = env::var("GAIL_AARNN_SOCKET")
         .ok()
         .or_else(|| env::var("REFINER_AARNN_SOCKET").ok())
-        .or_else(|| Path::new(DEFAULT_SOCKET_PATH).exists().then(|| DEFAULT_SOCKET_PATH.to_string()));
+        .or_else(|| {
+            Path::new(DEFAULT_SOCKET_PATH)
+                .exists()
+                .then(|| DEFAULT_SOCKET_PATH.to_string())
+        });
     let profile = SpecialistProfile {
         name: "AARNN".to_string(),
         engine_type: "aarnn".to_string(),
         endpoint,
         socket_path,
         repo_root,
-        sensory_size: env_int_any(&["GAIL_AARNN_SENSORY_SIZE", "REFINER_AARNN_SENSORY_SIZE"], 32) as usize,
-        output_size: env_int_any(&["GAIL_AARNN_OUTPUT_SIZE", "REFINER_AARNN_OUTPUT_SIZE"], 16) as usize,
-        aer_sensory_base: env_int_any(&["GAIL_AARNN_AER_SENSORY_BASE", "REFINER_AARNN_AER_SENSORY_BASE"], 4096) as u32,
-        aer_output_base: env_int_any(&["GAIL_AARNN_AER_OUTPUT_BASE", "REFINER_AARNN_AER_OUTPUT_BASE"], 16384) as u32,
+        sensory_size: env_int_any(
+            &["GAIL_AARNN_SENSORY_SIZE", "REFINER_AARNN_SENSORY_SIZE"],
+            32,
+        ) as usize,
+        output_size: env_int_any(&["GAIL_AARNN_OUTPUT_SIZE", "REFINER_AARNN_OUTPUT_SIZE"], 16)
+            as usize,
+        aer_sensory_base: env_int_any(
+            &[
+                "GAIL_AARNN_AER_SENSORY_BASE",
+                "REFINER_AARNN_AER_SENSORY_BASE",
+            ],
+            4096,
+        ) as u32,
+        aer_output_base: env_int_any(
+            &[
+                "GAIL_AARNN_AER_OUTPUT_BASE",
+                "REFINER_AARNN_AER_OUTPUT_BASE",
+            ],
+            16384,
+        ) as u32,
         timeout_seconds: env_float_any(&["GAIL_AARNN_TIMEOUT", "REFINER_AARNN_TIMEOUT"], 2.0),
         health_ttl_seconds: 300.0,
-        spike_threshold: env_float_any(&["GAIL_AARNN_SPIKE_THRESHOLD", "REFINER_AARNN_SPIKE_THRESHOLD"], 0.5),
+        spike_threshold: env_float_any(
+            &[
+                "GAIL_AARNN_SPIKE_THRESHOLD",
+                "REFINER_AARNN_SPIKE_THRESHOLD",
+            ],
+            0.5,
+        ),
         roles: vec!["planner", "reviewer", "researcher", "assistant"]
             .into_iter()
             .map(ToOwned::to_owned)
@@ -943,7 +1013,10 @@ fn legacy_aarnn_engine(client: Client) -> Option<SpecialistEngine> {
 fn env_bool_any(names: &[&str], default: bool) -> bool {
     for name in names {
         if let Ok(value) = env::var(name) {
-            return matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+            return matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
         }
     }
     default
@@ -972,11 +1045,18 @@ fn env_float_any(names: &[&str], default: f64) -> f64 {
 }
 
 #[cfg(unix)]
-fn socket_handshake(socket_path: String, sensory_size: usize, output_size: usize, timeout_seconds: f64) -> Result<Value> {
+fn socket_handshake(
+    socket_path: String,
+    sensory_size: usize,
+    output_size: usize,
+    timeout_seconds: f64,
+) -> Result<Value> {
     use std::os::unix::net::UnixDatagram;
 
     if !Path::new(&socket_path).exists() {
-        return Err(GailError::not_found(format!("AARNN socket does not exist: {socket_path}")));
+        return Err(GailError::not_found(format!(
+            "AARNN socket does not exist: {socket_path}"
+        )));
     }
     let client_path = format!("/tmp/gail_aarnn_{}_health.sock", Uuid::new_v4());
     let timeout = Duration::from_secs_f64(timeout_seconds.max(0.2));
@@ -989,13 +1069,21 @@ fn socket_handshake(socket_path: String, sensory_size: usize, output_size: usize
     let size = datagram.recv(&mut buffer)?;
     let _ = fs::remove_file(&client_path);
     let response = String::from_utf8_lossy(&buffer[..size]).to_string();
-    let payload = serde_json::from_str::<Value>(&response).unwrap_or_else(|_| json!({"raw": response}));
+    let payload =
+        serde_json::from_str::<Value>(&response).unwrap_or_else(|_| json!({"raw": response}));
     Ok(payload)
 }
 
 #[cfg(not(unix))]
-fn socket_handshake(_socket_path: String, _sensory_size: usize, _output_size: usize, _timeout_seconds: f64) -> Result<Value> {
-    Err(GailError::bad_request("Unix datagram sockets are not supported on this platform"))
+fn socket_handshake(
+    _socket_path: String,
+    _sensory_size: usize,
+    _output_size: usize,
+    _timeout_seconds: f64,
+) -> Result<Value> {
+    Err(GailError::bad_request(
+        "Unix datagram sockets are not supported on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -1003,7 +1091,9 @@ fn socket_predict(socket_path: String, timeout_seconds: f64, payload: Vec<u8>) -
     use std::os::unix::net::UnixDatagram;
 
     if !Path::new(&socket_path).exists() {
-        return Err(GailError::not_found(format!("AARNN socket does not exist: {socket_path}")));
+        return Err(GailError::not_found(format!(
+            "AARNN socket does not exist: {socket_path}"
+        )));
     }
     let client_path = format!("/tmp/gail_aarnn_{}_predict.sock", Uuid::new_v4());
     let timeout = Duration::from_secs_f64(timeout_seconds.max(0.2));
@@ -1019,8 +1109,14 @@ fn socket_predict(socket_path: String, timeout_seconds: f64, payload: Vec<u8>) -
 }
 
 #[cfg(not(unix))]
-fn socket_predict(_socket_path: String, _timeout_seconds: f64, _payload: Vec<u8>) -> Result<Vec<u8>> {
-    Err(GailError::bad_request("Unix datagram sockets are not supported on this platform"))
+fn socket_predict(
+    _socket_path: String,
+    _timeout_seconds: f64,
+    _payload: Vec<u8>,
+) -> Result<Vec<u8>> {
+    Err(GailError::bad_request(
+        "Unix datagram sockets are not supported on this platform",
+    ))
 }
 
 #[cfg(test)]
@@ -1041,14 +1137,23 @@ mod tests {
         );
         let analysis = engine
             .analyze_task(&NeuromorphicAnalyzeRequest {
-                text: "Implement an AARNN-generated SNN with an AER communication layer.".to_string(),
+                text: "Implement an AARNN-generated SNN with an AER communication layer."
+                    .to_string(),
                 workflow: Some("project_solver".to_string()),
                 role: Some("planner".to_string()),
             })
             .await
             .expect("analysis");
-        assert!(analysis.get("relevant").and_then(Value::as_bool).unwrap_or(false));
-        assert_eq!(analysis.get("mode").and_then(Value::as_str), Some("offline_heuristic"));
+        assert!(
+            analysis
+                .get("relevant")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        );
+        assert_eq!(
+            analysis.get("mode").and_then(Value::as_str),
+            Some("offline_heuristic")
+        );
         let context = engine.format_prompt_context(&analysis);
         assert!(context.contains("AER"));
         assert!(context.contains("AARNN"));
