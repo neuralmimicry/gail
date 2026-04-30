@@ -186,12 +186,20 @@ impl BacktestEngine {
         poll_interval: Duration,
         max_polls: usize,
     ) -> Self {
-        Self { octobot, profitability_threshold, poll_interval, max_polls }
+        Self {
+            octobot,
+            profitability_threshold,
+            poll_interval,
+            max_polls,
+        }
     }
 
     /// Run a complete backtesting cycle using explicit parameters.
     pub async fn run(&self, request: &BacktestStartRequest) -> BacktestSummary {
-        debug!("trading: starting OctoBot backtest (files={:?})", request.files);
+        debug!(
+            "trading: starting OctoBot backtest (files={:?})",
+            request.files
+        );
 
         // 1. Start the backtest.
         if let Err(err) = self.octobot.start_backtest(request).await {
@@ -208,11 +216,8 @@ impl BacktestEngine {
             tokio::time::sleep(self.poll_interval).await;
             match self.octobot.get_backtest_report().await {
                 Ok(Some(report)) => {
-                    let summary = BacktestSummary::from_report(
-                        &report,
-                        self.profitability_threshold,
-                        run_id,
-                    );
+                    let summary =
+                        BacktestSummary::from_report(&report, self.profitability_threshold, run_id);
                     info!(
                         "trading: backtest complete — assessment={} profit={:?}%",
                         summary.assessment, summary.profitability_pct

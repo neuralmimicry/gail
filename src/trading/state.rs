@@ -198,27 +198,15 @@ impl TradingState {
             .push_back(TradingLogEntry::new(level, category, message, context));
     }
 
-    pub fn log_info(
-        &mut self,
-        category: impl Into<String>,
-        message: impl Into<String>,
-    ) {
+    pub fn log_info(&mut self, category: impl Into<String>, message: impl Into<String>) {
         self.log("info", category, message, serde_json::Value::Null);
     }
 
-    pub fn log_warn(
-        &mut self,
-        category: impl Into<String>,
-        message: impl Into<String>,
-    ) {
+    pub fn log_warn(&mut self, category: impl Into<String>, message: impl Into<String>) {
         self.log("warn", category, message, serde_json::Value::Null);
     }
 
-    pub fn log_error(
-        &mut self,
-        category: impl Into<String>,
-        message: impl Into<String>,
-    ) {
+    pub fn log_error(&mut self, category: impl Into<String>, message: impl Into<String>) {
         let msg: String = message.into();
         self.last_error = Some(msg.clone());
         self.log("error", category, msg, serde_json::Value::Null);
@@ -316,19 +304,30 @@ impl SharedTradingState {
             match serde_json::to_string_pretty(&*state) {
                 Ok(json) => json,
                 Err(err) => {
-                    warn!("trading: failed to serialise state for persistence: {}", err);
+                    warn!(
+                        "trading: failed to serialise state for persistence: {}",
+                        err
+                    );
                     return;
                 }
             }
         };
         if let Some(parent) = path.parent() {
             if let Err(err) = fs::create_dir_all(parent).await {
-                warn!("trading: failed to create state dir {}: {}", parent.display(), err);
+                warn!(
+                    "trading: failed to create state dir {}: {}",
+                    parent.display(),
+                    err
+                );
                 return;
             }
         }
         if let Err(err) = fs::write(path, snapshot).await {
-            warn!("trading: failed to write state to {}: {}", path.display(), err);
+            warn!(
+                "trading: failed to write state to {}: {}",
+                path.display(),
+                err
+            );
         } else {
             debug!("trading: state persisted to {}", path.display());
         }
@@ -353,7 +352,11 @@ impl SharedTradingState {
                     state.log_info("startup", "Restored trading state from disk");
                 }
                 Err(err) => {
-                    warn!("trading: failed to parse persisted state from {}: {}", path.display(), err);
+                    warn!(
+                        "trading: failed to parse persisted state from {}: {}",
+                        path.display(),
+                        err
+                    );
                 }
             },
             Err(_) => {

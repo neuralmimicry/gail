@@ -73,10 +73,7 @@ impl TradingBridge {
     /// Create a new bridge and immediately start the background evaluation loop.
     /// Returns the bridge handle (for HTTP route access) and a control handle
     /// that stops the loop when dropped.
-    pub async fn start(
-        config: TradingConfig,
-        service: GailService,
-    ) -> (Self, TradingBridgeHandle) {
+    pub async fn start(config: TradingConfig, service: GailService) -> (Self, TradingBridgeHandle) {
         let state = SharedTradingState::new(config.log_ring_size, config.trade_ring_size);
 
         // Restore persisted state if available.
@@ -97,7 +94,12 @@ impl TradingBridge {
             run_evaluation_loop(loop_config, loop_state, loop_service, shutdown_rx).await;
         });
 
-        (bridge, TradingBridgeHandle { _shutdown_tx: shutdown_tx })
+        (
+            bridge,
+            TradingBridgeHandle {
+                _shutdown_tx: shutdown_tx,
+            },
+        )
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -133,7 +135,9 @@ async fn run_evaluation_loop(
     // Initial OctoBot login.
     if let Err(err) = octobot.login().await {
         warn!("trading: OctoBot login failed at startup: {}", err);
-        state.log_warn("startup", format!("OctoBot login failed: {err}")).await;
+        state
+            .log_warn("startup", format!("OctoBot login failed: {err}"))
+            .await;
     } else {
         state.log_info("startup", "Trading bridge started").await;
     }
@@ -242,9 +246,11 @@ async fn run_single_evaluation(
     let (target_exchanges, target_currencies) = {
         let s = state.0.lock().await;
         let ov = s.config_overrides.as_ref();
-        let exch = ov.and_then(|o| o.target_exchanges.clone())
+        let exch = ov
+            .and_then(|o| o.target_exchanges.clone())
             .unwrap_or_else(|| config.target_exchanges.clone());
-        let curr = ov.and_then(|o| o.target_currencies.clone())
+        let curr = ov
+            .and_then(|o| o.target_currencies.clone())
             .unwrap_or_else(|| config.target_currencies.clone());
         (exch, curr)
     };
@@ -262,7 +268,9 @@ async fn run_single_evaluation(
         }
         Err(err) => {
             warn!("trading: portfolio fetch failed: {}", err);
-            state.log_warn("eval", format!("Portfolio fetch failed: {err}")).await;
+            state
+                .log_warn("eval", format!("Portfolio fetch failed: {err}"))
+                .await;
             OctobotPortfolio::default()
         }
     };
@@ -313,12 +321,8 @@ async fn run_single_evaluation(
     );
 
     // --- 4. Compute fuzzy inputs ---
-    let fuzzy_inputs = compute_fuzzy_inputs(
-        best_snapshot.as_ref(),
-        &consensus,
-        &research,
-        &portfolio,
-    );
+    let fuzzy_inputs =
+        compute_fuzzy_inputs(best_snapshot.as_ref(), &consensus, &research, &portfolio);
     let fuzzy_out = fuzzy_engine.evaluate(&fuzzy_inputs);
 
     debug!(
@@ -334,23 +338,35 @@ async fn run_single_evaluation(
 
     info!(
         "trading: decision = {:?} exchange={} symbol={} amount=${:.2} confidence={:.2}",
-        decision.action, decision.exchange, decision.symbol,
-        decision.amount_usd, decision.confidence
+        decision.action,
+        decision.exchange,
+        decision.symbol,
+        decision.amount_usd,
+        decision.confidence
     );
 
-    state.log(
-        "info",
-        "decision",
-        format!("{:?} {}/{} ${:.2} conf={:.2}", decision.action, decision.exchange, decision.symbol, decision.amount_usd, decision.confidence),
-        json!({
-            "fuzzy_signal": fuzzy_out.signal,
-            "fuzzy_confidence": fuzzy_out.confidence,
-            "ai_signal": consensus.signal,
-            "ai_confidence": consensus.confidence,
-            "blended_signal": decision.blended_signal,
-            "rationale": decision.rationale
-        }),
-    ).await;
+    state
+        .log(
+            "info",
+            "decision",
+            format!(
+                "{:?} {}/{} ${:.2} conf={:.2}",
+                decision.action,
+                decision.exchange,
+                decision.symbol,
+                decision.amount_usd,
+                decision.confidence
+            ),
+            json!({
+                "fuzzy_signal": fuzzy_out.signal,
+                "fuzzy_confidence": fuzzy_out.confidence,
+                "ai_signal": consensus.signal,
+                "ai_confidence": consensus.confidence,
+                "blended_signal": decision.blended_signal,
+                "rationale": decision.rationale
+            }),
+        )
+        .await;
 
     // --- 6. Execute trade if warranted ---
     execute_if_warranted(octobot, &decision, state, config).await;
@@ -402,7 +418,9 @@ async fn execute_if_warranted(
 
     if decision.exchange.is_empty() || decision.symbol.is_empty() {
         warn!("trading: decision has no target exchange/symbol — skipping");
-        state.log_warn("execute", "No target exchange/symbol — trade skipped").await;
+        state
+            .log_warn("execute", "No target exchange/symbol — trade skipped")
+            .await;
         return;
     }
 
@@ -441,16 +459,23 @@ async fn execute_if_warranted(
                 s.record_trade(trade);
                 s.pending_override = None; // Clear override once executed.
             }
-            state.log(
-                "info",
-                "execute",
-                format!("{side} order placed: {}/{} ${:.2} id={}", decision.exchange, decision.symbol, decision.amount_usd, order.order_id),
-                json!({ "order_id": order.order_id, "status": order.status }),
-            ).await;
+            state
+                .log(
+                    "info",
+                    "execute",
+                    format!(
+                        "{side} order placed: {}/{} ${:.2} id={}",
+                        decision.exchange, decision.symbol, decision.amount_usd, order.order_id
+                    ),
+                    json!({ "order_id": order.order_id, "status": order.status }),
+                )
+                .await;
         }
         Err(err) => {
             warn!("trading: {} order failed: {}", side, err);
-            state.log_error("execute", format!("{side} order failed: {err}")).await;
+            state
+                .log_error("execute", format!("{side} order failed: {err}"))
+                .await;
         }
     }
 }
@@ -469,7 +494,9 @@ fn select_best_market_candidate(snapshots: &[MarketSnapshot]) -> Option<MarketSn
     let best = snapshots.iter().max_by(|a, b| {
         let score_a = market_score(a);
         let score_b = market_score(b);
-        score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+        score_a
+            .partial_cmp(&score_b)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     best.cloned()
 }
@@ -529,7 +556,7 @@ fn compute_fuzzy_inputs(
             / research.matches.len().max(1) as f64;
         // High score (close to 1.0) from RAG means relevant content found; treat as neutral.
         // We lean on the AI to interpret; keep sentiment neutral unless explicitly negative.
-        (avg_score - 0.5) * 0.4  // gentle signal
+        (avg_score - 0.5) * 0.4 // gentle signal
     };
 
     // Portfolio exposure: ratio of non-stablecoin holdings to total.

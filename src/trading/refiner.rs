@@ -115,7 +115,10 @@ impl RefinerClient {
                     .filter_map(|m| {
                         Some(RagMatch {
                             id: m.get("id").and_then(serde_json::Value::as_str)?.to_string(),
-                            score: m.get("score").and_then(serde_json::Value::as_f64).unwrap_or(0.0),
+                            score: m
+                                .get("score")
+                                .and_then(serde_json::Value::as_f64)
+                                .unwrap_or(0.0),
                             content: m
                                 .get("content")
                                 .and_then(serde_json::Value::as_str)
@@ -151,7 +154,10 @@ impl RefinerClient {
         match self.research(index_name, query, top_k).await {
             Ok(ctx) => ctx,
             Err(err) => {
-                tracing::warn!("trading: Refiner research failed (using empty context): {}", err);
+                tracing::warn!(
+                    "trading: Refiner research failed (using empty context): {}",
+                    err
+                );
                 ResearchContext::empty(query)
             }
         }

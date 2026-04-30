@@ -17,7 +17,9 @@ mod tests {
     use crate::trading::config::{TradingConfig, TradingConfigOverride};
     use crate::trading::decision::{DecisionEngine, TradeDecision};
     use crate::trading::fuzzy::{FuzzyEngine, FuzzyInputs};
-    use crate::trading::octobot::{CurrencyBalance, MarketSnapshot, OctobotOrder, OctobotPortfolio};
+    use crate::trading::octobot::{
+        CurrencyBalance, MarketSnapshot, OctobotOrder, OctobotPortfolio,
+    };
     use crate::trading::state::{ExecutedTrade, SharedTradingState, TradeAction, TradeOverride};
 
     // -----------------------------------------------------------------------
@@ -52,7 +54,9 @@ mod tests {
             confidence,
             reasoning: format!("test reasoning for {action}"),
             suggested_amount_usd: None,
-            raw_response: format!(r#"{{"action":"{action}","confidence":{confidence},"reasoning":"test"}}"#),
+            raw_response: format!(
+                r#"{{"action":"{action}","confidence":{confidence},"reasoning":"test"}}"#
+            ),
             parsed_ok: true,
             weight,
         }
@@ -97,22 +101,41 @@ mod tests {
         let mut weighted_signal = 0.0_f64;
         let mut total_weight = 0.0_f64;
         for a in &advices {
-            if !a.parsed_ok { continue; }
+            if !a.parsed_ok {
+                continue;
+            }
             let ew = (a.weight * a.confidence).max(0.01);
             weighted_signal += action_to_signal(&a.action) * ew;
             total_weight += ew;
         }
-        let signal = if total_weight > 0.0 { weighted_signal / total_weight } else { 0.0 };
+        let signal = if total_weight > 0.0 {
+            weighted_signal / total_weight
+        } else {
+            0.0
+        };
         let action = match signal {
             s if s >= 0.65 => "strong_buy",
             s if s >= 0.2 => "buy",
             s if s <= -0.65 => "strong_sell",
             s if s <= -0.2 => "sell",
             _ => "hold",
-        }.to_string();
-        let conf_num: f64 = advices.iter().filter(|a| a.parsed_ok).map(|a| a.confidence * a.weight).sum();
-        let conf_den: f64 = advices.iter().filter(|a| a.parsed_ok).map(|a| a.weight).sum();
-        let confidence = if conf_den > 0.0 { (conf_num / conf_den).clamp(0.0, 1.0) } else { 0.0 };
+        }
+        .to_string();
+        let conf_num: f64 = advices
+            .iter()
+            .filter(|a| a.parsed_ok)
+            .map(|a| a.confidence * a.weight)
+            .sum();
+        let conf_den: f64 = advices
+            .iter()
+            .filter(|a| a.parsed_ok)
+            .map(|a| a.weight)
+            .sum();
+        let confidence = if conf_den > 0.0 {
+            (conf_num / conf_den).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         AiConsensus {
             action,
             confidence,
@@ -125,29 +148,41 @@ mod tests {
     }
 
     fn make_strong_bullish_consensus() -> AiConsensus {
-        consensus_from_advices(vec![
-            make_advice("strong_buy", 0.9, 1.0),
-            make_advice("strong_buy", 0.85, 1.0),
-            make_advice("buy", 0.8, 0.9),
-        ], 0)
+        consensus_from_advices(
+            vec![
+                make_advice("strong_buy", 0.9, 1.0),
+                make_advice("strong_buy", 0.85, 1.0),
+                make_advice("buy", 0.8, 0.9),
+            ],
+            0,
+        )
     }
 
     fn make_strong_bearish_consensus() -> AiConsensus {
-        consensus_from_advices(vec![
-            make_advice("strong_sell", 0.9, 1.0),
-            make_advice("strong_sell", 0.85, 1.0),
-            make_advice("sell", 0.8, 0.9),
-        ], 0)
+        consensus_from_advices(
+            vec![
+                make_advice("strong_sell", 0.9, 1.0),
+                make_advice("strong_sell", 0.85, 1.0),
+                make_advice("sell", 0.8, 0.9),
+            ],
+            0,
+        )
     }
 
     fn make_neutral_consensus() -> AiConsensus {
-        consensus_from_advices(vec![
-            make_advice("hold", 0.5, 1.0),
-            make_advice("hold", 0.5, 1.0),
-        ], 0)
+        consensus_from_advices(
+            vec![make_advice("hold", 0.5, 1.0), make_advice("hold", 0.5, 1.0)],
+            0,
+        )
     }
 
-    fn make_snapshot(exchange: &str, symbol: &str, price: f64, change_pct: f64, volume: f64) -> MarketSnapshot {
+    fn make_snapshot(
+        exchange: &str,
+        symbol: &str,
+        price: f64,
+        change_pct: f64,
+        volume: f64,
+    ) -> MarketSnapshot {
         MarketSnapshot {
             exchange: exchange.to_string(),
             symbol: symbol.to_string(),
@@ -164,18 +199,24 @@ mod tests {
 
     fn make_portfolio(total_usd: f64) -> OctobotPortfolio {
         let mut currencies = std::collections::HashMap::new();
-        currencies.insert("BTC".to_string(), CurrencyBalance {
-            free: 0.001,
-            locked: 0.0,
-            total: 0.001,
-            value_usd: Some(total_usd * 0.8),
-        });
-        currencies.insert("USDT".to_string(), CurrencyBalance {
-            free: total_usd * 0.2,
-            locked: 0.0,
-            total: total_usd * 0.2,
-            value_usd: Some(total_usd * 0.2),
-        });
+        currencies.insert(
+            "BTC".to_string(),
+            CurrencyBalance {
+                free: 0.001,
+                locked: 0.0,
+                total: 0.001,
+                value_usd: Some(total_usd * 0.8),
+            },
+        );
+        currencies.insert(
+            "USDT".to_string(),
+            CurrencyBalance {
+                free: total_usd * 0.2,
+                locked: 0.0,
+                total: total_usd * 0.2,
+                value_usd: Some(total_usd * 0.2),
+            },
+        );
         OctobotPortfolio {
             currencies,
             total_value_usd: Some(total_usd),
@@ -228,8 +269,14 @@ mod tests {
 
     #[test]
     fn config_not_viable_without_octobot_url() {
-        let cfg = TradingConfig { enabled: true, ..TradingConfig::default() };
-        assert!(!cfg.is_viable(), "config without octobot_base_url must not be viable");
+        let cfg = TradingConfig {
+            enabled: true,
+            ..TradingConfig::default()
+        };
+        assert!(
+            !cfg.is_viable(),
+            "config without octobot_base_url must not be viable"
+        );
     }
 
     #[test]
@@ -248,7 +295,7 @@ mod tests {
             fuzzy_confidence_threshold: 1.5,
             fuzzy_weight: -0.1,
             evaluation_interval_seconds: 3, // below minimum of 10
-            max_parallel_advisors: 0,        // below minimum of 1
+            max_parallel_advisors: 0,       // below minimum of 1
             max_open_positions: 0,
             log_ring_size: 0,
             trade_ring_size: 0,
@@ -256,8 +303,10 @@ mod tests {
         };
         cfg.normalize();
         assert!(cfg.micro_trade_max_usd >= 0.01, "max_usd must be clamped");
-        assert!(cfg.micro_trade_min_usd <= cfg.micro_trade_max_usd,
-            "min must not exceed max after normalize");
+        assert!(
+            cfg.micro_trade_min_usd <= cfg.micro_trade_max_usd,
+            "min must not exceed max after normalize"
+        );
         assert!(cfg.fuzzy_confidence_threshold <= 1.0);
         assert!(cfg.fuzzy_weight >= 0.0);
         assert!(cfg.evaluation_interval_seconds >= 10);
@@ -274,8 +323,10 @@ mod tests {
             ..TradingConfig::default()
         };
         cfg.normalize();
-        assert!(!cfg.research_query_template.trim().is_empty(),
-            "empty template should be replaced with default");
+        assert!(
+            !cfg.research_query_template.trim().is_empty(),
+            "empty template should be replaced with default"
+        );
     }
 
     #[test]
@@ -285,7 +336,10 @@ mod tests {
             ..TradingConfig::default()
         };
         cfg.normalize();
-        assert!(!cfg.data_path.is_empty(), "empty data_path should be replaced");
+        assert!(
+            !cfg.data_path.is_empty(),
+            "empty data_path should be replaced"
+        );
     }
 
     #[test]
@@ -309,9 +363,20 @@ mod tests {
         for i in 0..10 {
             state.log_info("test", format!("message {i}"));
         }
-        assert_eq!(state.activity_log.len(), 5, "ring buffer must cap at log_ring_size");
+        assert_eq!(
+            state.activity_log.len(),
+            5,
+            "ring buffer must cap at log_ring_size"
+        );
         // Most recent message should be the last one written.
-        assert!(state.activity_log.back().unwrap().message.contains("message 9"));
+        assert!(
+            state
+                .activity_log
+                .back()
+                .unwrap()
+                .message
+                .contains("message 9")
+        );
     }
 
     #[test]
@@ -334,8 +399,15 @@ mod tests {
                 ai_confidence: 0.9,
             });
         }
-        assert_eq!(state.recent_trades.len(), 3, "trade ring must cap at trade_ring_size");
-        assert_eq!(state.trade_count, 6, "trade_count must reflect all recorded trades");
+        assert_eq!(
+            state.recent_trades.len(),
+            3,
+            "trade ring must cap at trade_ring_size"
+        );
+        assert_eq!(
+            state.trade_count, 6,
+            "trade_count must reflect all recorded trades"
+        );
     }
 
     #[test]
@@ -400,7 +472,10 @@ mod tests {
         });
         let ov = state.take_override();
         assert!(ov.is_some());
-        assert!(state.pending_override.is_none(), "override must be cleared after take");
+        assert!(
+            state.pending_override.is_none(),
+            "override must be cleared after take"
+        );
     }
 
     #[tokio::test]
@@ -449,7 +524,9 @@ mod tests {
     async fn shared_state_restore_missing_file_is_noop() {
         let state = SharedTradingState::new(100, 50);
         // Should not panic.
-        state.restore(&PathBuf::from("/tmp/gail_nonexistent_state_abc.json")).await;
+        state
+            .restore(&PathBuf::from("/tmp/gail_nonexistent_state_abc.json"))
+            .await;
         let s = state.0.lock().await;
         assert_eq!(s.evaluation_count, 0);
     }
@@ -473,10 +550,16 @@ mod tests {
                             research_sentiment: rs,
                             portfolio_exposure: pe,
                         });
-                        assert!(out.signal >= -1.0 && out.signal <= 1.0,
-                            "signal {:.4} out of [-1,1] for pt={pt} ai={ai}", out.signal);
-                        assert!(out.confidence >= 0.0 && out.confidence <= 1.0,
-                            "confidence {:.4} out of [0,1]", out.confidence);
+                        assert!(
+                            out.signal >= -1.0 && out.signal <= 1.0,
+                            "signal {:.4} out of [-1,1] for pt={pt} ai={ai}",
+                            out.signal
+                        );
+                        assert!(
+                            out.confidence >= 0.0 && out.confidence <= 1.0,
+                            "confidence {:.4} out of [0,1]",
+                            out.confidence
+                        );
                     }
                 }
             }
@@ -487,24 +570,33 @@ mod tests {
     fn fuzzy_bullish_inputs_produce_positive_signal() {
         let engine = FuzzyEngine::new();
         let out = engine.evaluate(&bullish_inputs());
-        assert!(out.signal > 0.2,
-            "strongly bullish inputs should produce positive signal, got {:.4}", out.signal);
+        assert!(
+            out.signal > 0.2,
+            "strongly bullish inputs should produce positive signal, got {:.4}",
+            out.signal
+        );
     }
 
     #[test]
     fn fuzzy_bearish_inputs_produce_negative_signal() {
         let engine = FuzzyEngine::new();
         let out = engine.evaluate(&bearish_inputs());
-        assert!(out.signal < -0.2,
-            "strongly bearish inputs should produce negative signal, got {:.4}", out.signal);
+        assert!(
+            out.signal < -0.2,
+            "strongly bearish inputs should produce negative signal, got {:.4}",
+            out.signal
+        );
     }
 
     #[test]
     fn fuzzy_neutral_inputs_produce_hold_ish_signal() {
         let engine = FuzzyEngine::new();
         let out = engine.evaluate(&FuzzyInputs::default());
-        assert!(out.signal.abs() < 0.4,
-            "neutral inputs should produce hold-ish signal, got {:.4}", out.signal);
+        assert!(
+            out.signal.abs() < 0.4,
+            "neutral inputs should produce hold-ish signal, got {:.4}",
+            out.signal
+        );
     }
 
     #[test]
@@ -521,8 +613,12 @@ mod tests {
                 research_sentiment: 0.0,
                 portfolio_exposure: 0.3,
             });
-            assert!(out.signal >= prev_signal - 0.2,
-                "signal should not sharply decrease as ai_consensus increases: prev={:.4} cur={:.4} ai={ai}", prev_signal, out.signal);
+            assert!(
+                out.signal >= prev_signal - 0.2,
+                "signal should not sharply decrease as ai_consensus increases: prev={:.4} cur={:.4} ai={ai}",
+                prev_signal,
+                out.signal
+            );
             prev_signal = out.signal;
         }
     }
@@ -547,9 +643,13 @@ mod tests {
             portfolio_exposure: 0.05, // underweight
         });
         // Underweight should be at least as bullish or more bullish.
-        assert!(out_underweight.signal >= out_overweight.signal - 0.1,
+        assert!(
+            out_underweight.signal >= out_overweight.signal - 0.1,
             "underweight exposure should not be less bullish than overweight; \
-             underweight={:.4} overweight={:.4}", out_underweight.signal, out_overweight.signal);
+             underweight={:.4} overweight={:.4}",
+            out_underweight.signal,
+            out_overweight.signal
+        );
     }
 
     #[test]
@@ -600,9 +700,12 @@ mod tests {
             portfolio_exposure: 0.2,
         });
         // High volume with bullish price/AI should be at least as bullish as low volume.
-        assert!(high_vol.signal >= low_vol.signal - 0.15,
+        assert!(
+            high_vol.signal >= low_vol.signal - 0.15,
             "high volume should not inhibit bullish signal; high={:.4} low={:.4}",
-            high_vol.signal, low_vol.signal);
+            high_vol.signal,
+            low_vol.signal
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -612,7 +715,11 @@ mod tests {
     #[test]
     fn consensus_all_strong_buy_produces_high_positive_signal() {
         let c = make_strong_bullish_consensus();
-        assert!(c.signal > 0.4, "all buy advices should produce positive signal: {:.4}", c.signal);
+        assert!(
+            c.signal > 0.4,
+            "all buy advices should produce positive signal: {:.4}",
+            c.signal
+        );
         assert_eq!(c.responders, 3);
         assert_eq!(c.failures, 0);
     }
@@ -620,13 +727,21 @@ mod tests {
     #[test]
     fn consensus_all_strong_sell_produces_high_negative_signal() {
         let c = make_strong_bearish_consensus();
-        assert!(c.signal < -0.4, "all sell advices should produce negative signal: {:.4}", c.signal);
+        assert!(
+            c.signal < -0.4,
+            "all sell advices should produce negative signal: {:.4}",
+            c.signal
+        );
     }
 
     #[test]
     fn consensus_all_hold_produces_near_zero_signal() {
         let c = make_neutral_consensus();
-        assert!(c.signal.abs() < 0.1, "all hold advices should produce ~0 signal: {:.4}", c.signal);
+        assert!(
+            c.signal.abs() < 0.1,
+            "all hold advices should produce ~0 signal: {:.4}",
+            c.signal
+        );
     }
 
     #[test]
@@ -640,14 +755,14 @@ mod tests {
 
     #[test]
     fn consensus_mixed_advices_signal_between_extremes() {
-        let advices = vec![
-            make_advice("buy", 0.8, 1.0),
-            make_advice("sell", 0.8, 1.0),
-        ];
+        let advices = vec![make_advice("buy", 0.8, 1.0), make_advice("sell", 0.8, 1.0)];
         let c = consensus_from_advices(advices, 0);
         // Equal buy/sell with equal weights → signal near 0.
-        assert!(c.signal.abs() < 0.2,
-            "balanced buy/sell should produce near-zero signal: {:.4}", c.signal);
+        assert!(
+            c.signal.abs() < 0.2,
+            "balanced buy/sell should produce near-zero signal: {:.4}",
+            c.signal
+        );
     }
 
     #[test]
@@ -658,8 +773,11 @@ mod tests {
             make_advice("strong_sell", 0.9, 1.0),
         ];
         let c = consensus_from_advices(advices, 0);
-        assert!(c.signal > 0.0,
-            "high-weight buy provider should dominate: signal={:.4}", c.signal);
+        assert!(
+            c.signal > 0.0,
+            "high-weight buy provider should dominate: signal={:.4}",
+            c.signal
+        );
     }
 
     #[test]
@@ -686,7 +804,10 @@ mod tests {
     fn consensus_single_provider_preserves_signal() {
         let advices = vec![make_advice("strong_buy", 0.9, 1.0)];
         let c = consensus_from_advices(advices, 0);
-        assert!(c.signal > 0.5, "single strong_buy should produce strong positive signal");
+        assert!(
+            c.signal > 0.5,
+            "single strong_buy should produce strong positive signal"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -708,7 +829,8 @@ mod tests {
         let decision = engine.decide(&fuzzy, &consensus, Some(&snap), &state, &config);
         assert!(
             matches!(decision.action, TradeAction::Buy | TradeAction::StrongBuy),
-            "strong bullish signals should produce a buy decision, got {:?}", decision.action
+            "strong bullish signals should produce a buy decision, got {:?}",
+            decision.action
         );
     }
 
@@ -723,7 +845,8 @@ mod tests {
         let decision = engine.decide(&fuzzy, &consensus, Some(&snap), &state, &config);
         assert!(
             matches!(decision.action, TradeAction::Sell | TradeAction::StrongSell),
-            "strong bearish signals should produce a sell decision, got {:?}", decision.action
+            "strong bearish signals should produce a sell decision, got {:?}",
+            decision.action
         );
     }
 
@@ -736,8 +859,12 @@ mod tests {
         let config = default_config();
         let snap = make_snapshot("binance", "BTC/USDT", 50000.0, 0.0, 1_000_000.0);
         let decision = engine.decide(&fuzzy, &consensus, Some(&snap), &state, &config);
-        assert_eq!(decision.action, TradeAction::Hold,
-            "neutral signals should hold, blended_signal={:.4}", decision.blended_signal);
+        assert_eq!(
+            decision.action,
+            TradeAction::Hold,
+            "neutral signals should hold, blended_signal={:.4}",
+            decision.blended_signal
+        );
     }
 
     #[test]
@@ -746,7 +873,7 @@ mod tests {
         // Construct very low confidence inputs.
         use crate::trading::fuzzy::FuzzyDecision;
         let fuzzy = FuzzyDecision {
-            signal: 0.8,    // strong directional signal
+            signal: 0.8,     // strong directional signal
             confidence: 0.1, // but very low confidence
             label: "buy".to_string(),
             term_activations: Default::default(),
@@ -769,10 +896,15 @@ mod tests {
         };
         let snap = make_snapshot("binance", "BTC/USDT", 50000.0, 5.0, 1_000_000.0);
         let decision = engine.decide(&fuzzy, &consensus, Some(&snap), &state, &config);
-        assert_eq!(decision.action, TradeAction::Hold,
-            "low confidence should be blocked by confidence gate");
-        assert!(decision.rationale.contains("Confidence"),
-            "rationale should mention confidence gate");
+        assert_eq!(
+            decision.action,
+            TradeAction::Hold,
+            "low confidence should be blocked by confidence gate"
+        );
+        assert!(
+            decision.rationale.contains("Confidence"),
+            "rationale should mention confidence gate"
+        );
     }
 
     #[test]
@@ -791,10 +923,16 @@ mod tests {
         state.open_positions = vec![make_open_order("o1"), make_open_order("o2")];
         let snap = make_snapshot("binance", "BTC/USDT", 50000.0, 5.0, 2_000_000.0);
         let decision = engine.decide(&fuzzy, &consensus, Some(&snap), &state, &config);
-        assert_eq!(decision.action, TradeAction::Hold,
-            "position gate should block buy when at max open positions");
-        assert!(decision.rationale.to_lowercase().contains("position") || decision.rationale.contains("Confidence"),
-            "rationale should mention position gate or confidence gate");
+        assert_eq!(
+            decision.action,
+            TradeAction::Hold,
+            "position gate should block buy when at max open positions"
+        );
+        assert!(
+            decision.rationale.to_lowercase().contains("position")
+                || decision.rationale.contains("Confidence"),
+            "rationale should mention position gate or confidence gate"
+        );
     }
 
     #[test]
@@ -817,10 +955,16 @@ mod tests {
         state.last_trade_at = Some(now - 10.0); // 10 seconds ago, cooldown is 300s
         let snap = make_snapshot("binance", "BTC/USDT", 50000.0, 5.0, 2_000_000.0);
         let decision = engine.decide(&fuzzy, &consensus, Some(&snap), &state, &config);
-        assert_eq!(decision.action, TradeAction::Hold,
-            "cooldown gate should block trade within cooldown interval");
-        assert!(decision.rationale.to_lowercase().contains("cooldown") || decision.rationale.contains("Confidence"),
-            "rationale should mention cooldown");
+        assert_eq!(
+            decision.action,
+            TradeAction::Hold,
+            "cooldown gate should block trade within cooldown interval"
+        );
+        assert!(
+            decision.rationale.to_lowercase().contains("cooldown")
+                || decision.rationale.contains("Confidence"),
+            "rationale should mention cooldown"
+        );
     }
 
     #[test]
@@ -841,13 +985,22 @@ mod tests {
             issued_by: "pbisaacs".to_string(),
         });
         let decision = engine.decide(&fuzzy, &consensus, None, &state, &config);
-        assert_eq!(decision.action, TradeAction::Buy, "override action should take effect");
+        assert_eq!(
+            decision.action,
+            TradeAction::Buy,
+            "override action should take effect"
+        );
         assert_eq!(decision.exchange, "kraken");
         assert_eq!(decision.symbol, "ETH/USDT");
         assert_eq!(decision.amount_usd, 15.0);
-        assert!(decision.override_applied, "override_applied flag must be set");
-        assert!(decision.rationale.contains("pbisaacs"),
-            "rationale should identify who issued the override");
+        assert!(
+            decision.override_applied,
+            "override_applied flag must be set"
+        );
+        assert!(
+            decision.rationale.contains("pbisaacs"),
+            "rationale should identify who issued the override"
+        );
     }
 
     #[test]
@@ -873,10 +1026,14 @@ mod tests {
             issued_by: "pbisaacs".to_string(),
         });
         let decision = engine.decide(&fuzzy, &consensus, None, &state, &config);
-        assert!(decision.amount_usd <= 20.0,
-            "override amount should be clamped to micro_trade_max_usd");
-        assert!(decision.amount_usd >= 2.0,
-            "override amount should be at least micro_trade_min_usd");
+        assert!(
+            decision.amount_usd <= 20.0,
+            "override amount should be clamped to micro_trade_max_usd"
+        );
+        assert!(
+            decision.amount_usd >= 2.0,
+            "override amount should be at least micro_trade_min_usd"
+        );
     }
 
     #[test]
@@ -895,9 +1052,7 @@ mod tests {
         );
 
         // Lower signal (but still buys) → smaller trade.
-        let low_signal_consensus = consensus_from_advices(vec![
-            make_advice("buy", 0.7, 1.0),
-        ], 0);
+        let low_signal_consensus = consensus_from_advices(vec![make_advice("buy", 0.7, 1.0)], 0);
         let moderate_inputs = FuzzyInputs {
             price_trend: 0.3,
             volume_ratio: 1.0,
@@ -916,9 +1071,13 @@ mod tests {
         if matches!(high.action, TradeAction::Buy | TradeAction::StrongBuy)
             && matches!(low.action, TradeAction::Buy | TradeAction::StrongBuy)
         {
-            assert!(high.amount_usd >= low.amount_usd,
+            assert!(
+                high.amount_usd >= low.amount_usd,
                 "stronger signal should produce larger or equal trade size; \
-                 high={:.2} low={:.2}", high.amount_usd, low.amount_usd);
+                 high={:.2} low={:.2}",
+                high.amount_usd,
+                low.amount_usd
+            );
         }
         // In any case, trade size must stay within configured bounds.
         if high.amount_usd > 0.0 {
@@ -935,8 +1094,11 @@ mod tests {
         let state = make_default_state();
         let config = default_config();
         let decision = engine.decide(&fuzzy, &consensus, None, &state, &config);
-        assert_eq!(decision.action, TradeAction::Hold,
-            "missing market snapshot should produce hold");
+        assert_eq!(
+            decision.action,
+            TradeAction::Hold,
+            "missing market snapshot should produce hold"
+        );
     }
 
     #[test]
@@ -967,11 +1129,20 @@ mod tests {
             failures: 0,
         };
         let snap = make_snapshot("binance", "BTC/USDT", 50000.0, 0.0, 1_000_000.0);
-        let decision = engine.decide(&fuzzy, &consensus, Some(&snap), &make_default_state(), &config);
+        let decision = engine.decide(
+            &fuzzy,
+            &consensus,
+            Some(&snap),
+            &make_default_state(),
+            &config,
+        );
         // Expected: 1.0 * 0.4 + (-1.0) * 0.6 = -0.2 → sell threshold
         let expected = 1.0 * 0.4 + (-1.0) * 0.6;
-        assert!((decision.blended_signal - expected).abs() < 0.01,
-            "blended_signal should be {expected:.3} got {:.3}", decision.blended_signal);
+        assert!(
+            (decision.blended_signal - expected).abs() < 0.01,
+            "blended_signal should be {expected:.3} got {:.3}",
+            decision.blended_signal
+        );
     }
 
     #[test]
@@ -996,8 +1167,11 @@ mod tests {
         });
         let config = default_config();
         let decision = engine.decide(&fuzzy_out, &consensus, Some(&snap), &state, &config);
-        assert_eq!(decision.action, TradeAction::Hold,
-            "runtime config override should raise threshold and block trade");
+        assert_eq!(
+            decision.action,
+            TradeAction::Hold,
+            "runtime config override should raise threshold and block trade"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1028,8 +1202,11 @@ mod tests {
             matches!(decision.action, TradeAction::Buy | TradeAction::StrongBuy),
             "full bullish scenario should produce buy/strong_buy, got {:?} \
              (fuzzy.signal={:.4}, ai.signal={:.4}, blended={:.4}, confidence={:.4})",
-            decision.action, fuzzy.signal, consensus.signal,
-            decision.blended_signal, decision.confidence
+            decision.action,
+            fuzzy.signal,
+            consensus.signal,
+            decision.blended_signal,
+            decision.confidence
         );
         assert!(decision.amount_usd >= config.micro_trade_min_usd);
         assert!(decision.amount_usd <= config.micro_trade_max_usd);
@@ -1060,7 +1237,10 @@ mod tests {
             matches!(decision.action, TradeAction::Sell | TradeAction::StrongSell),
             "full bearish scenario should produce sell/strong_sell, got {:?} \
              (fuzzy.signal={:.4}, ai.signal={:.4}, blended={:.4})",
-            decision.action, fuzzy.signal, consensus.signal, decision.blended_signal
+            decision.action,
+            fuzzy.signal,
+            consensus.signal,
+            decision.blended_signal
         );
     }
 
@@ -1081,11 +1261,18 @@ mod tests {
         let snap = make_snapshot("binance", "ETH/USDT", 3000.0, -2.0, 1_000_000.0);
         let config = default_config();
         let decision = decision_engine.decide(
-            &fuzzy, &bullish_ai, Some(&snap), &make_default_state(), &config
+            &fuzzy,
+            &bullish_ai,
+            Some(&snap),
+            &make_default_state(),
+            &config,
         );
         // With conflicting signals the blended signal should be moderate; it may hold.
-        assert!(decision.blended_signal.abs() <= 0.8,
-            "conflicting signals should produce moderate blended signal: {:.4}", decision.blended_signal);
+        assert!(
+            decision.blended_signal.abs() <= 0.8,
+            "conflicting signals should produce moderate blended signal: {:.4}",
+            decision.blended_signal
+        );
     }
 
     #[test]
@@ -1096,9 +1283,16 @@ mod tests {
         let consensus = make_strong_bullish_consensus();
         let snap = make_snapshot("binance", "BTC/USDT", 50000.0, 5.0, 2_000_000.0);
         let decision = decision_engine.decide(
-            &fuzzy, &consensus, Some(&snap), &make_default_state(), &default_config()
+            &fuzzy,
+            &consensus,
+            Some(&snap),
+            &make_default_state(),
+            &default_config(),
         );
-        assert!(!decision.rationale.is_empty(), "rationale must always be non-empty");
+        assert!(
+            !decision.rationale.is_empty(),
+            "rationale must always be non-empty"
+        );
     }
 
     #[test]
@@ -1109,13 +1303,25 @@ mod tests {
         let consensus = make_strong_bullish_consensus();
         let snap = make_snapshot("binance", "BTC/USDT", 50000.0, 5.0, 2_000_000.0);
         let decision = decision_engine.decide(
-            &fuzzy, &consensus, Some(&snap), &make_default_state(), &default_config()
+            &fuzzy,
+            &consensus,
+            Some(&snap),
+            &make_default_state(),
+            &default_config(),
         );
         // Verify signal components are propagated into decision for auditability.
-        assert!((decision.fuzzy_signal - fuzzy.signal).abs() < 0.001,
-            "fuzzy_signal must be recorded: expected {:.4} got {:.4}", fuzzy.signal, decision.fuzzy_signal);
-        assert!((decision.ai_signal - consensus.signal).abs() < 0.001,
-            "ai_signal must be recorded: expected {:.4} got {:.4}", consensus.signal, decision.ai_signal);
+        assert!(
+            (decision.fuzzy_signal - fuzzy.signal).abs() < 0.001,
+            "fuzzy_signal must be recorded: expected {:.4} got {:.4}",
+            fuzzy.signal,
+            decision.fuzzy_signal
+        );
+        assert!(
+            (decision.ai_signal - consensus.signal).abs() < 0.001,
+            "ai_signal must be recorded: expected {:.4} got {:.4}",
+            consensus.signal,
+            decision.ai_signal
+        );
         assert!((decision.fuzzy_confidence - fuzzy.confidence).abs() < 0.001);
         assert!((decision.ai_confidence - consensus.confidence).abs() < 0.001);
     }
@@ -1134,9 +1340,11 @@ mod tests {
         }
 
         let high_momentum = make_snapshot("binance", "BTC/USDT", 50000.0, 8.0, 5_000_000.0);
-        let low_momentum  = make_snapshot("binance", "ETH/USDT", 3000.0, 0.5, 500_000.0);
-        assert!(market_score(&high_momentum) > market_score(&low_momentum),
-            "high momentum/volume market should score higher");
+        let low_momentum = make_snapshot("binance", "ETH/USDT", 3000.0, 0.5, 500_000.0);
+        assert!(
+            market_score(&high_momentum) > market_score(&low_momentum),
+            "high momentum/volume market should score higher"
+        );
     }
 
     #[test]
@@ -1159,7 +1367,10 @@ mod tests {
             fetched_at: 0.0,
         };
         let score = market_score(&no_data);
-        assert!(score >= 0.0, "score with missing data should be non-negative: {score}");
+        assert!(
+            score >= 0.0,
+            "score with missing data should be non-negative: {score}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1179,8 +1390,12 @@ mod tests {
     #[test]
     fn trade_action_serialisation_roundtrip() {
         let actions = vec![
-            TradeAction::Buy, TradeAction::Sell, TradeAction::Hold,
-            TradeAction::StrongBuy, TradeAction::StrongSell, TradeAction::Cancel,
+            TradeAction::Buy,
+            TradeAction::Sell,
+            TradeAction::Hold,
+            TradeAction::StrongBuy,
+            TradeAction::StrongSell,
+            TradeAction::Cancel,
         ];
         for action in &actions {
             let json = serde_json::to_string(action).unwrap();
@@ -1198,8 +1413,12 @@ mod tests {
         // Replicate is_stablecoin logic from mod.rs
         fn is_stablecoin(sym: &str) -> bool {
             let lower = sym.to_ascii_lowercase();
-            lower.contains("usdt") || lower.contains("usdc") || lower.contains("busd")
-                || lower.contains("dai") || lower.contains("usd") || lower.contains("eur")
+            lower.contains("usdt")
+                || lower.contains("usdc")
+                || lower.contains("busd")
+                || lower.contains("dai")
+                || lower.contains("usd")
+                || lower.contains("eur")
         }
         assert!(is_stablecoin("USDT"));
         assert!(is_stablecoin("USDC"));
@@ -1219,14 +1438,18 @@ mod tests {
             let lower = sym.to_ascii_lowercase();
             lower.contains("usdt") || lower.contains("usd")
         };
-        let stable: f64 = portfolio.currencies.iter()
+        let stable: f64 = portfolio
+            .currencies
+            .iter()
             .filter(|(sym, _)| fn_is_stable(sym))
             .map(|(_, b)| b.value_usd.unwrap_or(0.0))
             .sum();
         let exposure = ((total - stable) / total).clamp(0.0, 1.0);
         // Portfolio has 80% BTC (non-stable) + 20% USDT (stable).
-        assert!((exposure - 0.8).abs() < 0.01,
-            "portfolio exposure should be ~0.8, got {exposure:.4}");
+        assert!(
+            (exposure - 0.8).abs() < 0.01,
+            "portfolio exposure should be ~0.8, got {exposure:.4}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1237,9 +1460,27 @@ mod tests {
     fn fuzzy_inputs_at_extreme_boundaries_do_not_panic() {
         let engine = FuzzyEngine::new();
         let extremes = [
-            FuzzyInputs { price_trend: -1.0, volume_ratio: 0.0, ai_consensus: -1.0, research_sentiment: -1.0, portfolio_exposure: 0.0 },
-            FuzzyInputs { price_trend: 1.0,  volume_ratio: 2.0, ai_consensus: 1.0,  research_sentiment: 1.0,  portfolio_exposure: 1.0 },
-            FuzzyInputs { price_trend: 0.0,  volume_ratio: 1.0, ai_consensus: 0.0,  research_sentiment: 0.0,  portfolio_exposure: 0.5 },
+            FuzzyInputs {
+                price_trend: -1.0,
+                volume_ratio: 0.0,
+                ai_consensus: -1.0,
+                research_sentiment: -1.0,
+                portfolio_exposure: 0.0,
+            },
+            FuzzyInputs {
+                price_trend: 1.0,
+                volume_ratio: 2.0,
+                ai_consensus: 1.0,
+                research_sentiment: 1.0,
+                portfolio_exposure: 1.0,
+            },
+            FuzzyInputs {
+                price_trend: 0.0,
+                volume_ratio: 1.0,
+                ai_consensus: 0.0,
+                research_sentiment: 0.0,
+                portfolio_exposure: 0.5,
+            },
         ];
         for inp in &extremes {
             let out = engine.evaluate(inp);
@@ -1321,7 +1562,11 @@ mod tests {
             enable_logs: false,
         };
         let result = client.start_backtest(&req).await;
-        assert!(result.is_ok(), "start_backtest should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "start_backtest should succeed: {:?}",
+            result
+        );
         server.verify().await;
     }
 
@@ -1336,8 +1581,7 @@ mod tests {
             .and(path("/backtesting"))
             .and(query_param("update_type", "backtesting_report"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(octobot_report_body(12.34, 5.0, 8)),
+                ResponseTemplate::new(200).set_body_json(octobot_report_body(12.34, 5.0, 8)),
             )
             .expect(1)
             .mount(&server)
@@ -1345,13 +1589,18 @@ mod tests {
 
         let client = OctobotClient::new(&server.uri(), None, 10.0);
         let report = client.get_backtest_report().await;
-        assert!(report.is_ok(), "get_backtest_report should succeed: {:?}", report);
+        assert!(
+            report.is_ok(),
+            "get_backtest_report should succeed: {:?}",
+            report
+        );
         let report = report.unwrap();
         assert!(report.is_some(), "report should be present (non-empty)");
         let report = report.unwrap();
         assert!(
             (report.best_profitability().unwrap() - 12.34).abs() < 0.01,
-            "profitability should be 12.34, got {:?}", report.best_profitability()
+            "profitability should be 12.34, got {:?}",
+            report.best_profitability()
         );
         assert_eq!(report.total_trades, 8);
         assert!(report.symbols.contains(&"BTC/USDT".to_string()));
@@ -1413,12 +1662,10 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/backtesting"))
             .and(query_param("update_type", "backtesting_data_files"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                    "user/backtesting/collector/binance_BTC_USDT_1h.data",
-                    "user/backtesting/collector/binance_ETH_USDT_1h.data"
-                ])),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                "user/backtesting/collector/binance_BTC_USDT_1h.data",
+                "user/backtesting/collector/binance_ETH_USDT_1h.data"
+            ])))
             .expect(1)
             .mount(&server)
             .await;
@@ -1461,8 +1708,7 @@ mod tests {
             .and(path("/backtesting"))
             .and(query_param("update_type", "backtesting_report"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(octobot_report_body(8.5, 3.2, 15)),
+                ResponseTemplate::new(200).set_body_json(octobot_report_body(8.5, 3.2, 15)),
             )
             .mount(&server)
             .await;
@@ -1474,8 +1720,12 @@ mod tests {
         let req = BacktestStartRequest::default();
         let summary = engine.run(&req).await;
 
-        assert_eq!(summary.assessment, ApproachAssessment::Viable,
-            "8.5% return should be viable (threshold=0.0): notes={}", summary.notes);
+        assert_eq!(
+            summary.assessment,
+            ApproachAssessment::Viable,
+            "8.5% return should be viable (threshold=0.0): notes={}",
+            summary.notes
+        );
         assert!(summary.profitability_pct.unwrap() > 0.0);
         assert_eq!(summary.beats_market, Some(true));
         assert_eq!(summary.total_trades, 15);
@@ -1510,8 +1760,7 @@ mod tests {
             .and(path("/backtesting"))
             .and(query_param("update_type", "backtesting_report"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(octobot_report_body(-15.0, 4.0, 5)),
+                ResponseTemplate::new(200).set_body_json(octobot_report_body(-15.0, 4.0, 5)),
             )
             .mount(&server)
             .await;
@@ -1521,8 +1770,11 @@ mod tests {
         let req = BacktestStartRequest::default();
         let summary = engine.run(&req).await;
 
-        assert_eq!(summary.assessment, ApproachAssessment::Unprofitable,
-            "−15% return should be unprofitable");
+        assert_eq!(
+            summary.assessment,
+            ApproachAssessment::Unprofitable,
+            "−15% return should be unprofitable"
+        );
         assert!(summary.profitability_pct.unwrap() < 0.0);
         assert_eq!(summary.run_id, None, "null run_id should be None");
     }
@@ -1537,7 +1789,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/backtesting"))
             .and(query_param("action_type", "start_backtesting"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("\"A backtesting is already running\""))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string("\"A backtesting is already running\""),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -1697,7 +1951,7 @@ mod tests {
         let client = OctobotClient::new(&server.uri(), None, 10.0);
         let engine = BacktestEngine::with_poll_params(
             client,
-            0.0,  // threshold: any positive return is viable
+            0.0, // threshold: any positive return is viable
             Duration::from_millis(1),
             5,
         );
@@ -1708,7 +1962,7 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
         let req = BacktestStartRequest {
-            files: vec![],  // let OctoBot choose data
+            files: vec![], // let OctoBot choose data
             start_timestamp: Some(now_ms - 30 * 86_400_000),
             end_timestamp: Some(now_ms),
             enable_logs: false,
@@ -1732,10 +1986,16 @@ mod tests {
             Some(true),
             "Strategy should beat market (+9.2% vs +4.8%)"
         );
-        assert_eq!(summary.total_trades, 22, "Should record all 22 simulated trades");
+        assert_eq!(
+            summary.total_trades, 22,
+            "Should record all 22 simulated trades"
+        );
         assert!(summary.symbols.contains(&"BTC/USDT".to_string()));
         assert_eq!(summary.run_id, Some(99));
-        assert!(!summary.notes.is_empty(), "Notes should describe the result");
+        assert!(
+            !summary.notes.is_empty(),
+            "Notes should describe the result"
+        );
 
         // --- Persist to state and verify surfaced correctly ---
         let state = SharedTradingState::new(100, 50);

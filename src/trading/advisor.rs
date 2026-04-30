@@ -152,7 +152,11 @@ impl TradingAdvisor {
             .cloned()
             .collect();
         // Sort by weight descending so highest-quality providers are preferred.
-        profiles.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal));
+        profiles.sort_by(|a, b| {
+            b.weight
+                .partial_cmp(&a.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         profiles.truncate(max);
         profiles
     }
@@ -209,7 +213,10 @@ async fn query_provider(
             }
         }
         Err(err) => {
-            debug!("trading: advisory query to {} failed: {}", provider_type, err);
+            debug!(
+                "trading: advisory query to {} failed: {}",
+                provider_type, err
+            );
             AiAdvice {
                 provider: provider_name,
                 model: None,
@@ -286,13 +293,22 @@ fn build_advisory_prompt(
     };
 
     let portfolio_section = {
-        let total = portfolio.total_value_usd.map(|v| format!("${v:.2}")).unwrap_or_else(|| "unknown".to_string());
+        let total = portfolio
+            .total_value_usd
+            .map(|v| format!("${v:.2}"))
+            .unwrap_or_else(|| "unknown".to_string());
         let top: Vec<String> = portfolio
             .currencies
             .iter()
             .filter(|(_, b)| b.total > 0.0)
             .take(8)
-            .map(|(sym, b)| format!("  {sym}: {:.6} (${:.2})", b.total, b.value_usd.unwrap_or(0.0)))
+            .map(|(sym, b)| {
+                format!(
+                    "  {sym}: {:.6} (${:.2})",
+                    b.total,
+                    b.value_usd.unwrap_or(0.0)
+                )
+            })
             .collect();
         format!("Total portfolio value: {total}\n{}", top.join("\n"))
     };
@@ -300,7 +316,10 @@ fn build_advisory_prompt(
     let research_section = if research.is_empty() {
         "No research context available.".to_string()
     } else {
-        format!("Research context:\n{}", &research.context[..research.context.len().min(1500)])
+        format!(
+            "Research context:\n{}",
+            &research.context[..research.context.len().min(1500)]
+        )
     };
 
     format!(
@@ -418,17 +437,29 @@ fn aggregate_consensus(advices: Vec<AiAdvice>, failures: usize) -> AiConsensus {
         *vote_map.entry(advice.action.clone()).or_insert(0.0) += effective_weight;
     }
 
-    let signal = if total_weight > 0.0 { weighted_signal / total_weight } else { 0.0 };
+    let signal = if total_weight > 0.0 {
+        weighted_signal / total_weight
+    } else {
+        0.0
+    };
     let action = signal_to_action(signal);
 
     // Confidence: mean of individual confidences, weighted by quality weight.
-    let conf_num: f64 = advices.iter().filter(|a| a.parsed_ok)
+    let conf_num: f64 = advices
+        .iter()
+        .filter(|a| a.parsed_ok)
         .map(|a| a.confidence * a.weight)
         .sum();
-    let conf_den: f64 = advices.iter().filter(|a| a.parsed_ok)
+    let conf_den: f64 = advices
+        .iter()
+        .filter(|a| a.parsed_ok)
         .map(|a| a.weight)
         .sum();
-    let confidence = if conf_den > 0.0 { (conf_num / conf_den).clamp(0.0, 1.0) } else { 0.0 };
+    let confidence = if conf_den > 0.0 {
+        (conf_num / conf_den).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
 
     let vote_distribution = serde_json::to_value(&vote_map).unwrap_or(json!({}));
 

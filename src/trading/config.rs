@@ -83,7 +83,6 @@ pub struct TradingConfig {
     // -----------------------------------------------------------------------
     // Backtesting
     // -----------------------------------------------------------------------
-
     /// Whether to run periodic backtests as a safety check on the approach.
     pub backtesting_enabled: bool,
 
@@ -128,8 +127,8 @@ impl Default for TradingConfig {
             target_exchanges: Vec::new(),
             target_currencies: Vec::new(),
             fuzzy_confidence_threshold: 0.65,
-            research_query_template:
-                "cryptocurrency market sentiment {currency} {exchange} {date}".to_string(),
+            research_query_template: "cryptocurrency market sentiment {currency} {exchange} {date}"
+                .to_string(),
             research_top_k: 5,
             log_ring_size: 1000,
             trade_ring_size: 200,
@@ -152,14 +151,15 @@ impl Default for TradingConfig {
 impl TradingConfig {
     /// Returns true if the minimum viable configuration is present to start the bridge.
     pub fn is_viable(&self) -> bool {
-        self.enabled
-            && !self.octobot_base_url.trim().is_empty()
+        self.enabled && !self.octobot_base_url.trim().is_empty()
     }
 
     /// Clamp and sanitise values after deserialisation.
     pub fn normalize(&mut self) {
         self.micro_trade_max_usd = self.micro_trade_max_usd.max(0.01);
-        self.micro_trade_min_usd = self.micro_trade_min_usd.max(0.01)
+        self.micro_trade_min_usd = self
+            .micro_trade_min_usd
+            .max(0.01)
             .min(self.micro_trade_max_usd);
         self.fuzzy_confidence_threshold = self.fuzzy_confidence_threshold.clamp(0.0, 1.0);
         self.fuzzy_weight = self.fuzzy_weight.clamp(0.0, 1.0);
@@ -178,7 +178,8 @@ impl TradingConfig {
         if self.data_path.trim().is_empty() {
             self.data_path = "./data/trading_state.json".to_string();
         }
-        self.backtest_profitability_threshold = self.backtest_profitability_threshold.clamp(-100.0, 100.0);
+        self.backtest_profitability_threshold =
+            self.backtest_profitability_threshold.clamp(-100.0, 100.0);
         self.backtest_interval_seconds = self.backtest_interval_seconds.max(300); // at least 5 min
         self.backtest_lookback_days = self.backtest_lookback_days.clamp(1, 365);
     }

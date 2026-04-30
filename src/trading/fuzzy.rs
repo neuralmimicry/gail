@@ -214,7 +214,12 @@ impl FuzzyEngine {
 
         let label = signal_to_label(signal);
 
-        FuzzyDecision { signal, confidence, label, term_activations: activations }
+        FuzzyDecision {
+            signal,
+            confidence,
+            label,
+            term_activations: activations,
+        }
     }
 }
 
@@ -246,28 +251,56 @@ fn signal_to_label(signal: f64) -> String {
 // ---------------------------------------------------------------------------
 
 // price_trend: [-1, 1]
-fn pt_down(x: f64) -> Interval { trapezoid_it2(x, -1.0, -1.0, -0.5, -0.1, 0.05) }
-fn pt_flat(x: f64) -> Interval { gaussian_it2(x, 0.0, 0.25, 0.08) }
-fn pt_up(x: f64) -> Interval   { trapezoid_it2(x, 0.1, 0.5, 1.0, 1.0, 0.05) }
+fn pt_down(x: f64) -> Interval {
+    trapezoid_it2(x, -1.0, -1.0, -0.5, -0.1, 0.05)
+}
+fn pt_flat(x: f64) -> Interval {
+    gaussian_it2(x, 0.0, 0.25, 0.08)
+}
+fn pt_up(x: f64) -> Interval {
+    trapezoid_it2(x, 0.1, 0.5, 1.0, 1.0, 0.05)
+}
 
 // volume_ratio: [0, 2]
-fn vr_low(x: f64) -> Interval  { trapezoid_it2(x, 0.0, 0.0, 0.5, 0.8, 0.06) }
-fn vr_high(x: f64) -> Interval { trapezoid_it2(x, 1.2, 1.6, 2.0, 2.0, 0.06) }
+fn vr_low(x: f64) -> Interval {
+    trapezoid_it2(x, 0.0, 0.0, 0.5, 0.8, 0.06)
+}
+fn vr_high(x: f64) -> Interval {
+    trapezoid_it2(x, 1.2, 1.6, 2.0, 2.0, 0.06)
+}
 
 // ai_consensus: [-1, 1]
-fn ai_bearish(x: f64) -> Interval  { trapezoid_it2(x, -1.0, -1.0, -0.4, -0.1, 0.05) }
-fn ai_neutral(x: f64) -> Interval  { gaussian_it2(x, 0.0, 0.25, 0.07) }
-fn ai_bullish(x: f64) -> Interval  { trapezoid_it2(x, 0.1, 0.4, 1.0, 1.0, 0.05) }
+fn ai_bearish(x: f64) -> Interval {
+    trapezoid_it2(x, -1.0, -1.0, -0.4, -0.1, 0.05)
+}
+fn ai_neutral(x: f64) -> Interval {
+    gaussian_it2(x, 0.0, 0.25, 0.07)
+}
+fn ai_bullish(x: f64) -> Interval {
+    trapezoid_it2(x, 0.1, 0.4, 1.0, 1.0, 0.05)
+}
 
 // research_sentiment: [-1, 1]
-fn rs_negative(x: f64) -> Interval { trapezoid_it2(x, -1.0, -1.0, -0.3, 0.0, 0.05) }
-fn rs_neutral(x: f64) -> Interval  { gaussian_it2(x, 0.0, 0.3, 0.07) }
-fn rs_positive(x: f64) -> Interval { trapezoid_it2(x, 0.0, 0.3, 1.0, 1.0, 0.05) }
+fn rs_negative(x: f64) -> Interval {
+    trapezoid_it2(x, -1.0, -1.0, -0.3, 0.0, 0.05)
+}
+fn rs_neutral(x: f64) -> Interval {
+    gaussian_it2(x, 0.0, 0.3, 0.07)
+}
+fn rs_positive(x: f64) -> Interval {
+    trapezoid_it2(x, 0.0, 0.3, 1.0, 1.0, 0.05)
+}
 
 // portfolio_exposure: [0, 1]
-fn pe_under(x: f64) -> Interval    { trapezoid_it2(x, 0.0, 0.0, 0.2, 0.4, 0.05) }
-fn pe_balanced(x: f64) -> Interval { gaussian_it2(x, 0.5, 0.2, 0.06) }
-fn pe_over(x: f64) -> Interval     { trapezoid_it2(x, 0.6, 0.8, 1.0, 1.0, 0.05) }
+fn pe_under(x: f64) -> Interval {
+    trapezoid_it2(x, 0.0, 0.0, 0.2, 0.4, 0.05)
+}
+fn pe_balanced(x: f64) -> Interval {
+    gaussian_it2(x, 0.5, 0.2, 0.06)
+}
+fn pe_over(x: f64) -> Interval {
+    trapezoid_it2(x, 0.6, 0.8, 1.0, 1.0, 0.05)
+}
 
 // ---------------------------------------------------------------------------
 // Rule builder
@@ -285,65 +318,71 @@ fn build_rules() -> Vec<Rule> {
 
     vec![
         // --- Strong buy ---
-        rule!( 1.0, "strong_buy", |i| {
-            let a = interval_min(pt_up(i.price_trend),  ai_bullish(i.ai_consensus));
+        rule!(1.0, "strong_buy", |i| {
+            let a = interval_min(pt_up(i.price_trend), ai_bullish(i.ai_consensus));
             let b = interval_min(a, rs_positive(i.research_sentiment));
             interval_min(b, pe_under(i.portfolio_exposure))
         }),
-        rule!( 1.0, "strong_buy", |i| {
-            let a = interval_min(pt_up(i.price_trend),  vr_high(i.volume_ratio));
+        rule!(1.0, "strong_buy", |i| {
+            let a = interval_min(pt_up(i.price_trend), vr_high(i.volume_ratio));
             interval_min(a, ai_bullish(i.ai_consensus))
         }),
-
         // --- Buy ---
-        rule!( 0.5, "buy", |i| {
+        rule!(0.5, "buy", |i| {
             interval_min(pt_up(i.price_trend), ai_bullish(i.ai_consensus))
         }),
-        rule!( 0.5, "buy", |i| {
-            let a = interval_min(ai_bullish(i.ai_consensus), rs_positive(i.research_sentiment));
+        rule!(0.5, "buy", |i| {
+            let a = interval_min(
+                ai_bullish(i.ai_consensus),
+                rs_positive(i.research_sentiment),
+            );
             interval_min(a, pe_under(i.portfolio_exposure))
         }),
-        rule!( 0.5, "buy", |i| {
+        rule!(0.5, "buy", |i| {
             let a = interval_min(pt_flat(i.price_trend), vr_high(i.volume_ratio));
             interval_min(a, ai_bullish(i.ai_consensus))
         }),
-        rule!( 0.5, "buy", |i| {
+        rule!(0.5, "buy", |i| {
             interval_min(pt_up(i.price_trend), rs_positive(i.research_sentiment))
         }),
-        rule!( 0.5, "buy", |i| {
+        rule!(0.5, "buy", |i| {
             let a = interval_min(ai_bullish(i.ai_consensus), pe_under(i.portfolio_exposure));
             interval_min(a, rs_neutral(i.research_sentiment))
         }),
-
         // --- Hold ---
-        rule!( 0.0, "hold", |i| {
+        rule!(0.0, "hold", |i| {
             interval_min(pt_flat(i.price_trend), ai_neutral(i.ai_consensus))
         }),
-        rule!( 0.0, "hold", |i| {
-            interval_min(ai_neutral(i.ai_consensus), pe_balanced(i.portfolio_exposure))
+        rule!(0.0, "hold", |i| {
+            interval_min(
+                ai_neutral(i.ai_consensus),
+                pe_balanced(i.portfolio_exposure),
+            )
         }),
-        rule!( 0.0, "hold", |i| {
+        rule!(0.0, "hold", |i| {
             let a = interval_min(pt_flat(i.price_trend), rs_neutral(i.research_sentiment));
             interval_min(a, vr_low(i.volume_ratio))
         }),
-        rule!( 0.0, "hold", |i| {
+        rule!(0.0, "hold", |i| {
             let a = interval_min(ai_bullish(i.ai_consensus), pe_over(i.portfolio_exposure));
             interval_min(a, rs_neutral(i.research_sentiment))
         }),
-        rule!( 0.0, "hold", |i| {
+        rule!(0.0, "hold", |i| {
             let a = interval_min(ai_bearish(i.ai_consensus), pe_under(i.portfolio_exposure));
             interval_min(a, rs_neutral(i.research_sentiment))
         }),
-        rule!( 0.0, "hold", |i| {
+        rule!(0.0, "hold", |i| {
             interval_min(pt_down(i.price_trend), vr_low(i.volume_ratio))
         }),
-
         // --- Sell ---
         rule!(-0.5, "sell", |i| {
             interval_min(pt_down(i.price_trend), ai_bearish(i.ai_consensus))
         }),
         rule!(-0.5, "sell", |i| {
-            let a = interval_min(ai_bearish(i.ai_consensus), rs_negative(i.research_sentiment));
+            let a = interval_min(
+                ai_bearish(i.ai_consensus),
+                rs_negative(i.research_sentiment),
+            );
             interval_min(a, pe_over(i.portfolio_exposure))
         }),
         rule!(-0.5, "sell", |i| {
@@ -356,7 +395,6 @@ fn build_rules() -> Vec<Rule> {
         rule!(-0.5, "sell", |i| {
             interval_min(ai_bearish(i.ai_consensus), pe_over(i.portfolio_exposure))
         }),
-
         // --- Strong sell ---
         rule!(-1.0, "strong_sell", |i| {
             let a = interval_min(pt_down(i.price_trend), ai_bearish(i.ai_consensus));
@@ -368,12 +406,14 @@ fn build_rules() -> Vec<Rule> {
             interval_min(a, ai_bearish(i.ai_consensus))
         }),
         rule!(-1.0, "strong_sell", |i| {
-            let a = interval_min(ai_bearish(i.ai_consensus), rs_negative(i.research_sentiment));
+            let a = interval_min(
+                ai_bearish(i.ai_consensus),
+                rs_negative(i.research_sentiment),
+            );
             interval_min(a, pe_over(i.portfolio_exposure))
         }),
-
         // --- Edge cases: high volume + neutral → buy/sell bias ---
-        rule!( 0.4, "buy", |i| {
+        rule!(0.4, "buy", |i| {
             let a = interval_min(vr_high(i.volume_ratio), pt_up(i.price_trend));
             interval_min(a, rs_positive(i.research_sentiment))
         }),
@@ -392,7 +432,9 @@ fn build_rules() -> Vec<Rule> {
 mod tests {
     use super::*;
 
-    fn engine() -> FuzzyEngine { FuzzyEngine::new() }
+    fn engine() -> FuzzyEngine {
+        FuzzyEngine::new()
+    }
 
     #[test]
     fn test_strong_buy_conditions() {
@@ -404,7 +446,11 @@ mod tests {
             research_sentiment: 0.8,
             portfolio_exposure: 0.1,
         });
-        assert!(out.signal > 0.3, "strong buy should produce positive signal, got {}", out.signal);
+        assert!(
+            out.signal > 0.3,
+            "strong buy should produce positive signal, got {}",
+            out.signal
+        );
         assert!(out.confidence > 0.1, "confidence should be non-trivial");
     }
 
@@ -418,14 +464,22 @@ mod tests {
             research_sentiment: -0.8,
             portfolio_exposure: 0.9,
         });
-        assert!(out.signal < -0.3, "strong sell should produce negative signal, got {}", out.signal);
+        assert!(
+            out.signal < -0.3,
+            "strong sell should produce negative signal, got {}",
+            out.signal
+        );
     }
 
     #[test]
     fn test_neutral_holds() {
         let e = engine();
         let out = e.evaluate(&FuzzyInputs::default());
-        assert!(out.signal.abs() < 0.4, "neutral inputs should produce hold-ish signal, got {}", out.signal);
+        assert!(
+            out.signal.abs() < 0.4,
+            "neutral inputs should produce hold-ish signal, got {}",
+            out.signal
+        );
     }
 
     #[test]
@@ -438,10 +492,16 @@ mod tests {
                     ai_consensus: ai,
                     ..Default::default()
                 });
-                assert!(out.signal >= -1.0 && out.signal <= 1.0,
-                    "signal out of range: {}", out.signal);
-                assert!(out.confidence >= 0.0 && out.confidence <= 1.0,
-                    "confidence out of range: {}", out.confidence);
+                assert!(
+                    out.signal >= -1.0 && out.signal <= 1.0,
+                    "signal out of range: {}",
+                    out.signal
+                );
+                assert!(
+                    out.confidence >= 0.0 && out.confidence <= 1.0,
+                    "confidence out of range: {}",
+                    out.confidence
+                );
             }
         }
     }

@@ -34,7 +34,7 @@ use crate::{
     providers::{TranscriptionInput, normalize_provider_type},
     trading::{
         config::TradingConfigOverride,
-        state::{TradeOverride, TradeAction},
+        state::{TradeAction, TradeOverride},
     },
 };
 
@@ -86,12 +86,18 @@ pub fn build_router(service: GailService) -> Router {
         .route("/v1/trading/logs", get(trading_logs))
         .route("/v1/trading/exchanges", get(trading_exchanges))
         .route("/v1/trading/currencies", get(trading_currencies))
-        .route("/v1/trading/config", get(trading_get_config).post(trading_set_config))
+        .route(
+            "/v1/trading/config",
+            get(trading_get_config).post(trading_set_config),
+        )
         .route("/v1/trading/pause", post(trading_pause))
         .route("/v1/trading/resume", post(trading_resume))
         .route("/v1/trading/override", post(trading_override))
         .route("/v1/trading/evaluate", post(trading_evaluate))
-        .route("/v1/trading/backtest", get(trading_backtest_result).post(trading_run_backtest))
+        .route(
+            "/v1/trading/backtest",
+            get(trading_backtest_result).post(trading_run_backtest),
+        )
         .with_state(service)
 }
 
@@ -513,10 +519,7 @@ fn trading_unavailable() -> Response {
         .into_response()
 }
 
-async fn trading_status(
-    State(service): State<GailService>,
-    headers: HeaderMap,
-) -> Response {
+async fn trading_status(State(service): State<GailService>, headers: HeaderMap) -> Response {
     if let Some(err_resp) = require_trading_scope(&service, &headers) {
         return err_resp;
     }
@@ -530,10 +533,7 @@ async fn trading_status(
     }
 }
 
-async fn trading_portfolio(
-    State(service): State<GailService>,
-    headers: HeaderMap,
-) -> Response {
+async fn trading_portfolio(State(service): State<GailService>, headers: HeaderMap) -> Response {
     if let Some(err_resp) = require_trading_scope(&service, &headers) {
         return err_resp;
     }
@@ -546,10 +546,7 @@ async fn trading_portfolio(
     }
 }
 
-async fn trading_positions(
-    State(service): State<GailService>,
-    headers: HeaderMap,
-) -> Response {
+async fn trading_positions(State(service): State<GailService>, headers: HeaderMap) -> Response {
     if let Some(err_resp) = require_trading_scope(&service, &headers) {
         return err_resp;
     }
@@ -610,10 +607,7 @@ async fn trading_logs(
     }
 }
 
-async fn trading_exchanges(
-    State(service): State<GailService>,
-    headers: HeaderMap,
-) -> Response {
+async fn trading_exchanges(State(service): State<GailService>, headers: HeaderMap) -> Response {
     if let Some(err_resp) = require_trading_scope(&service, &headers) {
         return err_resp;
     }
@@ -626,10 +620,7 @@ async fn trading_exchanges(
     }
 }
 
-async fn trading_currencies(
-    State(service): State<GailService>,
-    headers: HeaderMap,
-) -> Response {
+async fn trading_currencies(State(service): State<GailService>, headers: HeaderMap) -> Response {
     if let Some(err_resp) = require_trading_scope(&service, &headers) {
         return err_resp;
     }
@@ -649,10 +640,7 @@ async fn trading_currencies(
     }
 }
 
-async fn trading_get_config(
-    State(service): State<GailService>,
-    headers: HeaderMap,
-) -> Response {
+async fn trading_get_config(State(service): State<GailService>, headers: HeaderMap) -> Response {
     if let Some(err_resp) = require_trading_scope(&service, &headers) {
         return err_resp;
     }
@@ -690,10 +678,7 @@ async fn trading_set_config(
     }
 }
 
-async fn trading_pause(
-    State(service): State<GailService>,
-    headers: HeaderMap,
-) -> Response {
+async fn trading_pause(State(service): State<GailService>, headers: HeaderMap) -> Response {
     if let Some(err_resp) = require_trading_admin(&service, &headers) {
         return err_resp;
     }
@@ -708,10 +693,7 @@ async fn trading_pause(
     }
 }
 
-async fn trading_resume(
-    State(service): State<GailService>,
-    headers: HeaderMap,
-) -> Response {
+async fn trading_resume(State(service): State<GailService>, headers: HeaderMap) -> Response {
     if let Some(err_resp) = require_trading_admin(&service, &headers) {
         return err_resp;
     }
@@ -741,10 +723,7 @@ async fn trading_override(
     match service.trading_bridge() {
         None => trading_unavailable(),
         Some(bridge) => {
-            let action_str = body
-                .get("action")
-                .and_then(Value::as_str)
-                .unwrap_or("hold");
+            let action_str = body.get("action").and_then(Value::as_str).unwrap_or("hold");
             let action = match action_str {
                 "buy" => TradeAction::Buy,
                 "sell" => TradeAction::Sell,
@@ -759,10 +738,19 @@ async fn trading_override(
                 .unwrap_or(0.0);
             let override_req = TradeOverride {
                 action,
-                exchange: body.get("exchange").and_then(Value::as_str).map(str::to_string),
-                symbol: body.get("symbol").and_then(Value::as_str).map(str::to_string),
+                exchange: body
+                    .get("exchange")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                symbol: body
+                    .get("symbol")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 amount_usd: body.get("amount_usd").and_then(Value::as_f64),
-                reason: body.get("reason").and_then(Value::as_str).map(str::to_string),
+                reason: body
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 issued_at: now,
                 issued_by: auth_ctx.client_id.unwrap_or_else(|| "unknown".to_string()),
             };
@@ -775,10 +763,7 @@ async fn trading_override(
     }
 }
 
-async fn trading_evaluate(
-    State(service): State<GailService>,
-    headers: HeaderMap,
-) -> Response {
+async fn trading_evaluate(State(service): State<GailService>, headers: HeaderMap) -> Response {
     if let Some(err_resp) = require_trading_admin(&service, &headers) {
         return err_resp;
     }
@@ -853,8 +838,7 @@ async fn trading_run_backtest(
                     config.backtest_profitability_threshold,
                 );
                 let summary = if let Some(Json(val)) = body {
-                    let octo_req: OctoReq = serde_json::from_value(val)
-                        .unwrap_or_default();
+                    let octo_req: OctoReq = serde_json::from_value(val).unwrap_or_default();
                     engine.run(&octo_req).await
                 } else {
                     engine.run_with_config(&config).await

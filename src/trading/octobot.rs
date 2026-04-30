@@ -171,7 +171,10 @@ impl OctobotClient {
             .await
             .map_err(|e| format!("OctoBot status parse failed: {e}"))?;
         Ok(OctobotStatus {
-            running: body.get("running").and_then(Value::as_bool).unwrap_or(false),
+            running: body
+                .get("running")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             version: body
                 .get("version")
                 .and_then(Value::as_str)
@@ -397,7 +400,10 @@ impl OctobotClient {
         exchange: &str,
         symbol: &str,
     ) -> Result<MarketSnapshot, String> {
-        let url = format!("{}/api/market/ticker?exchange={}&symbol={}", self.base_url, exchange, symbol);
+        let url = format!(
+            "{}/api/market/ticker?exchange={}&symbol={}",
+            self.base_url, exchange, symbol
+        );
         let resp = self
             .client
             .get(&url)
@@ -415,14 +421,18 @@ impl OctobotClient {
         Ok(MarketSnapshot {
             exchange: exchange.to_string(),
             symbol: symbol.to_string(),
-            price: body.get("last").or_else(|| body.get("close"))
+            price: body
+                .get("last")
+                .or_else(|| body.get("close"))
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0),
             price_change_pct_1h: body.get("change_1h").and_then(Value::as_f64),
-            price_change_pct_24h: body.get("change_24h")
+            price_change_pct_24h: body
+                .get("change_24h")
                 .or_else(|| body.get("percentage"))
                 .and_then(Value::as_f64),
-            volume_24h: body.get("baseVolume")
+            volume_24h: body
+                .get("baseVolume")
                 .or_else(|| body.get("volume"))
                 .and_then(Value::as_f64),
             volume_change_pct: body.get("volume_change_pct").and_then(Value::as_f64),
@@ -449,20 +459,27 @@ impl OctobotClient {
         let mut snapshots = Vec::new();
         'outer: for exchange in exchanges.iter().filter(|e| e.enabled) {
             if !target_exchanges.is_empty()
-                && !target_exchanges.iter().any(|t| t.eq_ignore_ascii_case(&exchange.name))
+                && !target_exchanges
+                    .iter()
+                    .any(|t| t.eq_ignore_ascii_case(&exchange.name))
             {
                 continue;
             }
             for symbol in exchange.symbols.iter().take(limit) {
                 if !target_currencies.is_empty()
-                    && !target_currencies.iter().any(|t| t.eq_ignore_ascii_case(symbol))
+                    && !target_currencies
+                        .iter()
+                        .any(|t| t.eq_ignore_ascii_case(symbol))
                 {
                     continue;
                 }
                 match self.get_market_snapshot(&exchange.name, symbol).await {
                     Ok(snap) => snapshots.push(snap),
                     Err(err) => {
-                        warn!("trading: ticker {}/{} failed: {}", exchange.name, symbol, err);
+                        warn!(
+                            "trading: ticker {}/{} failed: {}",
+                            exchange.name, symbol, err
+                        );
                     }
                 }
                 if snapshots.len() >= limit {
@@ -748,9 +765,7 @@ fn extract_f64_map(value: Option<&Value>) -> std::collections::HashMap<String, f
 /// Extract total portfolio value per exchange from a portfolio object like:
 /// `{"binance": {"BTC": 0.05, "USDT": 1200.0}}`.
 /// Returns `{"binance": 1200.0 + BTC_value ...}` — here we just sum numeric values.
-fn extract_portfolio_totals(
-    value: Option<&Value>,
-) -> std::collections::HashMap<String, f64> {
+fn extract_portfolio_totals(value: Option<&Value>) -> std::collections::HashMap<String, f64> {
     let Some(obj) = value.and_then(Value::as_object) else {
         return std::collections::HashMap::new();
     };

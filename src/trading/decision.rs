@@ -9,7 +9,7 @@ use super::advisor::AiConsensus;
 use super::config::TradingConfig;
 use super::fuzzy::FuzzyDecision;
 use super::octobot::MarketSnapshot;
-use super::state::{TradingState, TradeAction};
+use super::state::{TradeAction, TradingState};
 
 fn now_ts() -> f64 {
     SystemTime::now()
@@ -71,7 +71,9 @@ pub struct DecisionEngine {
 
 impl DecisionEngine {
     pub fn new(fuzzy_weight: f64) -> Self {
-        Self { fuzzy_weight: fuzzy_weight.clamp(0.0, 1.0) }
+        Self {
+            fuzzy_weight: fuzzy_weight.clamp(0.0, 1.0),
+        }
     }
 
     /// Produce a final trade decision from fuzzy output, AI consensus, and current state.
@@ -99,9 +101,12 @@ impl DecisionEngine {
 
         debug!(
             "trading: decision — fuzzy={:.3}/{:.3} ai={:.3}/{:.3} blended={:.3}/{:.3}",
-            fuzzy.signal, fuzzy.confidence,
-            consensus.signal, consensus.confidence,
-            blended_signal, blended_confidence
+            fuzzy.signal,
+            fuzzy.confidence,
+            consensus.signal,
+            consensus.confidence,
+            blended_signal,
+            blended_confidence
         );
 
         // Confidence threshold gate.
@@ -252,7 +257,10 @@ struct EffectiveConfig {
 }
 
 impl EffectiveConfig {
-    fn from(base: &TradingConfig, overrides: &Option<super::config::TradingConfigOverride>) -> Self {
+    fn from(
+        base: &TradingConfig,
+        overrides: &Option<super::config::TradingConfigOverride>,
+    ) -> Self {
         let ov = overrides.as_ref();
         Self {
             fuzzy_confidence_threshold: ov
@@ -306,12 +314,13 @@ fn build_rationale(
         .collect();
 
     let ai_summary = if top_reasoning.is_empty() {
-        format!("AI consensus: {} ({} responders)", consensus.action, consensus.responders)
+        format!(
+            "AI consensus: {} ({} responders)",
+            consensus.action, consensus.responders
+        )
     } else {
         top_reasoning.join("; ")
     };
 
-    format!(
-        "Action={action_str} signal={signal:.3} confidence={confidence:.2}. {ai_summary}"
-    )
+    format!("Action={action_str} signal={signal:.3} confidence={confidence:.2}. {ai_summary}")
 }
