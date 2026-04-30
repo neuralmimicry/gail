@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     errors::{GailError, Result},
     models::{AarnnResponsePreference, SelectionMode},
+    trading::config::TradingConfig,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -18,6 +19,7 @@ pub struct GailConfig {
     pub providers: Vec<ProviderProfile>,
     pub specialists: Vec<SpecialistProfile>,
     pub storage: StorageConfig,
+    pub trading: TradingConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -135,6 +137,7 @@ impl Default for GailConfig {
             providers: Vec::new(),
             specialists: Vec::new(),
             storage: StorageConfig::default(),
+            trading: TradingConfig::default(),
         }
     }
 }
@@ -327,6 +330,7 @@ impl GailConfig {
                 specialist.keyword_hints = specialist.specialties.clone();
             }
         }
+        self.trading.normalize();
         Ok(())
     }
 }

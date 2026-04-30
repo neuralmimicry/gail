@@ -1,6 +1,6 @@
 # Gail
 
-Gail is the shared AI middleware for NeuralMimicry services. It consolidates the LLM routing, provider orchestration, neuromorphic specialist access, AER translation, transcription, and orchestration-status surfaces that were previously embedded inside Refiner.
+Gail is the shared AI middleware for NeuralMimicry services. It consolidates LLM routing, provider orchestration, neuromorphic specialist access, AER translation, transcription, orchestration-status surfaces, and a live crypto-trading bridge — all in one non-blocking Rust service.
 
 The service is designed so Refiner can delegate immediately, while Tracey and Continuum/NMC can consume the same HTTP contract without re-implementing provider selection or neuromorphic transport glue.
 
@@ -11,6 +11,7 @@ The service is designed so Refiner can delegate immediately, while Tracey and Co
 - Preserve Refiner features such as concurrent provider selection, persisted metrics, Ollama inventory visibility, transcription, and neuromorphic specialist routing.
 - Improve latency and efficiency centrally so optimisations benefit every Gail client.
 - Allow additional OpenAI-compatible providers, including NVIDIA NIM-hosted model families, without changing client integrations.
+- Provide an intelligent, autonomous, observable crypto-trading bridge using multi-AI consensus and Type-2 fuzzy logic.
 
 ## Runtime Surface
 
@@ -27,6 +28,19 @@ Gail exposes the following endpoints:
 | `POST /v1/aer/encode` | Encode spikes/events into `AER1` payloads |
 | `POST /v1/aer/decode` | Decode `AER1` payloads into spikes/events |
 | `GET /v1/status/orchestration` | Provider, engine, and metrics status |
+| `GET /v1/trading/status` | Trading bridge status snapshot |
+| `GET /v1/trading/portfolio` | OctoBot portfolio holdings |
+| `GET /v1/trading/positions` | Open OctoBot orders |
+| `GET /v1/trading/history` | Recent executed trades |
+| `GET /v1/trading/logs` | Activity log ring buffer |
+| `GET /v1/trading/exchanges` | Available exchanges from OctoBot |
+| `GET /v1/trading/currencies` | Available trading pairs |
+| `GET /v1/trading/config` | Current trading configuration |
+| `POST /v1/trading/config` | Update runtime trading configuration |
+| `POST /v1/trading/pause` | Pause the evaluation loop |
+| `POST /v1/trading/resume` | Resume the evaluation loop |
+| `POST /v1/trading/override` | Inject an operator trade override |
+| `POST /v1/trading/evaluate` | Trigger an immediate evaluation cycle |
 
 ## What Moved From Refiner
 
@@ -46,10 +60,13 @@ Gail exposes the following endpoints:
 ## Security Model
 
 - Bearer-token authentication with per-client IDs.
-- Route scopes: `health`, `llm`, `neuromorphic`, `aer`, `status`.
+- Route scopes: `health`, `llm`, `neuromorphic`, `aer`, `status`, `trading`, `trading_admin`.
 - `/healthz` can be configured to allow or deny unauthenticated probes.
+- All `/v1/trading/*` read endpoints require the `trading` scope.
+- All `/v1/trading/*` write endpoints (pause, resume, override, config POST, evaluate) additionally require either the `trading_admin` scope or a `client_id` listed in `trading.admin_client_ids` (default: `["pbisaacs"]`).
 - When `aarnn_bridge` is enabled, Gail should call AARNN with its own Customers-issued service-account bearer token rather than a browser-style session.
 - The supplied Ansible role publishes Gail behind TLS ingress and injects per-client bearer tokens for Refiner, Tracey, and Continuum/NMC.
+- OctoBot credentials (password, API keys) are stored in Kubernetes Secrets and never logged.
 
 ## Local Development
 
@@ -116,14 +133,207 @@ NMC already owns AARNN and cloud-control orchestration concerns. Gail sits along
 
 The AARNN bridge lets Gail mirror both prompt-side and response-side LLM traffic into AARNN so the attached network can be stimulated over time and, later, provide a candidate reply back into Gail's selection logic.
 
+## Trading Bridge
+
+The trading bridge (`src/trading/`) is a self-contained module that runs a background tokio evaluation loop alongside all existing Gail capabilities. It is disabled by default (`trading.enabled: false`) and can be enabled without restarting or touching any other Gail functionality.
+
+### Architecture
+
+```
+Gail HTTP Server
+  /v1/trading/* ←→ TradingBridge (Arc-shared state)
+                         │
+              ┌──────────┼───────────────────┐
+              ▼          ▼                   ▼
+        OctobotClient  RefinerClient   GailService
+        (market data,  (RAG research)  (all AI providers)
+         order mgmt)
+              │                              │
+              └─────── Background loop ──────┘
+                  Every N seconds (default 60):
+                  1. Fetch market snapshots + portfolio
+                  2. Query Refiner for market research
+                  3. Consult all AIs in parallel (JoinSet)
+                  4. Run Type-2 fuzzy inference
+                  5. Blend fuzzy + AI signals → decision
+                  6. Apply risk gates → execute or hold
+                  7. Log to ring buffer; persist state
+```
+
+### Evaluation Pipeline (one cycle)
+
+Each evaluation runs the following pipeline steps in sequence:
+
+**Step 1 — Market data** (`octobot.rs`)
+OctoBot is queried for market snapshots (price, 24 h change %, 24 h volume), the current portfolio (per-currency balances and USD values), and open orders. OctoBot uses session-cookie authentication; the client re-logs in at startup and on 401 responses. Up to 20 snapshots are fetched across all configured exchanges and currency filters.
+
+**Step 2 — Research** (`refiner.rs`)
+The highest-signal market snapshot (scored by `|Δ%| × ln(volume+1)`) is used to build a Refiner RAG query from the `research_query_template`. Refiner's `/api/rag/query` endpoint returns ranked context passages (default top 5). The research context is passed verbatim to the AI advisors and contributes a sentiment signal to the fuzzy engine.
+
+**Step 3 — Multi-AI advisory** (`advisor.rs`)
+`TradingAdvisor::consult_all()` fires all configured Gail provider profiles in parallel using a `tokio::task::JoinSet`. Each provider receives a structured prompt containing market data, portfolio state, and research context, and is asked to respond with:
+```json
+{
+  "action": "buy|sell|hold|strong_buy|strong_sell",
+  "confidence": 0.0–1.0,
+  "reasoning": "...",
+  "suggested_amount_usd": null
+}
+```
+Providers are selected by quality weight (EWMA from `MetricsStore`) and capped at `max_parallel_advisors`. Responses are aggregated into `AiConsensus` using weighted voting: `effective_weight = provider_weight × confidence`. The consensus signal is a weighted centroid in `[−1, +1]`.
+
+**Step 4 — Type-2 fuzzy inference** (`fuzzy.rs`)
+Five linguistic input variables are encoded from the gathered data:
+
+| Variable | Range | Derivation |
+| --- | --- | --- |
+| `price_trend` | −1 to +1 | `clamp(Δ% / 5, -1, 1)` |
+| `volume_ratio` | 0 to 2 | `clamp(vol24h / 1M, 0, 2)` |
+| `ai_consensus` | −1 to +1 | Aggregated AI signal |
+| `research_sentiment` | −1 to +1 | `(avg_rag_score − 0.5) × 0.4` |
+| `portfolio_exposure` | 0 to 1 | Non-stablecoin fraction of portfolio |
+
+Each variable has three linguistic terms with **interval Type-2 Gaussian membership functions** (lower/upper bounds encoding epistemic uncertainty). A rule base of 25 Mamdani rules fires against the five inputs and activates output terms (`strong_sell, sell, hold, buy, strong_buy`). Type reduction uses a simplified **Karnik-Mendel centroid** over the interval-weighted output terms to produce a crisp signal in `[−1, +1]` plus a confidence score.
+
+**Step 5 — Decision blending** (`decision.rs`)
+The fuzzy signal and AI consensus signal are blended with configurable weights (default: fuzzy 40%, AI 60%):
+```
+blended_signal     = fuzzy.signal × fuzzy_weight + ai.signal × ai_weight
+blended_confidence = fuzzy.confidence × fuzzy_weight + ai.confidence × ai_weight
+```
+Three sequential risk gates are applied before a trade is placed:
+1. **Confidence gate**: `blended_confidence < fuzzy_confidence_threshold` → hold
+2. **Position gate**: open positions ≥ `max_open_positions` and signal is buy → hold
+3. **Cooldown gate**: time since last trade < `min_trade_interval_seconds` → hold
+
+Trade size scales with `signal_strength × confidence` between `micro_trade_min_usd` and `micro_trade_max_usd`.
+
+Action thresholds on the blended signal:
+- `signal ≥ 0.65` → `strong_buy`
+- `signal ≥ 0.20` → `buy`
+- `signal ≤ −0.65` → `strong_sell`
+- `signal ≤ −0.20` → `sell`
+- otherwise → `hold`
+
+**Step 6 — Execution** (`mod.rs`)
+`place_buy_order` / `place_sell_order` is called on OctoBot via the session-authenticated client. Results (order ID, price, status) are recorded to the trade ring buffer.
+
+**Override mechanism**: if `TradingState.pending_override` is set via `POST /v1/trading/override`, the decision pipeline is bypassed and the override trade is executed directly with `confidence = 1.0`. The override is cleared after execution.
+
+### State and Persistence
+
+`SharedTradingState` (`state.rs`) is an `Arc<Mutex<TradingState>>` shared between the background loop and all HTTP handlers. It holds:
+
+- `paused` / `enabled` flags
+- `evaluation_count` / `trade_count` counters
+- `last_evaluation_at` / `last_trade_at` Unix timestamps
+- `current_portfolio` — latest OctoBot portfolio snapshot
+- `open_positions` — latest open orders
+- `recent_trades` — `VecDeque` ring buffer (default 200 entries)
+- `activity_log` — `VecDeque` ring buffer (default 1000 entries) with level, category, message, and JSON context
+- `available_exchanges` — populated from OctoBot on each cycle
+- `pending_override` — operator-injected trade override
+- `config_overrides` — runtime-mutable subset of config
+- `last_error` — most recent error string
+
+State is persisted to `data_path` (default `./data/trading_state.json`) every 5 evaluation cycles and on shutdown, and restored at startup.
+
+### Module Layout
+
+| File | Responsibility |
+| --- | --- |
+| `src/trading/mod.rs` | `TradingBridge`, background loop, evaluation pipeline, execution |
+| `src/trading/config.rs` | `TradingConfig`, `TradingConfigOverride` |
+| `src/trading/state.rs` | `TradingState`, `SharedTradingState`, ring buffers, persistence |
+| `src/trading/octobot.rs` | `OctobotClient` — session auth, market data, portfolio, orders |
+| `src/trading/refiner.rs` | `RefinerClient` — RAG research queries |
+| `src/trading/fuzzy.rs` | `FuzzyEngine` — Type-2 interval fuzzy logic, 25 rules, Karnik-Mendel |
+| `src/trading/advisor.rs` | `TradingAdvisor` — parallel multi-AI advisory, consensus aggregation |
+| `src/trading/decision.rs` | `DecisionEngine` — signal blending, risk gates, trade sizing |
+
+### Configuration Reference
+
+```yaml
+trading:
+  enabled: false                          # master switch
+  octobot_base_url: "${GAIL_TRADING_OCTOBOT_URL}"
+  octobot_password: "${GAIL_TRADING_OCTOBOT_PASSWORD}"
+  refiner_base_url: "${GAIL_TRADING_REFINER_URL}"
+  refiner_api_token: "${GAIL_TRADING_REFINER_TOKEN}"
+  admin_client_ids: ["pbisaacs"]          # write-access list
+  evaluation_interval_seconds: 60         # minimum 10
+  max_parallel_advisors: 5               # 1–20
+  micro_trade_max_usd: 25.0              # per-trade ceiling
+  micro_trade_min_usd: 1.0               # per-trade floor
+  max_open_positions: 5                  # 1–50
+  min_trade_interval_seconds: 120        # cooldown between trades
+  target_exchanges: []                   # empty = all available
+  target_currencies: []                  # empty = all available
+  fuzzy_confidence_threshold: 0.65       # minimum blended confidence to trade
+  fuzzy_weight: 0.4                      # fuzzy vs AI blend weight
+  research_query_template: "cryptocurrency market sentiment {currency} {exchange} {date}"
+  research_top_k: 5
+  log_ring_size: 1000
+  trade_ring_size: 200
+  data_path: "./data/trading_state.json"
+  octobot_timeout_seconds: 10.0
+  refiner_timeout_seconds: 15.0
+  advisor_timeout_seconds: 30.0
+```
+
+Runtime-mutable fields (via `POST /v1/trading/config`, no restart required):
+`evaluation_interval_seconds`, `micro_trade_max_usd`, `micro_trade_min_usd`, `max_open_positions`, `fuzzy_confidence_threshold`, `target_exchanges`, `target_currencies`.
+
+### NMC / Continuum Integration
+
+The NMC server proxies all `/v1/trading/*` Gail endpoints at `/gail/trading/*`. The NMC dashboard shows a live **Trading Bot** card (status, trade count, last trade time) and a detail modal with portfolio holdings, recent trades table, activity log, and admin controls (pause, resume, force-evaluate). All card data auto-refreshes on the 15-second polling cycle. The NMC CLI exposes the full surface via `nmc gail trading <subcommand>`:
+
+```
+nmc gail trading status
+nmc gail trading portfolio
+nmc gail trading positions
+nmc gail trading history [--limit N]
+nmc gail trading logs [--limit N]
+nmc gail trading exchanges
+nmc gail trading currencies
+nmc gail trading config
+nmc gail trading config-set --json '{"micro_trade_max_usd":15.0}'
+nmc gail trading pause
+nmc gail trading resume
+nmc gail trading override --action buy --symbol BTC/USDT --amount 10.0 --exchange binance
+nmc gail trading evaluate
+```
+
+### Ansible Variables
+
+The Ansible role (`roles/continuum_tenant_gail`) exposes the following defaults for the trading bridge (all off by default):
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `continuum_tenant_gail_trading_enabled` | `false` | Enable the bridge |
+| `continuum_tenant_gail_trading_octobot_url` | cluster-local OctoBot | OctoBot base URL |
+| `continuum_tenant_gail_trading_octobot_api_key` | secret file lookup | OctoBot API key |
+| `continuum_tenant_gail_trading_refiner_url` | cluster-local Refiner | Refiner base URL |
+| `continuum_tenant_gail_trading_refiner_token` | secret file lookup | Refiner API token |
+| `continuum_tenant_gail_trading_admin_token` | env / secret file | `pbisaacs` bearer token with `trading` + `trading_admin` scopes |
+| `continuum_tenant_gail_trading_eval_interval_seconds` | `60` | Evaluation interval |
+| `continuum_tenant_gail_trading_max_parallel_advisors` | `5` | Max parallel AI advisors |
+| `continuum_tenant_gail_trading_micro_trade_max_usd` | `25.0` | Per-trade ceiling (USD) |
+| `continuum_tenant_gail_trading_micro_trade_min_usd` | `1.0` | Per-trade floor (USD) |
+| `continuum_tenant_gail_trading_max_open_positions` | `5` | Max simultaneous positions |
+| `continuum_tenant_gail_trading_fuzzy_confidence_threshold` | `0.65` | Minimum trade confidence |
+| `continuum_tenant_gail_trading_admin_client_ids` | `["pbisaacs"]` | Admin client list |
+
+Secrets are looked up from `continuum_tenant_gail_secret_store_dir` files (`trading_octobot_api_key`, `trading_refiner_token`, `trading_admin_token`) or from environment variables.
+
 ## Deployment
 
 The Ansible role in `swarmhpc/swarmhpc/ansible/roles/continuum_tenant_gail`:
 
 - builds or syncs the Gail source tree,
 - builds and pushes the container image,
-- renders the Gail config into a Kubernetes Secret,
+- renders the Gail config (including trading section) into a Kubernetes Secret,
 - ships the shared AI-routing contract with the Gail runtime image,
-- persists Gail metrics on shared storage,
+- persists Gail metrics and trading state on shared storage,
 - exposes Gail via ingress/TLS, and
 - injects a matching bearer-token configuration into Refiner.

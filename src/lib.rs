@@ -10,3 +10,4 @@ pub mod orchestration;
 pub mod providers;
 pub mod routing;
 pub mod specialists;
+pub mod trading;

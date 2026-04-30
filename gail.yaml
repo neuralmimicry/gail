@@ -13,7 +13,10 @@ security:
       scopes: ["llm", "neuromorphic", "aer", "status", "health"]
     - client_id: "continuum"
       token: "${GAIL_CONTINUUM_API_TOKEN}"
-      scopes: ["llm", "neuromorphic", "aer", "status", "health"]
+      scopes: ["llm", "neuromorphic", "aer", "status", "health", "trading"]
+    - client_id: "pbisaacs"
+      token: "${GAIL_ADMIN_API_TOKEN}"
+      scopes: ["llm", "neuromorphic", "aer", "status", "health", "trading"]
 
 orchestration:
   enabled: true
@@ -132,3 +135,29 @@ aarnn_bridge:
 storage:
   metrics_path: "./data/provider_metrics.json"
   ollama_model_store_path: "./data/ollama_model_inventory.json"
+
+trading:
+  enabled: ${GAIL_TRADING_ENABLED}
+  octobot_base_url: "${GAIL_TRADING_OCTOBOT_URL}"
+  octobot_password: "${GAIL_TRADING_OCTOBOT_PASSWORD}"
+  refiner_base_url: "${GAIL_TRADING_REFINER_URL}"
+  refiner_api_token: "${GAIL_TRADING_REFINER_TOKEN}"
+  admin_client_ids: ["pbisaacs"]
+  evaluation_interval_seconds: ${GAIL_TRADING_EVAL_INTERVAL}
+  max_parallel_advisors: 5
+  micro_trade_max_usd: ${GAIL_TRADING_MAX_USD}
+  micro_trade_min_usd: ${GAIL_TRADING_MIN_USD}
+  max_open_positions: ${GAIL_TRADING_MAX_POSITIONS}
+  min_trade_interval_seconds: 120
+  target_exchanges: []
+  target_currencies: []
+  fuzzy_confidence_threshold: ${GAIL_TRADING_CONFIDENCE_THRESHOLD}
+  research_query_template: "cryptocurrency market sentiment {currency} {exchange} {date}"
+  research_top_k: 5
+  log_ring_size: 1000
+  trade_ring_size: 200
+  data_path: "./data/trading_state.json"
+  fuzzy_weight: 0.4
+  octobot_timeout_seconds: 10.0
+  refiner_timeout_seconds: 15.0
+  advisor_timeout_seconds: 30.0

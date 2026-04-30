@@ -12,32 +12,32 @@
         "privacy"
       ],
       "stats": {
-        "successes": 4,
+        "successes": 6,
         "failures": 0,
-        "total": 4,
-        "ewma_latency_ms": 0.4375,
-        "ewma_quality": 0.41015625,
+        "total": 6,
+        "ewma_latency_ms": 0.24609375,
+        "ewma_quality": 0.49321289062500007,
         "last_status": "success",
         "last_error": null,
-        "updated_at": 1777381577.822198
+        "updated_at": 1777541043.2131562
       },
       "roles": {
         "general:general": {
-          "successes": 4,
+          "successes": 6,
           "failures": 0,
-          "total": 4,
-          "ewma_latency_ms": 0.4375,
-          "ewma_quality": 0.41015625,
+          "total": 6,
+          "ewma_latency_ms": 0.24609375,
+          "ewma_quality": 0.49321289062500007,
           "last_status": "success",
           "last_error": null,
-          "updated_at": 1777381577.8222015
+          "updated_at": 1777541043.2131577
         }
       },
       "health": {
         "ok": true,
         "mode": "http",
-        "checked_at": 1777381009.8352828,
-        "latency_ms": 2,
+        "checked_at": 1777539848.0403955,
+        "latency_ms": 0,
         "message": "ok"
       }
     },
@@ -83,5 +83,5 @@
       }
     }
   },
-  "updated_at": 1777381577.8222015
+  "updated_at": 1777541043.213158
 }

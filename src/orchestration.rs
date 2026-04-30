@@ -33,6 +33,7 @@ use crate::{
         SpecialistEngine, analyze_specialist_engines, build_specialist_engines,
         specialist_engine_summaries,
     },
+    trading::TradingBridge,
 };
 
 const PROVIDER_HEALTH_TIMEOUT_SECONDS: u64 = 4;
@@ -49,6 +50,7 @@ struct GailServiceInner {
     metrics: MetricsStore,
     specialists: Vec<SpecialistEngine>,
     aarnn_bridge: Option<AarnnMirrorClient>,
+    trading_bridge: Option<TradingBridge>,
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +87,33 @@ impl GailService {
         let metrics = MetricsStore::new(config.storage.metrics_path.clone()).await?;
         let specialists = build_specialist_engines(&config, client.clone());
         let aarnn_bridge = AarnnMirrorClient::from_config(&config, client.clone(), &specialists);
+
+        // Construct a preliminary service (without trading) to pass into the trading bridge.
+        let preliminary = Self {
+            inner: Arc::new(GailServiceInner {
+                config: config.clone(),
+                client: client.clone(),
+                metrics: metrics.clone(),
+                specialists: specialists.clone(),
+                aarnn_bridge: aarnn_bridge.clone(),
+                trading_bridge: None,
+            }),
+        };
+
+        // Start trading bridge if configured.
+        let trading_bridge = if config.trading.is_viable() {
+            tracing::info!("trading: bridge is enabled — starting background loop");
+            let trading_cfg = config.trading.clone();
+            let (bridge, _handle) = TradingBridge::start(trading_cfg, preliminary).await;
+            // Note: _handle is dropped here; the background task keeps running because
+            // tokio::spawn holds it. The bridge background task will only stop when
+            // GailService is dropped (shutdown). For a clean shutdown we would store
+            // _handle, but for now the task runs for the lifetime of the process.
+            Some(bridge)
+        } else {
+            None
+        };
+
         Ok(Self {
             inner: Arc::new(GailServiceInner {
                 config,
@@ -92,6 +121,7 @@ impl GailService {
                 metrics,
                 specialists,
                 aarnn_bridge,
+                trading_bridge,
             }),
         })
     }
@@ -102,6 +132,10 @@ impl GailService {
 
     fn aarnn_bridge(&self) -> Option<&AarnnMirrorClient> {
         self.inner.aarnn_bridge.as_ref()
+    }
+
+    pub fn trading_bridge(&self) -> Option<&TradingBridge> {
+        self.inner.trading_bridge.as_ref()
     }
 
     pub fn authorize(&self, headers: &HeaderMap, required_scope: &str) -> Result<AuthContext> {

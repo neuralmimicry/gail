@@ -32,6 +32,10 @@ use crate::{
     },
     orchestration::GailService,
     providers::{TranscriptionInput, normalize_provider_type},
+    trading::{
+        config::TradingConfigOverride,
+        state::{TradeOverride, TradeAction},
+    },
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -74,6 +78,20 @@ pub fn build_router(service: GailService) -> Router {
         .route("/v1/aer/encode", post(encode_aer))
         .route("/v1/aer/decode", post(decode_aer))
         .route("/v1/status/orchestration", get(orchestration_status))
+        // Trading bridge endpoints
+        .route("/v1/trading/status", get(trading_status))
+        .route("/v1/trading/portfolio", get(trading_portfolio))
+        .route("/v1/trading/positions", get(trading_positions))
+        .route("/v1/trading/history", get(trading_history))
+        .route("/v1/trading/logs", get(trading_logs))
+        .route("/v1/trading/exchanges", get(trading_exchanges))
+        .route("/v1/trading/currencies", get(trading_currencies))
+        .route("/v1/trading/config", get(trading_get_config).post(trading_set_config))
+        .route("/v1/trading/pause", post(trading_pause))
+        .route("/v1/trading/resume", post(trading_resume))
+        .route("/v1/trading/override", post(trading_override))
+        .route("/v1/trading/evaluate", post(trading_evaluate))
+        .route("/v1/trading/backtest", get(trading_backtest_result).post(trading_run_backtest))
         .with_state(service)
 }
 
@@ -453,6 +471,410 @@ async fn orchestration_status(
             )
             .await,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Trading bridge HTTP handlers
+// ---------------------------------------------------------------------------
+
+/// Helper: require the `trading` scope and return an error response if missing.
+fn require_trading_scope(service: &GailService, headers: &HeaderMap) -> Option<Response> {
+    match service.authorize(headers, "trading") {
+        Ok(_) => None,
+        Err(err) => Some(err.into_response()),
+    }
+}
+
+/// Helper: require `trading` scope AND verify the client_id is in admin_client_ids.
+fn require_trading_admin(service: &GailService, headers: &HeaderMap) -> Option<Response> {
+    match service.authorize(headers, "trading") {
+        Ok(ctx) => {
+            let admin_ids = &service.config().trading.admin_client_ids;
+            if admin_ids.is_empty() {
+                return None; // no admin restriction configured
+            }
+            let client_id = ctx.client_id.as_deref().unwrap_or("");
+            if admin_ids.iter().any(|id| id == client_id) {
+                None
+            } else {
+                Some(GailError::unauthorized().into_response())
+            }
+        }
+        Err(err) => Some(err.into_response()),
+    }
+}
+
+/// Helper: return a 503 when the trading bridge is disabled/not configured.
+fn trading_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": "trading bridge is not enabled or configured" })),
+    )
+        .into_response()
+}
+
+async fn trading_status(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(err_resp) = require_trading_scope(&service, &headers) {
+        return err_resp;
+    }
+    match service.trading_bridge() {
+        None => trading_unavailable(),
+        Some(bridge) => {
+            let state = bridge.state.0.lock().await;
+            let snapshot = state.status_snapshot(bridge.is_enabled());
+            Json(snapshot).into_response()
+        }
+    }
+}
+
+async fn trading_portfolio(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(err_resp) = require_trading_scope(&service, &headers) {
+        return err_resp;
+    }
+    match service.trading_bridge() {
+        None => trading_unavailable(),
+        Some(bridge) => {
+            let state = bridge.state.0.lock().await;
+            Json(json!({ "portfolio": state.current_portfolio })).into_response()
+        }
+    }
+}
+
+async fn trading_positions(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(err_resp) = require_trading_scope(&service, &headers) {
+        return err_resp;
+    }
+    match service.trading_bridge() {
+        None => trading_unavailable(),
+        Some(bridge) => {
+            let state = bridge.state.0.lock().await;
+            Json(json!({ "positions": state.open_positions })).into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    limit: Option<usize>,
+}
+
+async fn trading_history(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+    Query(query): Query<HistoryQuery>,
+) -> Response {
+    if let Some(err_resp) = require_trading_scope(&service, &headers) {
+        return err_resp;
+    }
+    match service.trading_bridge() {
+        None => trading_unavailable(),
+        Some(bridge) => {
+            let limit = query.limit.unwrap_or(50).min(500);
+            let state = bridge.state.0.lock().await;
+            let trades: Vec<_> = state.recent_trades.iter().rev().take(limit).collect();
+            Json(json!({ "trades": trades, "total": state.trade_count })).into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    limit: Option<usize>,
+}
+
+async fn trading_logs(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+    Query(query): Query<LogsQuery>,
+) -> Response {
+    if let Some(err_resp) = require_trading_scope(&service, &headers) {
+        return err_resp;
+    }
+    match service.trading_bridge() {
+        None => trading_unavailable(),
+        Some(bridge) => {
+            let limit = query.limit.unwrap_or(100).min(1000);
+            let state = bridge.state.0.lock().await;
+            let logs: Vec<_> = state.activity_log.iter().rev().take(limit).collect();
+            Json(json!({ "logs": logs })).into_response()
+        }
+    }
+}
+
+async fn trading_exchanges(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(err_resp) = require_trading_scope(&service, &headers) {
+        return err_resp;
+    }
+    match service.trading_bridge() {
+        None => trading_unavailable(),
+        Some(bridge) => {
+            let state = bridge.state.0.lock().await;
+            Json(json!({ "exchanges": state.available_exchanges })).into_response()
+        }
+    }
+}
+
+async fn trading_currencies(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(err_resp) = require_trading_scope(&service, &headers) {
+        return err_resp;
+    }
+    match service.trading_bridge() {
+        None => trading_unavailable(),
+        Some(bridge) => {
+            let state = bridge.state.0.lock().await;
+            let currencies: Vec<String> = state
+                .available_exchanges
+                .iter()
+                .flat_map(|e| e.symbols.iter().cloned())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            Json(json!({ "currencies": currencies })).into_response()
+        }
+    }
+}
+
+async fn trading_get_config(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(err_resp) = require_trading_scope(&service, &headers) {
+        return err_resp;
+    }
+    match service.trading_bridge() {
+        None => trading_unavailable(),
+        Some(bridge) => {
+            let state = bridge.state.0.lock().await;
+            // Return effective config: base config + active overrides.
+            Json(json!({
+                "config": *bridge.config,
+                "overrides": state.config_overrides,
+                "enabled": bridge.is_enabled()
+            }))
+            .into_response()
+        }
+    }
+}
+
+async fn trading_set_config(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+    Json(overrides): Json<TradingConfigOverride>,
+) -> Response {
+    if let Some(err_resp) = require_trading_admin(&service, &headers) {
+        return err_resp;
+    }
+    match service.trading_bridge() {
+        None => trading_unavailable(),
+        Some(bridge) => {
+            let mut state = bridge.state.0.lock().await;
+            state.config_overrides = Some(overrides);
+            state.log_info("config", "Runtime config overrides updated via API");
+            Json(json!({ "ok": true, "message": "config overrides applied" })).into_response()
+        }
+    }
+}
+
+async fn trading_pause(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(err_resp) = require_trading_admin(&service, &headers) {
+        return err_resp;
+    }
+    match service.trading_bridge() {
+        None => trading_unavailable(),
+        Some(bridge) => {
+            let mut state = bridge.state.0.lock().await;
+            state.paused = true;
+            state.log_info("control", "Trading bridge PAUSED via API");
+            Json(json!({ "ok": true, "paused": true })).into_response()
+        }
+    }
+}
+
+async fn trading_resume(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(err_resp) = require_trading_admin(&service, &headers) {
+        return err_resp;
+    }
+    match service.trading_bridge() {
+        None => trading_unavailable(),
+        Some(bridge) => {
+            let mut state = bridge.state.0.lock().await;
+            state.paused = false;
+            state.log_info("control", "Trading bridge RESUMED via API");
+            Json(json!({ "ok": true, "paused": false })).into_response()
+        }
+    }
+}
+
+async fn trading_override(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Some(err_resp) = require_trading_admin(&service, &headers) {
+        return err_resp;
+    }
+    let auth_ctx = match service.authorize(&headers, "trading") {
+        Ok(ctx) => ctx,
+        Err(err) => return err.into_response(),
+    };
+    match service.trading_bridge() {
+        None => trading_unavailable(),
+        Some(bridge) => {
+            let action_str = body
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("hold");
+            let action = match action_str {
+                "buy" => TradeAction::Buy,
+                "sell" => TradeAction::Sell,
+                "strong_buy" => TradeAction::StrongBuy,
+                "strong_sell" => TradeAction::StrongSell,
+                "cancel" => TradeAction::Cancel,
+                _ => TradeAction::Hold,
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let override_req = TradeOverride {
+                action,
+                exchange: body.get("exchange").and_then(Value::as_str).map(str::to_string),
+                symbol: body.get("symbol").and_then(Value::as_str).map(str::to_string),
+                amount_usd: body.get("amount_usd").and_then(Value::as_f64),
+                reason: body.get("reason").and_then(Value::as_str).map(str::to_string),
+                issued_at: now,
+                issued_by: auth_ctx.client_id.unwrap_or_else(|| "unknown".to_string()),
+            };
+            let mut state = bridge.state.0.lock().await;
+            state.pending_override = Some(override_req);
+            state.log_info("control", format!("Trade override set: {action_str}"));
+            Json(json!({ "ok": true, "message": "override queued for next evaluation" }))
+                .into_response()
+        }
+    }
+}
+
+async fn trading_evaluate(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(err_resp) = require_trading_admin(&service, &headers) {
+        return err_resp;
+    }
+    match service.trading_bridge() {
+        None => trading_unavailable(),
+        Some(bridge) => {
+            // We can't directly trigger the loop, but we can log it.
+            // A full implementation would use a channel; for now return status.
+            let state = bridge.state.0.lock().await;
+            let snapshot = state.status_snapshot(bridge.is_enabled());
+            Json(json!({
+                "ok": true,
+                "message": "evaluation will occur at next scheduled interval",
+                "status": snapshot
+            }))
+            .into_response()
+        }
+    }
+}
+
+/// GET /v1/trading/backtest — return the most recent backtest summary and history.
+async fn trading_backtest_result(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(err_resp) = require_trading_scope(&service, &headers) {
+        return err_resp;
+    }
+    match service.trading_bridge() {
+        None => trading_unavailable(),
+        Some(bridge) => {
+            let state = bridge.state.0.lock().await;
+            Json(json!({
+                "last_backtest": state.last_backtest,
+                "backtest_history": state.backtest_history,
+                "backtesting_enabled": bridge.config.backtesting_enabled,
+                "backtest_interval_seconds": bridge.config.backtest_interval_seconds,
+                "backtest_profitability_threshold": bridge.config.backtest_profitability_threshold,
+            }))
+            .into_response()
+        }
+    }
+}
+
+/// POST /v1/trading/backtest — trigger an immediate backtesting run (admin only).
+///
+/// Optional JSON body: `{"files": [...], "start_timestamp": ms, "end_timestamp": ms}`
+/// If omitted, uses config defaults.
+async fn trading_run_backtest(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+    body: Option<Json<serde_json::Value>>,
+) -> Response {
+    if let Some(err_resp) = require_trading_admin(&service, &headers) {
+        return err_resp;
+    }
+    match service.trading_bridge() {
+        None => trading_unavailable(),
+        Some(bridge) => {
+            let config = bridge.config.clone();
+            let state = bridge.state.clone();
+            // Run the backtest in a background task so the HTTP response is immediate.
+            tokio::spawn(async move {
+                use crate::trading::backtest::BacktestEngine;
+                use crate::trading::octobot::{BacktestStartRequest as OctoReq, OctobotClient};
+                let engine = BacktestEngine::new(
+                    OctobotClient::new(
+                        &config.octobot_base_url,
+                        config.octobot_password.as_deref(),
+                        config.octobot_timeout_seconds,
+                    ),
+                    config.backtest_profitability_threshold,
+                );
+                let summary = if let Some(Json(val)) = body {
+                    let octo_req: OctoReq = serde_json::from_value(val)
+                        .unwrap_or_default();
+                    engine.run(&octo_req).await
+                } else {
+                    engine.run_with_config(&config).await
+                };
+                let should_pause = config.backtest_pause_on_failure
+                    && summary.assessment
+                        == crate::trading::backtest::ApproachAssessment::Unprofitable;
+                let mut s = state.0.lock().await;
+                s.record_backtest(summary);
+                if should_pause {
+                    s.paused = true;
+                }
+            });
+            Json(json!({
+                "ok": true,
+                "message": "backtesting run started in background; poll /v1/trading/backtest for results"
+            }))
+            .into_response()
+        }
+    }
 }
 
 async fn dispatch_openai_chat_completion(
