@@ -12,32 +12,32 @@
         "privacy"
       ],
       "stats": {
-        "successes": 7,
+        "successes": 8,
         "failures": 0,
-        "total": 7,
-        "ewma_latency_ms": 0.1845703125,
-        "ewma_quality": 0.51990966796875,
+        "total": 8,
+        "ewma_latency_ms": 0.388427734375,
+        "ewma_quality": 0.5399322509765625,
         "last_status": "success",
         "last_error": null,
-        "updated_at": 1777558670.7865767
+        "updated_at": 1777820118.806434
       },
       "roles": {
         "general:general": {
-          "successes": 7,
+          "successes": 8,
           "failures": 0,
-          "total": 7,
-          "ewma_latency_ms": 0.1845703125,
-          "ewma_quality": 0.51990966796875,
+          "total": 8,
+          "ewma_latency_ms": 0.388427734375,
+          "ewma_quality": 0.5399322509765625,
           "last_status": "success",
           "last_error": null,
-          "updated_at": 1777558670.7865787
+          "updated_at": 1777820118.806438
         }
       },
       "health": {
         "ok": true,
-        "mode": "http",
-        "checked_at": 1777558670.7845404,
-        "latency_ms": 18,
+        "mode": "runtime_completion",
+        "checked_at": 1777820118.8075333,
+        "latency_ms": 1,
         "message": "ok"
       }
     },
@@ -77,11 +77,11 @@
       "health": {
         "ok": true,
         "mode": "http",
-        "checked_at": 1777380973.7656896,
-        "latency_ms": 1,
+        "checked_at": 1777820118.7771263,
+        "latency_ms": 0,
         "message": "ok"
       }
     }
   },
-  "updated_at": 1777558670.7865787
+  "updated_at": 1777820118.807534
 }

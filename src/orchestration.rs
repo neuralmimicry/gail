@@ -75,6 +75,13 @@ struct InvocationResult {
     score: f64,
 }
 
+#[derive(Clone, Debug)]
+struct RankedCandidate {
+    candidate: ProviderCandidate,
+    score: f64,
+    health_ok: bool,
+}
+
 impl GailService {
     pub async fn new(config: GailConfig) -> Result<Self> {
         let client = Client::builder()
@@ -390,22 +397,18 @@ impl GailService {
         }
         let mut ranked = Vec::new();
         for candidate in candidates.drain(..) {
-            let score = self
-                .rank_candidate(&candidate, &workflow, &role, &task_tags)
-                .await;
-            ranked.push((score, candidate));
+            ranked.push(
+                self.rank_candidate(candidate, &workflow, &role, &task_tags)
+                    .await,
+            );
         }
         ranked.sort_by(|left, right| {
             right
-                .0
-                .partial_cmp(&left.0)
+                .score
+                .partial_cmp(&left.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let selected = ranked
-            .into_iter()
-            .take(max_candidates.max(1))
-            .map(|(_, candidate)| candidate)
-            .collect::<Vec<_>>();
+        let selected = select_ranked_candidates(ranked, max_candidates.max(1));
         if selected.is_empty() {
             return Err(GailError::bad_request(
                 "no provider candidates were selected",
@@ -475,6 +478,19 @@ impl GailService {
                         None,
                     )
                     .await?;
+                self.inner
+                    .metrics
+                    .record_health(
+                        &candidate_summary,
+                        HealthBucket {
+                            ok: Some(true),
+                            mode: Some("runtime_completion".to_string()),
+                            checked_at: None,
+                            latency_ms: Some(response.latency_ms),
+                            message: Some("ok".to_string()),
+                        },
+                    )
+                    .await?;
                 successful.push(candidate_summary);
             } else {
                 self.inner
@@ -487,6 +503,13 @@ impl GailService {
                         result.latency_ms,
                         -1.0,
                         result.error.as_deref(),
+                    )
+                    .await?;
+                self.inner
+                    .metrics
+                    .record_health(
+                        &candidate_summary,
+                        runtime_failure_health_bucket(result.error.as_deref(), result.latency_ms),
                     )
                     .await?;
                 failures.push(
@@ -970,6 +993,9 @@ impl GailService {
             );
         }
         dedupe_candidates(candidates)
+            .into_iter()
+            .filter(provider_candidate_is_usable)
+            .collect()
     }
 
     fn request_candidate(
@@ -999,11 +1025,11 @@ impl GailService {
 
     async fn rank_candidate(
         &self,
-        candidate: &ProviderCandidate,
+        candidate: ProviderCandidate,
         workflow: &str,
         role: &str,
         task_tags: &HashSet<String>,
-    ) -> f64 {
+    ) -> RankedCandidate {
         let overlap = task_tags.intersection(&candidate.specialties).count() as f64;
         let role_score = if candidate.roles.is_empty() {
             0.0
@@ -1012,7 +1038,7 @@ impl GailService {
         } else {
             -0.9
         };
-        let health = self.probe_health(candidate).await;
+        let health = self.probe_health(&candidate).await;
         let health_score = if health.ok { 0.4 } else { -1.4 };
         let preferred_score = if candidate.preferred { 0.7 } else { 0.0 };
         let metrics_bonus = self
@@ -1020,12 +1046,16 @@ impl GailService {
             .metrics
             .score_bonus(candidate.candidate_id().as_str(), workflow, role)
             .await;
-        candidate.weight
-            + (overlap * 0.85)
-            + role_score
-            + health_score
-            + preferred_score
-            + metrics_bonus
+        RankedCandidate {
+            health_ok: health.ok,
+            score: candidate.weight
+                + (overlap * 0.85)
+                + role_score
+                + health_score
+                + preferred_score
+                + metrics_bonus,
+            candidate,
+        }
     }
 
     async fn probe_health(&self, candidate: &ProviderCandidate) -> ProviderHealth {
@@ -1176,71 +1206,102 @@ impl GailService {
             &["REFINER_AI_RETRY_EMPTY_OUTPUT", "GAIL_RETRY_EMPTY_OUTPUT"],
             true,
         );
-        let mut quota_attempts = 0usize;
-        let mut timeout_attempts = 0usize;
-        let mut attempts = 0usize;
-        loop {
-            attempts += 1;
-            let mut effective =
-                provider_request_from_profile(&candidate.profile, &provider_request);
-            if effective.timeout_seconds.is_none() {
-                effective.timeout_seconds = timeout_cap;
-            }
-            let started = std::time::Instant::now();
-            let adapter = match build_adapter(self.inner.client.clone(), &candidate.profile) {
-                Ok(adapter) => adapter,
-                Err(error) => {
-                    return InvocationResult {
-                        candidate,
-                        response: None,
-                        error: Some(error.to_string()),
-                        latency_ms: None,
-                        quality: -1.0,
-                        score: f64::NEG_INFINITY,
-                    };
+        let effective_timeout_seconds =
+            request_timeout_with_cap(provider_request.timeout_seconds, timeout_cap);
+        let timeout_window =
+            effective_timeout_seconds.map(|seconds| Duration::from_secs(seconds.max(1)));
+        let client = self.inner.client.clone();
+        let candidate_for_invocation = candidate.clone();
+        let provider_request_for_invocation = provider_request.clone();
+        let invocation = async move {
+            let mut quota_attempts = 0usize;
+            let mut timeout_attempts = 0usize;
+            let mut attempts = 0usize;
+            loop {
+                attempts += 1;
+                let mut effective = provider_request_from_profile(
+                    &candidate_for_invocation.profile,
+                    &provider_request_for_invocation,
+                );
+                effective.timeout_seconds = effective_timeout_seconds;
+                let started = std::time::Instant::now();
+                let adapter = match build_adapter(client.clone(), &candidate_for_invocation.profile)
+                {
+                    Ok(adapter) => adapter,
+                    Err(error) => {
+                        return InvocationResult {
+                            candidate: candidate_for_invocation.clone(),
+                            response: None,
+                            error: Some(error.to_string()),
+                            latency_ms: None,
+                            quality: -1.0,
+                            score: f64::NEG_INFINITY,
+                        };
+                    }
+                };
+                match adapter.complete(&effective).await {
+                    Ok(response) => {
+                        let latency_ms = started.elapsed().as_millis() as u64;
+                        if response.text.trim().is_empty() && retry_empty && attempts < 2 {
+                            continue;
+                        }
+                        let quality = quality_score(&response.text, expected_json);
+                        return InvocationResult {
+                            candidate: candidate_for_invocation.clone(),
+                            response: Some(response),
+                            error: None,
+                            latency_ms: Some(latency_ms),
+                            quality,
+                            score: f64::NEG_INFINITY,
+                        };
+                    }
+                    Err(error) => {
+                        let latency_ms = started.elapsed().as_millis() as u64;
+                        if error.is_quota() && quota_attempts < quota_retries {
+                            let delay = Duration::from_secs_f64(
+                                quota_backoff_base * 2_f64.powi(quota_attempts as i32),
+                            );
+                            quota_attempts += 1;
+                            sleep(delay).await;
+                            continue;
+                        }
+                        if error.is_timeout() && timeout_attempts < timeout_retries {
+                            let delay = Duration::from_secs_f64(
+                                timeout_backoff_base * 2_f64.powi(timeout_attempts as i32),
+                            );
+                            timeout_attempts += 1;
+                            sleep(delay).await;
+                            continue;
+                        }
+                        return InvocationResult {
+                            candidate: candidate_for_invocation.clone(),
+                            response: None,
+                            error: Some(error.to_string()),
+                            latency_ms: Some(latency_ms),
+                            quality: -1.0,
+                            score: f64::NEG_INFINITY,
+                        };
+                    }
                 }
+            }
+        };
+        if let Some(timeout_window) = timeout_window {
+            return match tokio::time::timeout(timeout_window, invocation).await {
+                Ok(result) => result,
+                Err(_) => InvocationResult {
+                    candidate,
+                    response: None,
+                    error: Some(format!(
+                        "candidate timed out after {}s",
+                        timeout_window.as_secs().max(1)
+                    )),
+                    latency_ms: Some(timeout_window.as_millis() as u64),
+                    quality: -1.0,
+                    score: f64::NEG_INFINITY,
+                },
             };
-            match adapter.complete(&effective).await {
-                Ok(response) => {
-                    let latency_ms = started.elapsed().as_millis() as u64;
-                    if response.text.trim().is_empty() && retry_empty && attempts < 2 {
-                        continue;
-                    }
-                    let quality = quality_score(&response.text, expected_json);
-                    return InvocationResult {
-                        candidate,
-                        response: Some(response),
-                        error: None,
-                        latency_ms: Some(latency_ms),
-                        quality,
-                        score: f64::NEG_INFINITY,
-                    };
-                }
-                Err(error) => {
-                    let latency_ms = started.elapsed().as_millis() as u64;
-                    if error.is_quota() && quota_attempts < quota_retries {
-                        let delay = quota_backoff_base * 2_f64.powi(quota_attempts as i32);
-                        quota_attempts += 1;
-                        sleep(Duration::from_secs_f64(delay)).await;
-                        continue;
-                    }
-                    if error.is_timeout() && timeout_attempts < timeout_retries {
-                        let delay = timeout_backoff_base * 2_f64.powi(timeout_attempts as i32);
-                        timeout_attempts += 1;
-                        sleep(Duration::from_secs_f64(delay)).await;
-                        continue;
-                    }
-                    return InvocationResult {
-                        candidate,
-                        response: None,
-                        error: Some(error.to_string()),
-                        latency_ms: Some(latency_ms),
-                        quality: -1.0,
-                        score: f64::NEG_INFINITY,
-                    };
-                }
-            }
         }
+        invocation.await
     }
 
     fn select_specialist(&self, name: Option<&str>) -> Result<&SpecialistEngine> {
@@ -1508,6 +1569,121 @@ fn dedupe_candidates(candidates: Vec<ProviderCandidate>) -> Vec<ProviderCandidat
     deduped
 }
 
+fn request_timeout_with_cap(request_timeout: Option<u64>, timeout_cap: Option<u64>) -> Option<u64> {
+    match (
+        request_timeout.map(|value| value.max(1)),
+        timeout_cap.map(|value| value.max(1)),
+    ) {
+        (Some(request_timeout), Some(timeout_cap)) => Some(request_timeout.min(timeout_cap)),
+        (Some(request_timeout), None) => Some(request_timeout),
+        (None, Some(timeout_cap)) => Some(timeout_cap),
+        (None, None) => None,
+    }
+}
+
+fn provider_candidate_is_usable(candidate: &ProviderCandidate) -> bool {
+    provider_profile_is_usable(&candidate.profile)
+}
+
+fn provider_profile_is_usable(profile: &ProviderProfile) -> bool {
+    let provider_type = normalize_provider_type(profile.provider_type.as_str());
+    if provider_type.trim().is_empty() {
+        return false;
+    }
+    match provider_type.as_str() {
+        "openai" => {
+            has_usable_value(profile.api_key.as_deref())
+                || env_has_usable_value(&["OPENAI_API_KEY"])
+        }
+        "nvidia" => {
+            has_usable_value(profile.api_key.as_deref())
+                || env_has_usable_value(&["NVIDIA_API_KEY"])
+        }
+        "gemini" => {
+            has_usable_value(profile.api_key.as_deref())
+                || has_usable_value(profile.access_token.as_deref())
+                || env_has_usable_value(&[
+                    "GEMINI_API_KEY",
+                    "GEMINI_ACCESS_TOKEN",
+                    "GOOGLE_ACCESS_TOKEN",
+                ])
+        }
+        "ollama" => true,
+        _ => true,
+    }
+}
+
+fn has_usable_value(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .map(|value| !matches!(value.as_str(), "none" | "null" | "nil" | "undefined"))
+        .unwrap_or(false)
+}
+
+fn env_has_usable_value(names: &[&str]) -> bool {
+    names
+        .iter()
+        .any(|name| has_usable_value(env::var(name).ok().as_deref()))
+}
+
+fn select_ranked_candidates(
+    ranked: Vec<RankedCandidate>,
+    max_candidates: usize,
+) -> Vec<ProviderCandidate> {
+    let target = max_candidates.max(1);
+    let mut selected = Vec::new();
+    let mut selected_ids = HashSet::new();
+
+    for health_ok in [true, false] {
+        let mut seen_provider_types = HashSet::new();
+        for item in ranked.iter().filter(|item| item.health_ok == health_ok) {
+            if !seen_provider_types.insert(item.candidate.provider_type.clone()) {
+                continue;
+            }
+            let candidate_id = item.candidate.candidate_id();
+            if selected_ids.insert(candidate_id) {
+                selected.push(item.candidate.clone());
+                if selected.len() == target {
+                    return selected;
+                }
+            }
+        }
+        for item in ranked.iter().filter(|item| item.health_ok == health_ok) {
+            let candidate_id = item.candidate.candidate_id();
+            if selected_ids.insert(candidate_id) {
+                selected.push(item.candidate.clone());
+                if selected.len() == target {
+                    return selected;
+                }
+            }
+        }
+    }
+
+    selected
+}
+
+fn runtime_failure_health_bucket(error: Option<&str>, latency_ms: Option<u64>) -> HealthBucket {
+    let lowered = error.unwrap_or_default().to_ascii_lowercase();
+    let mode = if lowered.contains("timeout") || lowered.contains("timed out") {
+        "timeout"
+    } else if lowered.contains("quota") || lowered.contains("rate limit") {
+        "quota"
+    } else if lowered.contains("not configured") || lowered.contains("unsupported") {
+        "unconfigured"
+    } else {
+        "runtime_error"
+    };
+    HealthBucket {
+        ok: Some(false),
+        mode: Some(mode.to_string()),
+        checked_at: None,
+        latency_ms,
+        message: error.map(ToOwned::to_owned),
+    }
+}
+
 fn infer_specialties(
     provider_type: &str,
     model: &str,
@@ -1703,7 +1879,10 @@ fn preview_labels(mut labels: Vec<String>, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ChatMessage, MessageContent};
+    use crate::{
+        config::ProviderProfile,
+        models::{ChatMessage, MessageContent},
+    };
 
     #[test]
     fn quality_score_prefers_valid_json() {
@@ -1728,5 +1907,70 @@ mod tests {
             content: MessageContent::Text("Return only valid JSON with keys: summary".to_string()),
         }];
         assert!(expected_json(&messages, None));
+    }
+
+    #[test]
+    fn request_timeout_with_cap_respects_lower_bound() {
+        assert_eq!(request_timeout_with_cap(Some(180), Some(45)), Some(45));
+        assert_eq!(request_timeout_with_cap(Some(30), Some(45)), Some(30));
+        assert_eq!(request_timeout_with_cap(None, Some(45)), Some(45));
+    }
+
+    #[test]
+    fn provider_profile_is_usable_rejects_none_markers() {
+        let nvidia = ProviderProfile {
+            provider_type: "nvidia".to_string(),
+            api_key: Some("nvapi-test".to_string()),
+            ..ProviderProfile::default()
+        };
+        assert!(!has_usable_value(Some("None")));
+        assert!(!has_usable_value(Some("null")));
+        assert!(provider_profile_is_usable(&nvidia));
+    }
+
+    #[test]
+    fn select_ranked_candidates_prefers_healthy_diverse_providers() {
+        fn ranked(
+            provider_type: &str,
+            model: &str,
+            score: f64,
+            health_ok: bool,
+        ) -> RankedCandidate {
+            RankedCandidate {
+                score,
+                health_ok,
+                candidate: ProviderCandidate::from_profile(ProviderProfile {
+                    name: format!("{provider_type}-{model}"),
+                    provider_type: provider_type.to_string(),
+                    model: Some(model.to_string()),
+                    api_key: Some("token".to_string()),
+                    base_url: Some("http://example.internal".to_string()),
+                    ..ProviderProfile::default()
+                }),
+            }
+        }
+
+        let selected = select_ranked_candidates(
+            vec![
+                ranked("nvidia", "moonshotai/kimi-k2-instruct-0905", 5.0, true),
+                ranked("nvidia", "minimaxai/minimax-m2.7", 4.9, true),
+                ranked("ollama", "llama3.2", 4.0, true),
+                ranked("openai", "gpt-4o-mini", 6.0, false),
+            ],
+            3,
+        );
+
+        let labels = selected
+            .iter()
+            .map(|candidate| candidate.candidate_id())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "nvidia/moonshotai/kimi-k2-instruct-0905".to_string(),
+                "ollama/llama3.2".to_string(),
+                "nvidia/minimaxai/minimax-m2.7".to_string(),
+            ]
+        );
     }
 }

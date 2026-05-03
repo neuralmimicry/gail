@@ -291,6 +291,8 @@ impl GailConfig {
                 "server.bind_addr must not be empty",
             ));
         }
+        self.server.public_base_url =
+            normalize_optional_url(self.server.public_base_url.as_deref());
         if self.orchestration.max_parallel_candidates == 0 {
             self.orchestration.max_parallel_candidates = 1;
         }
@@ -315,13 +317,35 @@ impl GailConfig {
             self.storage.metrics_path = "data/provider_metrics.json".to_string();
         }
         for provider in &mut self.providers {
+            provider.provider_type =
+                normalize_optional_string(Some(provider.provider_type.as_str()))
+                    .unwrap_or_default();
+            provider.model = normalize_optional_string(provider.model.as_deref());
+            provider.api_key = normalize_optional_string(provider.api_key.as_deref());
+            provider.access_token = normalize_optional_string(provider.access_token.as_deref());
+            provider.base_url = normalize_optional_url(provider.base_url.as_deref());
+            provider.roles = provider
+                .roles
+                .iter()
+                .filter_map(|item| normalize_optional_string(Some(item.as_str())))
+                .collect();
+            provider.specialties = provider
+                .specialties
+                .iter()
+                .filter_map(|item| normalize_optional_string(Some(item.as_str())))
+                .collect();
+            provider.source = normalize_optional_string(provider.source.as_deref());
             if provider.source.is_none() {
                 provider.source = Some("config".to_string());
             }
+            provider.name = normalize_optional_string(Some(provider.name.as_str()))
+                .unwrap_or_else(|| provider.provider_type.clone());
             if provider.name.trim().is_empty() {
                 provider.name = provider.provider_type.clone();
             }
         }
+        self.providers
+            .retain(|provider| !provider.provider_type.trim().is_empty());
         for specialist in &mut self.specialists {
             if specialist.name.trim().is_empty() {
                 specialist.name = "AARNN".to_string();
@@ -336,10 +360,12 @@ impl GailConfig {
 }
 
 fn normalize_optional_string(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+    let cleaned = value.map(str::trim).filter(|value| !value.is_empty())?;
+    let lowered = cleaned.to_ascii_lowercase();
+    if matches!(lowered.as_str(), "none" | "null" | "nil" | "undefined") {
+        return None;
+    }
+    Some(cleaned.to_owned())
 }
 
 fn normalize_optional_url(value: Option<&str>) -> Option<String> {
