@@ -33,7 +33,7 @@ use crate::{
         SpecialistEngine, analyze_specialist_engines, build_specialist_engines,
         specialist_engine_summaries,
     },
-    trading::TradingBridge,
+    trading::{TradingBridge, TradingBridgeHandle},
 };
 
 const PROVIDER_HEALTH_TIMEOUT_SECONDS: u64 = 4;
@@ -43,7 +43,6 @@ pub struct GailService {
     inner: Arc<GailServiceInner>,
 }
 
-#[derive(Clone)]
 struct GailServiceInner {
     config: GailConfig,
     client: Client,
@@ -51,6 +50,7 @@ struct GailServiceInner {
     specialists: Vec<SpecialistEngine>,
     aarnn_bridge: Option<AarnnMirrorClient>,
     trading_bridge: Option<TradingBridge>,
+    _trading_bridge_handle: Option<TradingBridgeHandle>,
 }
 
 #[derive(Clone, Debug)]
@@ -104,21 +104,18 @@ impl GailService {
                 specialists: specialists.clone(),
                 aarnn_bridge: aarnn_bridge.clone(),
                 trading_bridge: None,
+                _trading_bridge_handle: None,
             }),
         };
 
         // Start trading bridge if configured.
-        let trading_bridge = if config.trading.is_viable() {
+        let (trading_bridge, trading_bridge_handle) = if config.trading.is_viable() {
             tracing::info!("trading: bridge is enabled — starting background loop");
             let trading_cfg = config.trading.clone();
-            let (bridge, _handle) = TradingBridge::start(trading_cfg, preliminary).await;
-            // Note: _handle is dropped here; the background task keeps running because
-            // tokio::spawn holds it. The bridge background task will only stop when
-            // GailService is dropped (shutdown). For a clean shutdown we would store
-            // _handle, but for now the task runs for the lifetime of the process.
-            Some(bridge)
+            let (bridge, handle) = TradingBridge::start(trading_cfg, preliminary).await;
+            (Some(bridge), Some(handle))
         } else {
-            None
+            (None, None)
         };
 
         Ok(Self {
@@ -129,6 +126,7 @@ impl GailService {
                 specialists,
                 aarnn_bridge,
                 trading_bridge,
+                _trading_bridge_handle: trading_bridge_handle,
             }),
         })
     }
