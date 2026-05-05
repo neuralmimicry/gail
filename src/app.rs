@@ -60,6 +60,34 @@ enum OpenAIResolvedRoute {
     },
 }
 
+#[derive(Clone, Debug, Default)]
+struct OpenAIToolContext {
+    tool_names: Vec<String>,
+}
+
+impl OpenAIToolContext {
+    fn from_tools(tools: Option<&Value>) -> Option<Self> {
+        let tool_names = tools
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(openai_tool_name)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        (!tool_names.is_empty()).then_some(Self { tool_names })
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.tool_names.iter().any(|tool| tool == name)
+    }
+
+    fn first_name(&self) -> Option<&str> {
+        self.tool_names.first().map(String::as_str)
+    }
+}
+
 pub fn build_router(service: GailService) -> Router {
     Router::new()
         .route("/healthz", get(health))
@@ -131,12 +159,18 @@ async fn openai_chat_completions(
         return openai_error_response(error);
     }
     let stream_response = request.stream.unwrap_or(false);
+    let tool_context = OpenAIToolContext::from_tools(request.tools.as_ref());
     match dispatch_openai_chat_completion(&service, request).await {
         Ok((public_model, response)) => {
             if stream_response {
                 openai_chat_completion_stream(public_model, response).into_response()
             } else {
-                Json(openai_chat_completion_body(&public_model, &response)).into_response()
+                Json(openai_chat_completion_body(
+                    &public_model,
+                    &response,
+                    tool_context.as_ref(),
+                ))
+                .into_response()
             }
         }
         Err(error) => openai_error_response(error),
@@ -877,6 +911,7 @@ async fn dispatch_openai_chat_completion(
         system_from_messages,
         request.instructions,
         response_format_system_hint(request.response_format.as_ref()),
+        tool_call_system_hint(request.tools.as_ref()),
         route_system_suffix(&route),
     ]);
 
@@ -1362,6 +1397,15 @@ fn extract_image_url(object: &serde_json::Map<String, Value>) -> Option<String> 
         })
 }
 
+fn openai_tool_name(tool: &Value) -> Option<String> {
+    tool.get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .or_else(|| tool.get("name").and_then(Value::as_str))
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| name.trim().to_string())
+}
+
 fn response_format_system_hint(format: Option<&OpenAIResponseFormat>) -> Option<String> {
     let format = format?;
     let kind = format
@@ -1385,6 +1429,14 @@ fn response_format_system_hint(format: Option<&OpenAIResponseFormat>) -> Option<
         ));
     }
     None
+}
+
+fn tool_call_system_hint(tools: Option<&Value>) -> Option<String> {
+    let context = OpenAIToolContext::from_tools(tools)?;
+    Some(format!(
+        "The caller supplied OpenAI tools. If a tool should be used, return only valid JSON in this exact shape: {{\"tool_name\":\"<one of: {}>\",\"arguments\":{{...}}}}. Do not return bare tool arguments or prose.",
+        context.tool_names.join(", ")
+    ))
 }
 
 fn route_request_category(
@@ -1919,7 +1971,135 @@ fn openai_responses_stream(
     Sse::new(stream::iter(events))
 }
 
-fn openai_chat_completion_body(public_model: &str, response: &CompletionResponse) -> Value {
+fn synthesize_openai_tool_call(
+    request_id: &str,
+    text: &str,
+    context: &OpenAIToolContext,
+) -> Option<Value> {
+    let parsed = extract_json_value(text);
+    let (tool_name, arguments) = match parsed {
+        Some(Value::Object(object)) => tool_call_from_object(object, context)?,
+        _ if text.contains("<finish>") || text.contains("</finish>") => {
+            ("finish".to_string(), json!({}))
+        }
+        _ => return None,
+    };
+    if !context.contains(&tool_name) {
+        return None;
+    }
+    let arguments = match arguments {
+        Value::Object(_) => arguments,
+        Value::String(raw) => serde_json::from_str::<Value>(&raw)
+            .ok()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({})),
+        Value::Null => json!({}),
+        _ => json!({ "value": arguments }),
+    };
+    let arguments_text = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
+    Some(json!({
+        "id": format!("call_{}_0", sanitize_openai_id_fragment(request_id)),
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "arguments": arguments_text,
+        }
+    }))
+}
+
+fn tool_call_from_object(
+    object: serde_json::Map<String, Value>,
+    context: &OpenAIToolContext,
+) -> Option<(String, Value)> {
+    if let Some(tool_name) = object.get("tool_name").and_then(Value::as_str) {
+        let arguments = object
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        return Some((tool_name.to_string(), arguments));
+    }
+    if let Some(function) = object.get("function").and_then(Value::as_object)
+        && let Some(tool_name) = function.get("name").and_then(Value::as_str)
+    {
+        let arguments = function
+            .get("arguments")
+            .cloned()
+            .or_else(|| object.get("arguments").cloned())
+            .unwrap_or_else(|| json!({}));
+        return Some((tool_name.to_string(), arguments));
+    }
+    if let Some(tool_calls) = object.get("tool_calls").and_then(Value::as_array)
+        && let Some(Value::Object(first)) = tool_calls.first()
+    {
+        return tool_call_from_object(first.clone(), context);
+    }
+    if object.is_empty() && context.contains("finish") {
+        return Some(("finish".to_string(), json!({})));
+    }
+    if object.contains_key("team_name") || object.contains_key("current_results") {
+        if context.contains("finish") {
+            return Some(("finish".to_string(), json!({})));
+        }
+    }
+    if object.contains_key("agent_name") && context.contains("run_agent") {
+        return Some(("run_agent".to_string(), Value::Object(object)));
+    }
+    if (object.contains_key("debator_agent_names") || object.contains_key("judge_agent_name"))
+        && context.contains("run_debate")
+    {
+        return Some(("run_debate".to_string(), Value::Object(object)));
+    }
+    let first_name = context.first_name()?;
+    if context.tool_names.len() == 1 {
+        return Some((first_name.to_string(), Value::Object(object)));
+    }
+    None
+}
+
+fn extract_json_value(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    serde_json::from_str::<Value>(trimmed).ok().or_else(|| {
+        let start = trimmed.find(|ch| ch == '{' || ch == '[')?;
+        let end = trimmed.rfind(|ch| ch == '}' || ch == ']')?;
+        if end <= start {
+            return None;
+        }
+        serde_json::from_str::<Value>(&trimmed[start..=end]).ok()
+    })
+}
+
+fn sanitize_openai_id_fragment(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect::<String>()
+}
+
+fn openai_chat_completion_body(
+    public_model: &str,
+    response: &CompletionResponse,
+    tool_context: Option<&OpenAIToolContext>,
+) -> Value {
+    let synthesized_tool_call = tool_context.and_then(|context| {
+        synthesize_openai_tool_call(&response.request_id, response.text.as_str(), context)
+    });
+    let (message, finish_reason) = match synthesized_tool_call {
+        Some(tool_call) => (
+            json!({
+                "role": "assistant",
+                "content": Value::Null,
+                "tool_calls": [tool_call],
+            }),
+            "tool_calls",
+        ),
+        None => (
+            json!({
+                "role": "assistant",
+                "content": response.text,
+            }),
+            "stop",
+        ),
+    };
     json!({
         "id": format!("chatcmpl_{}", response.request_id),
         "object": "chat.completion",
@@ -1928,11 +2108,8 @@ fn openai_chat_completion_body(public_model: &str, response: &CompletionResponse
         "choices": [
             {
                 "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": response.text,
-                },
-                "finish_reason": "stop",
+                "message": message,
+                "finish_reason": finish_reason,
             }
         ],
         "usage": openai_usage_body(response.usage.as_ref()),
@@ -2288,6 +2465,79 @@ mod tests {
         assert_eq!(payload["choices"][0]["message"]["content"], "mocked answer");
         assert_eq!(payload["gail"]["provider"], "ollama");
         assert_eq!(payload["gail"]["resolved_model"], "llama3.2");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_synthesizes_tool_calls_for_octobot_tools() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "{\"agent_name\":\"SignalAIAgentProducer\"}",
+                "prompt_eval_count": 8,
+                "eval_count": 5
+            })))
+            .mount(&server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/llama3.2",
+                            "base_url": server.uri(),
+                            "messages": [
+                                {"role": "user", "content": "choose the next team tool"}
+                            ],
+                            "tools": [{
+                                "type": "function",
+                                "function": {
+                                    "name": "run_agent",
+                                    "description": "Run a specific agent",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {
+                                            "agent_name": {"type": "string"}
+                                        },
+                                        "required": ["agent_name"]
+                                    }
+                                }
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+        let choice = &payload["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls");
+        assert!(choice["message"]["content"].is_null());
+        assert_eq!(
+            choice["message"]["tool_calls"][0]["function"]["name"],
+            "run_agent"
+        );
+        let args: Value = serde_json::from_str(
+            choice["message"]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .expect("arguments string"),
+        )
+        .expect("arguments json");
+        assert_eq!(args["agent_name"], "SignalAIAgentProducer");
     }
 
     #[tokio::test]

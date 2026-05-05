@@ -6,7 +6,7 @@
 ///  3. Consults all configured AI providers in parallel (TradingAdvisor)
 ///  4. Applies Type-2 fuzzy logic (FuzzyEngine)
 ///  5. Blends fuzzy + AI signals into a decision (DecisionEngine)
-///  6. Executes micro-trades via the OctoBot API
+///  6. Executes only through supported OctoBot trading/command bridges
 ///  7. Logs all activity in a ring-buffer (SharedTradingState)
 ///  8. Persists state to disk periodically
 ///

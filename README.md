@@ -165,7 +165,7 @@ Gail HTTP Server
 Each evaluation runs the following pipeline steps in sequence:
 
 **Step 1 — Market data** (`octobot.rs`)
-OctoBot is queried for market snapshots (price, 24 h change %, 24 h volume), the current portfolio (per-currency balances and USD values), and open orders. OctoBot uses session-cookie authentication; the client re-logs in at startup and on 401 responses. Up to 20 snapshots are fetched across all configured exchanges and currency filters.
+OctoBot is queried for market snapshots (price, 24 h change %, 24 h volume), portfolio totals where available, and open orders. The client probes `/api/ping` at startup; Continuum deployments normally keep OctoBot native web auth disabled behind shared ingress auth, so Gail does not attempt the old non-existent JSON password-login endpoint. Up to 20 snapshots are fetched across all configured exchanges and currency filters.
 
 **Step 2 — Research** (`refiner.rs`)
 The highest-signal market snapshot (scored by `|Δ%| × ln(volume+1)`) is used to build a Refiner RAG query from the `research_query_template`. Refiner's `/api/rag/query` endpoint returns ranked context passages (default top 5). The research context is passed verbatim to the AI advisors and contributes a sentiment signal to the fuzzy engine.
@@ -216,9 +216,9 @@ Action thresholds on the blended signal:
 - otherwise → `hold`
 
 **Step 6 — Execution** (`mod.rs`)
-`place_buy_order` / `place_sell_order` is called on OctoBot via the session-authenticated client. Results (order ID, price, status) are recorded to the trade ring buffer.
+Direct `place_buy_order` / `place_sell_order` calls return an explicit unsupported error because OctoBot's current web API exposes order cancellation and trading-mode/user-command surfaces, not direct market-order placement. Live execution should be routed through a supported OctoBot trading mode or command bridge before operator overrides or autonomous trades are enabled.
 
-**Override mechanism**: if `TradingState.pending_override` is set via `POST /v1/trading/override`, the decision pipeline is bypassed and the override trade is executed directly with `confidence = 1.0`. The override is cleared after execution.
+**Override mechanism**: if `TradingState.pending_override` is set via `POST /v1/trading/override`, the decision pipeline is bypassed and the override decision is attempted with `confidence = 1.0`. The override is cleared after the attempt.
 
 ### State and Persistence
 
@@ -245,7 +245,7 @@ State is persisted to `data_path` (default `./data/trading_state.json`) every 5 
 | `src/trading/mod.rs` | `TradingBridge`, background loop, evaluation pipeline, execution |
 | `src/trading/config.rs` | `TradingConfig`, `TradingConfigOverride` |
 | `src/trading/state.rs` | `TradingState`, `SharedTradingState`, ring buffers, persistence |
-| `src/trading/octobot.rs` | `OctobotClient` — session auth, market data, portfolio, orders |
+| `src/trading/octobot.rs` | `OctobotClient` — OctoBot web API probe, market data, portfolio totals, orders |
 | `src/trading/refiner.rs` | `RefinerClient` — RAG research queries |
 | `src/trading/fuzzy.rs` | `FuzzyEngine` — Type-2 interval fuzzy logic, 25 rules, Karnik-Mendel |
 | `src/trading/advisor.rs` | `TradingAdvisor` — parallel multi-AI advisory, consensus aggregation |
@@ -257,7 +257,7 @@ State is persisted to `data_path` (default `./data/trading_state.json`) every 5 
 trading:
   enabled: false                          # master switch
   octobot_base_url: "${GAIL_TRADING_OCTOBOT_URL}"
-  octobot_password: "${GAIL_TRADING_OCTOBOT_PASSWORD}"
+  octobot_password: null                   # only for native OctoBot web auth
   refiner_base_url: "${GAIL_TRADING_REFINER_URL}"
   refiner_api_token: "${GAIL_TRADING_REFINER_TOKEN}"
   admin_client_ids: ["pbisaacs"]          # write-access list
@@ -313,6 +313,8 @@ The Ansible role (`roles/continuum_tenant_gail`) exposes the following defaults 
 | `continuum_tenant_gail_trading_enabled` | `false` | Enable the bridge |
 | `continuum_tenant_gail_trading_octobot_url` | cluster-local OctoBot | OctoBot base URL |
 | `continuum_tenant_gail_trading_octobot_api_key` | secret file lookup | OctoBot API key |
+| `continuum_tenant_gail_trading_octobot_password` | env / secret / API key fallback | Native OctoBot web-auth password, only passed when native web auth is enabled |
+| `continuum_tenant_gail_trading_octobot_native_web_auth_enable` | OctoBot role auth flag | Whether to pass an OctoBot native web-auth password to Gail |
 | `continuum_tenant_gail_trading_refiner_url` | cluster-local Refiner | Refiner base URL |
 | `continuum_tenant_gail_trading_refiner_token` | secret file lookup | Refiner API token |
 | `continuum_tenant_gail_trading_admin_token` | env / secret file | `pbisaacs` bearer token with `trading` + `trading_admin` scopes |

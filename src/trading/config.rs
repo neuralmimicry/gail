@@ -12,7 +12,8 @@ pub struct TradingConfig {
     /// Base URL of the OctoBot web service (e.g. `http://octobot.octobot.svc.cluster.local:5001`).
     pub octobot_base_url: String,
 
-    /// OctoBot login password used for session-based API access.
+    /// Optional OctoBot native web-auth password.
+    /// Leave unset for shared-auth deployments where `/api/ping` is reachable.
     pub octobot_password: Option<String>,
 
     /// Base URL for the Refiner RAG service.

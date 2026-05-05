@@ -15,7 +15,7 @@ mod tests {
 
     use crate::trading::advisor::{AiAdvice, AiConsensus};
     use crate::trading::config::{TradingConfig, TradingConfigOverride};
-    use crate::trading::decision::{DecisionEngine, TradeDecision};
+    use crate::trading::decision::DecisionEngine;
     use crate::trading::fuzzy::{FuzzyEngine, FuzzyInputs};
     use crate::trading::octobot::{
         CurrencyBalance, MarketSnapshot, OctobotOrder, OctobotPortfolio,
@@ -480,7 +480,6 @@ mod tests {
 
     #[tokio::test]
     async fn shared_state_persist_and_restore() {
-        use crate::trading::state::TradingState;
         let state = SharedTradingState::new(100, 50);
 
         // Write some data.
@@ -1494,10 +1493,164 @@ mod tests {
     // =======================================================================
 
     use crate::trading::backtest::{ApproachAssessment, BacktestEngine, BacktestSummary};
-    use crate::trading::octobot::{BacktestRunReport, BacktestStartRequest, OctobotClient};
+    use crate::trading::octobot::{BacktestStartRequest, OctobotClient};
     use std::time::Duration;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{method, path, path_regex, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn octobot_client_login_probes_ping_without_legacy_account_login() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/ping"))
+            .respond_with(ResponseTemplate::new(200).set_body_json("Running since 2026-05-05."))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/login"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("legacy endpoint used"))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), Some("shared-auth-password"), 10.0);
+        let result = client.login().await;
+        assert!(result.is_ok(), "login should probe /api/ping: {result:?}");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_get_open_orders_parses_current_octobot_shape() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "orders": [{
+                    "id": "order-1",
+                    "exchange": "binance",
+                    "symbol": "BTC/USDT",
+                    "type": "BUY LIMIT",
+                    "amount": 0.01,
+                    "price": 65000.0,
+                    "status": "Real",
+                    "time": 1_777_777_777.0
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let orders = client.get_open_orders().await.unwrap();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].id, "order-1");
+        assert_eq!(orders[0].side, "buy");
+        assert_eq!(orders[0].order_type, "BUY LIMIT");
+        assert_eq!(orders[0].timestamp, Some(1_777_777_777.0));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_get_exchange_info_uses_first_exchange_and_configured_symbols() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/exchanges"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/first_exchange_details"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exchange_name": "binance",
+                "exchange_id": "binance-id"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/get_config_currency"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Bitcoin": {
+                    "enabled": true,
+                    "pairs": ["BTC/USDT", "BTC/USDC"]
+                },
+                "Ethereum": {
+                    "enabled": false,
+                    "pairs": ["ETH/USDT"]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let exchanges = client.get_exchange_info().await.unwrap();
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(exchanges[0].name, "binance");
+        assert_eq!(
+            exchanges[0].symbols,
+            vec!["BTC/USDC".to_string(), "BTC/USDT".to_string()]
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_get_market_snapshot_uses_dashboard_graph_fallback() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/market/ticker"))
+            .and(query_param("exchange", "binance"))
+            .and(query_param("symbol", "BTC/USDT"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/dashboard/watched_symbol/BTC(%7C|\|)USDT$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exchange_id": "binance-id",
+                "time_frame": "1h"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/dashboard/currency_price_graph_update/binance-id/BTC(%7C|\|)USDT/1h/live$",
+            ))
+            .and(query_param("display_orders", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "candles": {
+                    "close": [100.0, 110.0],
+                    "high": [101.0, 112.0],
+                    "low": [99.0, 105.0],
+                    "volume": [10.0, 15.0]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let snapshot = client
+            .get_market_snapshot("binance", "BTC/USDT")
+            .await
+            .unwrap();
+        assert_eq!(snapshot.exchange, "binance");
+        assert_eq!(snapshot.symbol, "BTC/USDT");
+        assert_eq!(snapshot.price, 110.0);
+        assert_eq!(snapshot.price_change_pct_24h, Some(10.0));
+        assert_eq!(snapshot.volume_24h, Some(25.0));
+        assert_eq!(snapshot.high_24h, Some(112.0));
+        assert_eq!(snapshot.low_24h, Some(99.0));
+        server.verify().await;
+    }
 
     // -----------------------------------------------------------------------
     // Helper: build an OctoBot-format backtest report response body.
@@ -1642,6 +1795,23 @@ mod tests {
                 ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({ "backtesting_id": 42 })),
             )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let run_id = client.get_backtest_run_id().await;
+        assert_eq!(run_id.unwrap(), Some(42));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn backtest_client_get_run_id_accepts_raw_numeric_body() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting_run_id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(42))
             .expect(1)
             .mount(&server)
             .await;

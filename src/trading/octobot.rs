@@ -1,13 +1,15 @@
 /// OctoBot REST API client.
 ///
-/// OctoBot exposes its web interface on port 5001.  Authentication is done
-/// via a session login (POST /api/accounts/login) that returns a session
-/// cookie, which is then attached to subsequent requests.  We also support
-/// the unofficial `Authorization: Basic` header approach as a fallback.
+/// OctoBot exposes its web interface on port 5001.  Current OctoBot web API
+/// routes are Flask endpoints under `/api/*` plus dashboard/backtesting routes.
+/// The cluster deployment keeps native OctoBot web auth disabled behind
+/// shared ingress auth, so the bridge treats `/api/ping` as the session probe.
 ///
 /// Endpoint coverage:
 ///   Portfolio, open orders, trade history, exchange/symbol listings,
-///   order placement and cancellation, and general status.
+///   order cancellation, market snapshots, and general status. Direct market
+///   order placement is intentionally refused until a supported OctoBot
+///   trading-mode or user-command bridge is configured.
 use std::time::Duration;
 
 use reqwest::{Client, ClientBuilder, StatusCode};
@@ -129,28 +131,86 @@ impl OctobotClient {
         }
     }
 
-    /// Authenticate with OctoBot and establish a session cookie.
-    pub async fn login(&self) -> Result<(), String> {
-        let Some(ref password) = self.password else {
-            return Ok(()); // no auth configured — assume open instance
-        };
-        let url = format!("{}/api/accounts/login", self.base_url);
-        let body = json!({ "password": password });
+    async fn get_json(&self, path: &str, label: &str) -> Result<Value, String> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("OctoBot {label} request failed: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!(
+                "OctoBot {label} failed: HTTP {}: {}",
+                status.as_u16(),
+                text.trim()
+            ));
+        }
+        serde_json::from_str(&text).map_err(|e| format!("OctoBot {label} parse failed: {e}"))
+    }
+
+    async fn get_optional_json(&self, path: &str, label: &str) -> Result<Option<Value>, String> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("OctoBot {label} request failed: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if status == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(format!(
+                "OctoBot {label} failed: HTTP {}: {}",
+                status.as_u16(),
+                text.trim()
+            ));
+        }
+        let parsed = serde_json::from_str(&text)
+            .map_err(|e| format!("OctoBot {label} parse failed: {e}"))?;
+        Ok(Some(parsed))
+    }
+
+    async fn post_json_with_status(
+        &self,
+        path: &str,
+        body: &Value,
+        label: &str,
+    ) -> Result<(StatusCode, Value), String> {
+        let url = format!("{}{}", self.base_url, path);
         let resp = self
             .client
             .post(&url)
-            .json(&body)
+            .json(body)
             .send()
             .await
-            .map_err(|e| format!("OctoBot login request failed: {e}"))?;
-        if resp.status().is_success() {
-            debug!("trading: OctoBot session established");
-            Ok(())
+            .map_err(|e| format!("OctoBot {label} request failed: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let parsed = if text.trim().is_empty() {
+            Value::Null
         } else {
-            Err(format!(
-                "OctoBot login rejected: HTTP {}",
-                resp.status().as_u16()
-            ))
+            serde_json::from_str(&text).unwrap_or_else(|_| json!({ "message": text }))
+        };
+        Ok((status, parsed))
+    }
+
+    /// Authenticate with OctoBot and establish a session cookie.
+    pub async fn login(&self) -> Result<(), String> {
+        match self.get_json("/api/ping", "ping").await {
+            Ok(_) => {
+                debug!("trading: OctoBot web API is reachable");
+                Ok(())
+            }
+            Err(err) if self.password.is_some() => Err(format!(
+                "{err}. OctoBot does not expose a JSON password-login endpoint; disable octobot_password for shared-auth cluster deployments or expose an authenticated API session."
+            )),
+            Err(err) => Err(err),
         }
     }
 
@@ -159,31 +219,17 @@ impl OctobotClient {
     // -----------------------------------------------------------------------
 
     pub async fn get_status(&self) -> Result<OctobotStatus, String> {
-        let url = format!("{}/api/status", self.base_url);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("OctoBot status request failed: {e}"))?;
-        let body: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("OctoBot status parse failed: {e}"))?;
+        let ping = self.get_json("/api/ping", "ping").await?;
+        let version = self
+            .get_optional_json("/api/version", "version")
+            .await?
+            .and_then(|body| body.as_str().map(str::to_string));
         Ok(OctobotStatus {
-            running: body
-                .get("running")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            version: body
-                .get("version")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            uptime_seconds: body.get("uptime").and_then(Value::as_f64),
-            trading_enabled: body
-                .get("trading_enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            running: true,
+            version,
+            uptime_seconds: None,
+            trading_enabled: ping.as_str().is_some_and(|value| value.contains("Running"))
+                || !ping.is_null(),
         })
     }
 
@@ -192,17 +238,25 @@ impl OctobotClient {
     // -----------------------------------------------------------------------
 
     pub async fn get_portfolio(&self) -> Result<OctobotPortfolio, String> {
-        let url = format!("{}/api/portfolio", self.base_url);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("OctoBot portfolio request failed: {e}"))?;
-        let body: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("OctoBot portfolio parse failed: {e}"))?;
+        let body = match self
+            .get_optional_json("/api/portfolio", "portfolio")
+            .await?
+        {
+            Some(body) => body,
+            None => {
+                let mut portfolio = OctobotPortfolio::default();
+                if let Some(body) = self
+                    .get_optional_json(
+                        "/api/historical_portfolio_value?currency=USDT",
+                        "historical portfolio",
+                    )
+                    .await?
+                {
+                    portfolio.total_value_usd = parse_latest_portfolio_value(&body);
+                }
+                return Ok(portfolio);
+            }
+        };
         let mut portfolio = OctobotPortfolio::default();
         if let Some(currencies) = body.as_object() {
             for (symbol, data) in currencies {
@@ -227,33 +281,15 @@ impl OctobotClient {
     // -----------------------------------------------------------------------
 
     pub async fn get_open_orders(&self) -> Result<Vec<OctobotOrder>, String> {
-        let url = format!("{}/api/orders", self.base_url);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("OctoBot open orders request failed: {e}"))?;
-        let body: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("OctoBot open orders parse failed: {e}"))?;
+        let body = self.get_json("/api/orders", "open orders").await?;
         parse_orders_array(&body)
     }
 
     pub async fn get_trade_history(&self, limit: usize) -> Result<Vec<OctobotTrade>, String> {
-        let url = format!("{}/api/trades?limit={}", self.base_url, limit);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("OctoBot trade history request failed: {e}"))?;
-        let body: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("OctoBot trade history parse failed: {e}"))?;
-        parse_trades_array(&body)
+        let body = self.get_json("/api/trades", "trade history").await?;
+        let mut trades = parse_trades_array(&body)?;
+        trades.truncate(limit);
+        Ok(trades)
     }
 
     pub async fn place_buy_order(
@@ -281,68 +317,21 @@ impl OctobotClient {
         side: &str,
         amount_usd: f64,
     ) -> Result<OctobotOrderResult, String> {
-        let url = format!("{}/api/orders", self.base_url);
-        let body = json!({
-            "exchange": exchange,
-            "symbol": symbol,
-            "side": side,
-            "amount": amount_usd,
-            "type": "market"
-        });
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("OctoBot place order request failed: {e}"))?;
-        let status = resp.status();
-        let data: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("OctoBot place order response parse failed: {e}"))?;
-        if status.is_success() {
-            Ok(OctobotOrderResult {
-                order_id: data
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string(),
-                symbol: symbol.to_string(),
-                side: side.to_string(),
-                amount: amount_usd,
-                price: data.get("price").and_then(Value::as_f64),
-                status: data
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("placed")
-                    .to_string(),
-            })
-        } else {
-            Err(format!(
-                "OctoBot order rejected (HTTP {}): {}",
-                status.as_u16(),
-                data.get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown error")
-            ))
-        }
+        let _ = (exchange, symbol, side, amount_usd);
+        Err("OctoBot's web API does not expose direct market order placement; configure an OctoBot trading mode or user-command bridge before enabling Gail live execution".to_string())
     }
 
     pub async fn cancel_order(&self, order_id: &str) -> Result<(), String> {
-        let url = format!("{}/api/orders/{}", self.base_url, order_id);
-        let resp = self
-            .client
-            .delete(&url)
-            .send()
-            .await
-            .map_err(|e| format!("OctoBot cancel order request failed: {e}"))?;
-        if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND {
+        let body = json!({ "id": order_id });
+        let (status, _) = self
+            .post_json_with_status("/api/orders?action=cancel_order", &body, "cancel order")
+            .await?;
+        if status.is_success() || status == StatusCode::NOT_FOUND {
             Ok(())
         } else {
             Err(format!(
                 "OctoBot cancel order failed: HTTP {}",
-                resp.status().as_u16()
+                status.as_u16()
             ))
         }
     }
@@ -352,17 +341,235 @@ impl OctobotClient {
     // -----------------------------------------------------------------------
 
     pub async fn get_exchange_info(&self) -> Result<Vec<OctobotExchange>, String> {
-        let url = format!("{}/api/exchanges", self.base_url);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("OctoBot exchanges request failed: {e}"))?;
-        let body: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("OctoBot exchanges parse failed: {e}"))?;
+        if let Some(body) = self
+            .get_optional_json("/api/exchanges", "exchanges")
+            .await?
+        {
+            let exchanges = parse_exchange_info_array(&body);
+            if !exchanges.is_empty() {
+                return Ok(exchanges);
+            }
+        }
+
+        let exchange_body = self
+            .get_optional_json("/api/first_exchange_details", "first exchange details")
+            .await?;
+        let Some(exchange_body) = exchange_body else {
+            return Ok(Vec::new());
+        };
+        let exchange_data = unwrap_octobot_data(&exchange_body);
+        let exchange_name = exchange_data
+            .get("exchange_name")
+            .or_else(|| exchange_data.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let symbols = self.configured_symbols().await.unwrap_or_default();
+        Ok(vec![OctobotExchange {
+            name: exchange_name,
+            enabled: true,
+            symbols,
+        }])
+    }
+
+    async fn configured_symbols(&self) -> Result<Vec<String>, String> {
+        let body = self
+            .get_optional_json("/api/get_config_currency", "configured currencies")
+            .await?
+            .unwrap_or(Value::Null);
+        let mut symbols = Vec::new();
+        if let Some(config) = body.as_object() {
+            for data in config.values() {
+                let enabled = data.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                if !enabled {
+                    continue;
+                }
+                if let Some(pairs) = data
+                    .get("pairs")
+                    .or_else(|| data.get("crypto-pairs"))
+                    .and_then(Value::as_array)
+                {
+                    symbols.extend(pairs.iter().filter_map(Value::as_str).map(str::to_string));
+                }
+            }
+        }
+        if symbols.is_empty()
+            && let Some(first) = self
+                .get_optional_json("/dashboard/first_symbol", "first symbol")
+                .await?
+        {
+            if let Some(symbol) = first.get("symbol").and_then(Value::as_str) {
+                symbols.push(symbol.replace('|', "/"));
+            }
+        }
+        symbols.sort();
+        symbols.dedup();
+        Ok(symbols)
+    }
+
+    /// Fetch market data (ticker) for a symbol on an exchange.
+    pub async fn get_market_snapshot(
+        &self,
+        exchange: &str,
+        symbol: &str,
+    ) -> Result<MarketSnapshot, String> {
+        let legacy_path = format!("/api/market/ticker?exchange={}&symbol={}", exchange, symbol);
+        if let Some(body) = self.get_optional_json(&legacy_path, "ticker").await? {
+            return Ok(parse_ticker_snapshot(exchange, symbol, &body));
+        }
+
+        let web_symbol = symbol.replace('/', "|");
+        let watched_path = format!("/dashboard/watched_symbol/{web_symbol}");
+        let watched = self.get_json(&watched_path, "watched symbol").await?;
+        let exchange_id = watched
+            .get("exchange_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "OctoBot watched symbol response missing exchange_id".to_string())?;
+        let time_frame = watched
+            .get("time_frame")
+            .and_then(Value::as_str)
+            .unwrap_or("1h");
+        let graph_path = format!(
+            "/dashboard/currency_price_graph_update/{exchange_id}/{web_symbol}/{time_frame}/live?display_orders=false"
+        );
+        let graph = self.get_json(&graph_path, "price graph").await?;
+        Ok(parse_graph_snapshot(exchange, symbol, &graph))
+    }
+}
+
+fn parse_exchange_info_array(body: &Value) -> Vec<OctobotExchange> {
+    let mut exchanges = Vec::new();
+    if let Some(arr) = body.as_array() {
+        for entry in arr {
+            let exchange = OctobotExchange {
+                name: entry
+                    .get("name")
+                    .or_else(|| entry.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                enabled: entry
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                symbols: entry
+                    .get("symbols")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            };
+            exchanges.push(exchange);
+        }
+    }
+    exchanges
+}
+
+fn unwrap_octobot_data(body: &Value) -> &Value {
+    body.get("data").unwrap_or(body)
+}
+
+fn parse_ticker_snapshot(exchange: &str, symbol: &str, body: &Value) -> MarketSnapshot {
+    let now = current_unix_timestamp_f64();
+    MarketSnapshot {
+        exchange: exchange.to_string(),
+        symbol: symbol.to_string(),
+        price: body
+            .get("last")
+            .or_else(|| body.get("close"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+        price_change_pct_1h: body.get("change_1h").and_then(Value::as_f64),
+        price_change_pct_24h: body
+            .get("change_24h")
+            .or_else(|| body.get("percentage"))
+            .and_then(Value::as_f64),
+        volume_24h: body
+            .get("baseVolume")
+            .or_else(|| body.get("volume"))
+            .and_then(Value::as_f64),
+        volume_change_pct: body.get("volume_change_pct").and_then(Value::as_f64),
+        high_24h: body.get("high").and_then(Value::as_f64),
+        low_24h: body.get("low").and_then(Value::as_f64),
+        fetched_at: now,
+    }
+}
+
+fn parse_graph_snapshot(exchange: &str, symbol: &str, body: &Value) -> MarketSnapshot {
+    let candles = body.get("candles").unwrap_or(&Value::Null);
+    let closes = value_array(candles, "close");
+    let highs = value_array(candles, "high");
+    let lows = value_array(candles, "low");
+    let volumes = value_array(candles, "volume").or_else(|| value_array(candles, "vol"));
+    let price = closes
+        .as_ref()
+        .and_then(|values| values.last().copied())
+        .unwrap_or(0.0);
+    let first_close = closes.as_ref().and_then(|values| values.first().copied());
+    let price_change_pct_24h = first_close
+        .filter(|first| first.abs() > f64::EPSILON)
+        .map(|first| ((price - first) / first) * 100.0);
+    MarketSnapshot {
+        exchange: exchange.to_string(),
+        symbol: symbol.to_string(),
+        price,
+        price_change_pct_1h: None,
+        price_change_pct_24h,
+        volume_24h: volumes.as_ref().map(|items| items.iter().sum()),
+        volume_change_pct: None,
+        high_24h: highs
+            .as_ref()
+            .and_then(|items| items.iter().copied().reduce(f64::max)),
+        low_24h: lows
+            .as_ref()
+            .and_then(|items| items.iter().copied().reduce(f64::min)),
+        fetched_at: current_unix_timestamp_f64(),
+    }
+}
+
+fn value_array(body: &Value, key: &str) -> Option<Vec<f64>> {
+    body.get(key).and_then(Value::as_array).map(|values| {
+        values
+            .iter()
+            .filter_map(|value| {
+                value
+                    .as_f64()
+                    .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+            })
+            .collect::<Vec<_>>()
+    })
+}
+
+fn current_unix_timestamp_f64() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn parse_latest_portfolio_value(body: &Value) -> Option<f64> {
+    body.as_array()
+        .and_then(|items| items.last())
+        .and_then(|item| item.get("value"))
+        .and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+        })
+}
+
+impl OctobotClient {
+    // -----------------------------------------------------------------------
+    // Exchanges and symbols continued
+    // -----------------------------------------------------------------------
+
+    #[allow(dead_code)]
+    async fn get_legacy_exchange_info(&self) -> Result<Vec<OctobotExchange>, String> {
+        let body = self.get_json("/api/exchanges", "exchanges").await?;
         let mut exchanges = Vec::new();
         if let Some(arr) = body.as_array() {
             for entry in arr {
@@ -392,54 +599,6 @@ impl OctobotClient {
             }
         }
         Ok(exchanges)
-    }
-
-    /// Fetch market data (ticker) for a symbol on an exchange.
-    pub async fn get_market_snapshot(
-        &self,
-        exchange: &str,
-        symbol: &str,
-    ) -> Result<MarketSnapshot, String> {
-        let url = format!(
-            "{}/api/market/ticker?exchange={}&symbol={}",
-            self.base_url, exchange, symbol
-        );
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("OctoBot ticker request failed: {e}"))?;
-        let body: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("OctoBot ticker parse failed: {e}"))?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
-        Ok(MarketSnapshot {
-            exchange: exchange.to_string(),
-            symbol: symbol.to_string(),
-            price: body
-                .get("last")
-                .or_else(|| body.get("close"))
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0),
-            price_change_pct_1h: body.get("change_1h").and_then(Value::as_f64),
-            price_change_pct_24h: body
-                .get("change_24h")
-                .or_else(|| body.get("percentage"))
-                .and_then(Value::as_f64),
-            volume_24h: body
-                .get("baseVolume")
-                .or_else(|| body.get("volume"))
-                .and_then(Value::as_f64),
-            volume_change_pct: body.get("volume_change_pct").and_then(Value::as_f64),
-            high_24h: body.get("high").and_then(Value::as_f64),
-            low_24h: body.get("low").and_then(Value::as_f64),
-            fetched_at: now,
-        })
     }
 
     /// Fetch tickers for all available symbols on enabled exchanges.
@@ -652,7 +811,10 @@ impl OctobotClient {
             .json()
             .await
             .map_err(|e| format!("OctoBot get_backtest_run_id parse failed: {e}"))?;
-        Ok(body.get("backtesting_id").and_then(Value::as_u64))
+        Ok(body
+            .get("backtesting_id")
+            .and_then(Value::as_u64)
+            .or_else(|| body.as_u64()))
     }
 
     /// List available `.data` files that can be used for backtesting.
@@ -795,6 +957,11 @@ fn parse_orders_array(body: &Value) -> Result<Vec<OctobotOrder>, String> {
     Ok(arr
         .iter()
         .filter_map(|entry| {
+            let order_type = entry
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("market")
+                .to_string();
             Some(OctobotOrder {
                 id: entry.get("id").and_then(Value::as_str)?.to_string(),
                 exchange: entry
@@ -809,14 +976,12 @@ fn parse_orders_array(body: &Value) -> Result<Vec<OctobotOrder>, String> {
                     .to_string(),
                 side: entry
                     .get("side")
+                    .or_else(|| entry.get("order_side"))
                     .and_then(Value::as_str)
+                    .or_else(|| infer_side(order_type.as_str()))
                     .unwrap_or("unknown")
                     .to_string(),
-                order_type: entry
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("market")
-                    .to_string(),
+                order_type,
                 amount: entry.get("amount").and_then(Value::as_f64).unwrap_or(0.0),
                 price: entry.get("price").and_then(Value::as_f64),
                 status: entry
@@ -824,7 +989,10 @@ fn parse_orders_array(body: &Value) -> Result<Vec<OctobotOrder>, String> {
                     .and_then(Value::as_str)
                     .unwrap_or("unknown")
                     .to_string(),
-                timestamp: entry.get("timestamp").and_then(Value::as_f64),
+                timestamp: entry
+                    .get("timestamp")
+                    .or_else(|| entry.get("time"))
+                    .and_then(Value::as_f64),
             })
         })
         .collect())
@@ -843,6 +1011,7 @@ fn parse_trades_array(body: &Value) -> Result<Vec<OctobotTrade>, String> {
     Ok(arr
         .iter()
         .filter_map(|entry| {
+            let trade_type = entry.get("type").and_then(Value::as_str).unwrap_or("");
             Some(OctobotTrade {
                 id: entry.get("id").and_then(Value::as_str).map(str::to_string),
                 exchange: entry
@@ -857,15 +1026,31 @@ fn parse_trades_array(body: &Value) -> Result<Vec<OctobotTrade>, String> {
                     .to_string(),
                 side: entry
                     .get("side")
+                    .or_else(|| entry.get("order_side"))
                     .and_then(Value::as_str)
+                    .or_else(|| infer_side(trade_type))
                     .unwrap_or("unknown")
                     .to_string(),
                 amount: entry.get("amount").and_then(Value::as_f64).unwrap_or(0.0),
                 price: entry.get("price").and_then(Value::as_f64).unwrap_or(0.0),
                 cost: entry.get("cost").and_then(Value::as_f64).unwrap_or(0.0),
                 fee: entry.get("fee").and_then(Value::as_f64),
-                timestamp: entry.get("timestamp").and_then(Value::as_f64),
+                timestamp: entry
+                    .get("timestamp")
+                    .or_else(|| entry.get("time"))
+                    .and_then(Value::as_f64),
             })
         })
         .collect())
+}
+
+fn infer_side(value: &str) -> Option<&'static str> {
+    let lowered = value.to_ascii_lowercase();
+    if lowered.contains("buy") {
+        Some("buy")
+    } else if lowered.contains("sell") {
+        Some("sell")
+    } else {
+        None
+    }
 }
