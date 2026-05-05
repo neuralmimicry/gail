@@ -99,12 +99,12 @@ impl GailError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::InvalidConfig(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Upstream { quota: true, .. } => StatusCode::TOO_MANY_REQUESTS,
+            Self::Upstream { timeout: true, .. } => StatusCode::GATEWAY_TIMEOUT,
             Self::Upstream {
                 status: Some(status),
                 ..
             } => *status,
-            Self::Upstream { quota: true, .. } => StatusCode::TOO_MANY_REQUESTS,
-            Self::Upstream { timeout: true, .. } => StatusCode::GATEWAY_TIMEOUT,
             Self::Upstream { .. } => StatusCode::BAD_GATEWAY,
             Self::Io(_) | Self::Json(_) | Self::Yaml(_) | Self::Reqwest(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR

@@ -1104,7 +1104,22 @@ impl GailService {
         } else {
             -0.9
         };
-        let health = self.probe_health(&candidate).await;
+        let health = if self
+            .inner
+            .metrics
+            .provider_in_quota_backoff(candidate.provider_type.as_str(), self.health_ttl_seconds())
+            .await
+        {
+            ProviderHealth {
+                ok: false,
+                status_code: None,
+                latency_ms: None,
+                message: Some("provider family is in cached quota backoff".to_string()),
+                mode: Some("quota".to_string()),
+            }
+        } else {
+            self.probe_health(&candidate).await
+        };
         let health_score = if health.ok { 0.4 } else { -1.4 };
         let preferred_score = if candidate.preferred { 0.7 } else { 0.0 };
         let metrics_bonus = self
@@ -1702,11 +1717,11 @@ fn select_ranked_candidates(
     let target = max_candidates.max(1);
     let mut selected = Vec::new();
     let mut selected_ids = HashSet::new();
+    let mut selected_provider_types = HashSet::new();
 
     for health_ok in [true, false] {
-        let mut seen_provider_types = HashSet::new();
         for item in ranked.iter().filter(|item| item.health_ok == health_ok) {
-            if !seen_provider_types.insert(item.candidate.provider_type.clone()) {
+            if !selected_provider_types.insert(item.candidate.provider_type.clone()) {
                 continue;
             }
             let candidate_id = item.candidate.candidate_id();
@@ -1717,6 +1732,9 @@ fn select_ranked_candidates(
                 }
             }
         }
+    }
+
+    for health_ok in [true, false] {
         for item in ranked.iter().filter(|item| item.health_ok == health_ok) {
             let candidate_id = item.candidate.candidate_id();
             if selected_ids.insert(candidate_id) {
@@ -2045,7 +2063,52 @@ mod tests {
             vec![
                 "nvidia/moonshotai/kimi-k2-instruct-0905".to_string(),
                 "ollama/llama3.2".to_string(),
-                "nvidia/minimaxai/minimax-m2.7".to_string(),
+                "openai/gpt-4o-mini".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn select_ranked_candidates_uses_fallback_family_before_duplicate_provider() {
+        fn ranked(
+            provider_type: &str,
+            model: &str,
+            score: f64,
+            health_ok: bool,
+        ) -> RankedCandidate {
+            RankedCandidate {
+                score,
+                health_ok,
+                health_mode: None,
+                candidate: ProviderCandidate::from_profile(ProviderProfile {
+                    name: format!("{provider_type}-{model}"),
+                    provider_type: provider_type.to_string(),
+                    model: Some(model.to_string()),
+                    api_key: Some("token".to_string()),
+                    base_url: Some("http://example.internal".to_string()),
+                    ..ProviderProfile::default()
+                }),
+            }
+        }
+
+        let selected = select_ranked_candidates(
+            vec![
+                ranked("nvidia", "moonshotai/kimi-k2-instruct-0905", 5.0, true),
+                ranked("nvidia", "minimaxai/minimax-m2.7", 4.9, true),
+                ranked("ollama", "llama3.2", 2.0, false),
+            ],
+            2,
+        );
+
+        let labels = selected
+            .iter()
+            .map(|candidate| candidate.candidate_id())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "nvidia/moonshotai/kimi-k2-instruct-0905".to_string(),
+                "ollama/llama3.2".to_string(),
             ]
         );
     }

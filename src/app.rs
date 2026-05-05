@@ -2223,12 +2223,12 @@ fn openai_error_status(error: &GailError) -> StatusCode {
         GailError::Unauthorized => StatusCode::UNAUTHORIZED,
         GailError::NotFound(_) => StatusCode::NOT_FOUND,
         GailError::InvalidConfig(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        GailError::Upstream { quota: true, .. } => StatusCode::TOO_MANY_REQUESTS,
+        GailError::Upstream { timeout: true, .. } => StatusCode::GATEWAY_TIMEOUT,
         GailError::Upstream {
             status: Some(status),
             ..
         } => *status,
-        GailError::Upstream { quota: true, .. } => StatusCode::TOO_MANY_REQUESTS,
-        GailError::Upstream { timeout: true, .. } => StatusCode::GATEWAY_TIMEOUT,
         GailError::Upstream { .. } => StatusCode::BAD_GATEWAY,
         GailError::Io(_) | GailError::Json(_) | GailError::Yaml(_) | GailError::Reqwest(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
@@ -2632,6 +2632,20 @@ mod tests {
             payload["error"]["message"],
             r#"nvidia upstream error: {"status":429,"title":"Too Many Requests"}"#
         );
+    }
+
+    #[tokio::test]
+    async fn openai_errors_prefer_nested_rate_limit_over_gateway_status() {
+        let error = GailError::upstream(
+            "gail",
+            Some(StatusCode::BAD_GATEWAY),
+            r#"nvidia upstream error: {"status":429,"title":"Too Many Requests"}"#,
+        );
+        let (status, payload) = read_response_json(openai_error_response(error)).await;
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(payload["error"]["type"], "rate_limit_error");
+        assert_eq!(payload["error"]["code"], "gail");
     }
 
     #[test]

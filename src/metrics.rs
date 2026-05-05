@@ -139,6 +139,38 @@ impl MetricsStore {
             .unwrap_or_default()
     }
 
+    pub async fn provider_in_quota_backoff(&self, provider: &str, ttl_seconds: f64) -> bool {
+        let provider = provider.trim();
+        if provider.is_empty() {
+            return false;
+        }
+        let now = now_ts();
+        let data = self.inner.lock().await;
+        data.candidates
+            .iter()
+            .filter(|(candidate_id, bucket)| {
+                bucket
+                    .provider
+                    .as_deref()
+                    .is_some_and(|item| item.eq_ignore_ascii_case(provider))
+                    || candidate_id
+                        .split_once('/')
+                        .map(|(prefix, _)| prefix.eq_ignore_ascii_case(provider))
+                        .unwrap_or(false)
+            })
+            .any(|(_, bucket)| {
+                bucket
+                    .health
+                    .mode
+                    .as_deref()
+                    .is_some_and(|mode| mode.eq_ignore_ascii_case("quota"))
+                    && bucket
+                        .health
+                        .checked_at
+                        .is_some_and(|checked_at| now - checked_at < ttl_seconds)
+            })
+    }
+
     pub async fn record_health(
         &self,
         summary: &CandidateSummary,
@@ -325,5 +357,47 @@ impl RoundTo for f64 {
     fn round_to(self, precision: i32) -> Self {
         let factor = 10_f64.powi(precision);
         (self * factor).round() / factor
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(provider: &str, model: &str) -> CandidateSummary {
+        CandidateSummary {
+            candidate_id: format!("{provider}/{model}"),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            configured_model: model.to_string(),
+            resolved_model: model.to_string(),
+            source: "test".to_string(),
+            specialties: Vec::new(),
+            roles: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_quota_backoff_matches_provider_family() {
+        let path = tempfile::NamedTempFile::new()
+            .expect("temp file")
+            .into_temp_path();
+        let store = MetricsStore::new(path.to_path_buf()).await.expect("store");
+        store
+            .record_health(
+                &summary("nvidia", "moonshotai/kimi-k2-instruct-0905"),
+                HealthBucket {
+                    ok: Some(false),
+                    mode: Some("quota".to_string()),
+                    checked_at: None,
+                    latency_ms: Some(10),
+                    message: Some("Too Many Requests".to_string()),
+                },
+            )
+            .await
+            .expect("record health");
+
+        assert!(store.provider_in_quota_backoff("nvidia", 1800.0).await);
+        assert!(!store.provider_in_quota_backoff("ollama", 1800.0).await);
     }
 }
