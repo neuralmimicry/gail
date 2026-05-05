@@ -98,12 +98,14 @@ The image expects a config file at `/app/config/gail.yaml` unless `GAIL_CONFIG` 
 
 - `providers`: shared LLM backends Gail can orchestrate.
 - `providers` can include `openai`, `gemini`, `ollama`, and OpenAI-compatible `nvidia` profiles backed by custom `base_url` values.
+- `gail-auto` dispatches providers in ranked waves. If a candidate reports quota, rate-limit, or upstream HTTP 429, Gail marks that provider family throttled for the request, records quota health, and tries the next suitable provider family instead of surfacing the first rate-limit failure.
 - `specialists`: explicit neuromorphic engines. Use this when you have named SNN/AARNN backends to register.
 - `aarnn_bridge`: mirrored Gail-to-AARNN LLM I/O bridge. Gail mirrors prompt-side and response-side text plus translated AER payloads to `POST /api/llm/mirror` and can optionally promote a future AARNN reply.
 - `config/ai-routing-profiles.json`: shared workflow/keyword/provider routing contract used by Gail and mirrored in Refiner for offline fallback.
 - `GAIL_ROUTING_PROFILES_PATH`: optional override for the routing contract path.
 - `GAIL_AARNN_*` env vars: optional legacy auto-attach path for an AARNN backend, mirroring Refiner's previous automatic fallback behaviour.
 - `storage.metrics_path`: persisted provider quality/latency metrics.
+- `orchestration.health_ttl_seconds`: cached provider-health TTL. Runtime quota health remains in backoff until this TTL expires, so later requests skip rate-limited candidates before probing them again.
 - `storage.ollama_model_store_path`: cached Ollama model inventory summary.
 
 ## AARNN Bridge

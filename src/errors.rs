@@ -71,8 +71,9 @@ impl GailError {
         message: impl Into<String>,
     ) -> Self {
         let message = message.into();
+        let quota =
+            status == Some(StatusCode::TOO_MANY_REQUESTS) || message_indicates_quota(&message);
         let lowered = message.to_ascii_lowercase();
-        let quota = status == Some(StatusCode::TOO_MANY_REQUESTS) || lowered.contains("quota");
         let timeout = lowered.contains("timeout") || lowered.contains("timed out");
         Self::Upstream {
             provider: provider.into(),
@@ -110,6 +111,22 @@ impl GailError {
             }
         }
     }
+}
+
+pub fn message_indicates_quota(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    let compact = lowered
+        .chars()
+        .filter(|char| !char.is_ascii_whitespace())
+        .collect::<String>();
+    lowered.contains("quota")
+        || lowered.contains("rate limit")
+        || lowered.contains("rate_limit")
+        || lowered.contains("too many requests")
+        || compact.contains("status\":429")
+        || compact.contains("status:429")
+        || lowered.contains("status 429")
+        || lowered.contains("http 429")
 }
 
 impl IntoResponse for GailError {
@@ -161,5 +178,23 @@ impl IntoResponse for GailError {
             },
         };
         (status, Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_detects_nested_too_many_requests_as_quota() {
+        let error = GailError::upstream(
+            "gail",
+            None,
+            r#"nvidia upstream error: {"status":429,"title":"Too Many Requests"}"#,
+        );
+        assert!(error.is_quota());
+        assert!(message_indicates_quota(r#"{"status": 429}"#));
+        assert!(message_indicates_quota("HTTP 429 from upstream"));
+        assert!(message_indicates_quota("rate_limit_exceeded"));
     }
 }

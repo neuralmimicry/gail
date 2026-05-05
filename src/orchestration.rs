@@ -1,6 +1,6 @@
 use std::{collections::HashSet, env, sync::Arc, time::Duration};
 
-use axum::http::{HeaderMap, header::AUTHORIZATION};
+use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::{
@@ -14,7 +14,7 @@ use crate::{
     aarnn_bridge::{AarnnMirrorClient, AarnnMirrorExchange},
     aer,
     config::{ApiTokenConfig, GailConfig, ProviderProfile},
-    errors::{GailError, Result},
+    errors::{GailError, Result, message_indicates_quota},
     metrics::{HealthBucket, MetricsStore},
     models::{
         AarnnMirrorDirection, AerDecodeRequest, AerDecodeResponse, AerEncodeRequest,
@@ -80,6 +80,7 @@ struct RankedCandidate {
     candidate: ProviderCandidate,
     score: f64,
     health_ok: bool,
+    health_mode: Option<String>,
 }
 
 impl GailService {
@@ -406,50 +407,117 @@ impl GailService {
                 .partial_cmp(&left.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let selected = select_ranked_candidates(ranked, max_candidates.max(1));
-        if selected.is_empty() {
-            return Err(GailError::bad_request(
-                "no provider candidates were selected",
-            ));
-        }
-
-        info!(
-            workflow = %workflow,
-            role = %role,
-            candidates = %preview_labels(selected.iter().map(|item| item.label(None)).collect::<Vec<_>>(), 6),
-            tags = %preview_labels(task_tags.iter().cloned().collect::<Vec<_>>(), 8),
-            "dispatching Gail orchestration"
-        );
-
         let expected_json = expected_json(
             &provider_request.messages,
             provider_request.system.as_deref(),
         );
-        let mut results = if selected.len() == 1 {
-            vec![
-                self.invoke_candidate(
-                    selected[0].clone(),
+        let wave_size = max_candidates.max(1);
+        let mut results = Vec::new();
+        let mut attempted_candidate_ids = HashSet::new();
+        let mut throttled_provider_types = HashSet::new();
+        let mut returned_early = false;
+        let mut wave_index = 0usize;
+        loop {
+            let unattempted = ranked
+                .iter()
+                .filter(|item| {
+                    !attempted_candidate_ids.contains(&item.candidate.candidate_id())
+                        && !throttled_provider_types.contains(&item.candidate.provider_type)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let remaining = unattempted
+                .iter()
+                .filter(|item| !ranked_candidate_is_in_quota_backoff(item))
+                .cloned()
+                .collect::<Vec<_>>();
+            if remaining.is_empty() && !unattempted.is_empty() {
+                if results.is_empty() {
+                    return Err(GailError::upstream(
+                        "gail",
+                        Some(StatusCode::TOO_MANY_REQUESTS),
+                        "all suitable providers are currently rate-limited; backing off before retry",
+                    ));
+                }
+                break;
+            }
+            let selected = select_ranked_candidates(remaining, wave_size);
+            if selected.is_empty() {
+                if results.is_empty() {
+                    return Err(GailError::bad_request(
+                        "no provider candidates were selected",
+                    ));
+                }
+                break;
+            }
+            wave_index += 1;
+            for candidate in &selected {
+                attempted_candidate_ids.insert(candidate.candidate_id());
+            }
+
+            info!(
+                workflow = %workflow,
+                role = %role,
+                fallback_wave = wave_index,
+                candidates = %preview_labels(selected.iter().map(|item| item.label(None)).collect::<Vec<_>>(), 6),
+                throttled_providers = %preview_labels(sorted_strings(throttled_provider_types.iter().cloned()), 6),
+                tags = %preview_labels(task_tags.iter().cloned().collect::<Vec<_>>(), 8),
+                "dispatching Gail orchestration"
+            );
+
+            let mut wave_results = if selected.len() == 1 {
+                vec![
+                    self.invoke_candidate(
+                        selected[0].clone(),
+                        provider_request.clone(),
+                        expected_json,
+                        timeout_cap,
+                    )
+                    .await,
+                ]
+            } else {
+                self.invoke_candidates(
+                    selected.clone(),
                     provider_request.clone(),
                     expected_json,
+                    selection_mode.clone(),
+                    early_success_enabled,
+                    early_success_settle_seconds,
+                    early_success_min_quality,
                     timeout_cap,
                 )
-                .await,
-            ]
-        } else {
-            self.invoke_candidates(
-                selected.clone(),
-                provider_request.clone(),
-                expected_json,
-                selection_mode.clone(),
-                early_success_enabled,
-                early_success_settle_seconds,
-                early_success_min_quality,
-                timeout_cap,
-            )
-            .await?
-        };
+                .await?
+            };
 
-        let returned_early = results.len() < selected.len() && selected.len() > 1;
+            returned_early |= wave_results.len() < selected.len() && selected.len() > 1;
+            let wave_has_success = wave_results.iter().any(|result| result.response.is_some());
+            let quota_providers = wave_results
+                .iter()
+                .filter(|result| result.response.is_none())
+                .filter_map(|result| {
+                    result
+                        .error
+                        .as_deref()
+                        .filter(|error| message_indicates_quota(error))
+                        .map(|_| result.candidate.provider_type.clone())
+                })
+                .collect::<HashSet<_>>();
+            if !quota_providers.is_empty() {
+                throttled_provider_types.extend(quota_providers.iter().cloned());
+                info!(
+                    workflow = %workflow,
+                    role = %role,
+                    fallback_wave = wave_index,
+                    throttled_providers = %preview_labels(sorted_strings(quota_providers.into_iter()), 6),
+                    "provider rate-limited; backing off and trying fallback candidates"
+                );
+            }
+            results.append(&mut wave_results);
+            if wave_has_success {
+                break;
+            }
+        }
+
         let mut successful = Vec::new();
         let mut failures = Vec::new();
         for result in results.iter_mut() {
@@ -1046,6 +1114,7 @@ impl GailService {
             .await;
         RankedCandidate {
             health_ok: health.ok,
+            health_mode: health.mode.clone(),
             score: candidate.weight
                 + (overlap * 0.85)
                 + role_score
@@ -1662,11 +1731,19 @@ fn select_ranked_candidates(
     selected
 }
 
+fn ranked_candidate_is_in_quota_backoff(item: &RankedCandidate) -> bool {
+    !item.health_ok
+        && item
+            .health_mode
+            .as_deref()
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("quota"))
+}
+
 fn runtime_failure_health_bucket(error: Option<&str>, latency_ms: Option<u64>) -> HealthBucket {
     let lowered = error.unwrap_or_default().to_ascii_lowercase();
     let mode = if lowered.contains("timeout") || lowered.contains("timed out") {
         "timeout"
-    } else if lowered.contains("quota") || lowered.contains("rate limit") {
+    } else if message_indicates_quota(error.unwrap_or_default()) {
         "quota"
     } else if lowered.contains("not configured") || lowered.contains("unsupported") {
         "unconfigured"
@@ -1937,6 +2014,7 @@ mod tests {
             RankedCandidate {
                 score,
                 health_ok,
+                health_mode: None,
                 candidate: ProviderCandidate::from_profile(ProviderProfile {
                     name: format!("{provider_type}-{model}"),
                     provider_type: provider_type.to_string(),
@@ -1970,5 +2048,32 @@ mod tests {
                 "nvidia/minimaxai/minimax-m2.7".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn ranked_candidate_quota_backoff_detects_cached_quota_health() {
+        let candidate = RankedCandidate {
+            score: 1.0,
+            health_ok: false,
+            health_mode: Some("quota".to_string()),
+            candidate: ProviderCandidate::from_profile(ProviderProfile {
+                provider_type: "nvidia".to_string(),
+                model: Some("moonshotai/kimi-k2-instruct-0905".to_string()),
+                api_key: Some("token".to_string()),
+                ..ProviderProfile::default()
+            }),
+        };
+        assert!(ranked_candidate_is_in_quota_backoff(&candidate));
+    }
+
+    #[test]
+    fn runtime_failure_health_bucket_classifies_nested_429_as_quota() {
+        let bucket = runtime_failure_health_bucket(
+            Some(r#"nvidia upstream error: {"status":429,"title":"Too Many Requests"}"#),
+            Some(12),
+        );
+        assert_eq!(bucket.mode.as_deref(), Some("quota"));
+        assert_eq!(bucket.ok, Some(false));
+        assert_eq!(bucket.latency_ms, Some(12));
     }
 }

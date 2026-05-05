@@ -2306,6 +2306,13 @@ mod tests {
 
     async fn test_service_with_config(mut config: GailConfig) -> GailService {
         config.security.allow_unauthenticated_health = false;
+        config.storage.metrics_path = std::env::temp_dir()
+            .join(format!(
+                "gail-test-provider-metrics-{}.json",
+                uuid::Uuid::new_v4()
+            ))
+            .to_string_lossy()
+            .to_string();
         config.security.api_tokens.push(ApiTokenConfig {
             client_id: "test".to_string(),
             token: "secret".to_string(),
@@ -2321,6 +2328,15 @@ mod tests {
             .await
             .expect("body");
         serde_json::from_slice(&bytes).expect("json")
+    }
+
+    async fn read_response_json(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload = serde_json::from_slice(&bytes).expect("json");
+        (status, payload)
     }
 
     async fn read_text(response: Response) -> String {
@@ -2597,6 +2613,132 @@ mod tests {
         assert_eq!(
             payload["gail"]["resolved_model"],
             "moonshotai/kimi-k2-instruct-0905"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_errors_preserve_nested_upstream_rate_limit_status() {
+        let error = GailError::upstream(
+            "gail",
+            None,
+            r#"nvidia upstream error: {"status":429,"title":"Too Many Requests"}"#,
+        );
+        let (status, payload) = read_response_json(openai_error_response(error)).await;
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(payload["error"]["type"], "rate_limit_error");
+        assert_eq!(payload["error"]["code"], "gail");
+        assert_eq!(
+            payload["error"]["message"],
+            r#"nvidia upstream error: {"status":429,"title":"Too Many Requests"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_falls_back_after_nvidia_rate_limit() {
+        let nvidia = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "moonshotai/kimi-k2-instruct-0905"}]
+            })))
+            .mount(&nvidia)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "0")
+                    .set_body_json(json!({"status": 429, "title": "Too Many Requests"})),
+            )
+            .mount(&nvidia)
+            .await;
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&ollama)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "ollama fallback answer",
+                "prompt_eval_count": 8,
+                "eval_count": 5
+            })))
+            .mount(&ollama)
+            .await;
+
+        let mut config = GailConfig::default();
+        config.orchestration.max_parallel_candidates = 1;
+        config.providers.push(ProviderProfile {
+            name: "NVIDIAKimi".to_string(),
+            provider_type: "nvidia".to_string(),
+            model: Some("moonshotai/kimi-k2-instruct-0905".to_string()),
+            api_key: Some("nvapi-test".to_string()),
+            base_url: Some(format!("{}/v1", nvidia.uri())),
+            roles: vec!["assistant".to_string()],
+            specialties: vec!["reasoning".to_string()],
+            weight: 10.0,
+            preferred: true,
+            ..ProviderProfile::default()
+        });
+        config.providers.push(ProviderProfile {
+            name: "OllamaLocal".to_string(),
+            provider_type: "ollama".to_string(),
+            model: Some("llama3.2".to_string()),
+            base_url: Some(ollama.uri()),
+            roles: vec!["assistant".to_string()],
+            specialties: vec!["local".to_string()],
+            weight: 0.1,
+            ..ProviderProfile::default()
+        });
+
+        let app = build_router(test_service_with_config(config).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "gail-auto",
+                            "max_candidates": 1,
+                            "messages": [{"role": "user", "content": "hello"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+
+        let payload = read_json(response).await;
+        assert_eq!(payload["model"], "gail-auto");
+        assert_eq!(
+            payload["choices"][0]["message"]["content"],
+            "ollama fallback answer"
+        );
+        assert_eq!(payload["gail"]["provider"], "ollama");
+        let candidates = payload["gail"]["trace"]["candidates"]
+            .as_array()
+            .expect("trace candidates");
+        assert!(candidates.iter().any(|candidate| {
+            candidate["provider"] == "nvidia"
+                && candidate["status"] == "error"
+                && candidate["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("Too Many Requests"))
+        }));
+        assert!(
+            candidates.iter().any(|candidate| {
+                candidate["provider"] == "ollama" && candidate["status"] == "ok"
+            })
         );
     }
 
