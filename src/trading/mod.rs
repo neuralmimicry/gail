@@ -362,6 +362,10 @@ async fn run_single_evaluation(
                 "fuzzy_confidence": fuzzy_out.confidence,
                 "ai_signal": consensus.signal,
                 "ai_confidence": consensus.confidence,
+                "ai_action": consensus.action,
+                "ai_responders": consensus.responders,
+                "ai_failures": consensus.failures,
+                "ai_vote_distribution": consensus.vote_distribution,
                 "blended_signal": decision.blended_signal,
                 "rationale": decision.rationale
             }),
@@ -514,10 +518,7 @@ fn build_research_query(config: &TradingConfig, snap: Option<&MarketSnapshot>) -
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        // Simple YYYY-MM-DD
-        let days = secs / 86400;
-        let year = 1970 + days / 365;
-        format!("{year}-04-30") // approximation
+        utc_date_from_unix_days((secs / 86_400) as i64)
     };
     let (currency, exchange) = snap
         .map(|s| (s.symbol.clone(), s.exchange.clone()))
@@ -528,6 +529,20 @@ fn build_research_query(config: &TradingConfig, snap: Option<&MarketSnapshot>) -
         .replace("{currency}", &currency)
         .replace("{exchange}", &exchange)
         .replace("{date}", &date)
+}
+
+fn utc_date_from_unix_days(days_since_epoch: i64) -> String {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 fn compute_fuzzy_inputs(

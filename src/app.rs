@@ -1425,7 +1425,7 @@ fn response_format_system_hint(format: Option<&OpenAIResponseFormat>) -> Option<
             .unwrap_or(Value::Null);
         let schema_text = serde_json::to_string(&schema).unwrap_or_else(|_| "{}".to_string());
         return Some(format!(
-            "Return only valid JSON that matches this schema exactly: {schema_text}"
+            "Return only a JSON data instance that satisfies this schema: {schema_text}. The schema is not the answer; do not echo `$defs`, `properties`, `required`, `title`, `type`, or `additionalProperties` unless those are explicitly required as user data fields."
         ));
     }
     None
@@ -2632,6 +2632,26 @@ mod tests {
             payload["error"]["message"],
             r#"nvidia upstream error: {"status":429,"title":"Too Many Requests"}"#
         );
+    }
+
+    #[test]
+    fn json_schema_response_format_hint_rejects_schema_echo() {
+        let hint = response_format_system_hint(Some(&OpenAIResponseFormat {
+            format_type: Some("json_schema".to_string()),
+            json_schema: Some(json!({
+                "name": "ExecutionPlan",
+                "schema": {
+                    "type": "object",
+                    "properties": {"steps": {"type": "array"}},
+                    "required": ["steps"],
+                    "additionalProperties": false
+                }
+            })),
+        }))
+        .expect("hint");
+
+        assert!(hint.contains("schema is not the answer"));
+        assert!(hint.contains("do not echo"));
     }
 
     #[tokio::test]

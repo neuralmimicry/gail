@@ -54,6 +54,9 @@ mod tests {
             confidence,
             reasoning: format!("test reasoning for {action}"),
             suggested_amount_usd: None,
+            risk_score: 0.25,
+            risk_flags: Vec::new(),
+            target_symbol: Some("BTC/USDT".to_string()),
             raw_response: format!(
                 r#"{{"action":"{action}","confidence":{confidence},"reasoning":"test"}}"#
             ),
@@ -70,6 +73,9 @@ mod tests {
             confidence: 0.0,
             reasoning: "provider error: timeout".to_string(),
             suggested_amount_usd: None,
+            risk_score: 1.0,
+            risk_flags: vec!["provider_error".to_string()],
+            target_symbol: None,
             raw_response: String::new(),
             parsed_ok: false,
             weight,
@@ -1369,6 +1375,15 @@ mod tests {
         assert!(
             score >= 0.0,
             "score with missing data should be non-negative: {score}"
+        );
+    }
+
+    #[test]
+    fn research_query_date_uses_real_utc_calendar_date() {
+        assert_eq!(crate::trading::utc_date_from_unix_days(0), "1970-01-01");
+        assert_eq!(
+            crate::trading::utc_date_from_unix_days(20_578),
+            "2026-05-05"
         );
     }
 

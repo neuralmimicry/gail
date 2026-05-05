@@ -179,10 +179,13 @@ The highest-signal market snapshot (scored by `|Δ%| × ln(volume+1)`) is used t
   "action": "buy|sell|hold|strong_buy|strong_sell",
   "confidence": 0.0–1.0,
   "reasoning": "...",
-  "suggested_amount_usd": null
+  "suggested_amount_usd": null,
+  "risk_score": 0.0–1.0,
+  "risk_flags": [],
+  "target_symbol": "BTC/USDT"
 }
 ```
-Providers are selected by quality weight (EWMA from `MetricsStore`) and capped at `max_parallel_advisors`. Responses are aggregated into `AiConsensus` using weighted voting: `effective_weight = provider_weight × confidence`. The consensus signal is a weighted centroid in `[−1, +1]`.
+Providers are selected by quality weight and provider-family diversity, so a single rate-limited cloud family does not crowd out OpenAI/Gemini/Ollama alternatives. Responses are parsed defensively, schema-echo responses are rejected, and `AiConsensus` uses weighted voting with agreement, response coverage, and risk penalties before producing a signal in `[−1, +1]`.
 
 **Step 4 — Type-2 fuzzy inference** (`fuzzy.rs`)
 Five linguistic input variables are encoded from the gathered data:
