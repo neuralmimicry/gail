@@ -57,6 +57,7 @@ pub struct OrchestrationConfig {
     pub early_success_settle_seconds: f64,
     pub early_success_min_quality: f64,
     pub candidate_timeout_cap_seconds: Option<u64>,
+    pub automation_candidate_timeout_cap_seconds: Option<u64>,
     pub always_route_specialists: bool,
 }
 
@@ -187,6 +188,7 @@ impl Default for OrchestrationConfig {
             early_success_settle_seconds: 0.75,
             early_success_min_quality: 0.5,
             candidate_timeout_cap_seconds: Some(45),
+            automation_candidate_timeout_cap_seconds: Some(12),
             always_route_specialists: false,
         }
     }

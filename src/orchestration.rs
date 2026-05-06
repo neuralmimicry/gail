@@ -334,7 +334,6 @@ impl GailService {
         let max_candidates = request
             .max_candidates
             .unwrap_or_else(|| self.max_parallel_candidates());
-        let timeout_cap = self.candidate_timeout_cap(&workflow, &role);
         let early_success_enabled = self.early_success_enabled(&workflow, &role, &selection_mode);
         let early_success_settle_seconds =
             self.early_success_settle_seconds(&workflow, &role, &selection_mode);
@@ -449,6 +448,8 @@ impl GailService {
             &provider_request.messages,
             provider_request.system.as_deref(),
         );
+        let timeout_cap =
+            self.candidate_timeout_cap(&workflow, &role, expected_json, &task_tags, &prompt_text);
         let wave_size = max_candidates.max(1);
         let mut results = Vec::new();
         let mut attempted_candidate_ids = HashSet::new();
@@ -1441,14 +1442,52 @@ impl GailService {
             });
         }
 
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum DeadlineKind {
+            EarlySuccess,
+            HardTimeout,
+        }
+
         let mut results = Vec::new();
+        let mut pending_candidate_ids = selected
+            .iter()
+            .map(ProviderCandidate::candidate_id)
+            .collect::<HashSet<_>>();
         let mut early_deadline: Option<Instant> = None;
+        let hard_deadline =
+            timeout_cap.map(|seconds| Instant::now() + Duration::from_secs(seconds.max(1)));
         while !join_set.is_empty() {
-            let joined = if let Some(deadline) = early_deadline {
+            let next_deadline = match (early_deadline, hard_deadline) {
+                (Some(early), Some(hard)) if early <= hard => {
+                    Some((early, DeadlineKind::EarlySuccess))
+                }
+                (Some(_early), Some(hard)) => Some((hard, DeadlineKind::HardTimeout)),
+                (Some(early), None) => Some((early, DeadlineKind::EarlySuccess)),
+                (None, Some(hard)) => Some((hard, DeadlineKind::HardTimeout)),
+                (None, None) => None,
+            };
+            let joined = if let Some((deadline, deadline_kind)) = next_deadline {
                 match tokio::time::timeout_at(deadline, join_set.join_next()).await {
                     Ok(result) => result,
                     Err(_) => {
                         join_set.abort_all();
+                        if deadline_kind == DeadlineKind::HardTimeout {
+                            let timeout_seconds = timeout_cap.unwrap_or_default().max(1);
+                            for candidate in selected.iter().cloned().filter(|candidate| {
+                                pending_candidate_ids.contains(&candidate.candidate_id())
+                            }) {
+                                results.push(InvocationResult {
+                                    candidate,
+                                    response: None,
+                                    error: Some(format!(
+                                        "candidate timed out after {timeout_seconds}s"
+                                    )),
+                                    latency_ms: Some(timeout_seconds * 1000),
+                                    quality: -1.0,
+                                    score: f64::NEG_INFINITY,
+                                });
+                            }
+                        }
                         break;
                     }
                 }
@@ -1477,6 +1516,7 @@ impl GailService {
             info!(candidate = %result.candidate.label(result.response.as_ref().map(|value| value.model.as_str())), status = if result.response.is_some() { "ok" } else { "error" }, latency_ms = ?result.latency_ms, quality = result.quality, error = ?result.error, "Gail candidate completed");
             let accepts_early =
                 result.response.is_some() && result.quality >= early_success_min_quality;
+            pending_candidate_ids.remove(&result.candidate.candidate_id());
             results.push(result);
             if !early_success_enabled || !accepts_early {
                 continue;
@@ -1723,7 +1763,14 @@ impl GailService {
         )
     }
 
-    fn candidate_timeout_cap(&self, workflow: &str, role: &str) -> Option<u64> {
+    fn candidate_timeout_cap(
+        &self,
+        workflow: &str,
+        role: &str,
+        expected_json: bool,
+        task_tags: &HashSet<String>,
+        prompt_text: &str,
+    ) -> Option<u64> {
         let default = if is_interactive_workflow(workflow, role) {
             45
         } else {
@@ -1740,7 +1787,38 @@ impl GailService {
             ],
             default.max(0) as u64,
         );
-        if value == 0 { None } else { Some(value.max(1)) }
+        let base = (value > 0).then(|| value.max(1));
+        if is_interactive_workflow(workflow, role) {
+            return base;
+        }
+        if !expected_json
+            && !text_or_tags_indicate_automation(workflow, role, task_tags, prompt_text)
+        {
+            return base;
+        }
+        let automation_default = self
+            .inner
+            .config
+            .orchestration
+            .automation_candidate_timeout_cap_seconds
+            .unwrap_or(12);
+        let automation_value = env_int_any(
+            &[
+                "GAIL_AUTOMATION_CANDIDATE_TIMEOUT_SECONDS",
+                "GAIL_AUTOMATION_CANDIDATE_TIMEOUT_CAP_SECONDS",
+                "REFINER_AI_AUTOMATION_CANDIDATE_TIMEOUT_SECONDS",
+                "REFINER_AI_AUTOMATION_CANDIDATE_TIMEOUT_CAP_SECONDS",
+            ],
+            automation_default,
+        );
+        if automation_value == 0 {
+            base
+        } else {
+            Some(
+                base.map(|base| base.min(automation_value.max(1)))
+                    .unwrap_or_else(|| automation_value.max(1)),
+            )
+        }
     }
 
     fn always_route_specialists(&self) -> bool {

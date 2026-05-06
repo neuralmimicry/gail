@@ -4,6 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use http::StatusCode;
 use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -127,16 +128,56 @@ impl OllamaProvider {
         request: &ProviderCompletionRequest,
     ) -> Result<ProviderInvocationResponse> {
         let base_urls = self.base_url_candidates(request.base_url.as_deref());
+        let total_timeout_seconds = request
+            .timeout_seconds
+            .unwrap_or_else(|| env_int("GAIL_OLLAMA_TIMEOUT_SECONDS", 30))
+            .max(1);
+        let deadline = Instant::now() + Duration::from_secs(total_timeout_seconds);
         let mut last_error = None;
         for (index, base_url) in base_urls.iter().enumerate() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                last_error = Some(GailError::upstream(
+                    "ollama",
+                    Some(StatusCode::GATEWAY_TIMEOUT),
+                    format!(
+                        "Ollama adaptive endpoint budget exhausted after {total_timeout_seconds}s"
+                    ),
+                ));
+                break;
+            }
             let mut scoped_request = request.clone();
             scoped_request.base_url = Some(base_url.clone());
-            match self.complete_once(&scoped_request).await {
-                Ok(mut response) => {
+            scoped_request.timeout_seconds =
+                Some(remaining.as_secs().max(1).min(total_timeout_seconds));
+            let result = tokio::time::timeout(remaining, self.complete_once(&scoped_request)).await;
+            match result {
+                Err(_) => {
+                    let message = format!(
+                        "Ollama adaptive endpoint budget exhausted after {total_timeout_seconds}s"
+                    );
+                    adaptive_schema::observe_failure(
+                        "ollama",
+                        "POST",
+                        &format!("{base_url}/api/generate"),
+                        "generate adaptive endpoint",
+                        None,
+                        &message,
+                    )
+                    .await;
+                    last_error = Some(GailError::upstream(
+                        "ollama",
+                        Some(StatusCode::GATEWAY_TIMEOUT),
+                        message,
+                    ));
+                    break;
+                }
+                Ok(Ok(mut response)) => {
                     if let Some(raw) = response.raw.as_mut() {
                         raw["gail_ollama_base_url"] = json!(base_url);
                         raw["gail_ollama_endpoint_index"] = json!(index);
                         raw["gail_ollama_endpoint_failover"] = json!(index > 0);
+                        raw["gail_ollama_total_timeout_seconds"] = json!(total_timeout_seconds);
                     }
                     if index > 0 {
                         let observed_raw = response.raw.clone().unwrap_or(Value::Null);
@@ -151,7 +192,7 @@ impl OllamaProvider {
                     }
                     return Ok(response);
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     let message = error.to_string();
                     adaptive_schema::observe_failure(
                         "ollama",
@@ -166,7 +207,7 @@ impl OllamaProvider {
                         base_url = %base_url,
                         endpoint_index = index,
                         error = %message,
-                        "Ollama endpoint failed; trying adaptive fallback endpoint if available"
+                        "Ollama endpoint failed; trying adaptive fallback endpoint if budget remains"
                     );
                     last_error = Some(error);
                 }
@@ -218,6 +259,9 @@ impl OllamaProvider {
             .timeout_seconds
             .map(|seconds| seconds.max(1).min(default_timeout))
             .unwrap_or(default_timeout);
+        let tags_timeout_seconds = env_int("GAIL_OLLAMA_TAGS_TIMEOUT_SECONDS", 4)
+            .max(1)
+            .min(timeout_seconds.max(1));
         let images = request
             .messages
             .iter()
@@ -236,7 +280,7 @@ impl OllamaProvider {
             .collect::<Vec<_>>();
         for attempt in 0..2 {
             let resolution = self
-                .resolve_model_for_request(&base_url, &model, &prompt)
+                .resolve_model_for_request(&base_url, &model, &prompt, tags_timeout_seconds)
                 .await?;
             let selected_model = resolution
                 .selected_model
@@ -655,8 +699,9 @@ impl OllamaProvider {
         base_url: &str,
         requested_model: &str,
         prompt_text: &str,
+        timeout_seconds: u64,
     ) -> Result<ModelResolution> {
-        let tags = fetch_ollama_tags(&self.client, base_url).await?;
+        let tags = fetch_ollama_tags(&self.client, base_url, timeout_seconds).await?;
         let models = tags
             .get("models")
             .and_then(Value::as_array)
@@ -855,11 +900,11 @@ fn json_headers() -> http::HeaderMap {
     headers
 }
 
-async fn fetch_ollama_tags(client: &Client, base_url: &str) -> Result<Value> {
+async fn fetch_ollama_tags(client: &Client, base_url: &str, timeout_seconds: u64) -> Result<Value> {
     let url = format!("{base_url}/api/tags");
     let response = match client
         .get(&url)
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(timeout_seconds.max(1)))
         .send()
         .await
     {

@@ -3154,6 +3154,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_chat_completions_degraded_json_respects_automation_timeout() {
+        let nvidia = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "moonshotai/kimi-k2-instruct-0905"}]
+            })))
+            .mount(&nvidia)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(5))
+                    .set_body_json(json!({
+                        "id": "chatcmpl-slow",
+                        "model": "moonshotai/kimi-k2-instruct-0905",
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "{\"action\":\"buy\"}"},
+                            "finish_reason": "stop"
+                        }]
+                    })),
+            )
+            .mount(&nvidia)
+            .await;
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&ollama)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .and(body_string_contains("Reply OK."))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "OK",
+                "prompt_eval_count": 1,
+                "eval_count": 1
+            })))
+            .mount(&ollama)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .and(body_string_contains("Evaluate the next USDT microtrade"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(5))
+                    .set_body_json(json!({
+                        "response": "{\"action\":\"buy\"}",
+                        "prompt_eval_count": 2,
+                        "eval_count": 3
+                    })),
+            )
+            .mount(&ollama)
+            .await;
+
+        let mut config = GailConfig::default();
+        config.orchestration.max_parallel_candidates = 2;
+        config.orchestration.candidate_timeout_cap_seconds = Some(30);
+        config
+            .orchestration
+            .automation_candidate_timeout_cap_seconds = Some(1);
+        config.providers.push(ProviderProfile {
+            name: "NVIDIAKimi".to_string(),
+            provider_type: "nvidia".to_string(),
+            model: Some("moonshotai/kimi-k2-instruct-0905".to_string()),
+            api_key: Some("nvapi-test".to_string()),
+            base_url: Some(format!("{}/v1", nvidia.uri())),
+            roles: vec!["general".to_string()],
+            specialties: vec!["json".to_string(), "trading".to_string()],
+            weight: 1.0,
+            preferred: true,
+            ..ProviderProfile::default()
+        });
+        config.providers.push(ProviderProfile {
+            name: "OllamaLocal".to_string(),
+            provider_type: "ollama".to_string(),
+            model: Some("llama3.2".to_string()),
+            base_url: Some(ollama.uri()),
+            roles: vec!["general".to_string()],
+            specialties: vec![
+                "local".to_string(),
+                "json".to_string(),
+                "trading".to_string(),
+            ],
+            weight: 0.5,
+            preferred: false,
+            ..ProviderProfile::default()
+        });
+
+        let app = build_router(test_service_with_config(config).await);
+        let started = std::time::Instant::now();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "gail-auto",
+                            "workflow": "trading",
+                            "request_category": "octobot trading evaluator",
+                            "messages": [
+                                {
+                                    "role": "system",
+                                    "content": "Return only valid JSON for the trading decision."
+                                },
+                                {
+                                    "role": "user",
+                                    "content": "Evaluate the next USDT microtrade."
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "automation fallback took {:?}",
+            started.elapsed()
+        );
+
+        let payload = read_json(response).await;
+        let content = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content string");
+        let decision: Value = serde_json::from_str(content).expect("degraded json");
+        assert_eq!(decision["status"], "degraded");
+        assert_eq!(decision["action"], "hold");
+        assert_eq!(payload["gail"]["trace"]["final_source"], "degraded_policy");
+    }
+
+    #[tokio::test]
     async fn openai_responses_route_input_text_items() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
