@@ -94,11 +94,20 @@ Build the container image locally:
 
 ```bash
 podman build \
+  -t ghcr.io/neuralmimicry/gail:local .
+```
+
+By default, the Containerfile builds a local architecture-correct Gail `.deb` from the checked-out source and installs that package into the runtime image. This keeps source-based Ansible rollouts independent of GitHub Release availability while still exercising the same Debian package layout as published releases.
+
+To build an image from a published GitHub Release package instead, pass a release selector:
+
+```bash
+podman build \
   --build-arg GAIL_VERSION=0.2.0 \
   -t ghcr.io/neuralmimicry/gail:0.2.0 .
 ```
 
-The Containerfile installs Gail from the matching GitHub Release `.deb` for the container architecture. `TARGETARCH` is mapped to Debian's `amd64` or `arm64` package names, with `dpkg --print-architecture` as a fallback for local Podman builds. Set `GAIL_VERSION=latest` to resolve the newest release asset, or set `GAIL_DEB_URL` to install a specific package URL directly.
+`TARGETARCH` is mapped to Debian's `amd64` or `arm64` package names, with `dpkg --print-architecture` as a fallback for local Podman builds. Set `GAIL_VERSION=latest` to resolve the newest release asset, or set `GAIL_DEB_URL` to install a specific package URL directly.
 
 The image keeps the existing container contract: it expects a config file at `/app/config/gail.yaml` unless `GAIL_CONFIG` is overridden, and it stores runtime data under `/app/data`.
 
