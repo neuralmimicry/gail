@@ -4,10 +4,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sysinfo::{Disks, System};
+use tokio::sync::Semaphore;
 
 use crate::{
     adaptive_schema,
@@ -21,6 +23,11 @@ use super::{
     env_int, error_message, infer_capabilities_from_model, infer_capabilities_from_text,
     is_model_not_found, post_json_with_retries, response_with_usage,
 };
+
+const PROVIDER_HEALTH_FALLBACK_TIMEOUT_SECONDS: u64 = 4;
+
+static OLLAMA_REQUEST_SEMAPHORE: Lazy<Semaphore> =
+    Lazy::new(|| Semaphore::new(env_int("GAIL_OLLAMA_MAX_CONCURRENT_REQUESTS", 1).max(1) as usize));
 
 #[derive(Clone)]
 pub struct OllamaProvider {
@@ -88,12 +95,43 @@ impl OllamaProvider {
         &self,
         request: &ProviderCompletionRequest,
     ) -> Result<ProviderInvocationResponse> {
+        let queue_timeout =
+            Duration::from_secs(env_int("GAIL_OLLAMA_QUEUE_TIMEOUT_SECONDS", 2).max(1));
+        let _permit = match tokio::time::timeout(queue_timeout, OLLAMA_REQUEST_SEMAPHORE.acquire())
+            .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                return Err(GailError::upstream(
+                    "ollama",
+                    None,
+                    "Ollama request limiter is closed",
+                ));
+            }
+            Err(_) => {
+                return Err(GailError::upstream(
+                    "ollama",
+                    None,
+                    "timeout waiting for local Ollama request slot; local model service is saturated",
+                ));
+            }
+        };
         let base_url = request
             .base_url
             .clone()
             .unwrap_or_else(|| self.base_url.clone());
         let mut model = request.model.clone().unwrap_or_else(|| self.model.clone());
         let prompt = collapse_messages(request);
+        let max_predict = env_int("GAIL_OLLAMA_MAX_PREDICT", 512).max(1) as u32;
+        let num_predict = request
+            .max_tokens
+            .map(|value| value.max(1).min(max_predict))
+            .unwrap_or(max_predict);
+        let default_timeout = env_int("GAIL_OLLAMA_TIMEOUT_SECONDS", 30).max(1);
+        let timeout_seconds = request
+            .timeout_seconds
+            .map(|seconds| seconds.max(1).min(default_timeout))
+            .unwrap_or(default_timeout);
         let images = request
             .messages
             .iter()
@@ -122,7 +160,10 @@ impl OllamaProvider {
             let mut payload = json!({
                 "model": model,
                 "prompt": prompt,
-                "options": {"temperature": request.temperature.unwrap_or(0.2)},
+                "options": {
+                    "temperature": request.temperature.unwrap_or(0.2),
+                    "num_predict": num_predict
+                },
                 "stream": false,
             });
             if !images.is_empty() {
@@ -135,13 +176,8 @@ impl OllamaProvider {
                 &format!("{base_url}/api/generate"),
                 &json_headers(),
                 &payload,
-                Duration::from_secs(
-                    request
-                        .timeout_seconds
-                        .unwrap_or(env_int("LLM_TIMEOUT_SECONDS", 180))
-                        .max(1),
-                ),
-                env_int("LLM_MAX_RETRIES", 2) as usize,
+                Duration::from_secs(timeout_seconds),
+                env_int("GAIL_OLLAMA_MAX_RETRIES", 0) as usize,
             )
             .await?;
             let latency_ms = started.elapsed().as_millis() as u64;
@@ -206,14 +242,13 @@ impl OllamaProvider {
     pub async fn health(&self, timeout_seconds: Option<u64>) -> Result<ProviderHealth> {
         let started = Instant::now();
         let url = format!("{}/api/tags", self.base_url);
+        let tags_timeout_seconds = timeout_seconds
+            .unwrap_or(PROVIDER_HEALTH_FALLBACK_TIMEOUT_SECONDS)
+            .max(1);
         let response = match self
             .client
             .get(&url)
-            .timeout(Duration::from_secs(
-                timeout_seconds
-                    .unwrap_or(env_int("LLM_TIMEOUT_SECONDS", 60))
-                    .max(1),
-            ))
+            .timeout(Duration::from_secs(tags_timeout_seconds))
             .send()
             .await
         {
@@ -231,38 +266,154 @@ impl OllamaProvider {
                 return Err(error.into());
             }
         };
-        let latency_ms = started.elapsed().as_millis() as u64;
-        if response.status().is_success() {
-            adaptive_schema::observe_success(
-                "ollama",
-                "GET",
-                &url,
-                "tags health",
-                &adaptive_schema::endpoint_status_body(response.status().as_u16()),
-            )
-            .await;
+        let status = response.status();
+        let body = response.text().await?;
+        let payload: Value =
+            serde_json::from_str(&body).unwrap_or_else(|_| json!({"message": body}));
+        if status.is_success() {
+            adaptive_schema::observe_success("ollama", "GET", &url, "tags health", &payload).await;
         } else {
             adaptive_schema::observe_failure(
                 "ollama",
                 "GET",
                 &url,
                 "tags health",
-                Some(response.status().as_u16()),
-                response.status().as_str(),
+                Some(status.as_u16()),
+                &payload.to_string(),
             )
             .await;
         }
-        Ok(ProviderHealth {
-            ok: response.status().is_success(),
-            status_code: Some(response.status().as_u16()),
-            latency_ms: Some(latency_ms),
-            message: Some(if response.status().is_success() {
-                "ok".to_string()
-            } else {
-                response.status().to_string()
-            }),
-            mode: Some("http".to_string()),
-        })
+        let tags_latency_ms = started.elapsed().as_millis() as u64;
+        if !status.is_success() {
+            return Ok(ProviderHealth {
+                ok: false,
+                status_code: Some(status.as_u16()),
+                latency_ms: Some(tags_latency_ms),
+                message: Some(status.to_string()),
+                mode: Some("http".to_string()),
+            });
+        }
+
+        if !env_bool("GAIL_OLLAMA_HEALTH_GENERATE_PROBE", true) {
+            return Ok(ProviderHealth {
+                ok: true,
+                status_code: Some(status.as_u16()),
+                latency_ms: Some(tags_latency_ms),
+                message: Some("ok".to_string()),
+                mode: Some("tags".to_string()),
+            });
+        }
+
+        let Some(model) = select_matching_installed_model(&payload, &self.model)
+            .or_else(|| select_matching_installed_model(&payload, &self.default_model))
+        else {
+            return Ok(ProviderHealth {
+                ok: false,
+                status_code: Some(status.as_u16()),
+                latency_ms: Some(tags_latency_ms),
+                message: Some(format!(
+                    "Ollama model {} is not installed and auto-pull is disabled",
+                    self.model
+                )),
+                mode: Some("missing_endpoint".to_string()),
+            });
+        };
+        self.generate_probe_health(&model, timeout_seconds).await
+    }
+
+    async fn generate_probe_health(
+        &self,
+        model: &str,
+        timeout_seconds: Option<u64>,
+    ) -> Result<ProviderHealth> {
+        let generate_url = format!("{}/api/generate", self.base_url);
+        let probe_timeout_seconds = env_int(
+            "GAIL_OLLAMA_HEALTH_GENERATE_TIMEOUT_SECONDS",
+            timeout_seconds.unwrap_or(PROVIDER_HEALTH_FALLBACK_TIMEOUT_SECONDS),
+        )
+        .max(1);
+        let probe_payload = json!({
+            "model": model,
+            "prompt": "Reply OK.",
+            "options": {
+                "temperature": 0,
+                "num_predict": 1
+            },
+            "stream": false,
+        });
+        let started = Instant::now();
+        let response = self
+            .client
+            .post(&generate_url)
+            .timeout(Duration::from_secs(probe_timeout_seconds))
+            .json(&probe_payload)
+            .send()
+            .await;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        match response {
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await?;
+                let payload: Value =
+                    serde_json::from_str(&body).unwrap_or_else(|_| json!({"message": body}));
+                if status.is_success() {
+                    adaptive_schema::observe_success(
+                        "ollama",
+                        "POST",
+                        &generate_url,
+                        "generate health",
+                        &payload,
+                    )
+                    .await;
+                    Ok(ProviderHealth {
+                        ok: true,
+                        status_code: Some(status.as_u16()),
+                        latency_ms: Some(latency_ms),
+                        message: Some("ok".to_string()),
+                        mode: Some("generate_probe".to_string()),
+                    })
+                } else {
+                    adaptive_schema::observe_failure(
+                        "ollama",
+                        "POST",
+                        &generate_url,
+                        "generate health",
+                        Some(status.as_u16()),
+                        &payload.to_string(),
+                    )
+                    .await;
+                    Ok(ProviderHealth {
+                        ok: false,
+                        status_code: Some(status.as_u16()),
+                        latency_ms: Some(latency_ms),
+                        message: Some(error_message(&payload)),
+                        mode: Some("upstream".to_string()),
+                    })
+                }
+            }
+            Err(error) => {
+                adaptive_schema::observe_failure(
+                    "ollama",
+                    "POST",
+                    &generate_url,
+                    "generate health",
+                    None,
+                    &error.to_string(),
+                )
+                .await;
+                Ok(ProviderHealth {
+                    ok: false,
+                    status_code: None,
+                    latency_ms: Some(latency_ms),
+                    message: Some(format!("generate probe failed: {error}")),
+                    mode: Some(if error.is_timeout() {
+                        "timeout".to_string()
+                    } else {
+                        "upstream".to_string()
+                    }),
+                })
+            }
+        }
     }
 
     pub async fn inventory_status(&self, config: &GailConfig) -> Result<OllamaInventoryStatus> {
@@ -371,30 +522,15 @@ impl OllamaProvider {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let requested_aliases = aliases_for_model(requested_model);
-        let prompt_capabilities = infer_capabilities_from_text(prompt_text);
-        let requested_capabilities = infer_capabilities_from_model(requested_model);
-        if let Some(installed) = models.iter().find(|entry| {
-            entry
-                .get("name")
-                .and_then(Value::as_str)
-                .map(|name| {
-                    aliases_for_model(name)
-                        .iter()
-                        .any(|alias| requested_aliases.contains(alias))
-                })
-                .unwrap_or(false)
-        }) {
-            let model = installed
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or(requested_model);
+        if let Some(model) = select_matching_model_from_entries(&models, requested_model) {
             return Ok(ModelResolution {
-                selected_model: Some(model.to_string()),
+                selected_model: Some(model),
                 requested_model: requested_model.to_string(),
                 recommended_downloads: Vec::new(),
             });
         }
+        let prompt_capabilities = infer_capabilities_from_text(prompt_text);
+        let requested_capabilities = infer_capabilities_from_model(requested_model);
         let mut best: Option<(i32, String)> = None;
         for entry in &models {
             let Some(name) = entry.get("name").and_then(Value::as_str) else {
@@ -456,8 +592,42 @@ fn collapse_messages(request: &ProviderCompletionRequest) -> String {
 
 fn aliases_for_model(model: &str) -> Vec<String> {
     let normalized = model.trim().to_ascii_lowercase();
+    let base = normalized
+        .split_once(':')
+        .map(|(name, _)| name.to_string())
+        .unwrap_or_else(|| normalized.clone());
     let bare = normalized.replace("latest", "").replace(':', "");
-    vec![normalized.clone(), bare]
+    vec![normalized.clone(), base, bare]
+}
+
+fn select_matching_installed_model(tags: &Value, requested_model: &str) -> Option<String> {
+    let models = tags.get("models").and_then(Value::as_array)?;
+    select_matching_model_from_entries(models, requested_model)
+}
+
+fn select_matching_model_from_entries(models: &[Value], requested_model: &str) -> Option<String> {
+    let requested_normalized = requested_model.trim().to_ascii_lowercase();
+    if let Some(exact) = models.iter().find_map(|entry| {
+        entry
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| name.trim().eq_ignore_ascii_case(&requested_normalized))
+            .map(ToOwned::to_owned)
+    }) {
+        return Some(exact);
+    }
+    let requested_aliases = aliases_for_model(requested_model);
+    models.iter().find_map(|entry| {
+        entry
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| {
+                aliases_for_model(name)
+                    .iter()
+                    .any(|alias| requested_aliases.contains(alias))
+            })
+            .map(ToOwned::to_owned)
+    })
 }
 
 fn json_headers() -> http::HeaderMap {
@@ -512,4 +682,38 @@ async fn fetch_ollama_tags(client: &Client, base_url: &str) -> Result<Value> {
     }
     adaptive_schema::observe_success("ollama", "GET", &url, "tags", &payload).await;
     Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_matching_accepts_base_name_for_tagged_model() {
+        let tags = json!({
+            "models": [
+                {"name": "llama3.2:3b"}
+            ]
+        });
+
+        assert_eq!(
+            select_matching_installed_model(&tags, "llama3.2").as_deref(),
+            Some("llama3.2:3b")
+        );
+    }
+
+    #[test]
+    fn model_matching_keeps_exact_tag_when_available() {
+        let tags = json!({
+            "models": [
+                {"name": "llama3.2:latest"},
+                {"name": "llama3.2:3b"}
+            ]
+        });
+
+        assert_eq!(
+            select_matching_installed_model(&tags, "llama3.2:3b").as_deref(),
+            Some("llama3.2:3b")
+        );
+    }
 }
