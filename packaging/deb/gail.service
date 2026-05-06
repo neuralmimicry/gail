@@ -1,0 +1,27 @@
+[Unit]
+Description=Gail AI middleware
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gail
+Group=gail
+WorkingDirectory=/var/lib/gail
+Environment=GAIL_CONFIG=/etc/gail/gail.yaml
+Environment=GAIL_ROUTING_PROFILES_PATH=/etc/gail/ai-routing-profiles.json
+Environment=RUST_LOG=info
+EnvironmentFile=-/etc/gail/gail.env
+ExecStart=/usr/bin/gail --config /etc/gail/gail.yaml
+Restart=on-failure
+RestartSec=5s
+StateDirectory=gail
+StateDirectoryMode=0750
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/gail
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

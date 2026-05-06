@@ -1,0 +1,11 @@
+.git
+.idea
+target
+data
+dist
+*.deb
+*.rpm
+*.tar
+*.tar.gz
+*.tgz
+*.zip

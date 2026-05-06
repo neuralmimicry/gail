@@ -1,0 +1,165 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without the leading v. Defaults to Cargo.toml when omitted."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Resolve release version
+    runs-on: [self-hosted, Linux, X64]
+    outputs:
+      app_version: ${{ steps.version.outputs.app_version }}
+      deb_version: ${{ steps.version.outputs.deb_version }}
+      tag_name: ${{ steps.version.outputs.tag_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        env:
+          DISPATCH_VERSION: ${{ github.event.inputs.version || '' }}
+        run: |
+          set -euo pipefail
+
+          version="${DISPATCH_VERSION:-}"
+          if [[ -z "${version}" && "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          fi
+          if [[ -z "${version}" ]]; then
+            version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)"
+          fi
+
+          version="${version#v}"
+
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?(\+[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "Invalid release version: ${version}" >&2
+            exit 2
+          fi
+
+          deb_version="${version//-/~}"
+          if [[ ! "${deb_version}" =~ ^[0-9][0-9A-Za-z.+~-]*$ ]]; then
+            echo "Invalid Debian package version: ${deb_version}" >&2
+            exit 2
+          fi
+
+          tag_name="v${version}"
+
+          {
+            echo "app_version=${version}"
+            echo "deb_version=${deb_version}"
+            echo "tag_name=${tag_name}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "Gail release version: ${version}"
+          echo "Debian package version: ${deb_version}"
+          echo "Release tag: ${tag_name}"
+
+  build-deb:
+    name: Build ${{ matrix.runner_arch }} Debian package
+    needs: version
+    runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner_arch: X64
+            deb_arch: amd64
+          - runner_arch: ARM64
+            deb_arch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Ensure packaging tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v dpkg-deb >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends dpkg
+          fi
+
+      - name: Set release version
+        run: bash scripts/set-release-version.sh "${{ needs.version.outputs.app_version }}"
+
+      - name: Build release binary
+        run: cargo build --locked --release -j 1
+
+      - name: Build Debian package
+        run: |
+          bash scripts/build-deb.sh \
+            --version "${{ needs.version.outputs.app_version }}" \
+            --deb-version "${{ needs.version.outputs.deb_version }}" \
+            --arch "${{ matrix.deb_arch }}" \
+            --binary target/release/gail \
+            --out-dir dist
+
+      - name: Inspect Debian package
+        run: dpkg-deb --info "dist/gail_${{ needs.version.outputs.deb_version }}_${{ matrix.deb_arch }}.deb"
+
+      - name: Upload Debian package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gail-deb-${{ matrix.deb_arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  github-release:
+    name: Publish GitHub release
+    needs:
+      - version
+      - build-deb
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - name: Download Debian packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gail-deb-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: release-assets
+        run: sha256sum *.deb > SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag_name }}
+          target_commitish: ${{ github.sha }}
+          name: Gail v${{ needs.version.outputs.app_version }}
+          generate_release_notes: true
+          prerelease: ${{ contains(needs.version.outputs.app_version, '-') }}
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/*.deb
+            release-assets/SHA256SUMS

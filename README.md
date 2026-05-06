@@ -93,10 +93,49 @@ The bundled [`gail.yaml`](./gail.yaml) is an example configuration. It supports 
 Build the container image locally:
 
 ```bash
-podman build -t ghcr.io/neuralmimicry/gail:latest .
+podman build \
+  --build-arg GAIL_VERSION=0.2.0 \
+  -t ghcr.io/neuralmimicry/gail:0.2.0 .
 ```
 
-The image expects a config file at `/app/config/gail.yaml` unless `GAIL_CONFIG` is overridden.
+The Containerfile installs Gail from the matching GitHub Release `.deb` for the container architecture. `TARGETARCH` is mapped to Debian's `amd64` or `arm64` package names, with `dpkg --print-architecture` as a fallback for local Podman builds. Set `GAIL_VERSION=latest` to resolve the newest release asset, or set `GAIL_DEB_URL` to install a specific package URL directly.
+
+The image keeps the existing container contract: it expects a config file at `/app/config/gail.yaml` unless `GAIL_CONFIG` is overridden, and it stores runtime data under `/app/data`.
+
+## Debian Releases
+
+The release workflow builds native Debian packages on the repo's self-hosted Linux runners for both X64 and ARM64:
+
+- `gail_<version>_amd64.deb`
+- `gail_<version>_arm64.deb`
+- `SHA256SUMS`
+
+Create a release by pushing a SemVer tag:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The same workflow can be run manually from GitHub Actions with a `version` input. On each release run, the workflow derives the Gail version from the tag or manual input, updates `Cargo.toml` and `Cargo.lock` inside the runner workspace before building, and publishes the `.deb` files to a GitHub Release. This keeps the binary's `CARGO_PKG_VERSION`, the Debian package version, and the release tag aligned without requiring generated release edits to be committed back to the branch.
+
+The package installs:
+
+- `/usr/bin/gail`
+- `/etc/gail/gail.yaml`
+- `/etc/gail/gail.env`
+- `/etc/gail/ai-routing-profiles.json`
+- `/lib/systemd/system/gail.service`
+- `/var/lib/gail/data`
+
+Install and start a release package with:
+
+```bash
+sudo apt install ./gail_0.2.0_amd64.deb
+sudo systemctl enable --now gail
+```
+
+Provider credentials, Gail bearer tokens, Ollama endpoints, and trading defaults belong in `/etc/gail/gail.env`. Persistent runtime state is written under `/var/lib/gail` because the systemd unit starts Gail with that working directory.
 
 ## Configuration Notes
 
