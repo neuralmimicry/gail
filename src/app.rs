@@ -2447,7 +2447,7 @@ mod tests {
     use tower::ServiceExt;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
+        matchers::{body_string_contains, method, path},
     };
 
     use crate::config::{ApiTokenConfig, GailConfig, ProviderProfile, SpecialistProfile};
@@ -3032,6 +3032,125 @@ mod tests {
                 candidate["provider"] == "ollama" && candidate["status"] == "ok"
             })
         );
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_returns_degraded_json_when_all_orchestrated_candidates_fail() {
+        let nvidia = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "moonshotai/kimi-k2-instruct-0905"}]
+            })))
+            .mount(&nvidia)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(502).set_body_json(json!({
+                "error": {"message": "upstream transport failed"}
+            })))
+            .mount(&nvidia)
+            .await;
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&ollama)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .and(body_string_contains("Reply OK."))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "OK",
+                "prompt_eval_count": 1,
+                "eval_count": 1
+            })))
+            .mount(&ollama)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .and(body_string_contains("Evaluate the next USDT microtrade"))
+            .respond_with(ResponseTemplate::new(502).set_body_json(json!({
+                "error": "local generation unavailable"
+            })))
+            .mount(&ollama)
+            .await;
+
+        let mut config = GailConfig::default();
+        config.orchestration.max_parallel_candidates = 1;
+        config.providers.push(ProviderProfile {
+            name: "NVIDIAKimi".to_string(),
+            provider_type: "nvidia".to_string(),
+            model: Some("moonshotai/kimi-k2-instruct-0905".to_string()),
+            api_key: Some("nvapi-test".to_string()),
+            base_url: Some(format!("{}/v1", nvidia.uri())),
+            roles: vec!["general".to_string()],
+            specialties: vec!["json".to_string(), "trading".to_string()],
+            weight: 1.0,
+            preferred: true,
+            ..ProviderProfile::default()
+        });
+        config.providers.push(ProviderProfile {
+            name: "OllamaLocal".to_string(),
+            provider_type: "ollama".to_string(),
+            model: Some("llama3.2".to_string()),
+            base_url: Some(ollama.uri()),
+            roles: vec!["general".to_string()],
+            specialties: vec![
+                "local".to_string(),
+                "json".to_string(),
+                "trading".to_string(),
+            ],
+            weight: 0.1,
+            preferred: false,
+            ..ProviderProfile::default()
+        });
+
+        let app = build_router(test_service_with_config(config).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "gail-auto",
+                            "workflow": "trading",
+                            "request_category": "octobot trading evaluator",
+                            "messages": [
+                                {
+                                    "role": "system",
+                                    "content": "Return only valid JSON for the trading decision."
+                                },
+                                {
+                                    "role": "user",
+                                    "content": "Evaluate the next USDT microtrade."
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+
+        let payload = read_json(response).await;
+        let content = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content string");
+        let decision: Value = serde_json::from_str(content).expect("degraded json");
+        assert_eq!(decision["status"], "degraded");
+        assert_eq!(decision["action"], "hold");
+        assert_eq!(decision["should_trade"], false);
+        assert_eq!(payload["gail"]["provider"], "gail");
+        assert_eq!(payload["gail"]["resolved_model"], "degraded_safety");
+        assert_eq!(payload["gail"]["trace"]["final_source"], "degraded_policy");
     }
 
     #[tokio::test]

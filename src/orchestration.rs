@@ -471,10 +471,57 @@ impl GailService {
                 .collect::<Vec<_>>();
             if remaining.is_empty() && !unattempted.is_empty() {
                 if results.is_empty() {
+                    let message = "all suitable providers are currently in adaptive backoff; retry after the recorded mitigation window".to_string();
+                    api_issues::observe_orchestration_failure(
+                        &workflow,
+                        &role,
+                        &message,
+                        json!({
+                            "attempted_candidate_count": attempted_candidate_ids.len(),
+                            "throttled_provider_types": sorted_strings(throttled_provider_types.clone()),
+                            "backoff_candidates": unattempted
+                                .iter()
+                                .map(|item| item.candidate.candidate_id())
+                                .collect::<Vec<_>>(),
+                        }),
+                    )
+                    .await;
+                    if should_return_degraded_fallback(
+                        &request,
+                        include_configured,
+                        &workflow,
+                        &role,
+                        expected_json,
+                        &task_tags,
+                        &prompt_text,
+                    ) {
+                        info!(
+                            workflow = %workflow,
+                            role = %role,
+                            "returning Gail degraded safety fallback because every provider is in adaptive backoff"
+                        );
+                        return Ok(self.degraded_completion_response(
+                            request_id,
+                            &workflow,
+                            &role,
+                            &task_tags,
+                            &selection_mode,
+                            returned_early,
+                            early_success_enabled,
+                            early_success_settle_seconds,
+                            expected_json,
+                            &prompt_text,
+                            vec![message],
+                            ranked_candidate_summaries(&unattempted),
+                            specialist_meta.as_ref(),
+                            attempted_candidate_ids.len(),
+                            sorted_strings(throttled_provider_types.clone()),
+                        ));
+                    }
                     return Err(GailError::upstream(
                         "gail",
                         Some(StatusCode::SERVICE_UNAVAILABLE),
-                        "all suitable providers are currently in adaptive backoff; retry after the recorded mitigation window",
+                        message,
                     ));
                 }
                 break;
@@ -663,12 +710,44 @@ impl GailService {
                 &role,
                 &message,
                 json!({
-                    "failures": failures,
+                    "failures": failures.clone(),
                     "attempted_candidate_count": attempted_candidate_ids.len(),
                     "throttled_provider_types": sorted_strings(throttled_provider_types.clone()),
                 }),
             )
             .await;
+            if should_return_degraded_fallback(
+                &request,
+                include_configured,
+                &workflow,
+                &role,
+                expected_json,
+                &task_tags,
+                &prompt_text,
+            ) {
+                info!(
+                    workflow = %workflow,
+                    role = %role,
+                    "returning Gail degraded safety fallback because every provider failed"
+                );
+                return Ok(self.degraded_completion_response(
+                    request_id,
+                    &workflow,
+                    &role,
+                    &task_tags,
+                    &selection_mode,
+                    returned_early,
+                    early_success_enabled,
+                    early_success_settle_seconds,
+                    expected_json,
+                    &prompt_text,
+                    failures,
+                    invocation_summaries_from_results(&results),
+                    specialist_meta.as_ref(),
+                    attempted_candidate_ids.len(),
+                    sorted_strings(throttled_provider_types.clone()),
+                ));
+            }
             return Err(GailError::upstream("gail", None, message));
         };
 
@@ -794,6 +873,74 @@ impl GailService {
             trace: Some(trace),
             raw,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn degraded_completion_response(
+        &self,
+        request_id: String,
+        workflow: &str,
+        role: &str,
+        task_tags: &HashSet<String>,
+        selection_mode: &SelectionMode,
+        returned_early: bool,
+        early_success_enabled: bool,
+        early_success_settle_seconds: f64,
+        expected_json: bool,
+        prompt_text: &str,
+        failures: Vec<String>,
+        mut candidate_summaries: Vec<CandidateInvocationSummary>,
+        specialist_meta: Option<&SpecialistAnalysisResponse>,
+        attempted_candidate_count: usize,
+        throttled_provider_types: Vec<String>,
+    ) -> CompletionResponse {
+        let selected_summary = degraded_candidate_summary(role);
+        candidate_summaries.insert(
+            0,
+            CandidateInvocationSummary {
+                summary: selected_summary.clone(),
+                latency_ms: Some(0),
+                quality: 0.0,
+                score: 0.0,
+                status: "ok".to_string(),
+                error: None,
+            },
+        );
+        let text = degraded_fallback_text(expected_json, workflow, role, prompt_text, &failures);
+        let trace = CompletionTrace {
+            workflow: workflow.to_string(),
+            role: role.to_string(),
+            task_tags: sorted_strings(task_tags.clone()),
+            selection_mode: selection_mode.clone(),
+            returned_early,
+            early_success_enabled,
+            early_success_settle_seconds,
+            selected: selected_summary,
+            candidates: candidate_summaries,
+            metrics_store_path: self.inner.metrics.path(),
+            specialist_engines: specialist_meta.and_then(|value| serde_json::to_value(value).ok()),
+            final_source: "degraded_policy".to_string(),
+            final_provider: "gail".to_string(),
+            final_model: "degraded_safety".to_string(),
+            aarnn_mirroring: None,
+        };
+        CompletionResponse {
+            request_id,
+            text,
+            provider: "gail".to_string(),
+            model: "degraded_safety".to_string(),
+            latency_ms: 0,
+            usage: None,
+            trace: Some(trace),
+            raw: Some(json!({
+                "selected_source": "degraded_policy",
+                "reason": "all_provider_candidates_failed",
+                "attempted_candidate_count": attempted_candidate_count,
+                "throttled_provider_types": throttled_provider_types,
+                "failures": failures,
+                "safety_action": "hold_no_trade",
+            })),
+        }
     }
 
     pub async fn transcribe(
@@ -2175,6 +2322,191 @@ where
     let mut items = values.into_iter().collect::<Vec<_>>();
     items.sort();
     items
+}
+
+fn should_return_degraded_fallback(
+    request: &CompletionRequest,
+    include_configured: bool,
+    workflow: &str,
+    role: &str,
+    expected_json: bool,
+    task_tags: &HashSet<String>,
+    prompt_text: &str,
+) -> bool {
+    if env_bool_any(
+        &[
+            "GAIL_DISABLE_DEGRADED_FALLBACK",
+            "REFINER_AI_DISABLE_DEGRADED_FALLBACK",
+        ],
+        false,
+    ) {
+        return false;
+    }
+    if env_bool_any(
+        &[
+            "GAIL_ALWAYS_DEGRADED_FALLBACK",
+            "REFINER_AI_ALWAYS_DEGRADED_FALLBACK",
+        ],
+        false,
+    ) {
+        return true;
+    }
+    if request.preferred_provider.is_some() && !include_configured {
+        return false;
+    }
+    if expected_json {
+        return true;
+    }
+    if is_interactive_workflow(workflow, role) {
+        return false;
+    }
+    if request.preferred_provider.is_none() {
+        return true;
+    }
+    text_or_tags_indicate_automation(workflow, role, task_tags, prompt_text)
+}
+
+fn text_or_tags_indicate_automation(
+    workflow: &str,
+    role: &str,
+    task_tags: &HashSet<String>,
+    prompt_text: &str,
+) -> bool {
+    let haystack = format!(
+        "{} {} {} {}",
+        workflow,
+        role,
+        task_tags.iter().cloned().collect::<Vec<_>>().join(" "),
+        prompt_text
+    )
+    .to_ascii_lowercase();
+    [
+        "agent",
+        "automation",
+        "crypto",
+        "evaluator",
+        "octobot",
+        "planner",
+        "portfolio",
+        "rebalance",
+        "refiner",
+        "researcher",
+        "reviewer",
+        "signal",
+        "strategy",
+        "trade",
+        "trading",
+    ]
+    .iter()
+    .any(|term| haystack.contains(term))
+}
+
+fn degraded_candidate_summary(role: &str) -> CandidateSummary {
+    CandidateSummary {
+        candidate_id: "gail/degraded_safety".to_string(),
+        provider: "gail".to_string(),
+        model: "degraded_safety".to_string(),
+        configured_model: "degraded_safety".to_string(),
+        resolved_model: "degraded_safety".to_string(),
+        source: "internal_degraded_policy".to_string(),
+        specialties: vec!["fallback".to_string(), "safety".to_string()],
+        roles: vec![role.to_string()],
+    }
+}
+
+fn invocation_summaries_from_results(
+    results: &[InvocationResult],
+) -> Vec<CandidateInvocationSummary> {
+    results
+        .iter()
+        .map(|result| CandidateInvocationSummary {
+            summary: result
+                .candidate
+                .summary(result.response.as_ref().map(|value| value.model.as_str())),
+            latency_ms: result.latency_ms,
+            quality: result.quality,
+            score: result.score,
+            status: if result.response.is_some() {
+                "ok".to_string()
+            } else {
+                "error".to_string()
+            },
+            error: result.error.clone(),
+        })
+        .collect()
+}
+
+fn ranked_candidate_summaries(candidates: &[RankedCandidate]) -> Vec<CandidateInvocationSummary> {
+    candidates
+        .iter()
+        .map(|candidate| CandidateInvocationSummary {
+            summary: candidate.candidate.summary(None),
+            latency_ms: None,
+            quality: -1.0,
+            score: candidate.score,
+            status: "skipped_backoff".to_string(),
+            error: candidate
+                .health_mode
+                .as_ref()
+                .map(|mode| format!("provider health backoff: {mode}")),
+        })
+        .collect()
+}
+
+fn degraded_fallback_text(
+    expected_json: bool,
+    workflow: &str,
+    role: &str,
+    prompt_text: &str,
+    failures: &[String],
+) -> String {
+    let reason = failures
+        .last()
+        .map(|value| value.as_str())
+        .unwrap_or("all provider candidates failed");
+    if expected_json {
+        let payload = if prompt_requests_manager_tool_call(prompt_text) {
+            json!({
+                "tool_name": "finish",
+                "arguments": {
+                    "status": "degraded",
+                    "decision": "hold",
+                    "action": "hold",
+                    "should_trade": false,
+                    "reason": reason,
+                }
+            })
+        } else {
+            json!({
+                "status": "degraded",
+                "decision": "hold",
+                "action": "hold",
+                "signal": "neutral",
+                "confidence": 0.0,
+                "should_trade": false,
+                "orders": [],
+                "trades": [],
+                "risk": "provider_unavailable",
+                "reason": reason,
+            })
+        };
+        return payload.to_string();
+    }
+    if text_or_tags_indicate_automation(workflow, role, &HashSet::new(), prompt_text) {
+        return format!(
+            "HOLD / NO_TRADE: Gail detected that every configured AI provider is unavailable or in adaptive backoff. Reason: {reason}. Do not open new positions until provider health recovers."
+        );
+    }
+    format!(
+        "Gail degraded fallback: every configured AI provider is unavailable or in adaptive backoff. Reason: {reason}."
+    )
+}
+
+fn prompt_requests_manager_tool_call(prompt_text: &str) -> bool {
+    let lowered = prompt_text.to_ascii_lowercase();
+    lowered.contains("tool_name")
+        && lowered.contains("arguments")
+        && (lowered.contains("manager") || lowered.contains("tool"))
 }
 
 fn is_interactive_workflow(workflow: &str, role: &str) -> bool {

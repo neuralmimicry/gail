@@ -84,11 +84,97 @@ impl OllamaProvider {
         &self.model
     }
 
+    fn base_url_candidates(&self, request_base_url: Option<&str>) -> Vec<String> {
+        let mut candidates = Vec::new();
+        push_base_url_candidate(&mut candidates, request_base_url);
+        push_base_url_candidate(&mut candidates, Some(self.base_url.as_str()));
+        for value in env_base_url_list("GAIL_OLLAMA_FALLBACK_BASE_URLS")
+            .into_iter()
+            .chain(env_base_url_list("OLLAMA_FALLBACK_BASE_URLS"))
+        {
+            push_base_url_candidate(&mut candidates, Some(value.as_str()));
+        }
+        if candidates.is_empty()
+            || candidates
+                .iter()
+                .any(|candidate| !base_url_uses_local_ollama_host(candidate))
+        {
+            push_base_url_candidate(
+                &mut candidates,
+                env::var("GAIL_OLLAMA_INTERNAL_BASE_URL").ok().as_deref(),
+            );
+            push_base_url_candidate(
+                &mut candidates,
+                Some("http://ollama.ollama.svc.cluster.local:11434"),
+            );
+        }
+
+        let mut with_variants = Vec::new();
+        for candidate in candidates {
+            push_base_url_candidate(&mut with_variants, Some(candidate.as_str()));
+            for variant in endpoint_scheme_variants(candidate.as_str()) {
+                push_base_url_candidate(&mut with_variants, Some(variant.as_str()));
+            }
+        }
+
+        let max_endpoints = env_int("GAIL_OLLAMA_MAX_ENDPOINTS", 4).max(1) as usize;
+        with_variants.truncate(max_endpoints);
+        with_variants
+    }
+
     pub async fn complete(
         &self,
         request: &ProviderCompletionRequest,
     ) -> Result<ProviderInvocationResponse> {
-        self.complete_once(request).await
+        let base_urls = self.base_url_candidates(request.base_url.as_deref());
+        let mut last_error = None;
+        for (index, base_url) in base_urls.iter().enumerate() {
+            let mut scoped_request = request.clone();
+            scoped_request.base_url = Some(base_url.clone());
+            match self.complete_once(&scoped_request).await {
+                Ok(mut response) => {
+                    if let Some(raw) = response.raw.as_mut() {
+                        raw["gail_ollama_base_url"] = json!(base_url);
+                        raw["gail_ollama_endpoint_index"] = json!(index);
+                        raw["gail_ollama_endpoint_failover"] = json!(index > 0);
+                    }
+                    if index > 0 {
+                        let observed_raw = response.raw.clone().unwrap_or(Value::Null);
+                        adaptive_schema::observe_success(
+                            "ollama",
+                            "POST",
+                            &format!("{base_url}/api/generate"),
+                            "generate adaptive endpoint",
+                            &observed_raw,
+                        )
+                        .await;
+                    }
+                    return Ok(response);
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    adaptive_schema::observe_failure(
+                        "ollama",
+                        "POST",
+                        &format!("{base_url}/api/generate"),
+                        "generate adaptive endpoint",
+                        None,
+                        &message,
+                    )
+                    .await;
+                    tracing::warn!(
+                        base_url = %base_url,
+                        endpoint_index = index,
+                        error = %message,
+                        "Ollama endpoint failed; trying adaptive fallback endpoint if available"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            GailError::upstream("ollama", None, "no Ollama endpoints were configured")
+        }))
     }
 
     async fn complete_once(
@@ -240,8 +326,40 @@ impl OllamaProvider {
     }
 
     pub async fn health(&self, timeout_seconds: Option<u64>) -> Result<ProviderHealth> {
+        let mut last_health = None;
+        let mut last_error = None;
+        for (index, base_url) in self.base_url_candidates(None).iter().enumerate() {
+            match self.health_for_base_url(base_url, timeout_seconds).await {
+                Ok(mut health) if health.ok => {
+                    if index > 0 {
+                        health.message = Some(format!("ok via adaptive endpoint {base_url}"));
+                        health.mode = health.mode.map(|mode| format!("adaptive_{mode}"));
+                    }
+                    return Ok(health);
+                }
+                Ok(health) => {
+                    last_health = Some(health);
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                }
+            }
+        }
+        if let Some(health) = last_health {
+            return Ok(health);
+        }
+        Err(last_error.unwrap_or_else(|| {
+            GailError::upstream("ollama", None, "no Ollama endpoints were configured")
+        }))
+    }
+
+    async fn health_for_base_url(
+        &self,
+        base_url: &str,
+        timeout_seconds: Option<u64>,
+    ) -> Result<ProviderHealth> {
         let started = Instant::now();
-        let url = format!("{}/api/tags", self.base_url);
+        let url = format!("{base_url}/api/tags");
         let tags_timeout_seconds = timeout_seconds
             .unwrap_or(PROVIDER_HEALTH_FALLBACK_TIMEOUT_SECONDS)
             .max(1);
@@ -318,15 +436,17 @@ impl OllamaProvider {
                 mode: Some("missing_endpoint".to_string()),
             });
         };
-        self.generate_probe_health(&model, timeout_seconds).await
+        self.generate_probe_health(base_url, &model, timeout_seconds)
+            .await
     }
 
     async fn generate_probe_health(
         &self,
+        base_url: &str,
         model: &str,
         timeout_seconds: Option<u64>,
     ) -> Result<ProviderHealth> {
-        let generate_url = format!("{}/api/generate", self.base_url);
+        let generate_url = format!("{base_url}/api/generate");
         let probe_timeout_seconds = env_int(
             "GAIL_OLLAMA_HEALTH_GENERATE_TIMEOUT_SECONDS",
             timeout_seconds.unwrap_or(PROVIDER_HEALTH_FALLBACK_TIMEOUT_SECONDS),
@@ -417,8 +537,28 @@ impl OllamaProvider {
     }
 
     pub async fn inventory_status(&self, config: &GailConfig) -> Result<OllamaInventoryStatus> {
+        let mut last_error = None;
+        for base_url in self.base_url_candidates(None) {
+            match self
+                .inventory_status_for_base_url(config, base_url.as_str())
+                .await
+            {
+                Ok(status) => return Ok(status),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            GailError::upstream("ollama", None, "no Ollama endpoints were configured")
+        }))
+    }
+
+    async fn inventory_status_for_base_url(
+        &self,
+        config: &GailConfig,
+        base_url: &str,
+    ) -> Result<OllamaInventoryStatus> {
         let started = Instant::now();
-        let url = format!("{}/api/tags", self.base_url);
+        let url = format!("{base_url}/api/tags");
         let response = match self
             .client
             .get(&url)
@@ -486,7 +626,7 @@ impl OllamaProvider {
         Ok(OllamaInventoryStatus {
             provider: json!({
                 "name": "ollama",
-                "base_url": self.base_url,
+                "base_url": base_url,
                 "reachable": status.is_success(),
                 "status_code": status.as_u16(),
                 "latency_ms": latency_ms,
@@ -590,6 +730,82 @@ fn collapse_messages(request: &ProviderCompletionRequest) -> String {
     prompt
 }
 
+fn env_base_url_list(name: &str) -> Vec<String> {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .split(|ch: char| ch == ',' || ch == ';' || ch.is_ascii_whitespace())
+                .filter_map(normalize_base_url)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn normalize_base_url(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "none" | "null" | "nil" | "undefined"
+        )
+    {
+        return None;
+    }
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    Some(with_scheme.trim_end_matches('/').to_string())
+}
+
+fn push_base_url_candidate(candidates: &mut Vec<String>, value: Option<&str>) {
+    let Some(normalized) = value.and_then(normalize_base_url) else {
+        return;
+    };
+    if !candidates
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&normalized))
+    {
+        candidates.push(normalized);
+    }
+}
+
+fn endpoint_scheme_variants(base_url: &str) -> Vec<String> {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return Vec::new();
+    };
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if url.scheme() != "http" || is_local_ollama_host(host.as_str()) {
+        return Vec::new();
+    }
+    let mut https_url = url;
+    if https_url.set_scheme("https").is_ok() {
+        vec![https_url.to_string().trim_end_matches('/').to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn base_url_uses_local_ollama_host(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+        .map(|host| is_local_ollama_host(host.as_str()))
+        .unwrap_or(false)
+}
+
+fn is_local_ollama_host(host: &str) -> bool {
+    host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host.ends_with(".local")
+        || host.ends_with(".svc")
+        || host.ends_with(".svc.cluster.local")
+        || host.contains(".svc.")
+}
+
 fn aliases_for_model(model: &str) -> Vec<String> {
     let normalized = model.trim().to_ascii_lowercase();
     let base = normalized
@@ -687,6 +903,9 @@ async fn fetch_ollama_tags(client: &Client, base_url: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{ChatMessage, MessageContent};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn model_matching_accepts_base_name_for_tagged_model() {
@@ -715,5 +934,79 @@ mod tests {
             select_matching_installed_model(&tags, "llama3.2:3b").as_deref(),
             Some("llama3.2:3b")
         );
+    }
+
+    #[test]
+    fn public_http_ollama_endpoint_adds_https_variant() {
+        assert_eq!(
+            endpoint_scheme_variants("http://ollama.neuralmimicry.ai"),
+            vec!["https://ollama.neuralmimicry.ai".to_string()]
+        );
+        assert!(
+            endpoint_scheme_variants("http://ollama.ollama.svc.cluster.local:11434").is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_fails_over_from_request_endpoint_to_provider_endpoint() {
+        let bad = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(502).set_body_json(json!({
+                "error": "bad gateway"
+            })))
+            .mount(&bad)
+            .await;
+
+        let good = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&good)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "local answer",
+                "prompt_eval_count": 2,
+                "eval_count": 3
+            })))
+            .mount(&good)
+            .await;
+
+        let provider = OllamaProvider {
+            client: Client::new(),
+            model: "llama3.2".to_string(),
+            default_model: "llama3.2".to_string(),
+            base_url: good.uri(),
+        };
+        let request = ProviderCompletionRequest {
+            provider: "ollama".to_string(),
+            model: Some("llama3.2".to_string()),
+            api_key: None,
+            access_token: None,
+            base_url: Some(bad.uri()),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: MessageContent::Text("hello".to_string()),
+            }],
+            system: None,
+            max_tokens: Some(8),
+            temperature: Some(0.0),
+            timeout_seconds: Some(4),
+            reasoning_effort: None,
+            request_category: None,
+        };
+
+        let response = provider
+            .complete(&request)
+            .await
+            .expect("fallback response");
+        assert_eq!(response.text, "local answer");
+        let raw = response.raw.expect("raw metadata");
+        assert_eq!(raw["gail_ollama_base_url"], good.uri());
+        assert_eq!(raw["gail_ollama_endpoint_failover"], true);
     }
 }
