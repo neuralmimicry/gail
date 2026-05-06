@@ -977,7 +977,11 @@ async fn trading_run_backtest(
                 );
                 let summary = if let Some(Json(val)) = body {
                     let octo_req: OctoReq = serde_json::from_value(val).unwrap_or_default();
-                    engine.run(&octo_req).await
+                    if octo_req.files.is_empty() {
+                        engine.run_with_config(&config).await
+                    } else {
+                        engine.run(&octo_req).await
+                    }
                 } else {
                     engine.run_with_config(&config).await
                 };

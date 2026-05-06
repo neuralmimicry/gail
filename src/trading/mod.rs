@@ -587,6 +587,20 @@ async fn execute_if_warranted(
         return;
     }
 
+    if !_config.live_execution_enabled {
+        info!(
+            "trading: live execution disabled — decision not sent to OctoBot exchange={} symbol={} action={:?} amount=${:.2}",
+            decision.exchange, decision.symbol, decision.action, decision.amount_usd
+        );
+        state
+            .log_warn(
+                "execute",
+                "Live execution disabled; decision was not sent to OctoBot",
+            )
+            .await;
+        return;
+    }
+
     let result = if side == "buy" {
         octobot
             .place_buy_order(&decision.exchange, &decision.symbol, decision.amount_usd)

@@ -593,6 +593,7 @@ async fn persist_postgres(
     client
         .batch_execute(
             r#"
+            SET client_min_messages TO WARNING;
             CREATE TABLE IF NOT EXISTS gail_api_issue_snapshots (
                 id BIGSERIAL PRIMARY KEY,
                 captured_at DOUBLE PRECISION NOT NULL,

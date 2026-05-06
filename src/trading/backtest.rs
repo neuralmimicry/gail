@@ -240,22 +240,80 @@ impl BacktestEngine {
 
     /// Run a backtest using defaults derived from the trading config.
     ///
-    /// - Uses `config.backtest_data_files` if specified, otherwise lets OctoBot
-    ///   choose automatically (empty files list triggers OctoBot's default selection).
+    /// - Uses `config.backtest_data_files` if specified, otherwise asks OctoBot
+    ///   for its available `.data` files and selects files matching
+    ///   `config.backtest_symbols`.
     /// - Time window: last `config.backtest_lookback_days` days.
     pub async fn run_with_config(&self, config: &TradingConfig) -> BacktestSummary {
         let now_ms = (now_ts() * 1000.0) as i64;
         let lookback_ms = (config.backtest_lookback_days as i64) * 86_400_000;
         let start_ms = now_ms - lookback_ms;
+        let files = match self.resolve_backtest_files(config).await {
+            Ok(files) => files,
+            Err(reason) => {
+                warn!("trading: skipping OctoBot backtest: {}", reason);
+                return BacktestSummary::incomplete(reason);
+            }
+        };
 
         let request = BacktestStartRequest {
-            files: config.backtest_data_files.clone(),
+            files,
             start_timestamp: Some(start_ms),
             end_timestamp: Some(now_ms),
             enable_logs: false,
         };
         self.run(&request).await
     }
+
+    async fn resolve_backtest_files(&self, config: &TradingConfig) -> Result<Vec<String>, String> {
+        if !config.backtest_data_files.is_empty() {
+            return Ok(config.backtest_data_files.clone());
+        }
+
+        let available = self.octobot.list_backtest_data_files().await?;
+        let selected = select_backtest_data_files(available, &config.backtest_symbols);
+        if selected.is_empty() {
+            return Err("no OctoBot backtesting .data files matched Gail's configured backtest symbols; collect or configure backtest data files before enabling Gail backtesting".to_string());
+        }
+        Ok(selected)
+    }
+}
+
+fn select_backtest_data_files(available: Vec<String>, symbols: &[String]) -> Vec<String> {
+    let wanted = symbols
+        .iter()
+        .map(|symbol| normalize_symbol_for_data_file(symbol))
+        .filter(|symbol| !symbol.is_empty())
+        .collect::<Vec<_>>();
+    available
+        .into_iter()
+        .filter(|file| {
+            if wanted.is_empty() {
+                return true;
+            }
+            let normalized_file = normalize_symbol_for_data_file(file);
+            wanted
+                .iter()
+                .any(|symbol| normalized_file.contains(symbol.as_str()))
+        })
+        .collect()
+}
+
+fn normalize_symbol_for_data_file(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
 }
 
 // ---------------------------------------------------------------------------
@@ -343,5 +401,28 @@ mod tests {
         assert!(!s.notes.is_empty(), "notes should describe the result");
         assert_eq!(s.run_id, Some(42));
         assert_eq!(s.total_trades, 12);
+    }
+
+    #[test]
+    fn backtest_file_selection_matches_symbols() {
+        let available = vec![
+            "user/backtesting/collector/binance_BTC_USDT_1h.data".to_string(),
+            "user/backtesting/collector/binance_ETH_USDT_1h.data".to_string(),
+        ];
+        let selected = select_backtest_data_files(available, &["BTC/USDT".to_string()]);
+        assert_eq!(
+            selected,
+            vec!["user/backtesting/collector/binance_BTC_USDT_1h.data"]
+        );
+    }
+
+    #[test]
+    fn backtest_file_selection_uses_all_when_symbols_empty() {
+        let available = vec![
+            "user/backtesting/collector/binance_BTC_USDT_1h.data".to_string(),
+            "user/backtesting/collector/binance_ETH_USDT_1h.data".to_string(),
+        ];
+        let selected = select_backtest_data_files(available.clone(), &[]);
+        assert_eq!(selected, available);
     }
 }

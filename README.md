@@ -155,6 +155,7 @@ Provider credentials, Gail bearer tokens, Ollama endpoints, and trading defaults
 - Local Ollama generation is deliberately conservative: `GAIL_OLLAMA_MAX_CONCURRENT_REQUESTS` defaults to `1`, `GAIL_OLLAMA_QUEUE_TIMEOUT_SECONDS` defaults to `2`, `GAIL_OLLAMA_TIMEOUT_SECONDS` defaults to `30`, `GAIL_OLLAMA_MAX_RETRIES` defaults to `0`, and `GAIL_OLLAMA_MAX_PREDICT` defaults to `512`.
 - `gail-auto` dispatches providers in ranked waves. If a candidate reports quota, rate-limit, upstream HTTP 429, or transient upstream failures such as 502/503/504, Gail marks that provider family throttled for the request, records health and an API issue mitigation, and tries the next suitable provider family instead of surfacing the first failure.
 - When every orchestrated non-interactive candidate fails or is in adaptive backoff, Gail records the issue and returns a degraded safety response instead of an upstream 502. Explicit JSON prompts and routing-tagged `json`/`structured_data` requests use `GAIL_AUTOMATION_CANDIDATE_TIMEOUT_SECONDS`/`automation_candidate_timeout_cap_seconds` to reach that fallback quickly, returning a valid hold/no-trade JSON payload so OctoBot and Refiner-style automation can continue safely while provider health recovers. Explicit single-provider requests still surface their real provider error.
+- When OctoBot requests an `ExecutionPlan` JSON schema and every provider is unavailable, Gail returns a schema-valid empty plan (`{"steps":[]}`) instead of a trading-decision object, so OctoBot can fall back without Pydantic validation failures.
 - Provider retirements, missing account functions, and authentication failures are classified separately from transient upstream failures, so Gail can stop repeating dead model/account paths while still trying healthy cloud or local alternatives.
 - Gail records active API/provider issues without calling back into Refiner during Refiner-originated Gail failures. This prevents cyclic retry loops while still exposing the active mitigation and next retry window.
 - Gail Trading's OctoBot and Refiner clients feed remote API failures and recoveries into the same issue registry, alongside the adaptive schema registry, so dashboard/Prometheus status covers trading dependencies as well as LLM providers.
@@ -284,9 +285,9 @@ Action thresholds on the blended signal:
 - otherwise → `hold`
 
 **Step 6 — Execution** (`mod.rs`)
-Direct `place_buy_order` / `place_sell_order` calls return an explicit unsupported error because OctoBot's current web API exposes order cancellation and trading-mode/user-command surfaces, not direct market-order placement. Live execution should be routed through a supported OctoBot trading mode or command bridge before operator overrides or autonomous trades are enabled.
+Gail evaluates decisions by default but does not send live orders unless `trading.live_execution_enabled` is explicitly enabled. Direct `place_buy_order` / `place_sell_order` calls return an explicit unsupported error because OctoBot's current web API exposes order cancellation and trading-mode/user-command surfaces, not direct market-order placement. Live execution should be routed through a supported OctoBot trading mode or command bridge before operator overrides or autonomous trades are enabled.
 
-**Override mechanism**: if `TradingState.pending_override` is set via `POST /v1/trading/override`, the decision pipeline is bypassed and the override decision is attempted with `confidence = 1.0`. The override is cleared after the attempt.
+**Override mechanism**: if `TradingState.pending_override` is set via `POST /v1/trading/override`, the decision pipeline is bypassed and the override decision is prepared with `confidence = 1.0`. The override still requires `trading.live_execution_enabled: true` before Gail submits anything to OctoBot. The override is cleared after the attempt.
 
 ### State and Persistence
 
@@ -349,6 +350,7 @@ trading:
   target_currencies: []                  # empty = all available
   fuzzy_confidence_threshold: 0.65       # minimum blended confidence to trade
   fuzzy_weight: 0.4                      # fuzzy vs AI blend weight
+  live_execution_enabled: false          # keep false until an order bridge exists
   research_query_template: "cryptocurrency market sentiment {currency} {exchange} {date}"
   research_top_k: 5
   log_ring_size: 1000
@@ -357,6 +359,8 @@ trading:
   octobot_timeout_seconds: 10.0
   refiner_timeout_seconds: 15.0
   advisor_timeout_seconds: 30.0
+  backtesting_enabled: false             # requires OctoBot .data files
+  backtest_data_files: []                # explicit .data files, or auto-discovered when enabled
 ```
 
 Runtime-mutable fields (via `POST /v1/trading/config`, no restart required):

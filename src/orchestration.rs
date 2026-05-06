@@ -2571,6 +2571,10 @@ fn degraded_fallback_text(
                     "reason": reason,
                 }
             })
+        } else if prompt_requests_execution_plan(prompt_text) {
+            json!({
+                "steps": []
+            })
         } else {
             json!({
                 "status": "degraded",
@@ -2595,6 +2599,13 @@ fn degraded_fallback_text(
     format!(
         "Gail degraded fallback: every configured AI provider is unavailable or in adaptive backoff. Reason: {reason}."
     )
+}
+
+fn prompt_requests_execution_plan(prompt_text: &str) -> bool {
+    let lowered = prompt_text.to_ascii_lowercase();
+    lowered.contains("executionplan")
+        && lowered.contains("steps")
+        && lowered.contains("additionalproperties")
 }
 
 fn prompt_requests_manager_tool_call(prompt_text: &str) -> bool {
@@ -2706,6 +2717,20 @@ mod tests {
             content: MessageContent::Text("Return only valid JSON with keys: summary".to_string()),
         }];
         assert!(expected_json(&messages, None));
+    }
+
+    #[test]
+    fn degraded_fallback_matches_execution_plan_schema() {
+        let prompt = r#"{"name":"ExecutionPlan","schema":{"type":"object","properties":{"steps":{"type":"array"}},"required":["steps"],"additionalProperties":false}}"#;
+        let text = degraded_fallback_text(
+            true,
+            "trading",
+            "planner",
+            prompt,
+            &["provider unavailable".to_string()],
+        );
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        assert_eq!(value, serde_json::json!({ "steps": [] }));
     }
 
     #[test]

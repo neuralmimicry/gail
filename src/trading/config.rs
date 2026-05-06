@@ -108,6 +108,13 @@ pub struct TradingConfig {
     /// If `true` and the most recent backtest assessment is `Unprofitable`,
     /// the live trading loop will be paused automatically until the approach is reviewed.
     pub backtest_pause_on_failure: bool,
+
+    /// Whether Gail is allowed to call OctoBot order-placement paths.
+    ///
+    /// Keep this disabled unless an OctoBot trading-mode or user-command bridge
+    /// that supports live order placement is configured and tested. Gail can
+    /// still evaluate markets and emit decisions while this is disabled.
+    pub live_execution_enabled: bool,
 }
 
 impl Default for TradingConfig {
@@ -138,13 +145,14 @@ impl Default for TradingConfig {
             octobot_timeout_seconds: 10.0,
             refiner_timeout_seconds: 15.0,
             advisor_timeout_seconds: 30.0,
-            backtesting_enabled: true,
+            backtesting_enabled: false,
             backtest_interval_seconds: 86_400,
             backtest_profitability_threshold: 0.0,
             backtest_data_files: Vec::new(),
             backtest_symbols: vec!["BTC/USDT".to_string()],
             backtest_lookback_days: 30,
             backtest_pause_on_failure: false,
+            live_execution_enabled: false,
         }
     }
 }
