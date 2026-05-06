@@ -18,7 +18,10 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use crate::adaptive_schema::{self, AdaptiveApiSchema};
+use crate::{
+    adaptive_schema::{self, AdaptiveApiSchema},
+    api_issues,
+};
 
 const OCTOBOT_API: &str = "octobot";
 
@@ -316,6 +319,7 @@ impl OctobotClient {
             .await
             .observe_success(method, path, label, body);
         adaptive_schema::observe_success(OCTOBOT_API, method, path, label, body).await;
+        api_issues::observe_api_recovery(OCTOBOT_API, method, path, label).await;
     }
 
     async fn observe_failure(
@@ -331,6 +335,7 @@ impl OctobotClient {
             .await
             .observe_failure(method, path, label, status, error);
         adaptive_schema::observe_failure(OCTOBOT_API, method, path, label, status, error).await;
+        api_issues::observe_api_failure(OCTOBOT_API, method, path, label, status, error).await;
     }
 
     /// Authenticate with OctoBot and establish a session cookie.

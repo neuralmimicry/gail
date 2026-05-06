@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     aarnn_bridge::{AarnnMirrorClient, AarnnMirrorExchange},
-    adaptive_schema, aer,
+    adaptive_schema, aer, api_issues,
     config::{ApiTokenConfig, GailConfig, ProviderProfile},
     errors::{GailError, Result, message_indicates_quota},
     metrics::{HealthBucket, MetricsStore},
@@ -86,6 +86,11 @@ struct RankedCandidate {
 impl GailService {
     pub async fn new(config: GailConfig) -> Result<Self> {
         adaptive_schema::configure_persistence(config.storage.adaptive_schema_path.clone()).await;
+        api_issues::configure_persistence(
+            config.storage.api_issues_path.clone(),
+            config.storage.postgres_dsn.clone(),
+        )
+        .await;
         let client = Client::builder()
             .use_rustls_tls()
             .pool_idle_timeout(Duration::from_secs(90))
@@ -197,7 +202,31 @@ impl GailService {
             &request.messages,
         ));
         let adapter = build_adapter(self.inner.client.clone(), &profile)?;
-        let response = adapter.complete(&request).await?;
+        let response = match adapter.complete(&request).await {
+            Ok(response) => response,
+            Err(error) => {
+                let category = runtime_failure_health_bucket(Some(&error.to_string()), None)
+                    .mode
+                    .unwrap_or_else(|| "runtime_error".to_string());
+                api_issues::observe_provider_failure(
+                    candidate.provider_type.as_str(),
+                    candidate.configured_model.as_str(),
+                    "direct",
+                    "assistant",
+                    category.as_str(),
+                    "warning",
+                    &error.to_string(),
+                    Some(self.health_ttl_seconds()),
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        api_issues::observe_provider_recovery(
+            candidate.provider_type.as_str(),
+            candidate.configured_model.as_str(),
+        )
+        .await;
         let quality = quality_score(response.text.as_str(), expected_json);
         let mirror_output = self
             .run_aarnn_output_mirror(
@@ -558,8 +587,19 @@ impl GailService {
                         },
                     )
                     .await?;
+                api_issues::observe_provider_recovery(
+                    candidate_summary.provider.as_str(),
+                    candidate_summary.configured_model.as_str(),
+                )
+                .await;
                 successful.push(candidate_summary);
             } else {
+                let health_bucket =
+                    runtime_failure_health_bucket(result.error.as_deref(), result.latency_ms);
+                let category = health_bucket
+                    .mode
+                    .clone()
+                    .unwrap_or_else(|| "runtime_error".to_string());
                 self.inner
                     .metrics
                     .record_result(
@@ -574,17 +614,24 @@ impl GailService {
                     .await?;
                 self.inner
                     .metrics
-                    .record_health(
-                        &candidate_summary,
-                        runtime_failure_health_bucket(result.error.as_deref(), result.latency_ms),
-                    )
+                    .record_health(&candidate_summary, health_bucket)
                     .await?;
-                failures.push(
-                    result
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| "unknown error".to_string()),
-                );
+                let failure_message = result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".to_string());
+                api_issues::observe_provider_failure(
+                    candidate_summary.provider.as_str(),
+                    candidate_summary.configured_model.as_str(),
+                    &workflow,
+                    &role,
+                    &category,
+                    severity_for_issue_category(&category),
+                    &failure_message,
+                    Some(self.health_ttl_seconds()),
+                )
+                .await;
+                failures.push(failure_message);
             }
         }
 
@@ -603,6 +650,17 @@ impl GailService {
                 .last()
                 .cloned()
                 .unwrap_or_else(|| "LLM orchestration returned no responses".to_string());
+            api_issues::observe_orchestration_failure(
+                &workflow,
+                &role,
+                &message,
+                json!({
+                    "failures": failures,
+                    "attempted_candidate_count": attempted_candidate_ids.len(),
+                    "throttled_provider_types": sorted_strings(throttled_provider_types.clone()),
+                }),
+            )
+            .await;
             return Err(GailError::upstream("gail", None, message));
         };
 
@@ -830,6 +888,7 @@ impl GailService {
         )
         .await;
         let metrics = self.inner.metrics.summary(candidate_limit.max(1)).await;
+        let api_issues = api_issues::snapshot().await;
         let model_inventory = self.first_ollama_inventory().await;
         let routing_profiles_path = resolve_routing_profiles_path(None::<&std::path::Path>)
             .ok()
@@ -849,6 +908,7 @@ impl GailService {
             "engines": engines,
             "aarnn_bridge": aarnn_bridge,
             "metrics": metrics,
+            "api_issues": api_issues,
             "model_inventory": model_inventory,
         })
     }
@@ -1814,6 +1874,14 @@ fn runtime_failure_health_bucket(error: Option<&str>, latency_ms: Option<u64>) -
         checked_at: None,
         latency_ms,
         message: error.map(ToOwned::to_owned),
+    }
+}
+
+fn severity_for_issue_category(category: &str) -> &'static str {
+    match category {
+        "quota" | "upstream" | "timeout" => "warning",
+        "unconfigured" => "critical",
+        _ => "warning",
     }
 }
 

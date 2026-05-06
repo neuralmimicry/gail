@@ -29,6 +29,8 @@ Gail exposes the following endpoints:
 | `POST /v1/aer/decode` | Decode `AER1` payloads into spikes/events |
 | `GET /v1/status/orchestration` | Provider, engine, and metrics status |
 | `GET /v1/status/api-schema` | Global adaptive API registry for remote integrations |
+| `GET /v1/status/api-issues` | Active provider/API issues and Gail's current mitigations |
+| `GET /metrics` | Prometheus text metrics for Gail API issue health |
 | `GET /v1/trading/status` | Trading bridge status snapshot |
 | `GET /v1/trading/portfolio` | OctoBot portfolio holdings |
 | `GET /v1/trading/positions` | Open OctoBot orders |
@@ -100,7 +102,9 @@ The image expects a config file at `/app/config/gail.yaml` unless `GAIL_CONFIG` 
 
 - `providers`: shared LLM backends Gail can orchestrate.
 - `providers` can include `openai`, `gemini`, `ollama`, and OpenAI-compatible `nvidia` profiles backed by custom `base_url` values.
-- `gail-auto` dispatches providers in ranked waves. If a candidate reports quota, rate-limit, upstream HTTP 429, or transient upstream failures such as 502/503/504, Gail marks that provider family throttled for the request, records health, and tries the next suitable provider family instead of surfacing the first failure.
+- `gail-auto` dispatches providers in ranked waves. If a candidate reports quota, rate-limit, upstream HTTP 429, or transient upstream failures such as 502/503/504, Gail marks that provider family throttled for the request, records health and an API issue mitigation, and tries the next suitable provider family instead of surfacing the first failure.
+- Gail records active API/provider issues without calling back into Refiner during Refiner-originated Gail failures. This prevents cyclic retry loops while still exposing the active mitigation and next retry window.
+- Gail Trading's OctoBot and Refiner clients feed remote API failures and recoveries into the same issue registry, alongside the adaptive schema registry, so dashboard/Prometheus status covers trading dependencies as well as LLM providers.
 - `specialists`: explicit neuromorphic engines. Use this when you have named SNN/AARNN backends to register.
 - `aarnn_bridge`: mirrored Gail-to-AARNN LLM I/O bridge. Gail mirrors prompt-side and response-side text plus translated AER payloads to `POST /api/llm/mirror` and can optionally promote a future AARNN reply.
 - `config/ai-routing-profiles.json`: shared workflow/keyword/provider routing contract used by Gail and mirrored in Refiner for offline fallback.
@@ -108,6 +112,8 @@ The image expects a config file at `/app/config/gail.yaml` unless `GAIL_CONFIG` 
 - `GAIL_AARNN_*` env vars: optional legacy auto-attach path for an AARNN backend, mirroring Refiner's previous automatic fallback behaviour.
 - `storage.metrics_path`: persisted provider quality/latency metrics.
 - `storage.adaptive_schema_path`: persisted adaptive API registry for provider, Refiner, AARNN, specialist, OctoBot, and trading feedback observations.
+- `storage.api_issues_path`: persisted issue registry for provider/API failures, mitigations, recoveries, and Prometheus/dashboard visibility.
+- `storage.postgres_dsn` or `GAIL_POSTGRES_DSN`: optional Postgres persistence for `gail_api_issues` and `gail_api_issue_snapshots`.
 - `orchestration.health_ttl_seconds`: cached provider-health TTL. Runtime quota health remains in backoff until this TTL expires, so later requests skip rate-limited candidates before probing them again.
 - `storage.ollama_model_store_path`: cached Ollama model inventory summary.
 
@@ -252,6 +258,7 @@ State is persisted to `data_path` (default `./data/trading_state.json`) every 5 
 | File | Responsibility |
 | --- | --- |
 | `src/adaptive_schema.rs` | Generic adaptive API registry shared by Gail providers, Refiner, AARNN, specialists, and trading |
+| `src/api_issues.rs` | Persistent provider/API issue registry, mitigation log, Postgres sync, and Prometheus metric rendering |
 | `src/trading/mod.rs` | `TradingBridge`, background loop, evaluation pipeline, execution |
 | `src/trading/config.rs` | `TradingConfig`, `TradingConfigOverride` |
 | `src/trading/state.rs` | `TradingState`, `SharedTradingState`, ring buffers, persistence |
@@ -267,6 +274,8 @@ State is persisted to `data_path` (default `./data/trading_state.json`) every 5 
 storage:
   metrics_path: "./data/provider_metrics.json"
   adaptive_schema_path: "./data/adaptive_api_schema.json"
+  api_issues_path: "./data/api_issues.json"
+  postgres_dsn: "${GAIL_POSTGRES_DSN}"
   ollama_model_store_path: "./data/ollama_model_inventory.json"
 
 trading:

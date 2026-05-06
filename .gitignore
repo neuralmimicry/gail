@@ -26,3 +26,4 @@ Thumbs.db
 
 # Runtime adaptive API observations
 /data/adaptive_api_schema.json
+/data/api_issues.json

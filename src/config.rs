@@ -82,6 +82,8 @@ pub struct AarnnBridgeConfig {
 pub struct StorageConfig {
     pub metrics_path: String,
     pub adaptive_schema_path: String,
+    pub api_issues_path: String,
+    pub postgres_dsn: Option<String>,
     pub ollama_model_store_path: Option<String>,
 }
 
@@ -193,6 +195,8 @@ impl Default for StorageConfig {
         Self {
             metrics_path: "data/provider_metrics.json".to_string(),
             adaptive_schema_path: "data/adaptive_api_schema.json".to_string(),
+            api_issues_path: "data/api_issues.json".to_string(),
+            postgres_dsn: None,
             ollama_model_store_path: None,
         }
     }
@@ -320,6 +324,22 @@ impl GailConfig {
         }
         if self.storage.adaptive_schema_path.trim().is_empty() {
             self.storage.adaptive_schema_path = "data/adaptive_api_schema.json".to_string();
+        }
+        if self.storage.api_issues_path.trim().is_empty() {
+            self.storage.api_issues_path = "data/api_issues.json".to_string();
+        }
+        if self
+            .storage
+            .postgres_dsn
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            self.storage.postgres_dsn = std::env::var("GAIL_POSTGRES_DSN")
+                .ok()
+                .or_else(|| std::env::var("DATABASE_URL").ok())
+                .filter(|value| !value.trim().is_empty());
         }
         for provider in &mut self.providers {
             provider.provider_type =

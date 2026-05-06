@@ -7,7 +7,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{Multipart, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use tokio::signal;
 
 use crate::{
-    adaptive_schema,
+    adaptive_schema, api_issues,
     config::ProviderProfile,
     errors::{GailError, Result},
     models::{
@@ -147,6 +147,8 @@ pub fn build_router(service: GailService) -> Router {
         .route("/v1/aer/decode", post(decode_aer))
         .route("/v1/status/orchestration", get(orchestration_status))
         .route("/v1/status/api-schema", get(adaptive_api_schema_status))
+        .route("/v1/status/api-issues", get(api_issues_status))
+        .route("/metrics", get(prometheus_metrics))
         // Trading bridge endpoints
         .route("/v1/trading/status", get(trading_status))
         .route("/v1/trading/portfolio", get(trading_portfolio))
@@ -570,6 +572,29 @@ async fn adaptive_api_schema_status(
     Ok(Json(json!({
         "adaptive_api_schema": adaptive_schema::snapshot().await,
     })))
+}
+
+async fn api_issues_status(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+) -> Result<Json<Value>> {
+    let _ = service.authorize(&headers, "status")?;
+    Ok(Json(json!({
+        "api_issues": api_issues::snapshot().await,
+    })))
+}
+
+async fn prometheus_metrics(State(service): State<GailService>, headers: HeaderMap) -> Response {
+    if !service.can_access_health_unauthenticated()
+        && let Err(error) = service.authorize(&headers, "status")
+    {
+        return error.into_response();
+    }
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4")],
+        api_issues::prometheus_metrics().await,
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -2438,6 +2463,21 @@ mod tests {
             ))
             .to_string_lossy()
             .to_string();
+        config.storage.adaptive_schema_path = std::env::temp_dir()
+            .join(format!(
+                "gail-test-adaptive-schema-{}.json",
+                uuid::Uuid::new_v4()
+            ))
+            .to_string_lossy()
+            .to_string();
+        config.storage.api_issues_path = std::env::temp_dir()
+            .join(format!(
+                "gail-test-api-issues-{}.json",
+                uuid::Uuid::new_v4()
+            ))
+            .to_string_lossy()
+            .to_string();
+        config.storage.postgres_dsn = None;
         config.security.api_tokens.push(ApiTokenConfig {
             client_id: "test".to_string(),
             token: "secret".to_string(),
@@ -2502,6 +2542,40 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_issues_status_exposes_registry() {
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/status/api-issues")
+                    .header("authorization", "Bearer secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+        assert!(payload.get("api_issues").is_some());
+    }
+
+    #[tokio::test]
+    async fn prometheus_metrics_expose_api_issue_gauges() {
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("authorization", "Bearer secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let body = read_text(response).await;
+        assert!(body.contains("gail_api_issues_active"));
     }
 
     #[tokio::test]
