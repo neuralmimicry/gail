@@ -2080,7 +2080,7 @@ fn synthesize_openai_tool_call(
     text: &str,
     context: &OpenAIToolContext,
 ) -> Option<Value> {
-    let parsed = extract_json_value(text);
+    let parsed = extract_tool_call_value(text).or_else(|| extract_json_value(text));
     let (tool_name, arguments) = match parsed {
         Some(Value::Object(object)) => tool_call_from_object(object, context)?,
         _ if text.contains("<finish>") || text.contains("</finish>") => {
@@ -2169,7 +2169,7 @@ fn tool_call_from_object(
 }
 
 fn normalize_manager_tool_call_text(text: &str) -> Option<String> {
-    let (value, already_transformed) = match extract_minimax_tool_call_value(text) {
+    let (value, already_transformed) = match extract_tool_call_value(text) {
         Some(value) => (value, true),
         None => (extract_json_value(text)?, false),
     };
@@ -2236,6 +2236,10 @@ fn normalize_manager_tool_call_text(text: &str) -> Option<String> {
     .ok()
 }
 
+fn extract_tool_call_value(text: &str) -> Option<Value> {
+    extract_minimax_tool_call_value(text).or_else(|| extract_bracket_tool_call_value(text))
+}
+
 fn extract_minimax_tool_call_value(text: &str) -> Option<Value> {
     let invoke_start = text.find("<invoke")?;
     let invoke_tag_end = text[invoke_start..].find('>')? + invoke_start;
@@ -2266,6 +2270,92 @@ fn extract_xml_attr(tag: &str, name: &str) -> Option<String> {
     let start = tag.find(&pattern)? + pattern.len();
     let end = tag[start..].find('"')? + start;
     Some(tag[start..end].to_string())
+}
+
+fn extract_bracket_tool_call_value(text: &str) -> Option<Value> {
+    let start = text.find("[TOOL_CALL]")? + "[TOOL_CALL]".len();
+    let end = text[start..].find("[/TOOL_CALL]")? + start;
+    let body = text[start..end].trim();
+    let tool_name = extract_arrow_field(body, "tool")?;
+    let args_body = extract_braced_arrow_field(body, "args");
+    let mut arguments = serde_json::Map::new();
+    if let Some(args_body) = args_body {
+        for (name, value) in extract_cli_style_args(args_body.as_str()) {
+            arguments.insert(name, Value::String(value));
+        }
+        for (name, value) in extract_arrow_args(args_body.as_str()) {
+            arguments.entry(name).or_insert(Value::String(value));
+        }
+    }
+    Some(json!({
+        "tool_name": tool_name,
+        "arguments": arguments,
+    }))
+}
+
+fn extract_arrow_field(text: &str, name: &str) -> Option<String> {
+    let pattern = format!("{name} =>");
+    let start = text.find(&pattern)? + pattern.len();
+    let rest = text[start..].trim_start();
+    if let Some(stripped) = rest.strip_prefix('"') {
+        let end = stripped.find('"')?;
+        return Some(stripped[..end].to_string());
+    }
+    let end = rest
+        .find(|ch: char| ch == ',' || ch == '}')
+        .unwrap_or(rest.len());
+    let value = rest[..end].trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn extract_braced_arrow_field(text: &str, name: &str) -> Option<String> {
+    let pattern = format!("{name} =>");
+    let start = text.find(&pattern)? + pattern.len();
+    let rest = text[start..].trim_start();
+    let inner_start = rest.find('{')? + 1;
+    let inner_end = rest[inner_start..].rfind('}')? + inner_start;
+    Some(rest[inner_start..inner_end].trim().to_string())
+}
+
+fn extract_cli_style_args(text: &str) -> Vec<(String, String)> {
+    let mut args = Vec::new();
+    let mut tokens = text.split_whitespace().peekable();
+    while let Some(token) = tokens.next() {
+        let Some(name) = token.strip_prefix("--") else {
+            continue;
+        };
+        let Some(value) = tokens.next() else {
+            break;
+        };
+        args.push((
+            name.trim_matches(|ch: char| ch == ',' || ch == '}')
+                .to_string(),
+            value
+                .trim_matches(|ch: char| ch == '"' || ch == ',' || ch == '}')
+                .to_string(),
+        ));
+    }
+    args
+}
+
+fn extract_arrow_args(text: &str) -> Vec<(String, String)> {
+    let mut args = Vec::new();
+    for part in text.split(',') {
+        let Some((name, value)) = part.split_once("=>") else {
+            continue;
+        };
+        let name = name
+            .trim()
+            .trim_start_matches("--")
+            .trim_matches(|ch: char| ch == '"' || ch == '{' || ch == '}');
+        let value = value
+            .trim()
+            .trim_matches(|ch: char| ch == '"' || ch == '{' || ch == '}');
+        if !name.is_empty() && !value.is_empty() {
+            args.push((name.to_string(), value.to_string()));
+        }
+    }
+    args
 }
 
 fn extract_json_value(text: &str) -> Option<Value> {
@@ -2818,6 +2908,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_chat_completions_synthesizes_bracket_tool_call_for_octobot_tools() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "I will start with signals. [TOOL_CALL] {tool => \"run_agent\", args => { --agent_name \"SignalAIAgentProducer\" }} [/TOOL_CALL]",
+                "prompt_eval_count": 8,
+                "eval_count": 5
+            })))
+            .mount(&server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/llama3.2",
+                            "base_url": server.uri(),
+                            "messages": [
+                                {"role": "user", "content": "choose the next team tool"}
+                            ],
+                            "tools": [{
+                                "type": "function",
+                                "function": {
+                                    "name": "run_agent",
+                                    "description": "Run a specific agent",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {
+                                            "agent_name": {"type": "string"}
+                                        },
+                                        "required": ["agent_name"]
+                                    }
+                                }
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+        let choice = &payload["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls");
+        assert_eq!(
+            choice["message"]["tool_calls"][0]["function"]["name"],
+            "run_agent"
+        );
+        let args: Value = serde_json::from_str(
+            choice["message"]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .expect("arguments string"),
+        )
+        .expect("arguments json");
+        assert_eq!(args["agent_name"], "SignalAIAgentProducer");
+    }
+
+    #[tokio::test]
     async fn openai_chat_completions_wraps_bare_manager_tool_arguments() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -2953,6 +3115,67 @@ mod tests {
             .and(path("/api/generate"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "response": "<minimax:tool_call><invoke name=\"run_agent\"><parameter name=\"agent_name\">SignalAIAgentProducer</parameter></invoke></minimax:tool_call>",
+                "prompt_eval_count": 8,
+                "eval_count": 5
+            })))
+            .mount(&server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/llama3.2",
+                            "base_url": server.uri(),
+                            "messages": [
+                                {
+                                    "role": "system",
+                                    "content": "Return a ManagerToolCall JSON object with tool_name and arguments."
+                                },
+                                {
+                                    "role": "user",
+                                    "content": "choose the next run_agent call for agent_name"
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+        let content = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content string");
+        let manager_call: Value = serde_json::from_str(content).expect("manager call json");
+        assert_eq!(manager_call["tool_name"], "run_agent");
+        assert_eq!(
+            manager_call["arguments"]["agent_name"],
+            "SignalAIAgentProducer"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_normalizes_bracket_manager_tool_call() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "Looking at the context, I need to coordinate the trading agents. [TOOL_CALL] {tool => \"run_agent\", args => { --agent_name \"SignalAIAgentProducer\" }} [/TOOL_CALL]",
                 "prompt_eval_count": 8,
                 "eval_count": 5
             })))
