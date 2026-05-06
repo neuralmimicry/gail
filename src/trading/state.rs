@@ -367,8 +367,8 @@ impl SharedTradingState {
     /// Restore state from disk if the file exists (best-effort, partial restore).
     pub async fn restore(&self, path: &PathBuf) {
         match fs::read_to_string(path).await {
-            Ok(raw) => match serde_json::from_str::<TradingState>(&raw) {
-                Ok(restored) => {
+            Ok(raw) => match parse_persisted_state(&raw) {
+                Ok((restored, repaired_snapshot)) => {
                     let mut state = self.0.lock().await;
                     // Restore counters and history but not ephemeral fields
                     state.evaluation_count = restored.evaluation_count;
@@ -384,6 +384,20 @@ impl SharedTradingState {
                     state.observed_external_log_fingerprints =
                         restored.observed_external_log_fingerprints;
                     state.log_info("startup", "Restored trading state from disk");
+                    drop(state);
+                    if let Some(snapshot) = repaired_snapshot {
+                        warn!(
+                            "trading: repaired legacy persisted state format in {}",
+                            path.display()
+                        );
+                        if let Err(err) = fs::write(path, snapshot).await {
+                            warn!(
+                                "trading: failed to write repaired state to {}: {}",
+                                path.display(),
+                                err
+                            );
+                        }
+                    }
                 }
                 Err(err) => {
                     warn!(
@@ -398,4 +412,52 @@ impl SharedTradingState {
             }
         }
     }
+}
+
+fn parse_persisted_state(raw: &str) -> Result<(TradingState, Option<String>), serde_json::Error> {
+    let mut payload = serde_json::from_str::<serde_json::Value>(raw)?;
+    let repaired = repair_legacy_state_payload(&mut payload);
+    let state = serde_json::from_value::<TradingState>(payload.clone())?;
+    let repaired_snapshot = if repaired {
+        Some(serde_json::to_string_pretty(&payload)?)
+    } else {
+        None
+    };
+    Ok((state, repaired_snapshot))
+}
+
+fn repair_legacy_state_payload(payload: &mut serde_json::Value) -> bool {
+    let Some(root) = payload.as_object_mut() else {
+        return false;
+    };
+    let mut repaired = false;
+
+    if let Some(activity_log) = root
+        .get_mut("activity_log")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for entry in activity_log {
+            let Some(entry) = entry.as_object_mut() else {
+                continue;
+            };
+            if !entry.contains_key("context") {
+                entry.insert("context".to_string(), serde_json::Value::Null);
+                repaired = true;
+            }
+        }
+    }
+
+    if !root.contains_key("api_schema") {
+        root.insert("api_schema".to_string(), serde_json::json!({}));
+        repaired = true;
+    }
+    if !root.contains_key("observed_external_log_fingerprints") {
+        root.insert(
+            "observed_external_log_fingerprints".to_string(),
+            serde_json::json!([]),
+        );
+        repaired = true;
+    }
+
+    repaired
 }

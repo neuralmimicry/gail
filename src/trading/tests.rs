@@ -586,6 +586,13 @@ mod tests {
         assert_eq!(s.evaluation_count, 17);
         assert_eq!(s.activity_log.front().unwrap().message, "legacy entry");
         assert!(s.activity_log.front().unwrap().context.is_null());
+        drop(s);
+
+        let repaired: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path()).expect("read repaired state"),
+        )
+        .expect("repaired state json");
+        assert!(repaired["activity_log"][0].get("context").is_some());
     }
 
     #[tokio::test]

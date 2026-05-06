@@ -18,6 +18,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fmt().with_env_filter(filter).with_target(false).init();
 
     let cli = Cli::parse();
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        config = %cli.config.display(),
+        "Gail starting"
+    );
     let config = GailConfig::load(&cli.config)?;
     let service = GailService::new(config.clone()).await?;
     let router = app::build_router(service);

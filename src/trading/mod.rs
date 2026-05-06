@@ -185,6 +185,11 @@ async fn run_evaluation_loop(
         None
     };
     let mut last_backtest_ts: f64 = 0.0;
+    info!(
+        interval_seconds = config.evaluation_interval_seconds,
+        backtesting_enabled = config.backtesting_enabled,
+        "trading: evaluation loop started"
+    );
 
     loop {
         tokio::select! {
@@ -239,9 +244,17 @@ async fn run_evaluation_loop(
                     }
                 }
             }
-            _ = &mut shutdown => {
-                info!("trading: evaluation loop shutting down");
-                state.log_info("shutdown", "Trading bridge evaluation loop stopped").await;
+            shutdown_result = &mut shutdown => {
+                match shutdown_result {
+                    Ok(()) => {
+                        info!("trading: evaluation loop shutting down by request");
+                        state.log_info("shutdown", "Trading bridge evaluation loop stopped").await;
+                    }
+                    Err(_) => {
+                        warn!("trading: evaluation loop shutting down because the runtime handle was dropped");
+                        state.log_warn("shutdown", "Trading bridge evaluation loop stopped after runtime handle drop").await;
+                    }
+                }
                 state.persist(&data_path).await;
                 break;
             }
