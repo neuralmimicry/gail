@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use tokio::signal;
 
 use crate::{
+    adaptive_schema,
     config::ProviderProfile,
     errors::{GailError, Result},
     models::{
@@ -88,6 +89,45 @@ impl OpenAIToolContext {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct OpenAIResponseSchemaContext {
+    manager_tool_call: bool,
+}
+
+impl OpenAIResponseSchemaContext {
+    fn from_chat_request(request: &OpenAIChatCompletionRequest) -> Self {
+        let mut context = String::new();
+        if let Some(instructions) = request.instructions.as_deref() {
+            context.push_str(instructions);
+            context.push('\n');
+        }
+        if let Some(format) = request.response_format.as_ref() {
+            if let Ok(text) = serde_json::to_string(format) {
+                context.push_str(&text);
+                context.push('\n');
+            }
+        }
+        for message in &request.messages {
+            context.push_str(&message.flattened_text());
+            context.push('\n');
+        }
+        let lowered = context.to_ascii_lowercase();
+        let manager_tool_call = lowered.contains("managertoolcall")
+            || (lowered.contains("tool_name")
+                && lowered.contains("arguments")
+                && (lowered.contains("agent_name") || lowered.contains("run_agent")));
+        Self { manager_tool_call }
+    }
+
+    fn normalize_response_text(&self, text: &str) -> Option<String> {
+        if self.manager_tool_call {
+            normalize_manager_tool_call_text(text)
+        } else {
+            None
+        }
+    }
+}
+
 pub fn build_router(service: GailService) -> Router {
     Router::new()
         .route("/healthz", get(health))
@@ -106,12 +146,14 @@ pub fn build_router(service: GailService) -> Router {
         .route("/v1/aer/encode", post(encode_aer))
         .route("/v1/aer/decode", post(decode_aer))
         .route("/v1/status/orchestration", get(orchestration_status))
+        .route("/v1/status/api-schema", get(adaptive_api_schema_status))
         // Trading bridge endpoints
         .route("/v1/trading/status", get(trading_status))
         .route("/v1/trading/portfolio", get(trading_portfolio))
         .route("/v1/trading/positions", get(trading_positions))
         .route("/v1/trading/history", get(trading_history))
         .route("/v1/trading/logs", get(trading_logs))
+        .route("/v1/trading/api-schema", get(trading_api_schema))
         .route("/v1/trading/exchanges", get(trading_exchanges))
         .route("/v1/trading/currencies", get(trading_currencies))
         .route(
@@ -160,8 +202,15 @@ async fn openai_chat_completions(
     }
     let stream_response = request.stream.unwrap_or(false);
     let tool_context = OpenAIToolContext::from_tools(request.tools.as_ref());
+    let response_schema_context = OpenAIResponseSchemaContext::from_chat_request(&request);
     match dispatch_openai_chat_completion(&service, request).await {
-        Ok((public_model, response)) => {
+        Ok((public_model, mut response)) => {
+            if tool_context.is_none()
+                && let Some(normalized) =
+                    response_schema_context.normalize_response_text(response.text.as_str())
+            {
+                response.text = normalized;
+            }
             if stream_response {
                 openai_chat_completion_stream(public_model, response).into_response()
             } else {
@@ -513,6 +562,16 @@ async fn orchestration_status(
     ))
 }
 
+async fn adaptive_api_schema_status(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+) -> Result<Json<Value>> {
+    let _ = service.authorize(&headers, "status")?;
+    Ok(Json(json!({
+        "adaptive_api_schema": adaptive_schema::snapshot().await,
+    })))
+}
+
 // ---------------------------------------------------------------------------
 // Trading bridge HTTP handlers
 // ---------------------------------------------------------------------------
@@ -637,6 +696,28 @@ async fn trading_logs(
             let state = bridge.state.0.lock().await;
             let logs: Vec<_> = state.activity_log.iter().rev().take(limit).collect();
             Json(json!({ "logs": logs })).into_response()
+        }
+    }
+}
+
+async fn trading_api_schema(State(service): State<GailService>, headers: HeaderMap) -> Response {
+    if let Some(err_resp) = require_trading_scope(&service, &headers) {
+        return err_resp;
+    }
+    match service.trading_bridge() {
+        None => trading_unavailable(),
+        Some(bridge) => {
+            let octobot_schema = {
+                let state = bridge.state.0.lock().await;
+                state.api_schema.clone()
+            };
+            let global_registry = adaptive_schema::snapshot().await;
+            Json(json!({
+                "api": "octobot",
+                "api_schema": octobot_schema,
+                "global_registry": global_registry,
+            }))
+            .into_response()
         }
     }
 }
@@ -2056,6 +2137,50 @@ fn tool_call_from_object(
     None
 }
 
+fn normalize_manager_tool_call_text(text: &str) -> Option<String> {
+    let Value::Object(mut object) = extract_json_value(text)? else {
+        return None;
+    };
+    let existing_tool_name = object
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if existing_tool_name.is_some() && object.get("arguments").is_some_and(Value::is_object) {
+        return None;
+    }
+
+    let tool_name = object
+        .remove("tool_name")
+        .and_then(|value| value.as_str().map(str::to_string))
+        .or_else(|| {
+            if object.contains_key("agent_name") {
+                Some("run_agent".to_string())
+            } else if object.contains_key("debator_agent_names")
+                || object.contains_key("judge_agent_name")
+            {
+                Some("run_debate".to_string())
+            } else {
+                None
+            }
+        })?;
+
+    let arguments = match object.remove("arguments") {
+        Some(Value::Object(arguments)) => Value::Object(arguments),
+        Some(Value::String(raw)) => serde_json::from_str::<Value>(&raw)
+            .ok()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({})),
+        Some(Value::Null) | None => Value::Object(object),
+        Some(value) => json!({ "value": value }),
+    };
+
+    serde_json::to_string(&json!({
+        "tool_name": tool_name,
+        "arguments": arguments,
+    }))
+    .ok()
+}
+
 fn extract_json_value(text: &str) -> Option<Value> {
     let trimmed = text.trim();
     serde_json::from_str::<Value>(trimmed).ok().or_else(|| {
@@ -2554,6 +2679,67 @@ mod tests {
         )
         .expect("arguments json");
         assert_eq!(args["agent_name"], "SignalAIAgentProducer");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_wraps_bare_manager_tool_arguments() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "{\"agent_name\":\"SignalAIAgentProducer\"}",
+                "prompt_eval_count": 8,
+                "eval_count": 5
+            })))
+            .mount(&server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/llama3.2",
+                            "base_url": server.uri(),
+                            "messages": [
+                                {
+                                    "role": "system",
+                                    "content": "Return a ManagerToolCall JSON object with tool_name and arguments."
+                                },
+                                {
+                                    "role": "user",
+                                    "content": "choose the next run_agent call for agent_name"
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+        let content = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content string");
+        let manager_call: Value = serde_json::from_str(content).expect("manager call json");
+        assert_eq!(manager_call["tool_name"], "run_agent");
+        assert_eq!(
+            manager_call["arguments"]["agent_name"],
+            "SignalAIAgentProducer"
+        );
     }
 
     #[tokio::test]

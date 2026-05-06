@@ -134,6 +134,7 @@ aarnn_bridge:
 
 storage:
   metrics_path: "./data/provider_metrics.json"
+  adaptive_schema_path: "./data/adaptive_api_schema.json"
   ollama_model_store_path: "./data/ollama_model_inventory.json"
 
 trading:

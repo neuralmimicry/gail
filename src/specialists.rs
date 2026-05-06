@@ -11,6 +11,7 @@ use tokio::task;
 use uuid::Uuid;
 
 use crate::{
+    adaptive_schema,
     aer::{decode_spikes, decode_spikes_auto, encode_spikes, payload_hex, spikes_from_floats},
     config::{GailConfig, SpecialistProfile},
     errors::{GailError, Result},
@@ -123,9 +124,10 @@ impl SpecialistEngine {
     pub async fn health_check(&self) -> Value {
         let started = std::time::Instant::now();
         let health = if let Some(endpoint) = normalized_url(self.profile.endpoint.as_deref()) {
+            let url = format!("{endpoint}/healthz");
             match self
                 .client
-                .get(format!("{endpoint}/healthz"))
+                .get(&url)
                 .timeout(Duration::from_secs_f64(
                     self.profile.timeout_seconds.max(0.2),
                 ))
@@ -138,6 +140,26 @@ impl SpecialistEngine {
                         .json::<Value>()
                         .await
                         .unwrap_or_else(|_| Value::Object(Default::default()));
+                    if status.is_success() {
+                        adaptive_schema::observe_success(
+                            &format!("specialist:{}", self.profile.name),
+                            "GET",
+                            &url,
+                            "health",
+                            &payload,
+                        )
+                        .await;
+                    } else {
+                        adaptive_schema::observe_failure(
+                            &format!("specialist:{}", self.profile.name),
+                            "GET",
+                            &url,
+                            "health",
+                            Some(status.as_u16()),
+                            &payload.to_string(),
+                        )
+                        .await;
+                    }
                     json!({
                         "ok": status.is_success(),
                         "mode": if status.is_success() { "http" } else { "http_error" },
@@ -145,7 +167,18 @@ impl SpecialistEngine {
                         "details": payload,
                     })
                 }
-                Err(error) => self.heuristic_health(Some(error.to_string())),
+                Err(error) => {
+                    adaptive_schema::observe_failure(
+                        &format!("specialist:{}", self.profile.name),
+                        "GET",
+                        &url,
+                        "health",
+                        None,
+                        &error.to_string(),
+                    )
+                    .await;
+                    self.heuristic_health(Some(error.to_string()))
+                }
             }
         } else if let Some(socket_path) = self.profile.socket_path.as_ref() {
             match self.socket_handshake(socket_path.clone()).await {
@@ -397,27 +430,60 @@ impl SpecialistEngine {
     }
 
     async fn predict_http(&self, endpoint: &str, inputs: &[f32]) -> Result<AarnnPrediction> {
-        let response = self
+        let url = format!("{endpoint}/predict");
+        let response = match self
             .client
-            .post(format!("{endpoint}/predict"))
+            .post(&url)
             .timeout(Duration::from_secs_f64(
                 self.profile.timeout_seconds.max(0.2),
             ))
             .json(&json!({"inputs": inputs}))
             .send()
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                adaptive_schema::observe_failure(
+                    &format!("specialist:{}", self.profile.name),
+                    "POST",
+                    &url,
+                    "predict",
+                    None,
+                    &error.to_string(),
+                )
+                .await;
+                return Err(error.into());
+            }
+        };
         let status = response.status();
         let payload = response
             .json::<Value>()
             .await
             .unwrap_or_else(|_| Value::Object(Default::default()));
         if !status.is_success() {
+            adaptive_schema::observe_failure(
+                &format!("specialist:{}", self.profile.name),
+                "POST",
+                &url,
+                "predict",
+                Some(status.as_u16()),
+                &payload.to_string(),
+            )
+            .await;
             return Err(GailError::upstream(
                 self.profile.name.clone(),
                 Some(status),
                 payload.to_string(),
             ));
         }
+        adaptive_schema::observe_success(
+            &format!("specialist:{}", self.profile.name),
+            "POST",
+            &url,
+            "predict",
+            &payload,
+        )
+        .await;
         let input_spikes = spikes_from_floats(inputs, self.profile.spike_threshold);
         let aer_payload = encode_spikes(now_ts_us(), self.profile.aer_sensory_base, &input_spikes);
         let score = payload

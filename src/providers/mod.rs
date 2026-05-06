@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 
 use crate::{
+    adaptive_schema,
     config::{GailConfig, ProviderProfile},
     errors::{GailError, Result},
     models::{CostInfo, ProviderCompletionRequest, TokenUsage},
@@ -316,11 +317,42 @@ pub async fn post_json_with_retries(
             .send()
             .await;
         match response {
-            Ok(response) if response.status().is_success() => return Ok(response),
+            Ok(response) if response.status().is_success() => {
+                let status = response.status().as_u16();
+                adaptive_schema::observe_success(
+                    provider,
+                    "POST",
+                    url,
+                    "provider json post",
+                    &adaptive_schema::endpoint_status_body(status),
+                )
+                .await;
+                return Ok(response);
+            }
             Ok(response) if !should_retry_status(response.status()) || attempt >= max_retries => {
+                let status = response.status();
+                adaptive_schema::observe_failure(
+                    provider,
+                    "POST",
+                    url,
+                    "provider json post",
+                    Some(status.as_u16()),
+                    status.as_str(),
+                )
+                .await;
                 return Ok(response);
             }
             Ok(response) => {
+                let status = response.status();
+                adaptive_schema::observe_failure(
+                    provider,
+                    "POST",
+                    url,
+                    "provider json post retry",
+                    Some(status.as_u16()),
+                    status.as_str(),
+                )
+                .await;
                 let delay = retry_after_seconds(response.headers()).unwrap_or_else(|| {
                     let jitter = rand::rng().random_range(0.0..0.2);
                     (base * 2_f64.powi(attempt as i32)).min(max_backoff) + jitter
@@ -329,9 +361,27 @@ pub async fn post_json_with_retries(
                 sleep(Duration::from_secs_f64(delay)).await;
             }
             Err(error) if attempt >= max_retries => {
+                adaptive_schema::observe_failure(
+                    provider,
+                    "POST",
+                    url,
+                    "provider json post",
+                    None,
+                    &error.to_string(),
+                )
+                .await;
                 return Err(GailError::upstream(provider, None, error.to_string()));
             }
             Err(error) => {
+                adaptive_schema::observe_failure(
+                    provider,
+                    "POST",
+                    url,
+                    "provider json post retry",
+                    None,
+                    &error.to_string(),
+                )
+                .await;
                 let delay = (base * 2_f64.powi(attempt as i32)).min(max_backoff);
                 tracing::debug!(provider, attempt, error = %error, "retrying failed POST");
                 attempt += 1;
@@ -360,11 +410,42 @@ pub async fn get_with_retries(
             .send()
             .await;
         match response {
-            Ok(response) if response.status().is_success() => return Ok(response),
+            Ok(response) if response.status().is_success() => {
+                let status = response.status().as_u16();
+                adaptive_schema::observe_success(
+                    provider,
+                    "GET",
+                    url,
+                    "provider get",
+                    &adaptive_schema::endpoint_status_body(status),
+                )
+                .await;
+                return Ok(response);
+            }
             Ok(response) if !should_retry_status(response.status()) || attempt >= max_retries => {
+                let status = response.status();
+                adaptive_schema::observe_failure(
+                    provider,
+                    "GET",
+                    url,
+                    "provider get",
+                    Some(status.as_u16()),
+                    status.as_str(),
+                )
+                .await;
                 return Ok(response);
             }
             Ok(response) => {
+                let status = response.status();
+                adaptive_schema::observe_failure(
+                    provider,
+                    "GET",
+                    url,
+                    "provider get retry",
+                    Some(status.as_u16()),
+                    status.as_str(),
+                )
+                .await;
                 let delay = retry_after_seconds(response.headers()).unwrap_or_else(|| {
                     let jitter = rand::rng().random_range(0.0..0.2);
                     (base * 2_f64.powi(attempt as i32)).min(max_backoff) + jitter
@@ -373,9 +454,27 @@ pub async fn get_with_retries(
                 sleep(Duration::from_secs_f64(delay)).await;
             }
             Err(error) if attempt >= max_retries => {
+                adaptive_schema::observe_failure(
+                    provider,
+                    "GET",
+                    url,
+                    "provider get",
+                    None,
+                    &error.to_string(),
+                )
+                .await;
                 return Err(GailError::upstream(provider, None, error.to_string()));
             }
             Err(error) => {
+                adaptive_schema::observe_failure(
+                    provider,
+                    "GET",
+                    url,
+                    "provider get retry",
+                    None,
+                    &error.to_string(),
+                )
+                .await;
                 let delay = (base * 2_f64.powi(attempt as i32)).min(max_backoff);
                 tracing::debug!(provider, attempt, error = %error, "retrying failed GET");
                 attempt += 1;

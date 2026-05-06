@@ -8,6 +8,8 @@ use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::adaptive_schema;
+
 // ---------------------------------------------------------------------------
 // Domain models
 // ---------------------------------------------------------------------------
@@ -86,18 +88,52 @@ impl RefinerClient {
         if let Some(ref token) = self.api_token {
             req = req.header("Authorization", format!("Bearer {token}"));
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| format!("Refiner RAG request failed: {e}"))?;
+        let resp = match req.send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                adaptive_schema::observe_failure(
+                    "refiner",
+                    "POST",
+                    "/api/rag/query",
+                    "rag query",
+                    None,
+                    &err.to_string(),
+                )
+                .await;
+                return Err(format!("Refiner RAG request failed: {err}"));
+            }
+        };
 
         let status = resp.status();
-        let data: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Refiner RAG response parse failed: {e}"))?;
+        let data: serde_json::Value = match resp.json().await {
+            Ok(data) => data,
+            Err(err) => {
+                let message = format!("Refiner RAG response parse failed: {err}");
+                adaptive_schema::observe_failure(
+                    "refiner",
+                    "POST",
+                    "/api/rag/query",
+                    "rag query",
+                    Some(status.as_u16()),
+                    &message,
+                )
+                .await;
+                return Err(message);
+            }
+        };
 
         if !status.is_success() {
+            adaptive_schema::observe_failure(
+                "refiner",
+                "POST",
+                "/api/rag/query",
+                "rag query",
+                Some(status.as_u16()),
+                data.get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+            )
+            .await;
             return Err(format!(
                 "Refiner RAG error (HTTP {}): {}",
                 status.as_u16(),
@@ -106,6 +142,8 @@ impl RefinerClient {
                     .unwrap_or("unknown")
             ));
         }
+        adaptive_schema::observe_success("refiner", "POST", "/api/rag/query", "rag query", &data)
+            .await;
 
         let matches = data
             .get("matches")

@@ -12,6 +12,7 @@ use tracing::{debug, warn};
 use super::backtest::BacktestSummary;
 use super::config::TradingConfigOverride;
 use super::octobot::{OctobotExchange, OctobotOrder, OctobotPortfolio};
+use crate::adaptive_schema::AdaptiveApiSchema;
 
 fn now_ts() -> f64 {
     SystemTime::now()
@@ -132,6 +133,9 @@ pub struct TradingStatusSnapshot {
     pub config_overrides_active: bool,
     pub last_backtest_assessment: Option<String>,
     pub last_backtest_at: Option<f64>,
+    pub api_schema_version: u64,
+    pub api_schema_hints: usize,
+    pub recent_api_adjustments: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +163,12 @@ pub struct TradingState {
     pub last_backtest: Option<BacktestSummary>,
     /// Ring buffer of historical backtest summaries (most recent last).
     pub backtest_history: VecDeque<BacktestSummary>,
+    /// Adaptive reference of OctoBot API endpoint shapes and semantic hints.
+    #[serde(default)]
+    pub api_schema: AdaptiveApiSchema,
+    /// Fingerprints for external OctoBot log rows already copied into Gail's log.
+    #[serde(default)]
+    pub observed_external_log_fingerprints: VecDeque<String>,
 }
 
 impl TradingState {
@@ -181,6 +191,8 @@ impl TradingState {
             trade_ring_size,
             last_backtest: None,
             backtest_history: VecDeque::with_capacity(20),
+            api_schema: AdaptiveApiSchema::default(),
+            observed_external_log_fingerprints: VecDeque::with_capacity(500),
         }
     }
 
@@ -238,6 +250,9 @@ impl TradingState {
                 .as_ref()
                 .map(|b| b.assessment.to_string()),
             last_backtest_at: self.last_backtest.as_ref().map(|b| b.run_at),
+            api_schema_version: self.api_schema.version,
+            api_schema_hints: self.api_schema.semantic_hints.len(),
+            recent_api_adjustments: self.api_schema.recent_adjustments.len(),
         }
     }
 
@@ -253,6 +268,22 @@ impl TradingState {
     /// Take any pending override and clear it from the state.
     pub fn take_override(&mut self) -> Option<TradeOverride> {
         self.pending_override.take()
+    }
+
+    pub fn remember_external_log(&mut self, fingerprint: String) -> bool {
+        if self
+            .observed_external_log_fingerprints
+            .iter()
+            .any(|existing| existing == &fingerprint)
+        {
+            return false;
+        }
+        if self.observed_external_log_fingerprints.len() >= 500 {
+            self.observed_external_log_fingerprints.pop_front();
+        }
+        self.observed_external_log_fingerprints
+            .push_back(fingerprint);
+        true
     }
 }
 
@@ -349,6 +380,9 @@ impl SharedTradingState {
                     state.config_overrides = restored.config_overrides;
                     state.last_backtest = restored.last_backtest;
                     state.backtest_history = restored.backtest_history;
+                    state.api_schema = restored.api_schema;
+                    state.observed_external_log_fingerprints =
+                        restored.observed_external_log_fingerprints;
                     state.log_info("startup", "Restored trading state from disk");
                 }
                 Err(err) => {

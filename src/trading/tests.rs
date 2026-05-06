@@ -358,6 +358,41 @@ mod tests {
         assert!(ov.target_currencies.is_none());
     }
 
+    #[test]
+    fn trade_floor_feedback_does_not_create_empty_override() {
+        use crate::trading::state::TradingState;
+
+        let config = TradingConfig {
+            micro_trade_min_usd: 5.0,
+            micro_trade_max_usd: 25.0,
+            ..TradingConfig::default()
+        };
+        let mut state = TradingState::new(100, 100);
+
+        crate::trading::apply_trade_floor_feedback(&config, &mut state, 4.0);
+
+        assert!(state.config_overrides.is_none());
+    }
+
+    #[test]
+    fn trade_floor_feedback_raises_minimum_and_maximum() {
+        use crate::trading::state::TradingState;
+
+        let config = TradingConfig {
+            micro_trade_min_usd: 1.0,
+            micro_trade_max_usd: 3.0,
+            ..TradingConfig::default()
+        };
+        let mut state = TradingState::new(100, 100);
+
+        crate::trading::apply_trade_floor_feedback(&config, &mut state, 5.0);
+
+        let overrides = state.config_overrides.expect("adaptive overrides");
+        assert_eq!(overrides.micro_trade_min_usd, Some(5.0));
+        assert_eq!(overrides.micro_trade_max_usd, Some(5.0));
+        assert_eq!(state.activity_log.len(), 1);
+    }
+
     // -----------------------------------------------------------------------
     // TradingState tests
     // -----------------------------------------------------------------------
@@ -1664,6 +1699,98 @@ mod tests {
         assert_eq!(snapshot.volume_24h, Some(25.0));
         assert_eq!(snapshot.high_24h, Some(112.0));
         assert_eq!(snapshot.low_24h, Some(99.0));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_schema_skips_known_missing_optional_ticker_route() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/market/ticker"))
+            .and(query_param("exchange", "binance"))
+            .and(query_param("symbol", "BTC/USDT"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/dashboard/watched_symbol/BTC(%7C|\|)USDT$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exchange_id": "binance-id",
+                "time_frame": "1h"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/dashboard/currency_price_graph_update/binance-id/BTC(%7C|\|)USDT/1h/live$",
+            ))
+            .and(query_param("display_orders", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "candles": {
+                    "close": [100.0, 110.0],
+                    "high": [101.0, 112.0],
+                    "low": [99.0, 105.0],
+                    "volume": [10.0, 15.0]
+                }
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        client
+            .get_market_snapshot("binance", "BTC/USDT")
+            .await
+            .unwrap();
+        client
+            .get_market_snapshot("binance", "BTC/USDT")
+            .await
+            .unwrap();
+        let schema = client.api_schema_snapshot().await;
+        assert!(
+            schema
+                .endpoints
+                .get("GET /api/market/ticker")
+                .is_some_and(|endpoint| endpoint.degraded)
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_logs_update_schema_hints() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/logs"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/logs"))
+            .and(query_param("format", "json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "Time\tLevel\tSource\tMessage\n\
+                 2026-05-06 06:06:00\tWARNING\tAIToolsTeamManagerAgentProducer\t3 validation errors for ManagerToolCall tool_name Field required arguments Field required agent_name Extra inputs\n\
+                 2026-05-06 06:04:10\tWARNING\tAIIndexTradingModeConsumer\tMissingMinimalExchangeTradeVolume {'cost': {'min': 5.0, 'max': 9000000.0}}\n",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let logs = client.get_recent_logs(10).await.unwrap();
+        assert_eq!(logs.len(), 2);
+        let schema = client.api_schema_snapshot().await;
+        assert!(
+            schema
+                .semantic_hints
+                .contains_key("manager_tool_call_shape")
+        );
+        assert_eq!(schema.numeric_hints.get("micro_trade_min_usd"), Some(&5.0));
         server.verify().await;
     }
 

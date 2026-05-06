@@ -33,15 +33,18 @@ use tokio::sync::oneshot;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
-use crate::orchestration::GailService;
+use crate::{
+    adaptive_schema::{self, AdaptiveApiRegistry},
+    orchestration::GailService,
+};
 use advisor::TradingAdvisor;
 use backtest::BacktestEngine;
-use config::TradingConfig;
+use config::{TradingConfig, TradingConfigOverride};
 use decision::{DecisionEngine, TradeDecision};
 use fuzzy::{FuzzyEngine, FuzzyInputs};
-use octobot::{MarketSnapshot, OctobotClient, OctobotPortfolio};
+use octobot::{MarketSnapshot, OctobotClient, OctobotLogEntry, OctobotPortfolio};
 use refiner::RefinerClient;
-use state::{ExecutedTrade, SharedTradingState, TradeAction};
+use state::{ExecutedTrade, SharedTradingState, TradeAction, TradingState};
 
 fn now_ts() -> f64 {
     SystemTime::now()
@@ -117,10 +120,28 @@ async fn run_evaluation_loop(
     service: GailService,
     mut shutdown: oneshot::Receiver<()>,
 ) {
-    let octobot = OctobotClient::new(
+    let mut restored_api_schema = {
+        let state = state.0.lock().await;
+        state.api_schema.clone()
+    };
+    let global_octobot_schema = adaptive_schema::api_snapshot("octobot").await;
+    if adaptive_schema_has_observations(&global_octobot_schema) {
+        restored_api_schema.merge(global_octobot_schema);
+    }
+    {
+        let mut state = state.0.lock().await;
+        state.api_schema = restored_api_schema.clone();
+    }
+    let mut restored_registry = AdaptiveApiRegistry::default();
+    restored_registry
+        .apis
+        .insert("octobot".to_string(), restored_api_schema.clone());
+    adaptive_schema::merge_snapshot(restored_registry).await;
+    let octobot = OctobotClient::new_with_schema(
         &config.octobot_base_url,
         config.octobot_password.as_deref(),
         config.octobot_timeout_seconds,
+        restored_api_schema,
     );
     let refiner = RefinerClient::new(
         &config.refiner_base_url,
@@ -297,6 +318,8 @@ async fn run_single_evaluation(
         }
     }
 
+    process_octobot_feedback(config, state, octobot).await;
+
     // --- 2. Build research query ---
     let best_snapshot = select_best_market_candidate(&market_snapshots);
     let research_query = build_research_query(config, best_snapshot.as_ref());
@@ -387,6 +410,126 @@ async fn run_single_evaluation(
         "trading: evaluation cycle complete in {:.1}ms",
         (now_ts() - eval_start) * 1000.0
     );
+}
+
+async fn process_octobot_feedback(
+    config: &TradingConfig,
+    state: &SharedTradingState,
+    octobot: &OctobotClient,
+) {
+    let logs = match octobot.get_recent_logs(25).await {
+        Ok(logs) => logs,
+        Err(err) => {
+            debug!("trading: OctoBot log feedback fetch failed: {}", err);
+            Vec::new()
+        }
+    };
+    let schema = octobot.api_schema_snapshot().await;
+    let recommended_min = schema.numeric_hints.get("micro_trade_min_usd").copied();
+
+    let mut s = state.0.lock().await;
+    for entry in logs.iter().filter(|entry| significant_octobot_log(entry)) {
+        let fingerprint = octobot_log_fingerprint(entry);
+        if s.remember_external_log(fingerprint) {
+            s.log(
+                log_level_for_external_entry(entry),
+                "octobot_log",
+                format!(
+                    "OctoBot {} {}: {}",
+                    entry.level, entry.source, entry.message
+                ),
+                json!(entry),
+            );
+        }
+    }
+
+    if let Some(min_usd) = recommended_min {
+        apply_trade_floor_feedback(config, &mut s, min_usd);
+    }
+    s.api_schema = schema;
+}
+
+fn significant_octobot_log(entry: &OctobotLogEntry) -> bool {
+    let level = entry.level.to_ascii_lowercase();
+    level.contains("error")
+        || level.contains("warn")
+        || entry.message.contains("MissingMinimalExchangeTradeVolume")
+        || entry.message.contains("ManagerToolCall")
+        || entry.message.contains("nvidia upstream error")
+}
+
+fn log_level_for_external_entry(entry: &OctobotLogEntry) -> &'static str {
+    if entry.level.eq_ignore_ascii_case("ERROR") {
+        "error"
+    } else if entry.level.to_ascii_lowercase().contains("warn") {
+        "warn"
+    } else {
+        "info"
+    }
+}
+
+fn octobot_log_fingerprint(entry: &OctobotLogEntry) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        entry.time.as_deref().unwrap_or_default(),
+        entry.level,
+        entry.source,
+        entry.message.chars().take(300).collect::<String>()
+    )
+}
+
+fn apply_trade_floor_feedback(
+    config: &TradingConfig,
+    state: &mut TradingState,
+    recommended_min_usd: f64,
+) {
+    if !recommended_min_usd.is_finite() || recommended_min_usd <= 0.0 {
+        return;
+    }
+    let target = recommended_min_usd
+        .max(config.micro_trade_min_usd)
+        .min(1_000_000.0);
+    let current_min = state
+        .config_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.micro_trade_min_usd)
+        .unwrap_or(config.micro_trade_min_usd);
+    let current_max = state
+        .config_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.micro_trade_max_usd)
+        .unwrap_or(config.micro_trade_max_usd);
+    let changed_min = target > current_min + f64::EPSILON;
+    let changed_max = current_max + f64::EPSILON < target;
+    if changed_min || changed_max {
+        let overrides: &mut TradingConfigOverride =
+            state.config_overrides.get_or_insert_with(Default::default);
+        if changed_min {
+            overrides.micro_trade_min_usd = Some(target);
+        }
+        if changed_max {
+            overrides.micro_trade_max_usd = Some(target);
+        }
+    }
+    if changed_min || changed_max {
+        state.log(
+            "warn",
+            "adaptive_schema",
+            format!("Adjusted micro-trade sizing from OctoBot exchange minimum: min=${target:.2}"),
+            json!({
+                "recommended_micro_trade_min_usd": target,
+                "micro_trade_min_usd_changed": changed_min,
+                "micro_trade_max_usd_changed": changed_max,
+            }),
+        );
+    }
+}
+
+fn adaptive_schema_has_observations(schema: &adaptive_schema::AdaptiveApiSchema) -> bool {
+    !schema.endpoints.is_empty()
+        || !schema.semantic_hints.is_empty()
+        || !schema.numeric_hints.is_empty()
+        || !schema.recent_adjustments.is_empty()
 }
 
 // ---------------------------------------------------------------------------

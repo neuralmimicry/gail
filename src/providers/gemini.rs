@@ -11,6 +11,7 @@ use reqwest::Client;
 use serde_json::{Value, json};
 
 use crate::{
+    adaptive_schema,
     config::ProviderProfile,
     errors::{GailError, Result},
     models::{ContentPart, MessageContent, ProviderCompletionRequest, TokenUsage},
@@ -333,17 +334,28 @@ async fn maybe_cached_content(model: &str, system: Option<&str>) -> Result<Optio
             .as_deref(),
     )?;
     let client = Client::builder().build()?;
+    let url = "https://generativelanguage.googleapis.com/v1beta/cachedContents";
     let response = client
-        .post("https://generativelanguage.googleapis.com/v1beta/cachedContents")
+        .post(url)
         .headers(headers)
         .timeout(Duration::from_secs(20))
         .json(&payload)
         .send()
         .await?;
     if !response.status().is_success() {
+        adaptive_schema::observe_failure(
+            "gemini",
+            "POST",
+            url,
+            "cache content",
+            Some(response.status().as_u16()),
+            response.status().as_str(),
+        )
+        .await;
         return Ok(None);
     }
     let data: Value = response.json().await?;
+    adaptive_schema::observe_success("gemini", "POST", url, "cache content", &data).await;
     let name = data
         .get("name")
         .and_then(Value::as_str)

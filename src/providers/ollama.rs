@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use sysinfo::{Disks, System};
 
 use crate::{
+    adaptive_schema,
     config::{GailConfig, ProviderProfile},
     errors::{GailError, Result},
     models::{MessageContent, ProviderCompletionRequest, TokenUsage},
@@ -199,17 +200,53 @@ impl OllamaProvider {
 
     pub async fn health(&self, timeout_seconds: Option<u64>) -> Result<ProviderHealth> {
         let started = Instant::now();
-        let response = self
+        let url = format!("{}/api/tags", self.base_url);
+        let response = match self
             .client
-            .get(format!("{}/api/tags", self.base_url))
+            .get(&url)
             .timeout(Duration::from_secs(
                 timeout_seconds
                     .unwrap_or(env_int("LLM_TIMEOUT_SECONDS", 60))
                     .max(1),
             ))
             .send()
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                adaptive_schema::observe_failure(
+                    "ollama",
+                    "GET",
+                    &url,
+                    "tags health",
+                    None,
+                    &error.to_string(),
+                )
+                .await;
+                return Err(error.into());
+            }
+        };
         let latency_ms = started.elapsed().as_millis() as u64;
+        if response.status().is_success() {
+            adaptive_schema::observe_success(
+                "ollama",
+                "GET",
+                &url,
+                "tags health",
+                &adaptive_schema::endpoint_status_body(response.status().as_u16()),
+            )
+            .await;
+        } else {
+            adaptive_schema::observe_failure(
+                "ollama",
+                "GET",
+                &url,
+                "tags health",
+                Some(response.status().as_u16()),
+                response.status().as_str(),
+            )
+            .await;
+        }
         Ok(ProviderHealth {
             ok: response.status().is_success(),
             status_code: Some(response.status().as_u16()),
@@ -225,17 +262,47 @@ impl OllamaProvider {
 
     pub async fn inventory_status(&self, config: &GailConfig) -> Result<OllamaInventoryStatus> {
         let started = Instant::now();
-        let response = self
+        let url = format!("{}/api/tags", self.base_url);
+        let response = match self
             .client
-            .get(format!("{}/api/tags", self.base_url))
+            .get(&url)
             .timeout(Duration::from_secs(10))
             .send()
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                adaptive_schema::observe_failure(
+                    "ollama",
+                    "GET",
+                    &url,
+                    "tags inventory",
+                    None,
+                    &error.to_string(),
+                )
+                .await;
+                return Err(error.into());
+            }
+        };
         let latency_ms = started.elapsed().as_millis() as u64;
         let status = response.status();
         let body = response.text().await?;
         let payload: Value =
             serde_json::from_str(&body).unwrap_or_else(|_| json!({"message": body}));
+        if status.is_success() {
+            adaptive_schema::observe_success("ollama", "GET", &url, "tags inventory", &payload)
+                .await;
+        } else {
+            adaptive_schema::observe_failure(
+                "ollama",
+                "GET",
+                &url,
+                "tags inventory",
+                Some(status.as_u16()),
+                &payload.to_string(),
+            )
+            .await;
+        }
         let models = payload
             .get("models")
             .and_then(Value::as_array)
@@ -398,20 +465,46 @@ fn json_headers() -> http::HeaderMap {
 }
 
 async fn fetch_ollama_tags(client: &Client, base_url: &str) -> Result<Value> {
-    let response = client
-        .get(format!("{base_url}/api/tags"))
+    let url = format!("{base_url}/api/tags");
+    let response = match client
+        .get(&url)
         .timeout(Duration::from_secs(10))
         .send()
-        .await?;
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            adaptive_schema::observe_failure(
+                "ollama",
+                "GET",
+                &url,
+                "tags",
+                None,
+                &error.to_string(),
+            )
+            .await;
+            return Err(error.into());
+        }
+    };
     let status = response.status();
     let body = response.text().await?;
     let payload: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({"message": body}));
     if !status.is_success() {
+        adaptive_schema::observe_failure(
+            "ollama",
+            "GET",
+            &url,
+            "tags",
+            Some(status.as_u16()),
+            &payload.to_string(),
+        )
+        .await;
         return Err(GailError::upstream(
             "ollama",
             Some(status),
             error_message(&payload),
         ));
     }
+    adaptive_schema::observe_success("ollama", "GET", &url, "tags", &payload).await;
     Ok(payload)
 }

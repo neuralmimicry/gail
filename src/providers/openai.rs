@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use tokio::time::sleep;
 
 use crate::{
+    adaptive_schema,
     config::ProviderProfile,
     errors::{GailError, Result},
     models::{MessageContent, ProviderCompletionRequest, TokenUsage},
@@ -420,27 +421,60 @@ impl OpenAIProvider {
                     .map_err(|error| GailError::Multipart(error.to_string()))?,
             );
         let started = Instant::now();
-        let response = self
+        let url = endpoint(&self.base_url, "audio/transcriptions");
+        let response = match self
             .client
-            .post(endpoint(&self.base_url, "audio/transcriptions"))
+            .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .multipart(form)
             .timeout(Duration::from_secs(
                 input.timeout_seconds.unwrap_or(60).max(1),
             ))
             .send()
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                adaptive_schema::observe_failure(
+                    self.provider_name.as_str(),
+                    "POST",
+                    &url,
+                    "audio transcription",
+                    None,
+                    &error.to_string(),
+                )
+                .await;
+                return Err(error.into());
+            }
+        };
         let latency_ms = started.elapsed().as_millis() as u64;
         let status = response.status();
         let body = response.text().await?;
         let data: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({"message": body}));
         if !status.is_success() {
+            adaptive_schema::observe_failure(
+                self.provider_name.as_str(),
+                "POST",
+                &url,
+                "audio transcription",
+                Some(status.as_u16()),
+                &error_message(&data),
+            )
+            .await;
             return Err(GailError::upstream(
                 self.provider_name.as_str(),
                 Some(status),
                 error_message(&data),
             ));
         }
+        adaptive_schema::observe_success(
+            self.provider_name.as_str(),
+            "POST",
+            &url,
+            "audio transcription",
+            &data,
+        )
+        .await;
         let text = data
             .get("text")
             .and_then(Value::as_str)

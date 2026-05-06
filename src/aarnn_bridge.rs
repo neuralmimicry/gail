@@ -4,8 +4,10 @@ use reqwest::{
     Client,
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
 };
+use serde_json::Value;
 
 use crate::{
+    adaptive_schema,
     aer::{encode_spikes, payload_hex},
     config::{AarnnBridgeConfig, GailConfig, SpecialistProfile},
     models::{
@@ -287,7 +289,7 @@ impl AarnnMirrorClient {
         request: &AarnnMirrorRequest,
     ) -> Result<AarnnMirrorResponse, String> {
         let url = format!("{}{}", self.endpoint, AARNN_MIRROR_PATH);
-        let response = self
+        let response = match self
             .client
             .post(url)
             .headers(self.headers()?)
@@ -295,7 +297,21 @@ impl AarnnMirrorClient {
             .json(request)
             .send()
             .await
-            .map_err(|error| error.to_string())?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                adaptive_schema::observe_failure(
+                    "aarnn_bridge",
+                    "POST",
+                    AARNN_MIRROR_PATH,
+                    "mirror",
+                    None,
+                    &error.to_string(),
+                )
+                .await;
+                return Err(error.to_string());
+            }
+        };
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -304,12 +320,43 @@ impl AarnnMirrorClient {
             } else {
                 format!("{status}: {body}")
             };
+            adaptive_schema::observe_failure(
+                "aarnn_bridge",
+                "POST",
+                AARNN_MIRROR_PATH,
+                "mirror",
+                Some(status.as_u16()),
+                &message,
+            )
+            .await;
             return Err(message);
         }
-        response
-            .json::<AarnnMirrorResponse>()
-            .await
-            .map_err(|error| error.to_string())
+        match response.json::<AarnnMirrorResponse>().await {
+            Ok(parsed) => {
+                let body = serde_json::to_value(&parsed).unwrap_or(Value::Null);
+                adaptive_schema::observe_success(
+                    "aarnn_bridge",
+                    "POST",
+                    AARNN_MIRROR_PATH,
+                    "mirror",
+                    &body,
+                )
+                .await;
+                Ok(parsed)
+            }
+            Err(error) => {
+                adaptive_schema::observe_failure(
+                    "aarnn_bridge",
+                    "POST",
+                    AARNN_MIRROR_PATH,
+                    "mirror",
+                    Some(status.as_u16()),
+                    &error.to_string(),
+                )
+                .await;
+                Err(error.to_string())
+            }
+        }
     }
 
     fn headers(&self) -> Result<HeaderMap, String> {

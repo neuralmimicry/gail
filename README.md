@@ -28,11 +28,13 @@ Gail exposes the following endpoints:
 | `POST /v1/aer/encode` | Encode spikes/events into `AER1` payloads |
 | `POST /v1/aer/decode` | Decode `AER1` payloads into spikes/events |
 | `GET /v1/status/orchestration` | Provider, engine, and metrics status |
+| `GET /v1/status/api-schema` | Global adaptive API registry for remote integrations |
 | `GET /v1/trading/status` | Trading bridge status snapshot |
 | `GET /v1/trading/portfolio` | OctoBot portfolio holdings |
 | `GET /v1/trading/positions` | Open OctoBot orders |
 | `GET /v1/trading/history` | Recent executed trades |
 | `GET /v1/trading/logs` | Activity log ring buffer |
+| `GET /v1/trading/api-schema` | Adaptive OctoBot API schema and feedback reference |
 | `GET /v1/trading/exchanges` | Available exchanges from OctoBot |
 | `GET /v1/trading/currencies` | Available trading pairs |
 | `GET /v1/trading/config` | Current trading configuration |
@@ -98,13 +100,14 @@ The image expects a config file at `/app/config/gail.yaml` unless `GAIL_CONFIG` 
 
 - `providers`: shared LLM backends Gail can orchestrate.
 - `providers` can include `openai`, `gemini`, `ollama`, and OpenAI-compatible `nvidia` profiles backed by custom `base_url` values.
-- `gail-auto` dispatches providers in ranked waves. If a candidate reports quota, rate-limit, or upstream HTTP 429, Gail marks that provider family throttled for the request, records quota health, and tries the next suitable provider family instead of surfacing the first rate-limit failure.
+- `gail-auto` dispatches providers in ranked waves. If a candidate reports quota, rate-limit, upstream HTTP 429, or transient upstream failures such as 502/503/504, Gail marks that provider family throttled for the request, records health, and tries the next suitable provider family instead of surfacing the first failure.
 - `specialists`: explicit neuromorphic engines. Use this when you have named SNN/AARNN backends to register.
 - `aarnn_bridge`: mirrored Gail-to-AARNN LLM I/O bridge. Gail mirrors prompt-side and response-side text plus translated AER payloads to `POST /api/llm/mirror` and can optionally promote a future AARNN reply.
 - `config/ai-routing-profiles.json`: shared workflow/keyword/provider routing contract used by Gail and mirrored in Refiner for offline fallback.
 - `GAIL_ROUTING_PROFILES_PATH`: optional override for the routing contract path.
 - `GAIL_AARNN_*` env vars: optional legacy auto-attach path for an AARNN backend, mirroring Refiner's previous automatic fallback behaviour.
 - `storage.metrics_path`: persisted provider quality/latency metrics.
+- `storage.adaptive_schema_path`: persisted adaptive API registry for provider, Refiner, AARNN, specialist, OctoBot, and trading feedback observations.
 - `orchestration.health_ttl_seconds`: cached provider-health TTL. Runtime quota health remains in backoff until this TTL expires, so later requests skip rate-limited candidates before probing them again.
 - `storage.ollama_model_store_path`: cached Ollama model inventory summary.
 
@@ -167,7 +170,7 @@ Gail HTTP Server
 Each evaluation runs the following pipeline steps in sequence:
 
 **Step 1 — Market data** (`octobot.rs`)
-OctoBot is queried for market snapshots (price, 24 h change %, 24 h volume), portfolio totals where available, and open orders. The client probes `/api/ping` at startup; Continuum deployments normally keep OctoBot native web auth disabled behind shared ingress auth, so Gail does not attempt the old non-existent JSON password-login endpoint. Up to 20 snapshots are fetched across all configured exchanges and currency filters.
+OctoBot is queried for market snapshots (price, 24 h change %, 24 h volume), portfolio totals where available, and open orders. The client probes `/api/ping` at startup; Continuum deployments normally keep OctoBot native web auth disabled behind shared ingress auth, so Gail does not attempt the old non-existent JSON password-login endpoint. Up to 20 snapshots are fetched across all configured exchanges and currency filters. Gail records each OctoBot endpoint's observed shape, status, failures, and log-derived semantic hints in an adaptive API schema; optional routes that prove missing or temporarily bad are skipped for a short TTL while fallback routes are used.
 
 **Step 2 — Research** (`refiner.rs`)
 The highest-signal market snapshot (scored by `|Δ%| × ln(volume+1)`) is used to build a Refiner RAG query from the `research_query_template`. Refiner's `/api/rag/query` endpoint returns ranked context passages (default top 5). The research context is passed verbatim to the AI advisors and contributes a sentiment signal to the fuzzy engine.
@@ -236,6 +239,7 @@ Direct `place_buy_order` / `place_sell_order` calls return an explicit unsupport
 - `open_positions` — latest open orders
 - `recent_trades` — `VecDeque` ring buffer (default 200 entries)
 - `activity_log` — `VecDeque` ring buffer (default 1000 entries) with level, category, message, and JSON context
+- `api_schema` — adaptive OctoBot endpoint/reference schema, semantic hints, and recent automatic adjustments
 - `available_exchanges` — populated from OctoBot on each cycle
 - `pending_override` — operator-injected trade override
 - `config_overrides` — runtime-mutable subset of config
@@ -247,6 +251,7 @@ State is persisted to `data_path` (default `./data/trading_state.json`) every 5 
 
 | File | Responsibility |
 | --- | --- |
+| `src/adaptive_schema.rs` | Generic adaptive API registry shared by Gail providers, Refiner, AARNN, specialists, and trading |
 | `src/trading/mod.rs` | `TradingBridge`, background loop, evaluation pipeline, execution |
 | `src/trading/config.rs` | `TradingConfig`, `TradingConfigOverride` |
 | `src/trading/state.rs` | `TradingState`, `SharedTradingState`, ring buffers, persistence |
@@ -259,6 +264,11 @@ State is persisted to `data_path` (default `./data/trading_state.json`) every 5 
 ### Configuration Reference
 
 ```yaml
+storage:
+  metrics_path: "./data/provider_metrics.json"
+  adaptive_schema_path: "./data/adaptive_api_schema.json"
+  ollama_model_store_path: "./data/ollama_model_inventory.json"
+
 trading:
   enabled: false                          # master switch
   octobot_base_url: "${GAIL_TRADING_OCTOBOT_URL}"
@@ -299,6 +309,7 @@ nmc gail trading portfolio
 nmc gail trading positions
 nmc gail trading history [--limit N]
 nmc gail trading logs [--limit N]
+nmc gail trading api-schema
 nmc gail trading exchanges
 nmc gail trading currencies
 nmc gail trading config

@@ -140,6 +140,16 @@ impl MetricsStore {
     }
 
     pub async fn provider_in_quota_backoff(&self, provider: &str, ttl_seconds: f64) -> bool {
+        self.provider_in_health_backoff(provider, &["quota"], ttl_seconds)
+            .await
+    }
+
+    pub async fn provider_in_health_backoff(
+        &self,
+        provider: &str,
+        modes: &[&str],
+        ttl_seconds: f64,
+    ) -> bool {
         let provider = provider.trim();
         if provider.is_empty() {
             return false;
@@ -163,7 +173,7 @@ impl MetricsStore {
                     .health
                     .mode
                     .as_deref()
-                    .is_some_and(|mode| mode.eq_ignore_ascii_case("quota"))
+                    .is_some_and(|mode| modes.iter().any(|item| mode.eq_ignore_ascii_case(item)))
                     && bucket
                         .health
                         .checked_at

@@ -81,6 +81,7 @@ pub struct AarnnBridgeConfig {
 #[serde(default)]
 pub struct StorageConfig {
     pub metrics_path: String,
+    pub adaptive_schema_path: String,
     pub ollama_model_store_path: Option<String>,
 }
 
@@ -191,6 +192,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             metrics_path: "data/provider_metrics.json".to_string(),
+            adaptive_schema_path: "data/adaptive_api_schema.json".to_string(),
             ollama_model_store_path: None,
         }
     }
@@ -315,6 +317,9 @@ impl GailConfig {
         self.aarnn_bridge.max_text_chars = self.aarnn_bridge.max_text_chars.clamp(128, 65_536);
         if self.storage.metrics_path.trim().is_empty() {
             self.storage.metrics_path = "data/provider_metrics.json".to_string();
+        }
+        if self.storage.adaptive_schema_path.trim().is_empty() {
+            self.storage.adaptive_schema_path = "data/adaptive_api_schema.json".to_string();
         }
         for provider in &mut self.providers {
             provider.provider_type =

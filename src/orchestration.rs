@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     aarnn_bridge::{AarnnMirrorClient, AarnnMirrorExchange},
-    aer,
+    adaptive_schema, aer,
     config::{ApiTokenConfig, GailConfig, ProviderProfile},
     errors::{GailError, Result, message_indicates_quota},
     metrics::{HealthBucket, MetricsStore},
@@ -85,6 +85,7 @@ struct RankedCandidate {
 
 impl GailService {
     pub async fn new(config: GailConfig) -> Result<Self> {
+        adaptive_schema::configure_persistence(config.storage.adaptive_schema_path.clone()).await;
         let client = Client::builder()
             .use_rustls_tls()
             .pool_idle_timeout(Duration::from_secs(90))
@@ -428,7 +429,7 @@ impl GailService {
                 .collect::<Vec<_>>();
             let remaining = unattempted
                 .iter()
-                .filter(|item| !ranked_candidate_is_in_quota_backoff(item))
+                .filter(|item| !ranked_candidate_is_in_provider_backoff(item))
                 .cloned()
                 .collect::<Vec<_>>();
             if remaining.is_empty() && !unattempted.is_empty() {
@@ -491,25 +492,25 @@ impl GailService {
 
             returned_early |= wave_results.len() < selected.len() && selected.len() > 1;
             let wave_has_success = wave_results.iter().any(|result| result.response.is_some());
-            let quota_providers = wave_results
+            let backoff_providers = wave_results
                 .iter()
                 .filter(|result| result.response.is_none())
                 .filter_map(|result| {
                     result
                         .error
                         .as_deref()
-                        .filter(|error| message_indicates_quota(error))
+                        .filter(|error| message_indicates_provider_backoff(error))
                         .map(|_| result.candidate.provider_type.clone())
                 })
                 .collect::<HashSet<_>>();
-            if !quota_providers.is_empty() {
-                throttled_provider_types.extend(quota_providers.iter().cloned());
+            if !backoff_providers.is_empty() {
+                throttled_provider_types.extend(backoff_providers.iter().cloned());
                 info!(
                     workflow = %workflow,
                     role = %role,
                     fallback_wave = wave_index,
-                    throttled_providers = %preview_labels(sorted_strings(quota_providers.into_iter()), 6),
-                    "provider rate-limited; backing off and trying fallback candidates"
+                    throttled_providers = %preview_labels(sorted_strings(backoff_providers.into_iter()), 6),
+                    "provider family in runtime backoff; trying fallback candidates"
                 );
             }
             results.append(&mut wave_results);
@@ -1107,15 +1108,19 @@ impl GailService {
         let health = if self
             .inner
             .metrics
-            .provider_in_quota_backoff(candidate.provider_type.as_str(), self.health_ttl_seconds())
+            .provider_in_health_backoff(
+                candidate.provider_type.as_str(),
+                &["quota", "upstream", "timeout"],
+                self.health_ttl_seconds(),
+            )
             .await
         {
             ProviderHealth {
                 ok: false,
                 status_code: None,
                 latency_ms: None,
-                message: Some("provider family is in cached quota backoff".to_string()),
-                mode: Some("quota".to_string()),
+                message: Some("provider family is in cached runtime backoff".to_string()),
+                mode: Some("provider_backoff".to_string()),
             }
         } else {
             self.probe_health(&candidate).await
@@ -1757,12 +1762,47 @@ fn ranked_candidate_is_in_quota_backoff(item: &RankedCandidate) -> bool {
             .is_some_and(|mode| mode.eq_ignore_ascii_case("quota"))
 }
 
+fn ranked_candidate_is_in_provider_backoff(item: &RankedCandidate) -> bool {
+    ranked_candidate_is_in_quota_backoff(item)
+        || (!item.health_ok
+            && item.health_mode.as_deref().is_some_and(|mode| {
+                ["upstream", "timeout", "provider_backoff"]
+                    .iter()
+                    .any(|item| mode.eq_ignore_ascii_case(item))
+            }))
+}
+
+fn message_indicates_provider_backoff(message: &str) -> bool {
+    message_indicates_quota(message) || message_indicates_transient_provider_failure(message)
+}
+
+fn message_indicates_transient_provider_failure(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("upstream error")
+        || lowered.contains("bad gateway")
+        || lowered.contains("gateway timeout")
+        || lowered.contains("error sending request")
+        || lowered.contains("connection reset")
+        || lowered.contains("connection closed")
+        || lowered.contains("http 502")
+        || lowered.contains("http 503")
+        || lowered.contains("http 504")
+        || lowered.contains("status 502")
+        || lowered.contains("status 503")
+        || lowered.contains("status 504")
+        || lowered.contains(" 502 ")
+        || lowered.contains(" 503 ")
+        || lowered.contains(" 504 ")
+}
+
 fn runtime_failure_health_bucket(error: Option<&str>, latency_ms: Option<u64>) -> HealthBucket {
     let lowered = error.unwrap_or_default().to_ascii_lowercase();
     let mode = if lowered.contains("timeout") || lowered.contains("timed out") {
         "timeout"
     } else if message_indicates_quota(error.unwrap_or_default()) {
         "quota"
+    } else if message_indicates_transient_provider_failure(error.unwrap_or_default()) {
+        "upstream"
     } else if lowered.contains("not configured") || lowered.contains("unsupported") {
         "unconfigured"
     } else {
@@ -2127,6 +2167,7 @@ mod tests {
             }),
         };
         assert!(ranked_candidate_is_in_quota_backoff(&candidate));
+        assert!(ranked_candidate_is_in_provider_backoff(&candidate));
     }
 
     #[test]
@@ -2138,5 +2179,13 @@ mod tests {
         assert_eq!(bucket.mode.as_deref(), Some("quota"));
         assert_eq!(bucket.ok, Some(false));
         assert_eq!(bucket.latency_ms, Some(12));
+    }
+
+    #[test]
+    fn runtime_failure_health_bucket_classifies_502_as_upstream_backoff() {
+        let message = "nvidia upstream error: error sending request for url (https://integrate.api.nvidia.com/v1/chat/completions)";
+        let bucket = runtime_failure_health_bucket(Some(message), Some(34));
+        assert_eq!(bucket.mode.as_deref(), Some("upstream"));
+        assert!(message_indicates_provider_backoff(message));
     }
 }

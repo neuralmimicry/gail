@@ -1,4 +1,5 @@
 pub mod aarnn_bridge;
+pub mod adaptive_schema;
 pub mod aer;
 pub mod app;
 pub mod client;

@@ -10,12 +10,17 @@
 ///   order cancellation, market snapshots, and general status. Direct market
 ///   order placement is intentionally refused until a supported OctoBot
 ///   trading-mode or user-command bridge is configured.
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use reqwest::{Client, ClientBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
+
+use crate::adaptive_schema::{self, AdaptiveApiSchema};
+
+const OCTOBOT_API: &str = "octobot";
 
 // ---------------------------------------------------------------------------
 // Domain models
@@ -87,6 +92,14 @@ pub struct OctobotOrderResult {
     pub status: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct OctobotLogEntry {
+    pub time: Option<String>,
+    pub level: String,
+    pub source: String,
+    pub message: String,
+}
+
 // ---------------------------------------------------------------------------
 // Market data snapshot (assembled from various OctoBot API endpoints)
 // ---------------------------------------------------------------------------
@@ -114,10 +127,25 @@ pub struct OctobotClient {
     client: Client,
     base_url: String,
     password: Option<String>,
+    api_schema: Arc<Mutex<AdaptiveApiSchema>>,
 }
 
 impl OctobotClient {
     pub fn new(base_url: &str, password: Option<&str>, timeout_seconds: f64) -> Self {
+        Self::new_with_schema(
+            base_url,
+            password,
+            timeout_seconds,
+            AdaptiveApiSchema::default(),
+        )
+    }
+
+    pub fn new_with_schema(
+        base_url: &str,
+        password: Option<&str>,
+        timeout_seconds: f64,
+        api_schema: AdaptiveApiSchema,
+    ) -> Self {
         let client = ClientBuilder::new()
             .use_rustls_tls()
             .cookie_store(true)
@@ -128,7 +156,12 @@ impl OctobotClient {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
             password: password.map(str::to_string),
+            api_schema: Arc::new(Mutex::new(api_schema)),
         }
+    }
+
+    pub async fn api_schema_snapshot(&self) -> AdaptiveApiSchema {
+        self.api_schema.lock().await.clone()
     }
 
     async fn get_json(&self, path: &str, label: &str) -> Result<Value, String> {
@@ -142,16 +175,35 @@ impl OctobotClient {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            self.observe_failure("GET", path, label, Some(status.as_u16()), text.trim())
+                .await;
             return Err(format!(
                 "OctoBot {label} failed: HTTP {}: {}",
                 status.as_u16(),
                 text.trim()
             ));
         }
-        serde_json::from_str(&text).map_err(|e| format!("OctoBot {label} parse failed: {e}"))
+        let parsed: Value = match serde_json::from_str(&text) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                let error = format!("OctoBot {label} parse failed: {err}");
+                self.observe_failure("GET", path, label, Some(status.as_u16()), &error)
+                    .await;
+                return Err(error);
+            }
+        };
+        self.observe_success("GET", path, label, &parsed).await;
+        Ok(parsed)
     }
 
     async fn get_optional_json(&self, path: &str, label: &str) -> Result<Option<Value>, String> {
+        if self.should_skip("GET", path).await {
+            debug!(
+                "trading: skipping OctoBot {} at {} due to adaptive schema backoff",
+                label, path
+            );
+            return Ok(None);
+        }
         let url = format!("{}{}", self.base_url, path);
         let resp = self
             .client
@@ -162,18 +214,66 @@ impl OctobotClient {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if status == StatusCode::NOT_FOUND {
+            self.observe_failure("GET", path, label, Some(status.as_u16()), text.trim())
+                .await;
             return Ok(None);
         }
         if !status.is_success() {
+            self.observe_failure("GET", path, label, Some(status.as_u16()), text.trim())
+                .await;
             return Err(format!(
                 "OctoBot {label} failed: HTTP {}: {}",
                 status.as_u16(),
                 text.trim()
             ));
         }
-        let parsed = serde_json::from_str(&text)
-            .map_err(|e| format!("OctoBot {label} parse failed: {e}"))?;
+        let parsed = match serde_json::from_str(&text) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                let error = format!("OctoBot {label} parse failed: {err}");
+                self.observe_failure("GET", path, label, Some(status.as_u16()), &error)
+                    .await;
+                return Err(error);
+            }
+        };
+        self.observe_success("GET", path, label, &parsed).await;
         Ok(Some(parsed))
+    }
+
+    async fn get_optional_text(&self, path: &str, label: &str) -> Result<Option<String>, String> {
+        if self.should_skip("GET", path).await {
+            debug!(
+                "trading: skipping OctoBot {} at {} due to adaptive schema backoff",
+                label, path
+            );
+            return Ok(None);
+        }
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("OctoBot {label} request failed: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if status == StatusCode::NOT_FOUND {
+            self.observe_failure("GET", path, label, Some(status.as_u16()), text.trim())
+                .await;
+            return Ok(None);
+        }
+        if !status.is_success() {
+            self.observe_failure("GET", path, label, Some(status.as_u16()), text.trim())
+                .await;
+            return Err(format!(
+                "OctoBot {label} failed: HTTP {}: {}",
+                status.as_u16(),
+                text.trim()
+            ));
+        }
+        self.observe_success("GET", path, label, &json!({ "body": "text" }))
+            .await;
+        Ok(Some(text))
     }
 
     async fn post_json_with_status(
@@ -197,7 +297,40 @@ impl OctobotClient {
         } else {
             serde_json::from_str(&text).unwrap_or_else(|_| json!({ "message": text }))
         };
+        if status.is_success() {
+            self.observe_success("POST", path, label, &parsed).await;
+        } else {
+            self.observe_failure("POST", path, label, Some(status.as_u16()), text.trim())
+                .await;
+        }
         Ok((status, parsed))
+    }
+
+    async fn should_skip(&self, method: &str, path: &str) -> bool {
+        self.api_schema.lock().await.should_skip(method, path)
+    }
+
+    async fn observe_success(&self, method: &str, path: &str, label: &str, body: &Value) {
+        self.api_schema
+            .lock()
+            .await
+            .observe_success(method, path, label, body);
+        adaptive_schema::observe_success(OCTOBOT_API, method, path, label, body).await;
+    }
+
+    async fn observe_failure(
+        &self,
+        method: &str,
+        path: &str,
+        label: &str,
+        status: Option<u16>,
+        error: &str,
+    ) {
+        self.api_schema
+            .lock()
+            .await
+            .observe_failure(method, path, label, status, error);
+        adaptive_schema::observe_failure(OCTOBOT_API, method, path, label, status, error).await;
     }
 
     /// Authenticate with OctoBot and establish a session cookie.
@@ -435,6 +568,50 @@ impl OctobotClient {
         let graph = self.get_json(&graph_path, "price graph").await?;
         Ok(parse_graph_snapshot(exchange, symbol, &graph))
     }
+
+    pub async fn get_recent_logs(&self, limit: usize) -> Result<Vec<OctobotLogEntry>, String> {
+        let limit = limit.clamp(1, 1000);
+        let candidate_paths = [
+            format!("/api/logs?limit={limit}"),
+            format!("/logs?format=json&limit={limit}"),
+            "/logs".to_string(),
+        ];
+        let mut last_error = None;
+        for path in candidate_paths {
+            match self.get_optional_text(&path, "logs").await {
+                Ok(Some(text)) => {
+                    let logs = parse_octobot_logs(&text, limit);
+                    if !logs.is_empty() {
+                        self.observe_log_entries(&logs).await;
+                        return Ok(logs);
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => last_error = Some(err),
+            }
+        }
+        if let Some(err) = last_error {
+            Err(err)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn observe_log_entries(&self, logs: &[OctobotLogEntry]) {
+        for entry in logs {
+            {
+                let mut schema = self.api_schema.lock().await;
+                schema.observe_log_entry(&entry.level, &entry.source, &entry.message);
+            }
+            adaptive_schema::observe_log_entry(
+                OCTOBOT_API,
+                &entry.level,
+                &entry.source,
+                &entry.message,
+            )
+            .await;
+        }
+    }
 }
 
 fn parse_exchange_info_array(body: &Value) -> Vec<OctobotExchange> {
@@ -549,6 +726,141 @@ fn current_unix_timestamp_f64() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+fn parse_octobot_logs(raw: &str, limit: usize) -> Vec<OctobotLogEntry> {
+    if let Ok(value) = serde_json::from_str::<Value>(raw) {
+        let mut logs = parse_octobot_log_value(&value);
+        logs.truncate(limit);
+        if !logs.is_empty() {
+            return logs;
+        }
+    }
+
+    let text = html_table_to_text(raw);
+    let mut logs = Vec::new();
+    for line in text.lines() {
+        if logs.len() >= limit {
+            break;
+        }
+        let cols = line
+            .split('\t')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .collect::<Vec<_>>();
+        if cols.len() >= 4 && looks_like_log_time(cols[0]) {
+            logs.push(OctobotLogEntry {
+                time: Some(cols[0].to_string()),
+                level: cols[1].to_string(),
+                source: cols[2].to_string(),
+                message: cols[3..].join(" "),
+            });
+        }
+    }
+    logs
+}
+
+fn parse_octobot_log_value(value: &Value) -> Vec<OctobotLogEntry> {
+    let entries = value
+        .as_array()
+        .or_else(|| value.get("logs").and_then(Value::as_array))
+        .or_else(|| value.get("data").and_then(Value::as_array));
+    let Some(entries) = entries else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let object = entry.as_object()?;
+            let message = object
+                .get("message")
+                .or_else(|| object.get("msg"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            if message.is_empty() {
+                return None;
+            }
+            Some(OctobotLogEntry {
+                time: object
+                    .get("time")
+                    .or_else(|| object.get("timestamp"))
+                    .or_else(|| object.get("date"))
+                    .and_then(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_string)
+                            .or_else(|| value.as_f64().map(|number| number.to_string()))
+                    }),
+                level: object
+                    .get("level")
+                    .and_then(Value::as_str)
+                    .unwrap_or("INFO")
+                    .to_string(),
+                source: object
+                    .get("source")
+                    .or_else(|| object.get("logger"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("OctoBot")
+                    .to_string(),
+                message: message.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn html_table_to_text(raw: &str) -> String {
+    let mut output = String::new();
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '<' {
+            output.push(ch);
+            continue;
+        }
+        let mut tag = String::new();
+        for tag_ch in chars.by_ref() {
+            if tag_ch == '>' {
+                break;
+            }
+            tag.push(tag_ch);
+        }
+        let tag_name = tag
+            .trim()
+            .trim_start_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if tag_name == "td" || tag_name == "th" {
+            output.push('\t');
+        } else if tag_name == "tr" && tag.trim_start().starts_with('/') {
+            output.push('\n');
+        }
+    }
+    decode_basic_html_entities(&output)
+}
+
+fn decode_basic_html_entities(value: &str) -> String {
+    value
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+fn looks_like_log_time(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 19
+        && bytes
+            .get(0..4)
+            .is_some_and(|year| year.iter().all(|item| item.is_ascii_digit()))
+        && bytes.get(4) == Some(&b'-')
+        && bytes.get(7) == Some(&b'-')
+        && bytes.get(10) == Some(&b' ')
+        && bytes.get(13) == Some(&b':')
+        && bytes.get(16) == Some(&b':')
 }
 
 fn parse_latest_portfolio_value(body: &Value) -> Option<f64> {
@@ -726,19 +1038,31 @@ impl OctobotClient {
             "{}/backtesting?action_type=start_backtesting&source=backtesting&run_on_common_part_only=true",
             self.base_url
         );
-        let resp = self
-            .client
-            .post(&url)
-            .json(request)
-            .send()
-            .await
-            .map_err(|e| format!("OctoBot start_backtest request failed: {e}"))?;
+        let path = "/backtesting?action_type=start_backtesting&source=backtesting&run_on_common_part_only=true";
+        let resp = match self.client.post(&url).json(request).send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                self.observe_failure("POST", path, "start backtest", None, &err.to_string())
+                    .await;
+                return Err(format!("OctoBot start_backtest request failed: {err}"));
+            }
+        };
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if status.is_success() {
+            self.observe_success("POST", path, "start backtest", &json!({ "body": text }))
+                .await;
             debug!("trading: OctoBot backtesting started: {}", text.trim());
             Ok(())
         } else {
+            self.observe_failure(
+                "POST",
+                path,
+                "start backtest",
+                Some(status.as_u16()),
+                text.trim(),
+            )
+            .await;
             Err(format!(
                 "OctoBot start_backtest rejected HTTP {}: {}",
                 status.as_u16(),
@@ -752,16 +1076,39 @@ impl OctobotClient {
     /// Maps to: `POST /backtesting?action_type=stop_backtesting`
     pub async fn stop_backtest(&self) -> Result<(), String> {
         let url = format!("{}/backtesting?action_type=stop_backtesting", self.base_url);
-        let resp = self
+        let path = "/backtesting?action_type=stop_backtesting";
+        let resp = match self
             .client
             .post(&url)
             .json(&serde_json::json!({}))
             .send()
             .await
-            .map_err(|e| format!("OctoBot stop_backtest request failed: {e}"))?;
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                self.observe_failure("POST", path, "stop backtest", None, &err.to_string())
+                    .await;
+                return Err(format!("OctoBot stop_backtest request failed: {err}"));
+            }
+        };
         if resp.status().is_success() {
+            self.observe_success(
+                "POST",
+                path,
+                "stop backtest",
+                &adaptive_schema::endpoint_status_body(resp.status().as_u16()),
+            )
+            .await;
             Ok(())
         } else {
+            self.observe_failure(
+                "POST",
+                path,
+                "stop backtest",
+                Some(resp.status().as_u16()),
+                resp.status().as_str(),
+            )
+            .await;
             Err(format!(
                 "OctoBot stop_backtest failed: HTTP {}",
                 resp.status().as_u16()
@@ -778,16 +1125,47 @@ impl OctobotClient {
             "{}/backtesting?update_type=backtesting_report&source=backtesting",
             self.base_url
         );
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("OctoBot get_backtest_report request failed: {e}"))?;
-        let body: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("OctoBot get_backtest_report parse failed: {e}"))?;
+        let path = "/backtesting?update_type=backtesting_report&source=backtesting";
+        let resp = match self.client.get(&url).send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                self.observe_failure("GET", path, "backtest report", None, &err.to_string())
+                    .await;
+                return Err(format!("OctoBot get_backtest_report request failed: {err}"));
+            }
+        };
+        let status = resp.status();
+        let body: Value = match resp.json().await {
+            Ok(body) => body,
+            Err(err) => {
+                let message = format!("OctoBot get_backtest_report parse failed: {err}");
+                self.observe_failure(
+                    "GET",
+                    path,
+                    "backtest report",
+                    Some(status.as_u16()),
+                    &message,
+                )
+                .await;
+                return Err(message);
+            }
+        };
+        if !status.is_success() {
+            self.observe_failure(
+                "GET",
+                path,
+                "backtest report",
+                Some(status.as_u16()),
+                &body.to_string(),
+            )
+            .await;
+            return Err(format!(
+                "OctoBot get_backtest_report failed: HTTP {}",
+                status.as_u16()
+            ));
+        }
+        self.observe_success("GET", path, "backtest report", &body)
+            .await;
 
         // OctoBot returns `{}` when no report is ready.
         if body.as_object().map(|o| o.is_empty()).unwrap_or(false) {
@@ -801,16 +1179,47 @@ impl OctobotClient {
     /// Maps to: `GET /backtesting_run_id`
     pub async fn get_backtest_run_id(&self) -> Result<Option<u64>, String> {
         let url = format!("{}/backtesting_run_id", self.base_url);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("OctoBot get_backtest_run_id request failed: {e}"))?;
-        let body: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("OctoBot get_backtest_run_id parse failed: {e}"))?;
+        let path = "/backtesting_run_id";
+        let resp = match self.client.get(&url).send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                self.observe_failure("GET", path, "backtest run id", None, &err.to_string())
+                    .await;
+                return Err(format!("OctoBot get_backtest_run_id request failed: {err}"));
+            }
+        };
+        let status = resp.status();
+        let body: Value = match resp.json().await {
+            Ok(body) => body,
+            Err(err) => {
+                let message = format!("OctoBot get_backtest_run_id parse failed: {err}");
+                self.observe_failure(
+                    "GET",
+                    path,
+                    "backtest run id",
+                    Some(status.as_u16()),
+                    &message,
+                )
+                .await;
+                return Err(message);
+            }
+        };
+        if !status.is_success() {
+            self.observe_failure(
+                "GET",
+                path,
+                "backtest run id",
+                Some(status.as_u16()),
+                &body.to_string(),
+            )
+            .await;
+            return Err(format!(
+                "OctoBot get_backtest_run_id failed: HTTP {}",
+                status.as_u16()
+            ));
+        }
+        self.observe_success("GET", path, "backtest run id", &body)
+            .await;
         Ok(body
             .get("backtesting_id")
             .and_then(Value::as_u64)
@@ -825,16 +1234,49 @@ impl OctobotClient {
             "{}/backtesting?update_type=backtesting_data_files&source=backtesting",
             self.base_url
         );
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("OctoBot list_backtest_data_files request failed: {e}"))?;
-        let body: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("OctoBot list_backtest_data_files parse failed: {e}"))?;
+        let path = "/backtesting?update_type=backtesting_data_files&source=backtesting";
+        let resp = match self.client.get(&url).send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                self.observe_failure("GET", path, "backtest data files", None, &err.to_string())
+                    .await;
+                return Err(format!(
+                    "OctoBot list_backtest_data_files request failed: {err}"
+                ));
+            }
+        };
+        let status = resp.status();
+        let body: Value = match resp.json().await {
+            Ok(body) => body,
+            Err(err) => {
+                let message = format!("OctoBot list_backtest_data_files parse failed: {err}");
+                self.observe_failure(
+                    "GET",
+                    path,
+                    "backtest data files",
+                    Some(status.as_u16()),
+                    &message,
+                )
+                .await;
+                return Err(message);
+            }
+        };
+        if !status.is_success() {
+            self.observe_failure(
+                "GET",
+                path,
+                "backtest data files",
+                Some(status.as_u16()),
+                &body.to_string(),
+            )
+            .await;
+            return Err(format!(
+                "OctoBot list_backtest_data_files failed: HTTP {}",
+                status.as_u16()
+            ));
+        }
+        self.observe_success("GET", path, "backtest data files", &body)
+            .await;
         // Response may be an array directly or wrapped in {"data_files": [...]}.
         let files = body
             .as_array()

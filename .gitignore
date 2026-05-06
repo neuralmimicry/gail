@@ -23,3 +23,6 @@ Thumbs.db
 
 # Backup files
 *.orig
+
+# Runtime adaptive API observations
+/data/adaptive_api_schema.json
