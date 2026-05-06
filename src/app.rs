@@ -2132,6 +2132,14 @@ fn tool_call_from_object(
             .unwrap_or_else(|| json!({}));
         return Some((tool_name.to_string(), arguments));
     }
+    if let Some(tool_name) = object.get("name").and_then(Value::as_str) {
+        let arguments = object
+            .get("parameters")
+            .cloned()
+            .or_else(|| object.get("arguments").cloned())
+            .unwrap_or_else(|| json!({}));
+        return Some((tool_name.to_string(), arguments));
+    }
     if let Some(tool_calls) = object.get("tool_calls").and_then(Value::as_array)
         && let Some(Value::Object(first)) = tool_calls.first()
     {
@@ -2161,20 +2169,32 @@ fn tool_call_from_object(
 }
 
 fn normalize_manager_tool_call_text(text: &str) -> Option<String> {
-    let Value::Object(mut object) = extract_json_value(text)? else {
+    let (value, already_transformed) = match extract_minimax_tool_call_value(text) {
+        Some(value) => (value, true),
+        None => (extract_json_value(text)?, false),
+    };
+    let Value::Object(mut object) = value else {
         return None;
     };
     let existing_tool_name = object
         .get("tool_name")
         .and_then(Value::as_str)
         .map(str::to_string);
-    if existing_tool_name.is_some() && object.get("arguments").is_some_and(Value::is_object) {
+    if !already_transformed
+        && existing_tool_name.is_some()
+        && object.get("arguments").is_some_and(Value::is_object)
+    {
         return None;
     }
 
     let tool_name = object
         .remove("tool_name")
         .and_then(|value| value.as_str().map(str::to_string))
+        .or_else(|| {
+            object
+                .remove("name")
+                .and_then(|value| value.as_str().map(str::to_string))
+        })
         .or_else(|| {
             if object.contains_key("agent_name") {
                 Some("run_agent".to_string())
@@ -2196,12 +2216,56 @@ fn normalize_manager_tool_call_text(text: &str) -> Option<String> {
         Some(Value::Null) | None => Value::Object(object),
         Some(value) => json!({ "value": value }),
     };
+    let arguments = match arguments {
+        Value::Object(mut arguments) if arguments.contains_key("parameters") => arguments
+            .remove("parameters")
+            .filter(Value::is_object)
+            .unwrap_or(Value::Object(arguments)),
+        Value::Object(mut arguments) if arguments.len() == 1 && arguments.contains_key("value") => {
+            arguments
+                .remove("value")
+                .unwrap_or(Value::Object(arguments))
+        }
+        value => value,
+    };
 
     serde_json::to_string(&json!({
         "tool_name": tool_name,
         "arguments": arguments,
     }))
     .ok()
+}
+
+fn extract_minimax_tool_call_value(text: &str) -> Option<Value> {
+    let invoke_start = text.find("<invoke")?;
+    let invoke_tag_end = text[invoke_start..].find('>')? + invoke_start;
+    let invoke_tag = &text[invoke_start..=invoke_tag_end];
+    let tool_name = extract_xml_attr(invoke_tag, "name")?;
+    let invoke_body_end = text[invoke_tag_end + 1..].find("</invoke>")? + invoke_tag_end + 1;
+    let body = &text[invoke_tag_end + 1..invoke_body_end];
+    let mut arguments = serde_json::Map::new();
+    let mut cursor = body;
+    while let Some(parameter_start) = cursor.find("<parameter") {
+        let parameter_tag_end = cursor[parameter_start..].find('>')? + parameter_start;
+        let parameter_tag = &cursor[parameter_start..=parameter_tag_end];
+        let parameter_name = extract_xml_attr(parameter_tag, "name")?;
+        let value_start = parameter_tag_end + 1;
+        let value_end = cursor[value_start..].find("</parameter>")? + value_start;
+        let value = cursor[value_start..value_end].trim();
+        arguments.insert(parameter_name, Value::String(value.to_string()));
+        cursor = &cursor[value_end + "</parameter>".len()..];
+    }
+    Some(json!({
+        "tool_name": tool_name,
+        "arguments": arguments,
+    }))
+}
+
+fn extract_xml_attr(tag: &str, name: &str) -> Option<String> {
+    let pattern = format!("{name}=\"");
+    let start = tag.find(&pattern)? + pattern.len();
+    let end = tag[start..].find('"')? + start;
+    Some(tag[start..end].to_string())
 }
 
 fn extract_json_value(text: &str) -> Option<Value> {
@@ -2815,6 +2879,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_chat_completions_normalizes_name_parameters_manager_tool_call() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "{\"name\":\"run_agent\",\"parameters\":{\"agent_name\":\"SignalAIAgentProducer\"}}",
+                "prompt_eval_count": 8,
+                "eval_count": 5
+            })))
+            .mount(&server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/llama3.2",
+                            "base_url": server.uri(),
+                            "messages": [
+                                {
+                                    "role": "system",
+                                    "content": "Return a ManagerToolCall JSON object with tool_name and arguments."
+                                },
+                                {
+                                    "role": "user",
+                                    "content": "choose the next run_agent call for agent_name"
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+        let content = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content string");
+        let manager_call: Value = serde_json::from_str(content).expect("manager call json");
+        assert_eq!(manager_call["tool_name"], "run_agent");
+        assert_eq!(
+            manager_call["arguments"]["agent_name"],
+            "SignalAIAgentProducer"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_normalizes_minimax_xml_manager_tool_call() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "<minimax:tool_call><invoke name=\"run_agent\"><parameter name=\"agent_name\">SignalAIAgentProducer</parameter></invoke></minimax:tool_call>",
+                "prompt_eval_count": 8,
+                "eval_count": 5
+            })))
+            .mount(&server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/llama3.2",
+                            "base_url": server.uri(),
+                            "messages": [
+                                {
+                                    "role": "system",
+                                    "content": "Return a ManagerToolCall JSON object with tool_name and arguments."
+                                },
+                                {
+                                    "role": "user",
+                                    "content": "choose the next run_agent call for agent_name"
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+        let content = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content string");
+        let manager_call: Value = serde_json::from_str(content).expect("manager call json");
+        assert_eq!(manager_call["tool_name"], "run_agent");
+        assert_eq!(
+            manager_call["arguments"]["agent_name"],
+            "SignalAIAgentProducer"
+        );
+    }
+
+    #[tokio::test]
     async fn openai_chat_completions_route_explicit_nvidia_models() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -3281,6 +3467,138 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(4),
             "automation fallback took {:?}",
+            started.elapsed()
+        );
+
+        let payload = read_json(response).await;
+        let content = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content string");
+        let decision: Value = serde_json::from_str(content).expect("degraded json");
+        assert_eq!(decision["status"], "degraded");
+        assert_eq!(decision["action"], "hold");
+        assert_eq!(payload["gail"]["trace"]["final_source"], "degraded_policy");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_json_tag_respects_automation_timeout() {
+        let nvidia = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "moonshotai/kimi-k2-instruct-0905"}]
+            })))
+            .mount(&nvidia)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(5))
+                    .set_body_json(json!({
+                        "id": "chatcmpl-slow",
+                        "model": "moonshotai/kimi-k2-instruct-0905",
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "{\"action\":\"buy\"}"},
+                            "finish_reason": "stop"
+                        }]
+                    })),
+            )
+            .mount(&nvidia)
+            .await;
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&ollama)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .and(body_string_contains("Reply OK."))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "OK",
+                "prompt_eval_count": 1,
+                "eval_count": 1
+            })))
+            .mount(&ollama)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .and(body_string_contains("Choose the next portfolio action."))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(5))
+                    .set_body_json(json!({
+                        "response": "{\"action\":\"buy\"}",
+                        "prompt_eval_count": 2,
+                        "eval_count": 3
+                    })),
+            )
+            .mount(&ollama)
+            .await;
+
+        let mut config = GailConfig::default();
+        config.orchestration.max_parallel_candidates = 2;
+        config.orchestration.candidate_timeout_cap_seconds = Some(30);
+        config
+            .orchestration
+            .automation_candidate_timeout_cap_seconds = Some(1);
+        config.providers.push(ProviderProfile {
+            name: "NVIDIAKimi".to_string(),
+            provider_type: "nvidia".to_string(),
+            model: Some("moonshotai/kimi-k2-instruct-0905".to_string()),
+            api_key: Some("nvapi-test".to_string()),
+            base_url: Some(format!("{}/v1", nvidia.uri())),
+            roles: vec!["general".to_string()],
+            specialties: vec!["json".to_string()],
+            weight: 1.0,
+            preferred: true,
+            ..ProviderProfile::default()
+        });
+        config.providers.push(ProviderProfile {
+            name: "OllamaLocal".to_string(),
+            provider_type: "ollama".to_string(),
+            model: Some("llama3.2".to_string()),
+            base_url: Some(ollama.uri()),
+            roles: vec!["general".to_string()],
+            specialties: vec!["local".to_string(), "json".to_string()],
+            weight: 0.5,
+            preferred: false,
+            ..ProviderProfile::default()
+        });
+
+        let app = build_router(test_service_with_config(config).await);
+        let started = std::time::Instant::now();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "gail-auto",
+                            "request_category": "json",
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": "Choose the next portfolio action."
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "json-tag fallback took {:?}",
             started.elapsed()
         );
 

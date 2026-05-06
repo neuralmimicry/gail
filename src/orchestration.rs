@@ -447,7 +447,7 @@ impl GailService {
         let expected_json = expected_json(
             &provider_request.messages,
             provider_request.system.as_deref(),
-        );
+        ) || task_tags_expect_json(&task_tags);
         let timeout_cap =
             self.candidate_timeout_cap(&workflow, &role, expected_json, &task_tags, &prompt_text);
         let wave_size = max_candidates.max(1);
@@ -545,6 +545,7 @@ impl GailService {
                 workflow = %workflow,
                 role = %role,
                 fallback_wave = wave_index,
+                timeout_cap_seconds = ?timeout_cap,
                 candidates = %preview_labels(selected.iter().map(|item| item.label(None)).collect::<Vec<_>>(), 6),
                 throttled_providers = %preview_labels(sorted_strings(throttled_provider_types.iter().cloned()), 6),
                 tags = %preview_labels(task_tags.iter().cloned().collect::<Vec<_>>(), 8),
@@ -2324,6 +2325,12 @@ fn expected_json(messages: &[crate::models::ChatMessage], system: Option<&str>) 
     .any(|hint| text.contains(hint))
 }
 
+fn task_tags_expect_json(task_tags: &HashSet<String>) -> bool {
+    task_tags
+        .iter()
+        .any(|tag| matches!(tag.as_str(), "json" | "structured_data"))
+}
+
 fn try_parse_json(text: &str) -> Option<Value> {
     let payload = text.trim();
     if payload.is_empty() {
@@ -2460,18 +2467,28 @@ fn text_or_tags_indicate_automation(
     .to_ascii_lowercase();
     [
         "agent",
+        "aiindex",
         "automation",
+        "code",
         "crypto",
         "evaluator",
+        "json",
+        "manager",
         "octobot",
         "planner",
+        "planning",
         "portfolio",
         "rebalance",
         "refiner",
+        "research",
         "researcher",
+        "review",
         "reviewer",
         "signal",
+        "structured_data",
         "strategy",
+        "technicalanalysis",
+        "tool",
         "trade",
         "trading",
     ]
