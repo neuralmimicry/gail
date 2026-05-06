@@ -4,6 +4,7 @@ server:
 
 security:
   allow_unauthenticated_health: true
+  allow_unauthenticated_metrics: true
   api_tokens:
     - client_id: "refiner"
       token: "${GAIL_REFINER_API_TOKEN}"
@@ -89,8 +90,8 @@ providers:
     provider: ollama
     model: "${GAIL_OLLAMA_MODEL}"
     base_url: "${GAIL_OLLAMA_BASE_URL}"
-    roles: ["planner", "assistant"]
-    specialties: ["local", "privacy", "code"]
+    roles: ["general", "planner", "reviewer", "researcher", "assistant"]
+    specialties: ["local", "privacy", "code", "planning", "json", "review", "research"]
     weight: 0.15
     source: "example"
 

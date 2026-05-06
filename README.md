@@ -30,7 +30,7 @@ Gail exposes the following endpoints:
 | `GET /v1/status/orchestration` | Provider, engine, and metrics status |
 | `GET /v1/status/api-schema` | Global adaptive API registry for remote integrations |
 | `GET /v1/status/api-issues` | Active provider/API issues and Gail's current mitigations |
-| `GET /metrics` | Prometheus text metrics for Gail API issue health |
+| `GET /metrics` | Prometheus text metrics for Gail API issue and provider health |
 | `GET /v1/trading/status` | Trading bridge status snapshot |
 | `GET /v1/trading/portfolio` | OctoBot portfolio holdings |
 | `GET /v1/trading/positions` | Open OctoBot orders |
@@ -102,7 +102,9 @@ The image expects a config file at `/app/config/gail.yaml` unless `GAIL_CONFIG` 
 
 - `providers`: shared LLM backends Gail can orchestrate.
 - `providers` can include `openai`, `gemini`, `ollama`, and OpenAI-compatible `nvidia` profiles backed by custom `base_url` values.
+- Gail keeps an Ollama local fallback candidate available when configured provider lists omit it, using `GAIL_OLLAMA_BASE_URL`/`GAIL_OLLAMA_MODEL` or the Continuum cluster-local Ollama defaults. Set `GAIL_DISABLE_OLLAMA_FALLBACK=true` only when local fallback attempts are explicitly unwanted.
 - `gail-auto` dispatches providers in ranked waves. If a candidate reports quota, rate-limit, upstream HTTP 429, or transient upstream failures such as 502/503/504, Gail marks that provider family throttled for the request, records health and an API issue mitigation, and tries the next suitable provider family instead of surfacing the first failure.
+- Provider retirements, missing account functions, and authentication failures are classified separately from transient upstream failures, so Gail can stop repeating dead model/account paths while still trying healthy cloud or local alternatives.
 - Gail records active API/provider issues without calling back into Refiner during Refiner-originated Gail failures. This prevents cyclic retry loops while still exposing the active mitigation and next retry window.
 - Gail Trading's OctoBot and Refiner clients feed remote API failures and recoveries into the same issue registry, alongside the adaptive schema registry, so dashboard/Prometheus status covers trading dependencies as well as LLM providers.
 - `specialists`: explicit neuromorphic engines. Use this when you have named SNN/AARNN backends to register.
@@ -114,6 +116,7 @@ The image expects a config file at `/app/config/gail.yaml` unless `GAIL_CONFIG` 
 - `storage.adaptive_schema_path`: persisted adaptive API registry for provider, Refiner, AARNN, specialist, OctoBot, and trading feedback observations.
 - `storage.api_issues_path`: persisted issue registry for provider/API failures, mitigations, recoveries, and Prometheus/dashboard visibility.
 - `storage.postgres_dsn` or `GAIL_POSTGRES_DSN`: optional Postgres persistence for `gail_api_issues` and `gail_api_issue_snapshots`.
+- `security.allow_unauthenticated_metrics`: allows Prometheus to scrape `/metrics` without sharing a bearer token. Keep it enabled only on trusted network paths.
 - `orchestration.health_ttl_seconds`: cached provider-health TTL. Runtime quota health remains in backoff until this TTL expires, so later requests skip rate-limited candidates before probing them again.
 - `storage.ollama_model_store_path`: cached Ollama model inventory summary.
 
@@ -361,6 +364,7 @@ The Ansible role in `swarmhpc/swarmhpc/ansible/roles/continuum_tenant_gail`:
 - builds and pushes the container image,
 - renders the Gail config (including trading section) into a Kubernetes Secret,
 - ships the shared AI-routing contract with the Gail runtime image,
-- persists Gail metrics and trading state on shared storage,
+- persists Gail metrics, adaptive API schema, API issue registry, Ollama inventory, and trading state on shared storage,
+- optionally mirrors API issue state into the shared Postgres service and exposes Gail issue/provider metrics to Prometheus,
 - exposes Gail via ingress/TLS, and
 - injects a matching bearer-token configuration into Refiner.

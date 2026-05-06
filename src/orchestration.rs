@@ -163,12 +163,20 @@ impl GailService {
         self.inner.config.security.allow_unauthenticated_health
     }
 
+    pub fn can_access_metrics_unauthenticated(&self) -> bool {
+        self.inner.config.security.allow_unauthenticated_metrics
+    }
+
     pub async fn health(&self) -> HealthResponse {
         HealthResponse {
             ok: true,
             service: "gail".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         }
+    }
+
+    pub async fn provider_prometheus_metrics(&self) -> String {
+        self.inner.metrics.prometheus_metrics().await
     }
 
     pub async fn direct_complete(
@@ -465,8 +473,8 @@ impl GailService {
                 if results.is_empty() {
                     return Err(GailError::upstream(
                         "gail",
-                        Some(StatusCode::TOO_MANY_REQUESTS),
-                        "all suitable providers are currently rate-limited; backing off before retry",
+                        Some(StatusCode::SERVICE_UNAVAILABLE),
+                        "all suitable providers are currently in adaptive backoff; retry after the recorded mitigation window",
                     ));
                 }
                 break;
@@ -1118,6 +1126,7 @@ impl GailService {
                     .cloned()
                     .map(ProviderCandidate::from_profile),
             );
+            append_local_ollama_fallback_candidate(&mut candidates);
         }
         dedupe_candidates(candidates)
             .into_iter()
@@ -1716,6 +1725,55 @@ fn dedupe_candidates(candidates: Vec<ProviderCandidate>) -> Vec<ProviderCandidat
     deduped
 }
 
+fn append_local_ollama_fallback_candidate(candidates: &mut Vec<ProviderCandidate>) {
+    if env_bool_any(
+        &[
+            "GAIL_DISABLE_OLLAMA_FALLBACK",
+            "REFINER_AI_DISABLE_OLLAMA_FALLBACK",
+        ],
+        false,
+    ) {
+        return;
+    }
+    if candidates
+        .iter()
+        .any(|candidate| candidate.provider_type.eq_ignore_ascii_case("ollama"))
+    {
+        return;
+    }
+    let model = env_string_any(&["GAIL_OLLAMA_MODEL", "OLLAMA_MODEL", "OLLAMA_DEFAULT_MODEL"])
+        .unwrap_or_else(|| "llama3.2".to_string());
+    let base_url = env_string_any(&["GAIL_OLLAMA_BASE_URL", "OLLAMA_BASE_URL", "OLLAMA_HOST"])
+        .unwrap_or_else(|| "http://ollama.ollama.svc.cluster.local:11434".to_string());
+    candidates.push(ProviderCandidate::from_profile(ProviderProfile {
+        name: "OllamaLocalFallback".to_string(),
+        provider_type: "ollama".to_string(),
+        model: Some(model),
+        api_key: None,
+        access_token: None,
+        base_url: Some(base_url),
+        roles: vec![
+            "general".to_string(),
+            "planner".to_string(),
+            "reviewer".to_string(),
+            "researcher".to_string(),
+            "assistant".to_string(),
+        ],
+        specialties: vec![
+            "local".to_string(),
+            "privacy".to_string(),
+            "code".to_string(),
+            "planning".to_string(),
+            "json".to_string(),
+            "review".to_string(),
+            "research".to_string(),
+        ],
+        weight: 0.12,
+        preferred: false,
+        source: Some("auto_local_fallback".to_string()),
+    }));
+}
+
 fn request_timeout_with_cap(request_timeout: Option<u64>, timeout_cap: Option<u64>) -> Option<u64> {
     match (
         request_timeout.map(|value| value.max(1)),
@@ -1783,6 +1841,11 @@ fn select_ranked_candidates(
     let mut selected = Vec::new();
     let mut selected_ids = HashSet::new();
     let mut selected_provider_types = HashSet::new();
+    let local_fallback = if target >= 2 {
+        best_local_fallback_candidate(&ranked)
+    } else {
+        None
+    };
 
     for health_ok in [true, false] {
         for item in ranked.iter().filter(|item| item.health_ok == health_ok) {
@@ -1793,7 +1856,7 @@ fn select_ranked_candidates(
             if selected_ids.insert(candidate_id) {
                 selected.push(item.candidate.clone());
                 if selected.len() == target {
-                    return selected;
+                    return ensure_local_fallback_selected(selected, local_fallback, target);
                 }
             }
         }
@@ -1805,12 +1868,54 @@ fn select_ranked_candidates(
             if selected_ids.insert(candidate_id) {
                 selected.push(item.candidate.clone());
                 if selected.len() == target {
-                    return selected;
+                    return ensure_local_fallback_selected(selected, local_fallback, target);
                 }
             }
         }
     }
 
+    ensure_local_fallback_selected(selected, local_fallback, target)
+}
+
+fn best_local_fallback_candidate(ranked: &[RankedCandidate]) -> Option<ProviderCandidate> {
+    ranked
+        .iter()
+        .filter(|item| candidate_is_local_fallback(&item.candidate))
+        .max_by(|left, right| {
+            left.health_ok.cmp(&right.health_ok).then_with(|| {
+                left.score
+                    .partial_cmp(&right.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        })
+        .map(|item| item.candidate.clone())
+}
+
+fn candidate_is_local_fallback(candidate: &ProviderCandidate) -> bool {
+    candidate.provider_type.eq_ignore_ascii_case("ollama")
+        || candidate.specialties.iter().any(|item| item == "local")
+}
+
+fn ensure_local_fallback_selected(
+    mut selected: Vec<ProviderCandidate>,
+    local_fallback: Option<ProviderCandidate>,
+    target: usize,
+) -> Vec<ProviderCandidate> {
+    let Some(local_fallback) = local_fallback else {
+        return selected;
+    };
+    if selected
+        .iter()
+        .any(|candidate| candidate.candidate_id() == local_fallback.candidate_id())
+    {
+        return selected;
+    }
+    if selected.len() < target {
+        selected.push(local_fallback);
+    } else if target >= 2 {
+        selected.pop();
+        selected.push(local_fallback);
+    }
     selected
 }
 
@@ -1826,18 +1931,31 @@ fn ranked_candidate_is_in_provider_backoff(item: &RankedCandidate) -> bool {
     ranked_candidate_is_in_quota_backoff(item)
         || (!item.health_ok
             && item.health_mode.as_deref().is_some_and(|mode| {
-                ["upstream", "timeout", "provider_backoff"]
-                    .iter()
-                    .any(|item| mode.eq_ignore_ascii_case(item))
+                [
+                    "upstream",
+                    "timeout",
+                    "provider_backoff",
+                    "unconfigured",
+                    "missing_endpoint",
+                ]
+                .iter()
+                .any(|item| mode.eq_ignore_ascii_case(item))
             }))
 }
 
 fn message_indicates_provider_backoff(message: &str) -> bool {
-    message_indicates_quota(message) || message_indicates_transient_provider_failure(message)
+    message_indicates_quota(message)
+        || message_indicates_provider_auth_failure(message)
+        || message_indicates_transient_provider_failure(message)
 }
 
 fn message_indicates_transient_provider_failure(message: &str) -> bool {
     let lowered = message.to_ascii_lowercase();
+    if message_indicates_provider_auth_failure(message)
+        || message_indicates_permanent_model_failure(message)
+    {
+        return false;
+    }
     lowered.contains("upstream error")
         || lowered.contains("bad gateway")
         || lowered.contains("gateway timeout")
@@ -1855,16 +1973,50 @@ fn message_indicates_transient_provider_failure(message: &str) -> bool {
         || lowered.contains(" 504 ")
 }
 
+fn message_indicates_provider_auth_failure(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("authentication failed")
+        || lowered.contains("unauthorized")
+        || lowered.contains("forbidden")
+        || lowered.contains("invalid api key")
+        || lowered.contains("status\":401")
+        || lowered.contains("status\":403")
+        || lowered.contains("status 401")
+        || lowered.contains("status 403")
+        || lowered.contains("http 401")
+        || lowered.contains("http 403")
+}
+
+fn message_indicates_permanent_model_failure(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("end of life")
+        || lowered.contains("no longer available")
+        || lowered.contains("not found for account")
+        || lowered.contains("status\":404")
+        || lowered.contains("status\":410")
+        || lowered.contains("status 404")
+        || lowered.contains("status 410")
+        || lowered.contains("http 404")
+        || lowered.contains("http 410")
+        || lowered.contains("\"title\":\"gone\"")
+        || lowered.contains("\"title\":\"not found\"")
+}
+
 fn runtime_failure_health_bucket(error: Option<&str>, latency_ms: Option<u64>) -> HealthBucket {
     let lowered = error.unwrap_or_default().to_ascii_lowercase();
     let mode = if lowered.contains("timeout") || lowered.contains("timed out") {
         "timeout"
     } else if message_indicates_quota(error.unwrap_or_default()) {
         "quota"
+    } else if message_indicates_provider_auth_failure(error.unwrap_or_default())
+        || lowered.contains("not configured")
+        || lowered.contains("unsupported")
+    {
+        "unconfigured"
+    } else if message_indicates_permanent_model_failure(error.unwrap_or_default()) {
+        "missing_endpoint"
     } else if message_indicates_transient_provider_failure(error.unwrap_or_default()) {
         "upstream"
-    } else if lowered.contains("not configured") || lowered.contains("unsupported") {
-        "unconfigured"
     } else {
         "runtime_error"
     };
@@ -1880,7 +2032,7 @@ fn runtime_failure_health_bucket(error: Option<&str>, latency_ms: Option<u64>) -
 fn severity_for_issue_category(category: &str) -> &'static str {
     match category {
         "quota" | "upstream" | "timeout" => "warning",
-        "unconfigured" => "critical",
+        "unconfigured" | "missing_endpoint" => "critical",
         _ => "warning",
     }
 }
@@ -2044,6 +2196,25 @@ fn env_bool_any(names: &[&str], default: bool) -> bool {
         }
     }
     default
+}
+
+fn env_string_any(names: &[&str]) -> Option<String> {
+    for name in names {
+        if let Ok(value) = env::var(name) {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if matches!(
+                trimmed.to_ascii_lowercase().as_str(),
+                "none" | "null" | "nil" | "undefined"
+            ) {
+                continue;
+            }
+            return Some(trimmed.trim_end_matches('/').to_string());
+        }
+    }
+    None
 }
 
 fn env_int_any(names: &[&str], default: u64) -> u64 {
@@ -2222,6 +2393,52 @@ mod tests {
     }
 
     #[test]
+    fn select_ranked_candidates_reserves_ollama_fallback_slot() {
+        fn ranked(
+            provider_type: &str,
+            model: &str,
+            score: f64,
+            health_ok: bool,
+        ) -> RankedCandidate {
+            RankedCandidate {
+                score,
+                health_ok,
+                health_mode: None,
+                candidate: ProviderCandidate::from_profile(ProviderProfile {
+                    name: format!("{provider_type}-{model}"),
+                    provider_type: provider_type.to_string(),
+                    model: Some(model.to_string()),
+                    api_key: Some("token".to_string()),
+                    base_url: Some("http://example.internal".to_string()),
+                    specialties: if provider_type == "ollama" {
+                        vec!["local".to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    ..ProviderProfile::default()
+                }),
+            }
+        }
+
+        let selected = select_ranked_candidates(
+            vec![
+                ranked("openai", "gpt-4o-mini", 9.0, true),
+                ranked("nvidia", "moonshotai/kimi-k2-instruct-0905", 8.0, true),
+                ranked("gemini", "gemini-2.5-flash", 7.0, true),
+                ranked("ollama", "llama3.2", 1.0, false),
+            ],
+            3,
+        );
+
+        let labels = selected
+            .iter()
+            .map(|candidate| candidate.candidate_id())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"ollama/llama3.2".to_string()));
+        assert_eq!(labels.len(), 3);
+    }
+
+    #[test]
     fn ranked_candidate_quota_backoff_detects_cached_quota_health() {
         let candidate = RankedCandidate {
             score: 1.0,
@@ -2254,6 +2471,22 @@ mod tests {
         let message = "nvidia upstream error: error sending request for url (https://integrate.api.nvidia.com/v1/chat/completions)";
         let bucket = runtime_failure_health_bucket(Some(message), Some(34));
         assert_eq!(bucket.mode.as_deref(), Some("upstream"));
+        assert!(message_indicates_provider_backoff(message));
+    }
+
+    #[test]
+    fn runtime_failure_health_bucket_classifies_model_retirement_as_missing_endpoint() {
+        let message = r#"nvidia upstream error: {"detail":"The model 'deepseek-ai/deepseek-v3.2' has reached its end of life on 2026-05-04T00:00:00Z and is no longer available.","status":410,"title":"Gone"}"#;
+        let bucket = runtime_failure_health_bucket(Some(message), Some(19));
+        assert_eq!(bucket.mode.as_deref(), Some("missing_endpoint"));
+        assert!(!message_indicates_transient_provider_failure(message));
+    }
+
+    #[test]
+    fn runtime_failure_health_bucket_classifies_auth_failure_as_unconfigured() {
+        let message = r#"nvidia upstream error: {"detail":"Authentication failed","status":401,"title":"Unauthorized"}"#;
+        let bucket = runtime_failure_health_bucket(Some(message), Some(21));
+        assert_eq!(bucket.mode.as_deref(), Some("unconfigured"));
         assert!(message_indicates_provider_backoff(message));
     }
 }

@@ -47,8 +47,11 @@ struct ModelResolution {
 
 impl OllamaProvider {
     pub fn new(client: Client, profile: &ProviderProfile) -> Self {
-        let default_model =
-            env::var("OLLAMA_DEFAULT_MODEL").unwrap_or_else(|_| "llama3.2".to_string());
+        let default_model = env::var("GAIL_OLLAMA_MODEL")
+            .ok()
+            .or_else(|| env::var("OLLAMA_MODEL").ok())
+            .or_else(|| env::var("OLLAMA_DEFAULT_MODEL").ok())
+            .unwrap_or_else(|| "llama3.2".to_string());
         let model = profile
             .model
             .clone()
@@ -56,7 +59,9 @@ impl OllamaProvider {
         let base_url = profile
             .base_url
             .clone()
+            .or_else(|| env::var("GAIL_OLLAMA_BASE_URL").ok())
             .or_else(|| env::var("OLLAMA_BASE_URL").ok())
+            .or_else(|| env::var("OLLAMA_HOST").ok())
             .unwrap_or_else(|| "http://localhost:11434".to_string())
             .trim_end_matches('/')
             .to_string();

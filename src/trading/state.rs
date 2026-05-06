@@ -31,7 +31,7 @@ pub struct TradingLogEntry {
     pub level: String,
     pub category: String,
     pub message: String,
-    #[serde(skip_serializing_if = "serde_json::Value::is_null")]
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub context: serde_json::Value,
 }
 

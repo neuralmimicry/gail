@@ -585,16 +585,14 @@ async fn api_issues_status(
 }
 
 async fn prometheus_metrics(State(service): State<GailService>, headers: HeaderMap) -> Response {
-    if !service.can_access_health_unauthenticated()
+    if !service.can_access_metrics_unauthenticated()
         && let Err(error) = service.authorize(&headers, "status")
     {
         return error.into_response();
     }
-    (
-        [(CONTENT_TYPE, "text/plain; version=0.0.4")],
-        api_issues::prometheus_metrics().await,
-    )
-        .into_response()
+    let mut rendered = api_issues::prometheus_metrics().await;
+    rendered.push_str(&service.provider_prometheus_metrics().await);
+    ([(CONTENT_TYPE, "text/plain; version=0.0.4")], rendered).into_response()
 }
 
 // ---------------------------------------------------------------------------

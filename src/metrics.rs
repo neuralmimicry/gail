@@ -357,6 +357,66 @@ impl MetricsStore {
             candidates: limited,
         }
     }
+
+    pub async fn prometheus_metrics(&self) -> String {
+        let data = self.inner.lock().await.clone();
+        render_prometheus_metrics(&data)
+    }
+}
+
+fn render_prometheus_metrics(data: &MetricsData) -> String {
+    let mut out = String::new();
+    out.push_str("# HELP gail_provider_candidate_successes_total Gail provider candidate successful completions.\n");
+    out.push_str("# TYPE gail_provider_candidate_successes_total counter\n");
+    out.push_str("# HELP gail_provider_candidate_failures_total Gail provider candidate failed completions.\n");
+    out.push_str("# TYPE gail_provider_candidate_failures_total counter\n");
+    out.push_str("# HELP gail_provider_candidate_health_ok Gail provider candidate health, 1 for healthy and 0 for degraded.\n");
+    out.push_str("# TYPE gail_provider_candidate_health_ok gauge\n");
+    out.push_str("# HELP gail_provider_candidate_latency_ms Gail provider candidate EWMA latency in milliseconds.\n");
+    out.push_str("# TYPE gail_provider_candidate_latency_ms gauge\n");
+    for (candidate_id, bucket) in &data.candidates {
+        let labels = format!(
+            "candidate_id=\"{}\",provider=\"{}\",model=\"{}\",health_mode=\"{}\"",
+            escape_label(candidate_id),
+            escape_label(bucket.provider.as_deref().unwrap_or("")),
+            escape_label(
+                bucket
+                    .resolved_model
+                    .as_deref()
+                    .or(bucket.model.as_deref())
+                    .unwrap_or("")
+            ),
+            escape_label(bucket.health.mode.as_deref().unwrap_or("unknown")),
+        );
+        out.push_str(&format!(
+            "gail_provider_candidate_successes_total{{{labels}}} {}\n",
+            bucket.stats.successes
+        ));
+        out.push_str(&format!(
+            "gail_provider_candidate_failures_total{{{labels}}} {}\n",
+            bucket.stats.failures
+        ));
+        if let Some(ok) = bucket.health.ok {
+            out.push_str(&format!(
+                "gail_provider_candidate_health_ok{{{labels}}} {}\n",
+                if ok { 1 } else { 0 }
+            ));
+        }
+        if let Some(latency) = bucket.stats.ewma_latency_ms {
+            out.push_str(&format!(
+                "gail_provider_candidate_latency_ms{{{labels}}} {:.3}\n",
+                latency
+            ));
+        }
+    }
+    out
+}
+
+fn escape_label(value: &str) -> String {
+    value
+        .replace('\\', r"\\")
+        .replace('"', "\\\"")
+        .replace('\n', r"\n")
 }
 
 trait RoundTo {
@@ -409,5 +469,29 @@ mod tests {
 
         assert!(store.provider_in_quota_backoff("nvidia", 1800.0).await);
         assert!(!store.provider_in_quota_backoff("ollama", 1800.0).await);
+    }
+
+    #[tokio::test]
+    async fn prometheus_metrics_include_provider_candidate_counters() {
+        let path = tempfile::NamedTempFile::new()
+            .expect("temp file")
+            .into_temp_path();
+        let store = MetricsStore::new(path.to_path_buf()).await.expect("store");
+        let summary = summary("ollama", "llama3.2");
+        store
+            .record_result(
+                &summary,
+                "project_solver",
+                "planner",
+                true,
+                Some(42),
+                1.0,
+                None,
+            )
+            .await
+            .expect("record result");
+        let rendered = store.prometheus_metrics().await;
+        assert!(rendered.contains("gail_provider_candidate_successes_total"));
+        assert!(rendered.contains("candidate_id=\"ollama/llama3.2\""));
     }
 }

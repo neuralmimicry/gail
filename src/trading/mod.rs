@@ -57,8 +57,12 @@ fn now_ts() -> f64 {
 // Handle for controlling the background task
 // ---------------------------------------------------------------------------
 
-pub struct TradingBridgeHandle {
+struct TradingBridgeRuntime {
     _shutdown_tx: oneshot::Sender<()>,
+}
+
+pub struct TradingBridgeHandle {
+    _runtime: Arc<TradingBridgeRuntime>,
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +74,7 @@ pub struct TradingBridgeHandle {
 pub struct TradingBridge {
     pub state: SharedTradingState,
     pub config: Arc<TradingConfig>,
+    _runtime: Arc<TradingBridgeRuntime>,
 }
 
 impl TradingBridge {
@@ -83,13 +88,16 @@ impl TradingBridge {
         let data_path = PathBuf::from(&config.data_path);
         state.restore(&data_path).await;
 
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let runtime = Arc::new(TradingBridgeRuntime {
+            _shutdown_tx: shutdown_tx,
+        });
         let config = Arc::new(config);
         let bridge = Self {
             state: state.clone(),
             config: config.clone(),
+            _runtime: runtime.clone(),
         };
-
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let loop_config = config.clone();
         let loop_state = state.clone();
         let loop_service = service.clone();
@@ -97,12 +105,7 @@ impl TradingBridge {
             run_evaluation_loop(loop_config, loop_state, loop_service, shutdown_rx).await;
         });
 
-        (
-            bridge,
-            TradingBridgeHandle {
-                _shutdown_tx: shutdown_tx,
-            },
-        )
+        (bridge, TradingBridgeHandle { _runtime: runtime })
     }
 
     pub fn is_enabled(&self) -> bool {

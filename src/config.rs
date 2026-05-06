@@ -34,6 +34,7 @@ pub struct ServerConfig {
 pub struct SecurityConfig {
     pub api_tokens: Vec<ApiTokenConfig>,
     pub allow_unauthenticated_health: bool,
+    pub allow_unauthenticated_metrics: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -159,6 +160,7 @@ impl Default for SecurityConfig {
         Self {
             api_tokens: Vec::new(),
             allow_unauthenticated_health: true,
+            allow_unauthenticated_metrics: true,
         }
     }
 }

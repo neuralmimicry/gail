@@ -561,6 +561,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_state_restore_accepts_legacy_log_entries_without_context() {
+        use crate::trading::state::TradingState;
+
+        let mut legacy = TradingState::new(100, 50);
+        legacy.evaluation_count = 17;
+        legacy.log_info("startup", "legacy entry");
+        let mut payload = serde_json::to_value(&legacy).expect("state json");
+        payload["activity_log"][0]
+            .as_object_mut()
+            .expect("legacy log object")
+            .remove("context");
+
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(
+            tmp.path(),
+            serde_json::to_string_pretty(&payload).expect("legacy state json"),
+        )
+        .expect("write legacy state");
+
+        let restored = SharedTradingState::new(100, 50);
+        restored.restore(&tmp.path().to_path_buf()).await;
+        let s = restored.0.lock().await;
+        assert_eq!(s.evaluation_count, 17);
+        assert_eq!(s.activity_log.front().unwrap().message, "legacy entry");
+        assert!(s.activity_log.front().unwrap().context.is_null());
+    }
+
+    #[tokio::test]
     async fn shared_state_restore_missing_file_is_noop() {
         let state = SharedTradingState::new(100, 50);
         // Should not panic.
