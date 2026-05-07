@@ -145,6 +145,23 @@ impl RefinerClient {
                 .get("error")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown");
+            if status.as_u16() == 404 && error == "index_not_found" {
+                adaptive_schema::observe_success(
+                    "refiner",
+                    "POST",
+                    "/api/rag/query",
+                    "rag query",
+                    &data,
+                )
+                .await;
+                api_issues::observe_api_recovery("refiner", "POST", "/api/rag/query", "rag query")
+                    .await;
+                tracing::debug!(
+                    index_name = index_name,
+                    "trading: Refiner RAG index not found; using empty context"
+                );
+                return Ok(ResearchContext::empty(query));
+            }
             adaptive_schema::observe_failure(
                 "refiner",
                 "POST",
@@ -227,5 +244,56 @@ impl RefinerClient {
                 ResearchContext::empty(query)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn research_uses_empty_context_when_optional_index_is_missing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/rag/query"))
+            .and(header("authorization", "Bearer refiner-token"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": "index_not_found"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = RefinerClient::new(&server.uri(), Some("refiner-token"), 1.0);
+        let context = client
+            .research("crypto", "bitcoin market sentiment", 5)
+            .await
+            .expect("missing optional RAG index should not fail trading research");
+
+        assert_eq!(context.query, "bitcoin market sentiment");
+        assert!(context.is_empty());
+        assert!(context.matches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn research_still_fails_on_refiner_auth_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/rag/query"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": "unauthorized"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = RefinerClient::new(&server.uri(), None, 1.0);
+        let err = client
+            .research("crypto", "bitcoin market sentiment", 5)
+            .await
+            .expect_err("auth failures must remain visible");
+
+        assert!(err.contains("HTTP 401"));
+        assert!(err.contains("unauthorized"));
     }
 }
