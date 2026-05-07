@@ -265,7 +265,7 @@ mod tests {
         assert_eq!(cfg.fuzzy_weight, 0.4);
         assert_eq!(cfg.max_open_positions, 5);
         assert_eq!(cfg.evaluation_interval_seconds, 60);
-        assert!(!cfg.live_execution_enabled);
+        assert!(cfg.live_execution_enabled);
         assert!(!cfg.backtesting_enabled);
     }
 

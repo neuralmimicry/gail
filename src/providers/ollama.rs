@@ -10,7 +10,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sysinfo::{Disks, System};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::{
     adaptive_schema,
@@ -26,9 +26,11 @@ use super::{
 };
 
 const PROVIDER_HEALTH_FALLBACK_TIMEOUT_SECONDS: u64 = 4;
+const OLLAMA_SATURATION_BACKOFF_SECONDS: u64 = 120;
 
 static OLLAMA_REQUEST_SEMAPHORE: Lazy<Semaphore> =
     Lazy::new(|| Semaphore::new(env_int("GAIL_OLLAMA_MAX_CONCURRENT_REQUESTS", 1).max(1) as usize));
+static OLLAMA_SATURATED_UNTIL: Lazy<Mutex<Option<Instant>>> = Lazy::new(|| Mutex::new(None));
 
 #[derive(Clone)]
 pub struct OllamaProvider {
@@ -127,6 +129,9 @@ impl OllamaProvider {
         &self,
         request: &ProviderCompletionRequest,
     ) -> Result<ProviderInvocationResponse> {
+        if let Some(remaining) = ollama_saturation_remaining().await {
+            return Err(ollama_saturated_error(remaining));
+        }
         let base_urls = self.base_url_candidates(request.base_url.as_deref());
         let total_timeout_seconds = request
             .timeout_seconds
@@ -203,6 +208,15 @@ impl OllamaProvider {
                         &message,
                     )
                     .await;
+                    if message_indicates_ollama_saturation(&message) {
+                        tracing::warn!(
+                            base_url = %base_url,
+                            endpoint_index = index,
+                            error = %message,
+                            "Ollama local model service saturated; backing off before retrying"
+                        );
+                        return Err(error);
+                    }
                     tracing::warn!(
                         base_url = %base_url,
                         endpoint_index = index,
@@ -224,25 +238,25 @@ impl OllamaProvider {
     ) -> Result<ProviderInvocationResponse> {
         let queue_timeout =
             Duration::from_secs(env_int("GAIL_OLLAMA_QUEUE_TIMEOUT_SECONDS", 2).max(1));
-        let _permit = match tokio::time::timeout(queue_timeout, OLLAMA_REQUEST_SEMAPHORE.acquire())
-            .await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => {
-                return Err(GailError::upstream(
-                    "ollama",
-                    None,
-                    "Ollama request limiter is closed",
-                ));
-            }
-            Err(_) => {
-                return Err(GailError::upstream(
-                    "ollama",
-                    None,
-                    "timeout waiting for local Ollama request slot; local model service is saturated",
-                ));
-            }
-        };
+        let _permit =
+            match tokio::time::timeout(queue_timeout, OLLAMA_REQUEST_SEMAPHORE.acquire()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => {
+                    return Err(GailError::upstream(
+                        "ollama",
+                        None,
+                        "Ollama request limiter is closed",
+                    ));
+                }
+                Err(_) => {
+                    let backoff = mark_ollama_saturated().await;
+                    return Err(GailError::upstream(
+                        "ollama",
+                        None,
+                        ollama_saturated_message(backoff),
+                    ));
+                }
+            };
         let base_url = request
             .base_url
             .clone()
@@ -370,6 +384,15 @@ impl OllamaProvider {
     }
 
     pub async fn health(&self, timeout_seconds: Option<u64>) -> Result<ProviderHealth> {
+        if let Some(remaining) = ollama_saturation_remaining().await {
+            return Ok(ProviderHealth {
+                ok: false,
+                status_code: None,
+                latency_ms: None,
+                message: Some(ollama_saturated_message(remaining)),
+                mode: Some("ollama_saturated".to_string()),
+            });
+        }
         let mut last_health = None;
         let mut last_error = None;
         for (index, base_url) in self.base_url_candidates(None).iter().enumerate() {
@@ -785,6 +808,52 @@ fn env_base_url_list(name: &str) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn ollama_saturation_backoff() -> Duration {
+    Duration::from_secs(
+        env_int(
+            "GAIL_OLLAMA_SATURATION_BACKOFF_SECONDS",
+            OLLAMA_SATURATION_BACKOFF_SECONDS,
+        )
+        .max(1) as u64,
+    )
+}
+
+async fn ollama_saturation_remaining() -> Option<Duration> {
+    let mut saturated_until = OLLAMA_SATURATED_UNTIL.lock().await;
+    let until = (*saturated_until)?;
+    let now = Instant::now();
+    if until <= now {
+        *saturated_until = None;
+        None
+    } else {
+        Some(until.saturating_duration_since(now))
+    }
+}
+
+async fn mark_ollama_saturated() -> Duration {
+    let backoff = ollama_saturation_backoff();
+    let mut saturated_until = OLLAMA_SATURATED_UNTIL.lock().await;
+    *saturated_until = Some(Instant::now() + backoff);
+    backoff
+}
+
+fn ollama_saturated_message(remaining: Duration) -> String {
+    format!(
+        "local Ollama request queue is saturated; backing off before retrying in {}s",
+        remaining.as_secs().max(1)
+    )
+}
+
+fn ollama_saturated_error(remaining: Duration) -> GailError {
+    GailError::upstream("ollama", None, ollama_saturated_message(remaining))
+}
+
+fn message_indicates_ollama_saturation(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("local ollama request queue is saturated")
+        || lowered.contains("local model service is saturated")
 }
 
 fn normalize_base_url(value: &str) -> Option<String> {

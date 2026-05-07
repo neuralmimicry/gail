@@ -111,9 +111,9 @@ pub struct TradingConfig {
 
     /// Whether Gail is allowed to call OctoBot order-placement paths.
     ///
-    /// Keep this disabled unless an OctoBot trading-mode or user-command bridge
-    /// that supports live order placement is configured and tested. Gail can
-    /// still evaluate markets and emit decisions while this is disabled.
+    /// Gail enables live execution by default for the trading bridge rollout.
+    /// The OctoBot client still reports a clear execution error if the deployed
+    /// OctoBot surface does not expose a supported live order-placement path.
     pub live_execution_enabled: bool,
 }
 
@@ -152,7 +152,7 @@ impl Default for TradingConfig {
             backtest_symbols: vec!["BTC/USDT".to_string()],
             backtest_lookback_days: 30,
             backtest_pause_on_failure: false,
-            live_execution_enabled: false,
+            live_execution_enabled: true,
         }
     }
 }

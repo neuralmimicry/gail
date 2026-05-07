@@ -1323,7 +1323,25 @@ impl GailService {
         } else {
             -0.9
         };
-        let health = if self
+        let health = if is_ollama_candidate(&candidate)
+            && self
+                .inner
+                .metrics
+                .provider_in_health_backoff(
+                    candidate.provider_type.as_str(),
+                    &["ollama_saturated"],
+                    ollama_saturation_backoff_seconds(),
+                )
+                .await
+        {
+            ProviderHealth {
+                ok: false,
+                status_code: None,
+                latency_ms: None,
+                message: Some("local Ollama is saturated; waiting before retry".to_string()),
+                mode: Some("ollama_saturated".to_string()),
+            }
+        } else if self
             .inner
             .metrics
             .provider_in_health_backoff(
@@ -1364,17 +1382,27 @@ impl GailService {
     }
 
     async fn probe_health(&self, candidate: &ProviderCandidate) -> ProviderHealth {
+        let cached = self
+            .inner
+            .metrics
+            .health_snapshot(candidate.candidate_id().as_str())
+            .await;
+        let health_ttl_seconds = if is_ollama_candidate(candidate)
+            && cached
+                .mode
+                .as_deref()
+                .is_some_and(|mode| mode.eq_ignore_ascii_case("ollama_saturated"))
+        {
+            ollama_saturation_backoff_seconds()
+        } else {
+            self.health_ttl_seconds()
+        };
         if !self
             .inner
             .metrics
-            .should_probe(candidate.candidate_id().as_str(), self.health_ttl_seconds())
+            .should_probe(candidate.candidate_id().as_str(), health_ttl_seconds)
             .await
         {
-            let cached = self
-                .inner
-                .metrics
-                .health_snapshot(candidate.candidate_id().as_str())
-                .await;
             return ProviderHealth {
                 ok: cached.ok.unwrap_or(false),
                 status_code: None,
@@ -2122,6 +2150,14 @@ fn candidate_is_local_fallback(candidate: &ProviderCandidate) -> bool {
         || candidate.specialties.iter().any(|item| item == "local")
 }
 
+fn is_ollama_candidate(candidate: &ProviderCandidate) -> bool {
+    candidate.provider_type.eq_ignore_ascii_case("ollama")
+}
+
+fn ollama_saturation_backoff_seconds() -> f64 {
+    env_float_any(&["GAIL_OLLAMA_SATURATION_BACKOFF_SECONDS"], 120.0).max(1.0)
+}
+
 fn ensure_local_fallback_selected(
     mut selected: Vec<ProviderCandidate>,
     local_fallback: Option<ProviderCandidate>,
@@ -2160,6 +2196,7 @@ fn ranked_candidate_is_in_provider_backoff(item: &RankedCandidate) -> bool {
                 [
                     "upstream",
                     "timeout",
+                    "ollama_saturated",
                     "provider_backoff",
                     "unconfigured",
                     "missing_endpoint",
@@ -2171,8 +2208,15 @@ fn ranked_candidate_is_in_provider_backoff(item: &RankedCandidate) -> bool {
 
 fn message_indicates_provider_backoff(message: &str) -> bool {
     message_indicates_quota(message)
+        || message_indicates_ollama_saturation(message)
         || message_indicates_provider_auth_failure(message)
         || message_indicates_transient_provider_failure(message)
+}
+
+fn message_indicates_ollama_saturation(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("local ollama request queue is saturated")
+        || lowered.contains("local model service is saturated")
 }
 
 fn message_indicates_transient_provider_failure(message: &str) -> bool {
@@ -2230,7 +2274,9 @@ fn message_indicates_permanent_model_failure(message: &str) -> bool {
 
 fn runtime_failure_health_bucket(error: Option<&str>, latency_ms: Option<u64>) -> HealthBucket {
     let lowered = error.unwrap_or_default().to_ascii_lowercase();
-    let mode = if lowered.contains("timeout") || lowered.contains("timed out") {
+    let mode = if message_indicates_ollama_saturation(error.unwrap_or_default()) {
+        "ollama_saturated"
+    } else if lowered.contains("timeout") || lowered.contains("timed out") {
         "timeout"
     } else if message_indicates_quota(error.unwrap_or_default()) {
         "quota"
@@ -2923,6 +2969,14 @@ mod tests {
         let message = "nvidia upstream error: error sending request for url (https://integrate.api.nvidia.com/v1/chat/completions)";
         let bucket = runtime_failure_health_bucket(Some(message), Some(34));
         assert_eq!(bucket.mode.as_deref(), Some("upstream"));
+        assert!(message_indicates_provider_backoff(message));
+    }
+
+    #[test]
+    fn runtime_failure_health_bucket_classifies_ollama_saturation_as_local_backoff() {
+        let message = "ollama upstream error: local Ollama request queue is saturated; backing off before retrying in 120s";
+        let bucket = runtime_failure_health_bucket(Some(message), Some(2000));
+        assert_eq!(bucket.mode.as_deref(), Some("ollama_saturated"));
         assert!(message_indicates_provider_backoff(message));
     }
 

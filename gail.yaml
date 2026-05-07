@@ -162,7 +162,7 @@ trading:
   trade_ring_size: 200
   data_path: "./data/trading_state.json"
   fuzzy_weight: 0.4
-  live_execution_enabled: false
+  live_execution_enabled: true
   octobot_timeout_seconds: 10.0
   refiner_timeout_seconds: 15.0
   advisor_timeout_seconds: 30.0
