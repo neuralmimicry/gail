@@ -1820,6 +1820,15 @@ impl GailService {
         if is_interactive_workflow(workflow, role) {
             return base;
         }
+        if expected_json
+            && (prompt_requests_execution_plan(prompt_text)
+                || prompt_requests_manager_tool_call(prompt_text))
+        {
+            // Multi-agent manager planning payloads (ExecutionPlan / tool-call envelopes)
+            // need a full request budget; forcing automation caps here collapses the
+            // plan to degraded no-op outputs like `{"steps":[]}`.
+            return base;
+        }
         if !expected_json
             && !text_or_tags_indicate_automation(workflow, role, task_tags, prompt_text)
         {

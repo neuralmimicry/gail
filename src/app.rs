@@ -3840,6 +3840,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_chat_completions_execution_plan_uses_standard_timeout_cap() {
+        let nvidia = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "moonshotai/kimi-k2-instruct-0905"}]
+            })))
+            .mount(&nvidia)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(2))
+                    .set_body_json(json!({
+                        "id": "chatcmpl-plan",
+                        "model": "moonshotai/kimi-k2-instruct-0905",
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": "{\"steps\":[{\"step\":\"summarize_market\",\"inputs\":{\"mode\":\"distribution\"}}]}"
+                            },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 13,
+                            "completion_tokens": 9,
+                            "total_tokens": 22
+                        }
+                    })),
+            )
+            .mount(&nvidia)
+            .await;
+
+        let mut config = GailConfig::default();
+        config.orchestration.max_parallel_candidates = 1;
+        config.orchestration.candidate_timeout_cap_seconds = Some(8);
+        config
+            .orchestration
+            .automation_candidate_timeout_cap_seconds = Some(1);
+        config.providers.push(ProviderProfile {
+            name: "NVIDIAKimi".to_string(),
+            provider_type: "nvidia".to_string(),
+            model: Some("moonshotai/kimi-k2-instruct-0905".to_string()),
+            api_key: Some("nvapi-test".to_string()),
+            base_url: Some(format!("{}/v1", nvidia.uri())),
+            roles: vec!["general".to_string()],
+            specialties: vec!["json".to_string(), "planning".to_string()],
+            weight: 1.0,
+            preferred: true,
+            ..ProviderProfile::default()
+        });
+
+        let app = build_router(test_service_with_config(config).await);
+        let started = std::time::Instant::now();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "gail-auto",
+                            "workflow": "trading",
+                            "request_category": "octobot trading evaluator",
+                            "messages": [
+                                {
+                                    "role": "system",
+                                    "content": r#"{"name":"ExecutionPlan","schema":{"type":"object","properties":{"steps":{"type":"array"}},"required":["steps"],"additionalProperties":false}}"#
+                                },
+                                {
+                                    "role": "user",
+                                    "content": "Generate the next execution plan."
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(2),
+            "execution-plan request should not be clipped by automation timeout: {:?}",
+            started.elapsed()
+        );
+
+        let payload = read_json(response).await;
+        let content = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content string");
+        let parsed: Value = serde_json::from_str(content).expect("execution plan json");
+        assert_eq!(parsed["steps"][0]["step"], "summarize_market");
+        assert_ne!(payload["gail"]["trace"]["final_source"], "degraded_policy");
+    }
+
+    #[tokio::test]
     async fn openai_responses_route_input_text_items() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
