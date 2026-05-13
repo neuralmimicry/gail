@@ -128,7 +128,11 @@ impl RefinerClient {
                 "top_k": top_k,
                 "min_score": 0.3
             });
-            let resp = match self.with_auth(self.client.post(&url).json(&body)).send().await {
+            let resp = match self
+                .with_auth(self.client.post(&url).json(&body))
+                .send()
+                .await
+            {
                 Ok(resp) => resp,
                 Err(err) => {
                     adaptive_schema::observe_failure(
@@ -213,8 +217,13 @@ impl RefinerClient {
                         &data,
                     )
                     .await;
-                    api_issues::observe_api_recovery("refiner", "POST", "/api/rag/query", "rag query")
-                        .await;
+                    api_issues::observe_api_recovery(
+                        "refiner",
+                        "POST",
+                        "/api/rag/query",
+                        "rag query",
+                    )
+                    .await;
                     tracing::debug!(
                         index_name = index_name,
                         "trading: Refiner RAG index not found; using empty context"
@@ -245,9 +254,16 @@ impl RefinerClient {
                     error
                 ));
             }
-            adaptive_schema::observe_success("refiner", "POST", "/api/rag/query", "rag query", &data)
+            adaptive_schema::observe_success(
+                "refiner",
+                "POST",
+                "/api/rag/query",
+                "rag query",
+                &data,
+            )
+            .await;
+            api_issues::observe_api_recovery("refiner", "POST", "/api/rag/query", "rag query")
                 .await;
-            api_issues::observe_api_recovery("refiner", "POST", "/api/rag/query", "rag query").await;
 
             let matches = data
                 .get("matches")
