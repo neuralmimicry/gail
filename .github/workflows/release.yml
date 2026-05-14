@@ -28,6 +28,7 @@ jobs:
     outputs:
       app_version: ${{ steps.version.outputs.app_version }}
       deb_version: ${{ steps.version.outputs.deb_version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
       tag_name: ${{ steps.version.outputs.tag_name }}
     steps:
       - name: Checkout
@@ -62,11 +63,21 @@ jobs:
             exit 2
           fi
 
+          is_prerelease="false"
+          if [[ "${version}" == *-* ]]; then
+            is_prerelease="true"
+          fi
+
           tag_name="v${version}"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" != "${tag_name}" ]]; then
+            echo "Tag-triggered release mismatch: ref=${GITHUB_REF_NAME}, derived=${tag_name}" >&2
+            exit 2
+          fi
 
           {
             echo "app_version=${version}"
             echo "deb_version=${deb_version}"
+            echo "is_prerelease=${is_prerelease}"
             echo "tag_name=${tag_name}"
           } >> "${GITHUB_OUTPUT}"
 
@@ -113,6 +124,20 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release -j 1
 
+      - name: Verify release binary version
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary_version="$(target/release/gail --version | sed -nE 's/^[^ ]+ ([^ ]+).*$/\1/p')"
+          if [[ -z "${binary_version}" ]]; then
+            echo "Unable to read release binary version" >&2
+            exit 2
+          fi
+          if [[ "${binary_version}" != "${{ needs.version.outputs.app_version }}" ]]; then
+            echo "Binary version mismatch: expected ${{ needs.version.outputs.app_version }}, got ${binary_version}" >&2
+            exit 2
+          fi
+
       - name: Build Debian package
         run: |
           bash scripts/build-deb.sh \
@@ -157,8 +182,8 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: Gail v${{ needs.version.outputs.app_version }}
           generate_release_notes: true
-          prerelease: ${{ contains(needs.version.outputs.app_version, '-') }}
-          make_latest: true
+          prerelease: ${{ needs.version.outputs.is_prerelease == 'true' }}
+          make_latest: ${{ needs.version.outputs.is_prerelease != 'true' }}
           fail_on_unmatched_files: true
           files: |
             release-assets/*.deb

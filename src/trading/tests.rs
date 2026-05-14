@@ -563,6 +563,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_state_persist_includes_null_log_context_field() {
+        let state = SharedTradingState::new(100, 50);
+        state.log_info("startup", "no context payload").await;
+
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        state.persist(&tmp.path().to_path_buf()).await;
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.path()).expect("state json"))
+                .expect("valid state payload");
+        assert!(
+            payload["activity_log"][0].get("context").is_some(),
+            "persisted activity_log entries must include context for backward compatibility"
+        );
+        assert!(payload["activity_log"][0]["context"].is_null());
+    }
+
+    #[tokio::test]
     async fn shared_state_restore_accepts_legacy_log_entries_without_context() {
         use crate::trading::state::TradingState;
 

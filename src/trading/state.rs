@@ -26,13 +26,26 @@ fn now_ts() -> f64 {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TradingLogEntry {
     pub ts: f64,
     pub level: String,
     pub category: String,
     pub message: String,
-    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    #[serde(default)]
     pub context: serde_json::Value,
+}
+
+impl Default for TradingLogEntry {
+    fn default() -> Self {
+        Self {
+            ts: 0.0,
+            level: String::new(),
+            category: String::new(),
+            message: String::new(),
+            context: serde_json::Value::Null,
+        }
+    }
 }
 
 impl TradingLogEntry {
