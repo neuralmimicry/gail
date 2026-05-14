@@ -25,11 +25,11 @@ use super::{
     is_model_not_found, post_json_with_retries, response_with_usage,
 };
 
-const PROVIDER_HEALTH_FALLBACK_TIMEOUT_SECONDS: u64 = 4;
-const OLLAMA_SATURATION_BACKOFF_SECONDS: u64 = 120;
+const PROVIDER_HEALTH_FALLBACK_TIMEOUT_SECONDS: u64 = 12;
+const OLLAMA_SATURATION_BACKOFF_SECONDS: u64 = 20;
 
 static OLLAMA_REQUEST_SEMAPHORE: Lazy<Semaphore> =
-    Lazy::new(|| Semaphore::new(env_int("GAIL_OLLAMA_MAX_CONCURRENT_REQUESTS", 1).max(1) as usize));
+    Lazy::new(|| Semaphore::new(env_int("GAIL_OLLAMA_MAX_CONCURRENT_REQUESTS", 2).max(1) as usize));
 static OLLAMA_SATURATED_UNTIL: Lazy<Mutex<Option<Instant>>> = Lazy::new(|| Mutex::new(None));
 
 #[derive(Clone)]
@@ -237,7 +237,7 @@ impl OllamaProvider {
         request: &ProviderCompletionRequest,
     ) -> Result<ProviderInvocationResponse> {
         let queue_timeout =
-            Duration::from_secs(env_int("GAIL_OLLAMA_QUEUE_TIMEOUT_SECONDS", 2).max(1));
+            Duration::from_secs(env_int("GAIL_OLLAMA_QUEUE_TIMEOUT_SECONDS", 20).max(1));
         let _permit =
             match tokio::time::timeout(queue_timeout, OLLAMA_REQUEST_SEMAPHORE.acquire()).await {
                 Ok(Ok(permit)) => permit,
@@ -479,7 +479,7 @@ impl OllamaProvider {
             });
         }
 
-        if !env_bool("GAIL_OLLAMA_HEALTH_GENERATE_PROBE", true) {
+        if !env_bool("GAIL_OLLAMA_HEALTH_GENERATE_PROBE", false) {
             return Ok(ProviderHealth {
                 ok: true,
                 status_code: Some(status.as_u16()),

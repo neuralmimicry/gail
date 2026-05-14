@@ -2164,7 +2164,7 @@ fn is_ollama_candidate(candidate: &ProviderCandidate) -> bool {
 }
 
 fn ollama_saturation_backoff_seconds() -> f64 {
-    env_float_any(&["GAIL_OLLAMA_SATURATION_BACKOFF_SECONDS"], 120.0).max(1.0)
+    env_float_any(&["GAIL_OLLAMA_SATURATION_BACKOFF_SECONDS"], 20.0).max(1.0)
 }
 
 fn ensure_local_fallback_selected(
