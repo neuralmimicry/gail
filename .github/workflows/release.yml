@@ -2,6 +2,8 @@ name: Release
 
 on:
   push:
+    branches:
+      - "main"
     tags:
       - "v*"
   workflow_dispatch:
@@ -44,13 +46,40 @@ jobs:
 
           version="${DISPATCH_VERSION:-}"
           if [[ -z "${version}" && "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            version="${GITHUB_REF_NAME}"
+            version="${GITHUB_REF_NAME#v}"
           fi
           if [[ -z "${version}" ]]; then
-            version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)"
+            cargo_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)"
+            if [[ -z "${cargo_version}" ]]; then
+              echo "Unable to resolve Cargo package version from Cargo.toml" >&2
+              exit 2
+            fi
+            git fetch --tags --force origin >/dev/null 2>&1 || true
+            latest_tag_version="$(git tag -l 'v*' | sed 's/^v//' | sort -V | tail -n 1)"
+            if [[ -n "${latest_tag_version}" ]]; then
+              candidate="$(printf '%s\n%s\n' "${cargo_version}" "${latest_tag_version}" | sort -V | tail -n 1)"
+            else
+              candidate="${cargo_version}"
+            fi
+            version="${candidate}"
+            if git rev-parse -q --verify "refs/tags/v${version}" >/dev/null; then
+              if [[ ! "${version}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+                echo "Auto-bump requires stable SemVer MAJOR.MINOR.PATCH, got: ${version}" >&2
+                exit 2
+              fi
+              major="${BASH_REMATCH[1]}"
+              minor="${BASH_REMATCH[2]}"
+              patch="${BASH_REMATCH[3]}"
+              while true; do
+                patch="$((patch + 1))"
+                candidate="${major}.${minor}.${patch}"
+                if ! git rev-parse -q --verify "refs/tags/v${candidate}" >/dev/null; then
+                  version="${candidate}"
+                  break
+                fi
+              done
+            fi
           fi
-
-          version="${version#v}"
 
           if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?(\+[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
             echo "Invalid release version: ${version}" >&2
