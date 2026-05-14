@@ -16,7 +16,7 @@ COPY config ./config
 COPY gail.yaml .
 COPY packaging ./packaging
 COPY scripts ./scripts
-RUN set -eux; \
+RUN set -eu; \
     if [ "${GAIL_VERSION}" != "source" ] && [ "${GAIL_VERSION}" != "latest" ]; then \
         release_version="${GAIL_VERSION#v}"; \
         bash scripts/set-release-version.sh "${release_version}"; \
@@ -39,17 +39,19 @@ ARG GAIL_VERSION=source
 ARG GAIL_DEB_URL=
 ARG GAIL_RELEASE_REPOSITORY=neuralmimicry/gail
 ARG GAIL_RELEASE_BASE_URL=
+ARG GAIL_RELEASE_TOKEN=
 ARG APP_USER=gail
 ARG APP_UID=10001
 ARG APP_GID=10001
 
 COPY --from=source-deb /out/gail_*.deb /tmp/source-gail.deb
 
-RUN set -eux; \
+RUN set -eu; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        jq \
         tini; \
     groupadd --gid "${APP_GID}" "${APP_USER}"; \
     useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --shell /bin/sh "${APP_USER}"; \
@@ -59,6 +61,17 @@ RUN set -eux; \
         arm64|aarch64) deb_arch="arm64" ;; \
         *) echo "Unsupported container architecture: ${detected_arch}" >&2; exit 2 ;; \
     esac; \
+    github_api_get() { \
+        api_url="$1"; \
+        if [ -n "${GAIL_RELEASE_TOKEN}" ]; then \
+            curl -fsSL \
+                -H "Authorization: Bearer ${GAIL_RELEASE_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "${api_url}"; \
+        else \
+            curl -fsSL "${api_url}"; \
+        fi; \
+    }; \
     release_base_url="${GAIL_RELEASE_BASE_URL:-https://github.com/${GAIL_RELEASE_REPOSITORY}/releases/download}"; \
     if [ -n "${GAIL_DEB_URL}" ]; then \
         echo "Installing Gail package for ${deb_arch} from ${GAIL_DEB_URL}"; \
@@ -72,21 +85,56 @@ RUN set -eux; \
         fi; \
         cp /tmp/source-gail.deb /tmp/gail.deb; \
     elif [ "${GAIL_VERSION}" = "latest" ]; then \
-        deb_url="$(curl -fsSL "https://api.github.com/repos/${GAIL_RELEASE_REPOSITORY}/releases/latest" \
-            | sed -nE "s/.*\"browser_download_url\": \"([^\"]*gail_[^\"]*_${deb_arch}\\.deb)\".*/\\1/p" \
-            | head -n 1)"; \
-        if [ -z "${deb_url}" ]; then \
-            echo "Could not resolve latest Gail ${deb_arch} .deb release asset" >&2; \
-            exit 2; \
+        release_json="$(github_api_get "https://api.github.com/repos/${GAIL_RELEASE_REPOSITORY}/releases/latest")"; \
+        if [ -n "${GAIL_RELEASE_TOKEN}" ]; then \
+            deb_api_url="$(printf '%s' "${release_json}" \
+                | jq -r --arg arch "${deb_arch}" '.assets[] | select(.name | test("^gail_.*_" + $arch + "\\.deb$")) | .url' \
+                | head -n 1)"; \
+            if [ -z "${deb_api_url}" ]; then \
+                echo "Could not resolve latest Gail ${deb_arch} .deb release asset API URL" >&2; \
+                exit 2; \
+            fi; \
+            echo "Installing Gail package for ${deb_arch} from authenticated release asset API"; \
+            curl -fsSL \
+                -H "Authorization: Bearer ${GAIL_RELEASE_TOKEN}" \
+                -H "Accept: application/octet-stream" \
+                "${deb_api_url}" \
+                -o /tmp/gail.deb; \
+        else \
+            deb_url="$(printf '%s' "${release_json}" \
+                | jq -r --arg arch "${deb_arch}" '.assets[] | select(.name | test("^gail_.*_" + $arch + "\\.deb$")) | .browser_download_url' \
+                | head -n 1)"; \
+            if [ -z "${deb_url}" ]; then \
+                echo "Could not resolve latest Gail ${deb_arch} .deb release asset URL (set GAIL_RELEASE_TOKEN for private repos)" >&2; \
+                exit 2; \
+            fi; \
+            echo "Installing Gail package for ${deb_arch} from ${deb_url}"; \
+            curl -fsSL "${deb_url}" -o /tmp/gail.deb; \
         fi; \
-        echo "Installing Gail package for ${deb_arch} from ${deb_url}"; \
-        curl -fsSL "${deb_url}" -o /tmp/gail.deb; \
     else \
         release_version="${GAIL_VERSION#v}"; \
         deb_version="$(printf '%s' "${release_version}" | sed 's/-/~/g')"; \
-        deb_url="${release_base_url}/v${release_version}/gail_${deb_version}_${deb_arch}.deb"; \
-        echo "Installing Gail package for ${deb_arch} from ${deb_url}"; \
-        curl -fsSL "${deb_url}" -o /tmp/gail.deb; \
+        if [ -n "${GAIL_RELEASE_TOKEN}" ]; then \
+            release_json="$(github_api_get "https://api.github.com/repos/${GAIL_RELEASE_REPOSITORY}/releases/tags/v${release_version}")"; \
+            expected_name="gail_${deb_version}_${deb_arch}.deb"; \
+            deb_api_url="$(printf '%s' "${release_json}" \
+                | jq -r --arg expected "${expected_name}" '.assets[] | select(.name == $expected) | .url' \
+                | head -n 1)"; \
+            if [ -z "${deb_api_url}" ]; then \
+                echo "Could not resolve Gail ${expected_name} release asset API URL" >&2; \
+                exit 2; \
+            fi; \
+            echo "Installing Gail package for ${deb_arch} from authenticated release asset API"; \
+            curl -fsSL \
+                -H "Authorization: Bearer ${GAIL_RELEASE_TOKEN}" \
+                -H "Accept: application/octet-stream" \
+                "${deb_api_url}" \
+                -o /tmp/gail.deb; \
+        else \
+            deb_url="${release_base_url}/v${release_version}/gail_${deb_version}_${deb_arch}.deb"; \
+            echo "Installing Gail package for ${deb_arch} from ${deb_url}"; \
+            curl -fsSL "${deb_url}" -o /tmp/gail.deb; \
+        fi; \
     fi; \
     apt-get install -y --no-install-recommends /tmp/gail.deb; \
     rm -f /tmp/gail.deb /tmp/source-gail.deb; \

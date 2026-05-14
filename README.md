@@ -109,6 +109,8 @@ podman build \
 
 `TARGETARCH` is mapped to Debian's `amd64` or `arm64` package names, with `dpkg --print-architecture` as a fallback for local Podman builds. Set `GAIL_VERSION=latest` to resolve the newest release asset, or set `GAIL_DEB_URL` to install a specific package URL directly.
 
+For private GitHub repositories, set `GAIL_RELEASE_TOKEN` (for example via `--build-arg GAIL_RELEASE_TOKEN` with a token that has `repo` access). Gail then resolves release assets through the authenticated GitHub API instead of public release URLs.
+
 The image keeps the existing container contract: it expects a config file at `/app/config/gail.yaml` unless `GAIL_CONFIG` is overridden, and it stores runtime data under `/app/data`.
 
 ## Debian Releases
