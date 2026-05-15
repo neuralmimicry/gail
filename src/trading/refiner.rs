@@ -2,7 +2,10 @@
 ///
 /// Calls `POST /api/rag/query` on the Refiner service to obtain external
 /// market information and sentiment context for AI advisors.
-use std::time::Duration;
+use std::{
+    cmp::Ordering,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use futures::future::join_all;
 use reqwest::{Client, ClientBuilder};
@@ -23,6 +26,7 @@ pub struct RagMatch {
     pub content: String,
     pub source: Option<String>,
     pub citation: Option<String>,
+    pub published_at_unix: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -161,6 +165,8 @@ fn parse_rag_match(raw: &serde_json::Value) -> Option<RagMatch> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
+    let published_at_unix = infer_match_timestamp(raw, source.as_deref(), citation.as_deref())
+        .and_then(normalize_unix_ts);
     Some(RagMatch {
         id: if id.is_empty() {
             format!("match:{}", content.chars().take(32).collect::<String>())
@@ -174,7 +180,231 @@ fn parse_rag_match(raw: &serde_json::Value) -> Option<RagMatch> {
         content,
         source,
         citation,
+        published_at_unix,
     })
+}
+
+fn normalize_unix_ts(ts: i64) -> Option<i64> {
+    let seconds = if ts.abs() >= 1_000_000_000_000 {
+        ts / 1000
+    } else {
+        ts
+    };
+    if (946_684_800..=4_102_444_800).contains(&seconds) {
+        Some(seconds)
+    } else {
+        None
+    }
+}
+
+fn parse_timestamp_value(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_u64().and_then(|v| i64::try_from(v).ok()))
+            .or_else(|| n.as_f64().map(|v| v.round() as i64))
+            .and_then(normalize_unix_ts),
+        serde_json::Value::String(s) => parse_timestamp_string(s),
+        _ => None,
+    }
+}
+
+fn parse_timestamp_string(raw: &str) -> Option<i64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if (10..=16).contains(&trimmed.len()) && trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        if let Ok(parsed) = trimmed.parse::<i64>() {
+            if let Some(ts) = normalize_unix_ts(parsed) {
+                return Some(ts);
+            }
+        }
+    }
+    parse_yyyy_mm_dd_timestamp(trimmed)
+}
+
+fn parse_yyyy_mm_dd_timestamp(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 10 {
+        return None;
+    }
+    for idx in 0..=bytes.len() - 10 {
+        let Some(year) = parse_digits(bytes, idx, 4) else {
+            continue;
+        };
+        let Some(sep) = bytes.get(idx + 4).copied() else {
+            continue;
+        };
+        if sep != b'-' && sep != b'/' {
+            continue;
+        }
+        let Some(month) = parse_digits(bytes, idx + 5, 2) else {
+            continue;
+        };
+        if bytes.get(idx + 7).copied() != Some(sep) {
+            continue;
+        }
+        let Some(day) = parse_digits(bytes, idx + 8, 2) else {
+            continue;
+        };
+        if !(1..=12).contains(&month) {
+            continue;
+        }
+        let day_max = days_in_month(year as i32, month as u32) as i64;
+        if !(1..=day_max).contains(&day) {
+            continue;
+        }
+        return unix_ts_from_ymd(year as i32, month as u32, day as u32);
+    }
+    None
+}
+
+fn parse_digits(bytes: &[u8], start: usize, len: usize) -> Option<i64> {
+    let mut value: i64 = 0;
+    for offset in 0..len {
+        let ch = *bytes.get(start + offset)?;
+        if !ch.is_ascii_digit() {
+            return None;
+        }
+        value = value * 10 + i64::from(ch - b'0');
+    }
+    Some(value)
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let mut y = i64::from(year);
+    let m = i64::from(month);
+    let d = i64::from(day);
+    if m <= 2 {
+        y -= 1;
+    }
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = m + if m > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn unix_ts_from_ymd(year: i32, month: u32, day: u32) -> Option<i64> {
+    let days = days_from_civil(year, month, day);
+    normalize_unix_ts(days.saturating_mul(86_400))
+}
+
+fn infer_match_timestamp(
+    raw: &serde_json::Value,
+    source: Option<&str>,
+    citation: Option<&str>,
+) -> Option<i64> {
+    let mut candidates: Vec<i64> = Vec::new();
+    let timestamp_fields = [
+        "published_at",
+        "publishedAt",
+        "updated_at",
+        "updatedAt",
+        "created_at",
+        "createdAt",
+        "timestamp",
+        "ts",
+        "time",
+        "date",
+        "datetime",
+        "fetched_at",
+        "last_modified",
+    ];
+    if let Some(obj) = raw.as_object() {
+        for key in &timestamp_fields {
+            if let Some(value) = obj.get(*key) {
+                if let Some(ts) = parse_timestamp_value(value) {
+                    candidates.push(ts);
+                }
+            }
+        }
+        if let Some(metadata) = obj.get("metadata").and_then(serde_json::Value::as_object) {
+            for (key, value) in metadata {
+                let lowered = key.to_ascii_lowercase();
+                if lowered.contains("time")
+                    || lowered.contains("date")
+                    || lowered.contains("publish")
+                    || lowered.contains("update")
+                    || lowered.contains("create")
+                    || lowered.contains("stamp")
+                {
+                    if let Some(ts) = parse_timestamp_value(value) {
+                        candidates.push(ts);
+                    }
+                }
+            }
+        }
+    }
+    for text in [source, citation].into_iter().flatten() {
+        if let Some(ts) = parse_timestamp_string(text) {
+            candidates.push(ts);
+        }
+    }
+    candidates.into_iter().max()
+}
+
+fn now_unix_ts() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn utc_date_from_unix_days(days_since_epoch: i64) -> String {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn format_match_timestamp(ts: i64) -> String {
+    utc_date_from_unix_days(ts.div_euclid(86_400))
+}
+
+fn recency_order(left: &RagMatch, right: &RagMatch) -> Ordering {
+    match (left.published_at_unix, right.published_at_unix) {
+        (Some(left_ts), Some(right_ts)) => right_ts.cmp(&left_ts).then_with(|| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(Ordering::Equal)
+        }),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(Ordering::Equal),
+    }
 }
 
 fn merge_research_contexts(
@@ -186,12 +416,13 @@ fn merge_research_contexts(
 ) -> ResearchContext {
     let mut deduped_matches: Vec<RagMatch> = Vec::new();
     let mut seen_match_keys = std::collections::HashSet::new();
-    let mut context_blocks = Vec::new();
+    let mut fallback_context_blocks = Vec::new();
     let mut sources = std::collections::BTreeSet::new();
+    let now_ts = now_unix_ts();
 
     for ctx in contexts {
         if !ctx.context.trim().is_empty() {
-            context_blocks.push(format!("Query: {}\n{}", ctx.query, ctx.context.trim()));
+            fallback_context_blocks.push(format!("Query: {}\n{}", ctx.query, ctx.context.trim()));
         }
         for m in ctx.matches {
             if let Some(source) = m.source.as_deref() {
@@ -216,29 +447,56 @@ fn merge_research_contexts(
         }
     }
 
-    deduped_matches.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    deduped_matches.sort_by(recency_order);
+    let dated_match_count = deduped_matches
+        .iter()
+        .filter(|m| m.published_at_unix.is_some())
+        .count();
 
     if top_k > 0 && deduped_matches.len() > top_k {
         deduped_matches.truncate(top_k);
     }
 
-    if context_blocks.is_empty() {
-        let fallback = deduped_matches
-            .iter()
-            .map(|m| m.content.trim())
-            .filter(|content| !content.is_empty())
-            .take(3)
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        if !fallback.is_empty() {
-            context_blocks.push(fallback);
-        }
-    }
+    let recency_blocks = deduped_matches
+        .iter()
+        .filter_map(|m| {
+            let content = m.content.trim();
+            if content.is_empty() {
+                return None;
+            }
+            let source_label = m
+                .source
+                .as_deref()
+                .or(m.citation.as_deref())
+                .unwrap_or("unknown_source");
+            let line = match m.published_at_unix {
+                Some(ts) => {
+                    let age_days = now_ts.saturating_sub(ts).max(0) / 86_400;
+                    format!(
+                        "score={:.3} date={} age_days={} source={}",
+                        m.score,
+                        format_match_timestamp(ts),
+                        age_days,
+                        source_label
+                    )
+                }
+                None => format!(
+                    "score={:.3} date=unknown age_days=unknown source={}",
+                    m.score, source_label
+                ),
+            };
+            Some(format!("[{line}]\n{content}"))
+        })
+        .take(top_k.max(1))
+        .collect::<Vec<_>>();
+
+    let context_body = if !recency_blocks.is_empty() {
+        recency_blocks.join("\n\n")
+    } else if !fallback_context_blocks.is_empty() {
+        fallback_context_blocks.join("\n\n---\n\n")
+    } else {
+        String::new()
+    };
 
     let mut header_lines: Vec<String> = Vec::new();
     if !site_hints.is_empty() {
@@ -250,13 +508,25 @@ fn merge_research_contexts(
             sources.into_iter().take(12).collect::<Vec<_>>().join(", ")
         ));
     }
+    header_lines.push(
+        "Time relevance policy: newest timestamped evidence ranks above older or undated matches."
+            .to_string(),
+    );
+    header_lines.push(format!(
+        "Reference date (UTC): {}",
+        format_match_timestamp(now_ts)
+    ));
+    header_lines.push(format!(
+        "Timestamp coverage: {dated_match_count}/{} matches carried parseable dates.",
+        deduped_matches.len()
+    ));
     let header = if header_lines.is_empty() {
         String::new()
     } else {
         format!("{}\n\n", header_lines.join("\n"))
     };
 
-    let context = format!("{}{}", header, context_blocks.join("\n\n---\n\n"));
+    let context = format!("{}{}", header, context_body);
 
     ResearchContext {
         query: base_query.to_string(),
@@ -692,6 +962,64 @@ mod tests {
         assert_eq!(queries[1], "btc market momentum site:bloomberg.com");
     }
 
+    #[test]
+    fn parse_timestamp_string_supports_iso_date_and_unix_seconds() {
+        let iso = parse_timestamp_string("published on 2026-05-15 by Bloomberg")
+            .expect("must parse ISO date");
+        assert_eq!(format_match_timestamp(iso), "2026-05-15");
+
+        let unix = parse_timestamp_string("1715731200").expect("must parse unix seconds");
+        assert_eq!(format_match_timestamp(unix), "2024-05-15");
+    }
+
+    #[test]
+    fn merge_research_contexts_prioritizes_newer_dated_matches() {
+        let contexts = vec![ResearchContext {
+            query: "btc market sentiment".to_string(),
+            context: "legacy context".to_string(),
+            matches: vec![
+                RagMatch {
+                    id: "old-high-score".to_string(),
+                    score: 0.99,
+                    content: "Older article".to_string(),
+                    source: Some("https://example.com/2024/01/01/report".to_string()),
+                    citation: None,
+                    published_at_unix: unix_ts_from_ymd(2024, 1, 1),
+                },
+                RagMatch {
+                    id: "newer-lower-score".to_string(),
+                    score: 0.61,
+                    content: "More recent article".to_string(),
+                    source: Some("https://example.com/2026/05/15/report".to_string()),
+                    citation: None,
+                    published_at_unix: unix_ts_from_ymd(2026, 5, 15),
+                },
+                RagMatch {
+                    id: "undated-high-score".to_string(),
+                    score: 1.0,
+                    content: "Undated article".to_string(),
+                    source: Some("https://example.com/undated".to_string()),
+                    citation: None,
+                    published_at_unix: None,
+                },
+            ],
+            source: "refiner/crypto".to_string(),
+        }];
+        let merged = merge_research_contexts(
+            "btc market sentiment",
+            "crypto",
+            &vec!["bloomberg.com".to_string()],
+            5,
+            contexts,
+        );
+
+        assert_eq!(merged.matches[0].id, "newer-lower-score");
+        assert_eq!(merged.matches[1].id, "old-high-score");
+        assert_eq!(merged.matches[2].id, "undated-high-score");
+        assert!(merged.context.contains("Time relevance policy"));
+        assert!(merged.context.contains("Timestamp coverage:"));
+    }
+
     #[tokio::test]
     async fn research_parses_openapi_match_shape_and_falls_back_to_match_text() {
         let server = MockServer::start().await;
@@ -730,6 +1058,10 @@ mod tests {
         assert_eq!(
             context.matches[0].citation.as_deref(),
             Some("bloomberg:2026-05-15")
+        );
+        assert_eq!(
+            context.matches[0].published_at_unix,
+            unix_ts_from_ymd(2026, 5, 15)
         );
         assert!(
             context
@@ -779,7 +1111,12 @@ mod tests {
                 .context
                 .contains("Preferred sites: bloomberg.com, reuters.com, cnbc.com")
         );
-        assert!(context.context.contains("Query: btc market sentiment"));
+        assert!(
+            context
+                .context
+                .contains("Time relevance policy: newest timestamped evidence ranks above older or undated matches.")
+        );
+        assert!(context.context.contains("Market breadth improving"));
         assert_eq!(context.matches.len(), 1, "deduped match list expected");
     }
 }
