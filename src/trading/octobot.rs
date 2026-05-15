@@ -16,6 +16,7 @@ use reqwest::{Client, ClientBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
 use crate::{
@@ -24,6 +25,7 @@ use crate::{
 };
 
 const OCTOBOT_API: &str = "octobot";
+const MAX_PARALLEL_MARKET_SNAPSHOT_REQUESTS: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Domain models
@@ -932,7 +934,7 @@ impl OctobotClient {
                 return Vec::new();
             }
         };
-        let mut snapshots = Vec::new();
+        let mut targets: Vec<(String, String)> = Vec::new();
         'outer: for exchange in exchanges.iter().filter(|e| e.enabled) {
             if !target_exchanges.is_empty()
                 && !target_exchanges
@@ -949,17 +951,73 @@ impl OctobotClient {
                 {
                     continue;
                 }
-                match self.get_market_snapshot(&exchange.name, symbol).await {
-                    Ok(snap) => snapshots.push(snap),
-                    Err(err) => {
-                        warn!(
-                            "trading: ticker {}/{} failed: {}",
-                            exchange.name, symbol, err
-                        );
+                targets.push((exchange.name.clone(), symbol.clone()));
+                if targets.len() >= limit {
+                    break 'outer;
+                }
+            }
+        }
+        if targets.is_empty() {
+            return Vec::new();
+        }
+
+        let mut snapshots = Vec::new();
+        let mut join_set: JoinSet<(String, String, Result<MarketSnapshot, String>)> =
+            JoinSet::new();
+        let mut pending = targets.into_iter();
+        let max_parallel = MAX_PARALLEL_MARKET_SNAPSHOT_REQUESTS.max(1);
+        for _ in 0..max_parallel {
+            let Some((exchange, symbol)) = pending.next() else {
+                break;
+            };
+            let client = self.clone();
+            join_set.spawn(async move {
+                let result = client.get_market_snapshot(&exchange, &symbol).await;
+                (exchange, symbol, result)
+            });
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok((_exchange, _symbol, Ok(snapshot))) => {
+                    snapshots.push(snapshot);
+                    if snapshots.len() >= limit {
+                        join_set.abort_all();
+                        break;
+                    }
+                    if let Some((next_exchange, next_symbol)) = pending.next() {
+                        let client = self.clone();
+                        join_set.spawn(async move {
+                            let result = client
+                                .get_market_snapshot(&next_exchange, &next_symbol)
+                                .await;
+                            (next_exchange, next_symbol, result)
+                        });
                     }
                 }
-                if snapshots.len() >= limit {
-                    break 'outer;
+                Ok((exchange, symbol, Err(err))) => {
+                    warn!("trading: ticker {}/{} failed: {}", exchange, symbol, err);
+                    if let Some((next_exchange, next_symbol)) = pending.next() {
+                        let client = self.clone();
+                        join_set.spawn(async move {
+                            let result = client
+                                .get_market_snapshot(&next_exchange, &next_symbol)
+                                .await;
+                            (next_exchange, next_symbol, result)
+                        });
+                    }
+                }
+                Err(error) => {
+                    warn!("trading: market snapshot task failed: {}", error);
+                    if let Some((next_exchange, next_symbol)) = pending.next() {
+                        let client = self.clone();
+                        join_set.spawn(async move {
+                            let result = client
+                                .get_market_snapshot(&next_exchange, &next_symbol)
+                                .await;
+                            (next_exchange, next_symbol, result)
+                        });
+                    }
                 }
             }
         }

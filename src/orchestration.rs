@@ -1,9 +1,15 @@
-use std::{collections::HashSet, env, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::{
+    sync::{Mutex, oneshot},
     task::JoinSet,
     time::{Instant, sleep},
 };
@@ -24,6 +30,7 @@ use crate::{
         ProviderCompletionRequest, SelectionMode, SpecialistAnalysisResponse,
         TranscriptionResponse,
     },
+    nmc_telemetry::{NmcAgentSignal, NmcTelemetryClient},
     providers::{
         ProviderHealth, ProviderInvocationResponse, TranscriptionInput, build_adapter,
         normalize_provider_type, provider_request_from_profile,
@@ -49,8 +56,10 @@ struct GailServiceInner {
     metrics: MetricsStore,
     specialists: Vec<SpecialistEngine>,
     aarnn_bridge: Option<AarnnMirrorClient>,
+    nmc_telemetry: Option<NmcTelemetryClient>,
     trading_bridge: Option<TradingBridge>,
     _trading_bridge_handle: Option<TradingBridgeHandle>,
+    load_tracker: Arc<Mutex<LoadTracker>>,
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +72,18 @@ struct ProviderCandidate {
     weight: f64,
     specialties: HashSet<String>,
     roles: HashSet<String>,
+    host_group: Option<String>,
+    priority_bias: f64,
+    usage_penalty_decay_seconds: f64,
+    max_concurrent_requests: Option<usize>,
+    resource_cost_cpu: f64,
+    resource_cost_ram_mb: u64,
+    resource_cost_vram_mb: u64,
+    host_cpu_budget: Option<f64>,
+    host_ram_budget_mb: Option<u64>,
+    host_vram_budget_mb: Option<u64>,
+    nmc_agent_id: Option<String>,
+    nmc_host: Option<String>,
 }
 
 #[derive(Debug)]
@@ -83,6 +104,37 @@ struct RankedCandidate {
     health_mode: Option<String>,
 }
 
+#[derive(Default)]
+struct LoadTracker {
+    candidate_in_flight: HashMap<String, usize>,
+    host_usage: HashMap<String, HostLoad>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HostLoad {
+    requests: usize,
+    cpu: f64,
+    ram_mb: u64,
+    vram_mb: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CandidateLoadSnapshot {
+    candidate_limit_ratio: f64,
+    candidate_limit_reached: bool,
+    host_budget_ratio: f64,
+    host_budget_reached: bool,
+}
+
+#[derive(Clone, Debug)]
+struct LoadReservation {
+    candidate_id: String,
+    host_group: Option<String>,
+    resource_cost_cpu: f64,
+    resource_cost_ram_mb: u64,
+    resource_cost_vram_mb: u64,
+}
+
 impl GailService {
     pub async fn new(config: GailConfig) -> Result<Self> {
         adaptive_schema::configure_persistence(config.storage.adaptive_schema_path.clone()).await;
@@ -101,6 +153,8 @@ impl GailService {
         let metrics = MetricsStore::new(config.storage.metrics_path.clone()).await?;
         let specialists = build_specialist_engines(&config, client.clone());
         let aarnn_bridge = AarnnMirrorClient::from_config(&config, client.clone(), &specialists);
+        let nmc_telemetry = NmcTelemetryClient::from_config(&config, client.clone());
+        let load_tracker = Arc::new(Mutex::new(LoadTracker::default()));
 
         // Construct a preliminary service (without trading) to pass into the trading bridge.
         let preliminary = Self {
@@ -110,8 +164,10 @@ impl GailService {
                 metrics: metrics.clone(),
                 specialists: specialists.clone(),
                 aarnn_bridge: aarnn_bridge.clone(),
+                nmc_telemetry: nmc_telemetry.clone(),
                 trading_bridge: None,
                 _trading_bridge_handle: None,
+                load_tracker: load_tracker.clone(),
             }),
         };
 
@@ -132,8 +188,10 @@ impl GailService {
                 metrics,
                 specialists,
                 aarnn_bridge,
+                nmc_telemetry,
                 trading_bridge,
                 _trading_bridge_handle: trading_bridge_handle,
+                load_tracker,
             }),
         })
     }
@@ -144,6 +202,10 @@ impl GailService {
 
     fn aarnn_bridge(&self) -> Option<&AarnnMirrorClient> {
         self.inner.aarnn_bridge.as_ref()
+    }
+
+    fn nmc_telemetry(&self) -> Option<&NmcTelemetryClient> {
+        self.inner.nmc_telemetry.as_ref()
     }
 
     pub fn trading_bridge(&self) -> Option<&TradingBridge> {
@@ -195,20 +257,22 @@ impl GailService {
         profile.base_url = request.base_url.clone();
         profile.source = Some("request_direct".to_string());
         let candidate = ProviderCandidate::from_profile(profile.clone());
-        let mirror_input = self.spawn_aarnn_mirror(self.build_aarnn_exchange(
-            request_id.as_str(),
-            request_id.as_str(),
-            "direct",
-            "assistant",
-            AarnnMirrorDirection::Input,
-            Some(request.provider.as_str()),
-            request.model.as_deref(),
-            request.request_category.as_deref(),
-            request.system.as_deref(),
-            None,
-            prompt_text.as_str(),
-            &request.messages,
-        ));
+        let mirror_input = self
+            .spawn_aarnn_mirror(self.build_aarnn_exchange(
+                request_id.as_str(),
+                request_id.as_str(),
+                "direct",
+                "assistant",
+                AarnnMirrorDirection::Input,
+                Some(request.provider.as_str()),
+                request.model.as_deref(),
+                request.request_category.as_deref(),
+                request.system.as_deref(),
+                None,
+                prompt_text.as_str(),
+                &request.messages,
+            ))
+            .await;
         let adapter = build_adapter(self.inner.client.clone(), &profile)?;
         let response = match adapter.complete(&request).await {
             Ok(response) => response,
@@ -410,20 +474,22 @@ impl GailService {
             &provider_request.messages,
             provider_request.system.as_deref(),
         );
-        let mirror_input = self.spawn_aarnn_mirror(self.build_aarnn_exchange(
-            request_id.as_str(),
-            request_id.as_str(),
-            workflow.as_str(),
-            role.as_str(),
-            AarnnMirrorDirection::Input,
-            Some(provider_request.provider.as_str()),
-            provider_request.model.as_deref(),
-            provider_request.request_category.as_deref(),
-            provider_request.system.as_deref(),
-            None,
-            mirrored_prompt_text.as_str(),
-            &provider_request.messages,
-        ));
+        let mirror_input = self
+            .spawn_aarnn_mirror(self.build_aarnn_exchange(
+                request_id.as_str(),
+                request_id.as_str(),
+                workflow.as_str(),
+                role.as_str(),
+                AarnnMirrorDirection::Input,
+                Some(provider_request.provider.as_str()),
+                provider_request.model.as_deref(),
+                provider_request.request_category.as_deref(),
+                provider_request.system.as_deref(),
+                None,
+                mirrored_prompt_text.as_str(),
+                &provider_request.messages,
+            ))
+            .await;
 
         let mut candidates = self.build_candidates(&request, include_configured);
         if candidates.is_empty() {
@@ -432,11 +498,25 @@ impl GailService {
             ));
         }
         let mut ranked = Vec::new();
+        let mut rank_join_set = JoinSet::new();
         for candidate in candidates.drain(..) {
-            ranked.push(
-                self.rank_candidate(candidate, &workflow, &role, &task_tags)
-                    .await,
-            );
+            let service = self.clone();
+            let workflow_clone = workflow.clone();
+            let role_clone = role.clone();
+            let task_tags_clone = task_tags.clone();
+            rank_join_set.spawn(async move {
+                service
+                    .rank_candidate(candidate, &workflow_clone, &role_clone, &task_tags_clone)
+                    .await
+            });
+        }
+        while let Some(result) = rank_join_set.join_next().await {
+            match result {
+                Ok(item) => ranked.push(item),
+                Err(error) => {
+                    tracing::warn!(error = %error, "candidate ranking task failed");
+                }
+            }
         }
         ranked.sort_by(|left, right| {
             right
@@ -966,6 +1046,7 @@ impl GailService {
             weight: 0.0,
             preferred: true,
             source: Some("request_transcribe".to_string()),
+            ..ProviderProfile::default()
         };
         let adapter = build_adapter(self.inner.client.clone(), &profile)?;
         let response = adapter.transcribe(&input).await?;
@@ -1052,6 +1133,12 @@ impl GailService {
             .map(|path| path.display().to_string());
         let routing_profiles_version = default_routing_profiles().version;
         let aarnn_bridge = AarnnMirrorClient::status(&self.inner.config, &self.inner.specialists);
+        let nmc_telemetry = if let Some(client) = self.nmc_telemetry() {
+            serde_json::to_value(client.status().await).unwrap_or_else(|_| Value::Null)
+        } else {
+            serde_json::to_value(NmcTelemetryClient::status_from_config(&self.inner.config))
+                .unwrap_or_else(|_| Value::Null)
+        };
         json!({
             "enabled": self.inner.config.orchestration.enabled,
             "routing_profiles_path": routing_profiles_path,
@@ -1064,6 +1151,7 @@ impl GailService {
             "engine_count": engines.len(),
             "engines": engines,
             "aarnn_bridge": aarnn_bridge,
+            "nmc_telemetry": nmc_telemetry,
             "metrics": metrics,
             "api_issues": api_issues,
             "model_inventory": model_inventory,
@@ -1071,36 +1159,63 @@ impl GailService {
     }
 
     async fn provider_summaries(&self, probe_health: bool) -> Vec<Value> {
-        let mut providers = Vec::new();
-        for profile in &self.inner.config.providers {
-            let provider_type = normalize_provider_type(profile.provider_type.as_str());
-            let health = if probe_health {
-                match build_adapter(self.inner.client.clone(), profile) {
-                    Ok(adapter) => {
-                        match adapter.health(Some(PROVIDER_HEALTH_TIMEOUT_SECONDS)).await {
-                            Ok(status) => json!(status),
-                            Err(error) => json!({"ok": false, "message": error.to_string()}),
+        let profiles = self.inner.config.providers.clone();
+        let mut join_set = JoinSet::new();
+        for (index, profile) in profiles.into_iter().enumerate() {
+            let client = self.inner.client.clone();
+            join_set.spawn(async move {
+                let provider_type = normalize_provider_type(profile.provider_type.as_str());
+                let health = if probe_health {
+                    match build_adapter(client, &profile) {
+                        Ok(adapter) => {
+                            match adapter.health(Some(PROVIDER_HEALTH_TIMEOUT_SECONDS)).await {
+                                Ok(status) => json!(status),
+                                Err(error) => json!({"ok": false, "message": error.to_string()}),
+                            }
                         }
+                        Err(error) => json!({"ok": false, "message": error.to_string()}),
                     }
-                    Err(error) => json!({"ok": false, "message": error.to_string()}),
-                }
-            } else {
-                Value::Null
-            };
-            providers.push(json!({
-                "name": profile.name,
-                "provider": provider_type,
-                "model": profile.model,
-                "source": profile.source,
-                "roles": profile.roles,
-                "specialties": profile.specialties,
-                "weight": profile.weight,
-                "preferred": profile.preferred,
-                "base_url": profile.base_url,
-                "health": health,
-            }));
+                } else {
+                    Value::Null
+                };
+                (
+                    index,
+                    json!({
+                        "name": profile.name,
+                        "provider": provider_type,
+                        "model": profile.model,
+                        "source": profile.source,
+                        "roles": profile.roles,
+                        "specialties": profile.specialties,
+                        "weight": profile.weight,
+                        "preferred": profile.preferred,
+                        "base_url": profile.base_url,
+                        "host_group": profile.host_group,
+                        "max_concurrent_requests": profile.max_concurrent_requests,
+                        "resource_cost_cpu": profile.resource_cost_cpu,
+                        "resource_cost_ram_mb": profile.resource_cost_ram_mb,
+                        "resource_cost_vram_mb": profile.resource_cost_vram_mb,
+                        "host_cpu_budget": profile.host_cpu_budget,
+                        "host_ram_budget_mb": profile.host_ram_budget_mb,
+                        "host_vram_budget_mb": profile.host_vram_budget_mb,
+                        "nmc_agent_id": profile.nmc_agent_id,
+                        "nmc_host": profile.nmc_host,
+                        "health": health,
+                    }),
+                )
+            });
         }
-        providers
+        let mut ordered = Vec::new();
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(item) => ordered.push(item),
+                Err(error) => {
+                    tracing::warn!(error = %error, "provider summary task failed");
+                }
+            }
+        }
+        ordered.sort_by_key(|(index, _)| *index);
+        ordered.into_iter().map(|(_, value)| value).collect()
     }
 
     async fn first_ollama_inventory(&self) -> Value {
@@ -1117,10 +1232,10 @@ impl GailService {
         Value::Null
     }
 
-    fn spawn_aarnn_mirror(
+    async fn spawn_aarnn_mirror(
         &self,
         exchange: AarnnMirrorExchange,
-    ) -> Option<tokio::task::JoinHandle<crate::models::AarnnMirrorInvocationTrace>> {
+    ) -> Option<oneshot::Receiver<crate::models::AarnnMirrorInvocationTrace>> {
         let bridge = self.inner.aarnn_bridge.clone()?;
         let should_mirror = match exchange.direction {
             AarnnMirrorDirection::Input => bridge.should_mirror_input(),
@@ -1129,20 +1244,28 @@ impl GailService {
         if !should_mirror {
             return None;
         }
-        Some(tokio::spawn(async move { bridge.mirror(exchange).await }))
+        bridge.enqueue(exchange, true).await
     }
 
     async fn await_aarnn_mirror_task(
         &self,
-        task: Option<tokio::task::JoinHandle<crate::models::AarnnMirrorInvocationTrace>>,
+        task: Option<oneshot::Receiver<crate::models::AarnnMirrorInvocationTrace>>,
     ) -> Option<crate::models::AarnnMirrorInvocationTrace> {
         let task = task?;
-        match task.await {
-            Ok(trace) => Some(trace),
-            Err(error) => {
-                tracing::warn!(error = %error, "AARNN mirror task join failed");
+        let wait_timeout = self
+            .aarnn_bridge()
+            .map(|bridge| bridge.candidate_wait_timeout())
+            .unwrap_or_else(|| Duration::from_millis(0));
+        if wait_timeout.is_zero() {
+            return None;
+        }
+        match tokio::time::timeout(wait_timeout, task).await {
+            Ok(Ok(trace)) => Some(trace),
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "AARNN mirror receiver dropped");
                 None
             }
+            Err(_) => None,
         }
     }
 
@@ -1160,28 +1283,24 @@ impl GailService {
         text: &str,
         messages: &[crate::models::ChatMessage],
     ) -> Option<crate::models::AarnnMirrorInvocationTrace> {
-        let bridge = self.aarnn_bridge()?;
-        if !bridge.should_mirror_output() {
-            return None;
-        }
-        Some(
-            bridge
-                .mirror(self.build_aarnn_exchange(
-                    request_id,
-                    conversation_id,
-                    workflow,
-                    role,
-                    AarnnMirrorDirection::Output,
-                    provider,
-                    model,
-                    request_category,
-                    system,
-                    prompt_text,
-                    text,
-                    messages,
-                ))
-                .await,
+        self.await_aarnn_mirror_task(
+            self.spawn_aarnn_mirror(self.build_aarnn_exchange(
+                request_id,
+                conversation_id,
+                workflow,
+                role,
+                AarnnMirrorDirection::Output,
+                provider,
+                model,
+                request_category,
+                system,
+                prompt_text,
+                text,
+                messages,
+            ))
+            .await,
         )
+        .await
     }
 
     fn build_aarnn_exchange(
@@ -1305,6 +1424,7 @@ impl GailService {
             weight: if preferred { 0.4 } else { 0.0 },
             preferred,
             source: Some(source.to_string()),
+            ..ProviderProfile::default()
         })
     }
 
@@ -1315,6 +1435,7 @@ impl GailService {
         role: &str,
         task_tags: &HashSet<String>,
     ) -> RankedCandidate {
+        let candidate_id = candidate.candidate_id();
         let overlap = task_tags.intersection(&candidate.specialties).count() as f64;
         let role_score = if candidate.roles.is_empty() {
             0.0
@@ -1361,22 +1482,64 @@ impl GailService {
         } else {
             self.probe_health(&candidate).await
         };
-        let health_score = if health.ok { 0.4 } else { -1.4 };
+        let nmc_signal = self.nmc_signal_for_candidate(&candidate).await;
+        let nmc_constrained = nmc_signal.as_ref().is_some_and(|signal| signal.constrained);
+        let nmc_pressure_penalty = nmc_signal
+            .as_ref()
+            .map(|signal| signal.pressure_ratio.clamp(0.0, 2.5) * 1.35)
+            .unwrap_or(0.0);
+        let nmc_hard_limit_penalty = if nmc_constrained { 2.8 } else { 0.0 };
+        let load = self.load_snapshot(&candidate).await;
+        let usage_penalty = self
+            .inner
+            .metrics
+            .recent_usage_penalty(
+                candidate_id.as_str(),
+                workflow,
+                role,
+                candidate.usage_penalty_decay_seconds,
+            )
+            .await;
+        let resource_penalty =
+            (load.candidate_limit_ratio * 1.1) + (load.host_budget_ratio.clamp(0.0, 2.0) * 1.2);
+        let hard_limit_penalty = if load.candidate_limit_reached || load.host_budget_reached {
+            2.4
+        } else {
+            0.0
+        };
+        let health_ok = health.ok
+            && !load.candidate_limit_reached
+            && !load.host_budget_reached
+            && !nmc_constrained;
+        let health_mode = if nmc_constrained {
+            Some("nmc_constrained".to_string())
+        } else if !health_ok && health.ok {
+            Some("resource_saturated".to_string())
+        } else {
+            health.mode.clone()
+        };
+        let health_score = if health_ok { 0.4 } else { -1.4 };
         let preferred_score = if candidate.preferred { 0.7 } else { 0.0 };
         let metrics_bonus = self
             .inner
             .metrics
-            .score_bonus(candidate.candidate_id().as_str(), workflow, role)
+            .score_bonus(candidate_id.as_str(), workflow, role)
             .await;
         RankedCandidate {
-            health_ok: health.ok,
-            health_mode: health.mode.clone(),
+            health_ok,
+            health_mode,
             score: candidate.weight
+                + candidate.priority_bias
                 + (overlap * 0.85)
                 + role_score
                 + health_score
                 + preferred_score
-                + metrics_bonus,
+                + metrics_bonus
+                - usage_penalty
+                - resource_penalty
+                - hard_limit_penalty
+                - nmc_pressure_penalty
+                - nmc_hard_limit_penalty,
             candidate,
         }
     }
@@ -1447,6 +1610,151 @@ impl GailService {
             )
             .await;
         health
+    }
+
+    async fn nmc_signal_for_candidate(
+        &self,
+        candidate: &ProviderCandidate,
+    ) -> Option<NmcAgentSignal> {
+        let nmc = self.nmc_telemetry()?;
+        nmc.signal(
+            candidate.nmc_agent_id.as_deref(),
+            candidate.nmc_host.as_deref(),
+            candidate.host_group.as_deref(),
+        )
+        .await
+    }
+
+    async fn load_snapshot(&self, candidate: &ProviderCandidate) -> CandidateLoadSnapshot {
+        let candidate_id = candidate.candidate_id();
+        let tracker = self.inner.load_tracker.lock().await;
+        let candidate_in_flight = tracker
+            .candidate_in_flight
+            .get(&candidate_id)
+            .copied()
+            .unwrap_or(0);
+        let candidate_limit = candidate.max_concurrent_requests;
+        let candidate_limit_ratio = candidate_limit
+            .map(|limit| candidate_in_flight as f64 / limit.max(1) as f64)
+            .unwrap_or(0.0);
+        let candidate_limit_reached = candidate_limit
+            .map(|limit| candidate_in_flight >= limit.max(1))
+            .unwrap_or(false);
+        let host_usage = candidate
+            .host_group
+            .as_ref()
+            .map(|group| tracker.host_usage.get(group).cloned().unwrap_or_default());
+        let projected_host_usage = host_usage.as_ref().map(|current| HostLoad {
+            requests: current.requests.saturating_add(1),
+            cpu: current.cpu + candidate.resource_cost_cpu.max(0.0),
+            ram_mb: current
+                .ram_mb
+                .saturating_add(candidate.resource_cost_ram_mb.max(0)),
+            vram_mb: current
+                .vram_mb
+                .saturating_add(candidate.resource_cost_vram_mb.max(0)),
+        });
+        let host_budget_ratio = projected_host_usage
+            .as_ref()
+            .map(|usage| host_budget_ratio(candidate, usage))
+            .unwrap_or(0.0);
+        let host_budget_reached = projected_host_usage
+            .as_ref()
+            .is_some_and(|usage| host_budget_exceeded(candidate, usage));
+        CandidateLoadSnapshot {
+            candidate_limit_ratio,
+            candidate_limit_reached,
+            host_budget_ratio,
+            host_budget_reached,
+        }
+    }
+
+    async fn reserve_candidate_load(
+        &self,
+        candidate: &ProviderCandidate,
+    ) -> Option<LoadReservation> {
+        let candidate_id = candidate.candidate_id();
+        let mut tracker = self.inner.load_tracker.lock().await;
+        let candidate_in_flight = tracker
+            .candidate_in_flight
+            .get(&candidate_id)
+            .copied()
+            .unwrap_or(0);
+        if candidate
+            .max_concurrent_requests
+            .is_some_and(|limit| candidate_in_flight >= limit.max(1))
+        {
+            return None;
+        }
+        if let Some(host_group) = candidate.host_group.as_ref() {
+            let current = tracker
+                .host_usage
+                .get(host_group)
+                .cloned()
+                .unwrap_or_default();
+            let projected = HostLoad {
+                requests: current.requests.saturating_add(1),
+                cpu: current.cpu + candidate.resource_cost_cpu.max(0.0),
+                ram_mb: current
+                    .ram_mb
+                    .saturating_add(candidate.resource_cost_ram_mb.max(0)),
+                vram_mb: current
+                    .vram_mb
+                    .saturating_add(candidate.resource_cost_vram_mb.max(0)),
+            };
+            if host_budget_exceeded(candidate, &projected) {
+                return None;
+            }
+            tracker.host_usage.insert(host_group.clone(), projected);
+        }
+        tracker
+            .candidate_in_flight
+            .entry(candidate_id.clone())
+            .and_modify(|value| *value += 1)
+            .or_insert(1);
+        Some(LoadReservation {
+            candidate_id,
+            host_group: candidate.host_group.clone(),
+            resource_cost_cpu: candidate.resource_cost_cpu.max(0.0),
+            resource_cost_ram_mb: candidate.resource_cost_ram_mb.max(0),
+            resource_cost_vram_mb: candidate.resource_cost_vram_mb.max(0),
+        })
+    }
+
+    async fn release_candidate_load(&self, reservation: LoadReservation) {
+        let mut tracker = self.inner.load_tracker.lock().await;
+        if let Some(current) = tracker
+            .candidate_in_flight
+            .get(reservation.candidate_id.as_str())
+            .copied()
+        {
+            if current <= 1 {
+                tracker
+                    .candidate_in_flight
+                    .remove(reservation.candidate_id.as_str());
+            } else {
+                tracker
+                    .candidate_in_flight
+                    .insert(reservation.candidate_id.clone(), current - 1);
+            }
+        }
+        if let Some(host_group) = reservation.host_group.as_ref() {
+            let mut should_remove = false;
+            if let Some(current) = tracker.host_usage.get_mut(host_group) {
+                current.requests = current.requests.saturating_sub(1);
+                current.cpu = (current.cpu - reservation.resource_cost_cpu).max(0.0);
+                current.ram_mb = current
+                    .ram_mb
+                    .saturating_sub(reservation.resource_cost_ram_mb.max(0));
+                current.vram_mb = current
+                    .vram_mb
+                    .saturating_sub(reservation.resource_cost_vram_mb.max(0));
+                should_remove = current.requests == 0;
+            }
+            if should_remove {
+                tracker.host_usage.remove(host_group);
+            }
+        }
     }
 
     async fn invoke_candidates(
@@ -1570,6 +1878,44 @@ impl GailService {
         expected_json: bool,
         timeout_cap: Option<u64>,
     ) -> InvocationResult {
+        if let Some(signal) = self.nmc_signal_for_candidate(&candidate).await {
+            if signal.constrained {
+                let agent = if signal.agent_id.trim().is_empty() {
+                    "unknown"
+                } else {
+                    signal.agent_id.as_str()
+                };
+                let host = if signal.host.trim().is_empty() {
+                    "unknown"
+                } else {
+                    signal.host.as_str()
+                };
+                return InvocationResult {
+                    candidate,
+                    response: None,
+                    error: Some(format!(
+                        "candidate skipped because NMC/Tracey telemetry reports constrained capacity (agent={agent}, host={host}, status={}, mode={}, optimize_status={}, pressure_ratio={:.2})",
+                        signal.status, signal.mode, signal.optimize_status, signal.pressure_ratio,
+                    )),
+                    latency_ms: None,
+                    quality: -1.0,
+                    score: f64::NEG_INFINITY,
+                };
+            }
+        }
+        let Some(load_reservation) = self.reserve_candidate_load(&candidate).await else {
+            return InvocationResult {
+                candidate,
+                response: None,
+                error: Some(
+                    "candidate skipped because configured concurrency/resource budget is exhausted"
+                        .to_string(),
+                ),
+                latency_ms: None,
+                quality: -1.0,
+                score: f64::NEG_INFINITY,
+            };
+        };
         let quota_retries = env_int_any(&["LLM_RATE_LIMIT_RETRIES"], 2) as usize;
         let timeout_retries = env_int_any(&["LLM_TIMEOUT_RETRIES"], 1) as usize;
         let quota_backoff_base = env_float_any(&["LLM_RATE_LIMIT_BACKOFF_BASE"], 1.0).max(0.1);
@@ -1657,8 +2003,8 @@ impl GailService {
                 }
             }
         };
-        if let Some(timeout_window) = timeout_window {
-            return match tokio::time::timeout(timeout_window, invocation).await {
+        let result = if let Some(timeout_window) = timeout_window {
+            match tokio::time::timeout(timeout_window, invocation).await {
                 Ok(result) => result,
                 Err(_) => InvocationResult {
                     candidate,
@@ -1671,9 +2017,12 @@ impl GailService {
                     quality: -1.0,
                     score: f64::NEG_INFINITY,
                 },
-            };
-        }
-        invocation.await
+            }
+        } else {
+            invocation.await
+        };
+        self.release_candidate_load(load_reservation).await;
+        result
     }
 
     fn select_specialist(&self, name: Option<&str>) -> Result<&SpecialistEngine> {
@@ -1897,6 +2246,18 @@ impl ProviderCandidate {
             .unwrap_or_else(|| "config".to_string());
         let weight = profile.weight;
         let preferred = profile.preferred;
+        let host_group = profile.host_group.clone();
+        let priority_bias = profile.priority_bias;
+        let usage_penalty_decay_seconds = profile.usage_penalty_decay_seconds.max(30.0);
+        let max_concurrent_requests = profile.max_concurrent_requests.map(|value| value.max(1));
+        let resource_cost_cpu = profile.resource_cost_cpu.max(0.0);
+        let resource_cost_ram_mb = profile.resource_cost_ram_mb.max(0);
+        let resource_cost_vram_mb = profile.resource_cost_vram_mb.max(0);
+        let host_cpu_budget = profile.host_cpu_budget.filter(|value| *value > 0.0);
+        let host_ram_budget_mb = profile.host_ram_budget_mb.filter(|value| *value > 0);
+        let host_vram_budget_mb = profile.host_vram_budget_mb.filter(|value| *value > 0);
+        let nmc_agent_id = profile.nmc_agent_id.clone();
+        let nmc_host = profile.nmc_host.clone();
         Self {
             profile,
             source,
@@ -1906,6 +2267,18 @@ impl ProviderCandidate {
             weight,
             specialties,
             roles,
+            host_group,
+            priority_bias,
+            usage_penalty_decay_seconds,
+            max_concurrent_requests,
+            resource_cost_cpu,
+            resource_cost_ram_mb,
+            resource_cost_vram_mb,
+            host_cpu_budget,
+            host_ram_budget_mb,
+            host_vram_budget_mb,
+            nmc_agent_id,
+            nmc_host,
         }
     }
 
@@ -2034,6 +2407,7 @@ fn append_local_ollama_fallback_candidate(candidates: &mut Vec<ProviderCandidate
         weight: 0.12,
         preferred: false,
         source: Some("auto_local_fallback".to_string()),
+        ..ProviderProfile::default()
     }));
 }
 
@@ -2167,6 +2541,27 @@ fn ollama_saturation_backoff_seconds() -> f64 {
     env_float_any(&["GAIL_OLLAMA_SATURATION_BACKOFF_SECONDS"], 20.0).max(1.0)
 }
 
+fn host_budget_ratio(candidate: &ProviderCandidate, usage: &HostLoad) -> f64 {
+    let mut ratios = Vec::new();
+    if let Some(cpu_budget) = candidate.host_cpu_budget.filter(|value| *value > 0.0) {
+        ratios.push(usage.cpu / cpu_budget);
+    }
+    if let Some(ram_budget_mb) = candidate.host_ram_budget_mb.filter(|value| *value > 0) {
+        ratios.push(usage.ram_mb as f64 / ram_budget_mb as f64);
+    }
+    if let Some(vram_budget_mb) = candidate.host_vram_budget_mb.filter(|value| *value > 0) {
+        ratios.push(usage.vram_mb as f64 / vram_budget_mb as f64);
+    }
+    ratios
+        .into_iter()
+        .fold(0.0_f64, |acc, value| acc.max(value))
+        .max(0.0)
+}
+
+fn host_budget_exceeded(candidate: &ProviderCandidate, usage: &HostLoad) -> bool {
+    host_budget_ratio(candidate, usage) > 1.0
+}
+
 fn ensure_local_fallback_selected(
     mut selected: Vec<ProviderCandidate>,
     local_fallback: Option<ProviderCandidate>,
@@ -2206,6 +2601,8 @@ fn ranked_candidate_is_in_provider_backoff(item: &RankedCandidate) -> bool {
                     "upstream",
                     "timeout",
                     "ollama_saturated",
+                    "resource_saturated",
+                    "nmc_constrained",
                     "provider_backoff",
                     "unconfigured",
                     "missing_endpoint",
@@ -2218,6 +2615,8 @@ fn ranked_candidate_is_in_provider_backoff(item: &RankedCandidate) -> bool {
 fn message_indicates_provider_backoff(message: &str) -> bool {
     message_indicates_quota(message)
         || message_indicates_ollama_saturation(message)
+        || message_indicates_resource_saturation(message)
+        || message_indicates_nmc_constrained(message)
         || message_indicates_provider_auth_failure(message)
         || message_indicates_transient_provider_failure(message)
 }
@@ -2226,6 +2625,19 @@ fn message_indicates_ollama_saturation(message: &str) -> bool {
     let lowered = message.to_ascii_lowercase();
     lowered.contains("local ollama request queue is saturated")
         || lowered.contains("local model service is saturated")
+}
+
+fn message_indicates_resource_saturation(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("configured concurrency/resource budget is exhausted")
+        || lowered.contains("resource budget exhausted")
+}
+
+fn message_indicates_nmc_constrained(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("nmc/tracey telemetry reports constrained capacity")
+        || lowered.contains("nmc telemetry reports constrained capacity")
+        || lowered.contains("nmc_constrained")
 }
 
 fn message_indicates_transient_provider_failure(message: &str) -> bool {
@@ -2285,6 +2697,10 @@ fn runtime_failure_health_bucket(error: Option<&str>, latency_ms: Option<u64>) -
     let lowered = error.unwrap_or_default().to_ascii_lowercase();
     let mode = if message_indicates_ollama_saturation(error.unwrap_or_default()) {
         "ollama_saturated"
+    } else if message_indicates_resource_saturation(error.unwrap_or_default()) {
+        "resource_saturated"
+    } else if message_indicates_nmc_constrained(error.unwrap_or_default()) {
+        "nmc_constrained"
     } else if lowered.contains("timeout") || lowered.contains("timed out") {
         "timeout"
     } else if message_indicates_quota(error.unwrap_or_default()) {
@@ -3002,6 +3418,51 @@ mod tests {
         let message = r#"nvidia upstream error: {"detail":"Authentication failed","status":401,"title":"Unauthorized"}"#;
         let bucket = runtime_failure_health_bucket(Some(message), Some(21));
         assert_eq!(bucket.mode.as_deref(), Some("unconfigured"));
+        assert!(message_indicates_provider_backoff(message));
+    }
+
+    #[test]
+    fn host_budget_ratio_and_overload_detection_work_for_shared_host() {
+        let candidate = ProviderCandidate::from_profile(ProviderProfile {
+            provider_type: "ollama".to_string(),
+            model: Some("llama3.2".to_string()),
+            host_group: Some("host-a".to_string()),
+            host_cpu_budget: Some(16.0),
+            host_ram_budget_mb: Some(65_536),
+            host_vram_budget_mb: Some(24_576),
+            ..ProviderProfile::default()
+        });
+        let safe = HostLoad {
+            requests: 2,
+            cpu: 10.0,
+            ram_mb: 32_768,
+            vram_mb: 12_000,
+        };
+        assert!(!host_budget_exceeded(&candidate, &safe));
+        let overloaded = HostLoad {
+            requests: 4,
+            cpu: 18.0,
+            ram_mb: 72_000,
+            vram_mb: 20_000,
+        };
+        assert!(host_budget_ratio(&candidate, &overloaded) > 1.0);
+        assert!(host_budget_exceeded(&candidate, &overloaded));
+    }
+
+    #[test]
+    fn runtime_failure_health_bucket_classifies_resource_saturation() {
+        let message =
+            "candidate skipped because configured concurrency/resource budget is exhausted";
+        let bucket = runtime_failure_health_bucket(Some(message), Some(5));
+        assert_eq!(bucket.mode.as_deref(), Some("resource_saturated"));
+        assert!(message_indicates_provider_backoff(message));
+    }
+
+    #[test]
+    fn runtime_failure_health_bucket_classifies_nmc_constrained() {
+        let message = "candidate skipped because NMC/Tracey telemetry reports constrained capacity (agent=tracey-1, host=node-a, status=healthy, mode=constrained, optimize_status=avoid, pressure_ratio=1.25)";
+        let bucket = runtime_failure_health_bucket(Some(message), Some(7));
+        assert_eq!(bucket.mode.as_deref(), Some("nmc_constrained"));
         assert!(message_indicates_provider_backoff(message));
     }
 }

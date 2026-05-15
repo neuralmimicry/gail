@@ -265,6 +265,9 @@ mod tests {
         assert_eq!(cfg.fuzzy_weight, 0.4);
         assert_eq!(cfg.max_open_positions, 5);
         assert_eq!(cfg.evaluation_interval_seconds, 60);
+        assert_eq!(cfg.research_index_name, "crypto");
+        assert_eq!(cfg.research_site_hints, vec!["bloomberg.com".to_string()]);
+        assert_eq!(cfg.research_max_parallel_queries, 3);
         assert!(cfg.live_execution_enabled);
         assert!(!cfg.backtesting_enabled);
     }
@@ -305,6 +308,14 @@ mod tests {
             evaluation_interval_seconds: 3, // below minimum of 10
             max_parallel_advisors: 0,       // below minimum of 1
             max_open_positions: 0,
+            research_index_name: "   ".to_string(),
+            research_site_hints: vec![
+                " bloomberg.com ".to_string(),
+                "".to_string(),
+                "BLOOMBERG.com".to_string(),
+            ],
+            research_max_parallel_queries: 0,
+            research_top_k: 0,
             log_ring_size: 0,
             trade_ring_size: 0,
             ..TradingConfig::default()
@@ -320,6 +331,10 @@ mod tests {
         assert!(cfg.evaluation_interval_seconds >= 10);
         assert!(cfg.max_parallel_advisors >= 1);
         assert!(cfg.max_open_positions >= 1);
+        assert_eq!(cfg.research_index_name, "crypto");
+        assert_eq!(cfg.research_site_hints, vec!["bloomberg.com".to_string()]);
+        assert_eq!(cfg.research_max_parallel_queries, 1);
+        assert_eq!(cfg.research_top_k, 1);
         assert!(cfg.log_ring_size >= 10);
         assert!(cfg.trade_ring_size >= 10);
     }

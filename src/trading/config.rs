@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 /// Configuration for the Gail crypto-trading bridge.
@@ -55,6 +57,17 @@ pub struct TradingConfig {
     /// Template for Refiner research queries.
     /// Supports `{currency}`, `{exchange}`, `{date}` placeholders.
     pub research_query_template: String,
+
+    /// Refiner RAG index name used for trading research lookups.
+    pub research_index_name: String,
+
+    /// Source-domain hints used to bias research queries (e.g. `bloomberg.com`).
+    /// Gail fans out `site:<domain>` query variants in parallel.
+    pub research_site_hints: Vec<String>,
+
+    /// Maximum number of Refiner research queries to run in parallel per cycle.
+    /// Includes the base query and any `site:<domain>` variants.
+    pub research_max_parallel_queries: usize,
 
     /// How many top RAG results to request from Refiner.
     pub research_top_k: usize,
@@ -137,6 +150,9 @@ impl Default for TradingConfig {
             fuzzy_confidence_threshold: 0.65,
             research_query_template: "cryptocurrency market sentiment {currency} {exchange} {date}"
                 .to_string(),
+            research_index_name: "crypto".to_string(),
+            research_site_hints: vec!["bloomberg.com".to_string()],
+            research_max_parallel_queries: 3,
             research_top_k: 5,
             log_ring_size: 1000,
             trade_ring_size: 200,
@@ -184,6 +200,19 @@ impl TradingConfig {
             self.research_query_template =
                 "cryptocurrency market sentiment {currency} {exchange} {date}".to_string();
         }
+        if self.research_index_name.trim().is_empty() {
+            self.research_index_name = "crypto".to_string();
+        }
+        self.research_max_parallel_queries = self.research_max_parallel_queries.clamp(1, 8);
+        self.research_top_k = self.research_top_k.clamp(1, 25);
+        let mut seen_site_hints: HashSet<String> = HashSet::new();
+        self.research_site_hints = self
+            .research_site_hints
+            .iter()
+            .map(|hint| hint.trim().to_string())
+            .filter(|hint| !hint.is_empty())
+            .filter(|hint| seen_site_hints.insert(hint.to_ascii_lowercase()))
+            .collect();
         if self.data_path.trim().is_empty() {
             self.data_path = "./data/trading_state.json".to_string();
         }

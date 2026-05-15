@@ -152,6 +152,8 @@ Provider credentials, Gail bearer tokens, Ollama endpoints, and trading defaults
 
 - `providers`: shared LLM backends Gail can orchestrate.
 - `providers` can include `openai`, `gemini`, `ollama`, and OpenAI-compatible `nvidia` profiles backed by custom `base_url` values.
+- Provider-level resource routing knobs are available per profile: `priority_bias`, `usage_penalty_decay_seconds`, `max_concurrent_requests`, `resource_cost_cpu`, `resource_cost_ram_mb`, `resource_cost_vram_mb`, and shared-host budgets (`host_group`, `host_cpu_budget`, `host_ram_budget_mb`, `host_vram_budget_mb`). Use the same `host_group` across Ollama instances on one physical host so Gail can avoid overcommitting CPU/RAM/VRAM.
+- Provider profiles can also bind to Tracey/NMC telemetry with `nmc_agent_id` and/or `nmc_host`, so Gail can down-rank or skip constrained hosts reported by NMC `/tracey/adaptive`.
 - Gail keeps an Ollama local fallback candidate available when configured provider lists omit it, using `GAIL_OLLAMA_BASE_URL`/`GAIL_OLLAMA_MODEL` or the Continuum Ollama defaults. Ollama health checks use `/api/tags` by default to avoid false negatives on slower local models; enable `GAIL_OLLAMA_HEALTH_GENERATE_PROBE=true` when you need bounded generation probes in health checks.
 - Ollama endpoint selection is adaptive. Gail tries the request/profile endpoint first, derives an HTTPS variant for public HTTP endpoints, and then tries `GAIL_OLLAMA_FALLBACK_BASE_URLS` plus the cluster-local Ollama service when the configured endpoint is not local. These attempts share one request budget instead of multiplying the timeout by the number of endpoints.
 - Local Ollama generation is tuned for higher-latency local inference by default: `GAIL_OLLAMA_MAX_CONCURRENT_REQUESTS` defaults to `2`, `GAIL_OLLAMA_QUEUE_TIMEOUT_SECONDS` defaults to `20`, `GAIL_OLLAMA_SATURATION_BACKOFF_SECONDS` defaults to `20`, `GAIL_OLLAMA_TIMEOUT_SECONDS` defaults to `30`, `GAIL_OLLAMA_MAX_RETRIES` defaults to `0`, and `GAIL_OLLAMA_MAX_PREDICT` defaults to `512`. When the local queue is saturated, Gail backs off before retrying instead of cycling through every Ollama endpoint alias.
@@ -163,6 +165,8 @@ Provider credentials, Gail bearer tokens, Ollama endpoints, and trading defaults
 - Gail Trading's OctoBot and Refiner clients feed remote API failures and recoveries into the same issue registry, alongside the adaptive schema registry, so dashboard/Prometheus status covers trading dependencies as well as LLM providers.
 - `specialists`: explicit neuromorphic engines. Use this when you have named SNN/AARNN backends to register.
 - `aarnn_bridge`: mirrored Gail-to-AARNN LLM I/O bridge. Gail mirrors prompt-side and response-side text plus translated AER payloads to `POST /api/llm/mirror` and can optionally promote a future AARNN reply.
+- `aarnn_bridge` queue controls (`queue_capacity`, `worker_count`, `enqueue_timeout_ms`, `candidate_wait_timeout_ms`) keep LLM↔SNN mirroring non-blocking while still allowing short bounded waits for candidate reply promotion.
+- `nmc_telemetry`: optional NMC/Tracey feed (`/tracey/adaptive`) that contributes live host pressure and constraint signals to provider ranking/execution decisions.
 - `config/ai-routing-profiles.json`: shared workflow/keyword/provider routing contract used by Gail and mirrored in Refiner for offline fallback.
 - `GAIL_ROUTING_PROFILES_PATH`: optional override for the routing contract path.
 - `GAIL_AARNN_*` env vars: optional legacy auto-attach path for an AARNN backend, mirroring Refiner's previous automatic fallback behaviour.
@@ -182,6 +186,7 @@ Use `aarnn_bridge` when Gail should mirror every LLM input and output into an AA
 - `access_token` should be the Gail Customers-issued service-account bearer token.
 - `response_preference` defaults to `llm_preferred`.
 - `prefer_aarnn_when_confident` is available, but the current AARNN candidate reply is a deliberately low-confidence bootstrap echo until network-output decoding is mature.
+- Mirroring runs through an internal bounded bus with parallel workers; when the queue is saturated, exchanges are dropped quickly instead of blocking the request path.
 
 ## Product Integration
 
@@ -195,7 +200,7 @@ Tracey can consume Gail's neuromorphic and AER endpoints as a stable HTTP contra
 
 ### Continuum / NMC
 
-NMC already owns AARNN and cloud-control orchestration concerns. Gail sits alongside that stack as the shared AI middleware layer for LLM, neuromorphic scoring, and AER translation so Continuum-facing tooling can call one service contract instead of product-specific glue.
+NMC already owns AARNN and cloud-control orchestration concerns. Gail sits alongside that stack as the shared AI middleware layer for LLM, neuromorphic scoring, and AER translation so Continuum-facing tooling can call one service contract instead of product-specific glue. When `nmc_telemetry` is enabled, Gail also consumes NMC `/tracey/adaptive` pressure/constraint signals to steer provider ranking and avoid overloaded agents/hosts.
 
 ### AARNN
 
@@ -236,7 +241,7 @@ Each evaluation runs the following pipeline steps in sequence:
 OctoBot is queried for market snapshots (price, 24 h change %, 24 h volume), portfolio totals where available, and open orders. The client probes `/api/ping` at startup; Continuum deployments normally keep OctoBot native web auth disabled behind shared ingress auth, so Gail does not attempt the old non-existent JSON password-login endpoint. Up to 20 snapshots are fetched across all configured exchanges and currency filters. Gail records each OctoBot endpoint's observed shape, status, failures, and log-derived semantic hints in an adaptive API schema; optional routes that prove missing or temporarily bad are skipped for a short TTL while fallback routes are used.
 
 **Step 2 — Research** (`refiner.rs`)
-The highest-signal market snapshot (scored by `|Δ%| × ln(volume+1)`) is used to build a Refiner RAG query from the `research_query_template`. Refiner's `/api/rag/query` endpoint returns ranked context passages (default top 5). The research context is passed verbatim to the AI advisors and contributes a sentiment signal to the fuzzy engine.
+The highest-signal market snapshot (scored by `|Δ%| × ln(volume+1)`) is used to build a Refiner RAG query from the `research_query_template`. Gail queries the configured RAG index (`research_index_name`) and can fan out additional source-biased queries in parallel using `site:<domain>` hints (for example `bloomberg.com`) from `research_site_hints`. Refiner's `/api/rag/query` endpoint returns ranked context passages (default top 5). Gail merges the contexts, de-duplicates matches, and forwards source/citation hints to AI advisors.
 
 **Step 3 — Multi-AI advisory** (`advisor.rs`)
 `TradingAdvisor::consult_all()` fires all configured Gail provider profiles in parallel using a `tokio::task::JoinSet`. Each provider receives a structured prompt containing market data, portfolio state, and research context, and is asked to respond with:
@@ -354,6 +359,9 @@ trading:
   fuzzy_weight: 0.4                      # fuzzy vs AI blend weight
   live_execution_enabled: true
   research_query_template: "cryptocurrency market sentiment {currency} {exchange} {date}"
+  research_index_name: "crypto"
+  research_site_hints: ["bloomberg.com", "reuters.com", "cnbc.com"]
+  research_max_parallel_queries: 3
   research_top_k: 5
   log_ring_size: 1000
   trade_ring_size: 200

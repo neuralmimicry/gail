@@ -475,9 +475,29 @@ fn build_advisory_prompt(
     let research_section = if research.is_empty() {
         "No research context available.".to_string()
     } else {
+        let citations = research
+            .matches
+            .iter()
+            .take(6)
+            .map(|m| {
+                let src = m
+                    .source
+                    .as_deref()
+                    .or(m.citation.as_deref())
+                    .unwrap_or("unknown_source");
+                format!("  - {:.2} {}", m.score, src)
+            })
+            .collect::<Vec<_>>();
+        let citations_block = if citations.is_empty() {
+            "Top citations: none".to_string()
+        } else {
+            format!("Top citations:\n{}", citations.join("\n"))
+        };
         format!(
-            "Research context:\n{}",
-            &research.context[..research.context.len().min(1500)]
+            "Research source: {}\n{}\nResearch context:\n{}",
+            research.source,
+            citations_block,
+            &research.context[..research.context.len().min(1800)]
         )
     };
 

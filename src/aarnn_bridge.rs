@@ -1,10 +1,18 @@
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use reqwest::{
     Client,
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
 };
 use serde_json::Value;
+use tokio::{
+    sync::{Semaphore, mpsc, oneshot},
+    time::timeout,
+};
+use tracing::warn;
 
 use crate::{
     adaptive_schema,
@@ -19,6 +27,12 @@ use crate::{
 
 const AARNN_MIRROR_PATH: &str = "/api/llm/mirror";
 const AARNN_RESPONSE_MODEL: &str = "aarnn-snn-aer-bridge";
+
+#[derive(Debug)]
+struct AarnnMirrorJob {
+    exchange: AarnnMirrorExchange,
+    response: Option<oneshot::Sender<AarnnMirrorInvocationTrace>>,
+}
 
 #[derive(Clone, Debug)]
 pub struct AarnnMirrorExchange {
@@ -42,6 +56,11 @@ pub struct AarnnMirrorClient {
     endpoint: String,
     access_token: Option<String>,
     timeout: Duration,
+    queue_tx: mpsc::Sender<AarnnMirrorJob>,
+    queue_capacity: usize,
+    worker_count: usize,
+    enqueue_timeout: Duration,
+    candidate_wait_timeout: Duration,
     mirror_input: bool,
     mirror_output: bool,
     request_candidate_reply: bool,
@@ -68,11 +87,21 @@ impl AarnnMirrorClient {
         }
         let endpoint = resolve_endpoint(bridge, specialists, &config.specialists)?;
         let transport = resolve_transport_profile(specialists, &config.specialists);
-        Some(Self {
+        let queue_capacity = bridge.queue_capacity.clamp(8, 32_768);
+        let worker_count = bridge.worker_count.clamp(1, 128);
+        let (queue_tx, queue_rx) = mpsc::channel(queue_capacity);
+        let mirror = Self {
             client,
             endpoint,
             access_token: bridge.access_token.clone(),
             timeout: Duration::from_secs_f64(bridge.timeout_seconds.max(0.2)),
+            queue_tx,
+            queue_capacity,
+            worker_count,
+            enqueue_timeout: Duration::from_millis(bridge.enqueue_timeout_ms.clamp(1, 10_000)),
+            candidate_wait_timeout: Duration::from_millis(
+                bridge.candidate_wait_timeout_ms.min(30_000),
+            ),
             mirror_input: bridge.mirror_input,
             mirror_output: bridge.mirror_output,
             request_candidate_reply: bridge.request_candidate_reply,
@@ -85,7 +114,9 @@ impl AarnnMirrorClient {
             sensory_size: transport.sensory_size,
             aer_sensory_base: transport.aer_sensory_base,
             aer_output_base: transport.aer_output_base,
-        })
+        };
+        mirror.start_worker_bus(queue_rx);
+        Some(mirror)
     }
 
     pub fn status(config: &GailConfig, specialists: &[SpecialistEngine]) -> AarnnBridgeStatus {
@@ -104,6 +135,10 @@ impl AarnnMirrorClient {
             available: bridge.enabled && endpoint.is_some(),
             endpoint,
             timeout_seconds: bridge.timeout_seconds.max(0.2),
+            queue_capacity: bridge.queue_capacity.clamp(8, 32_768),
+            worker_count: bridge.worker_count.clamp(1, 128),
+            enqueue_timeout_ms: bridge.enqueue_timeout_ms.clamp(1, 10_000),
+            candidate_wait_timeout_ms: bridge.candidate_wait_timeout_ms.min(30_000),
             mirror_input: bridge.mirror_input,
             mirror_output: bridge.mirror_output,
             request_candidate_reply: bridge.request_candidate_reply,
@@ -147,6 +182,10 @@ impl AarnnMirrorClient {
 
     pub fn candidate_min_reply_chars(&self) -> usize {
         self.candidate_min_reply_chars
+    }
+
+    pub fn candidate_wait_timeout(&self) -> Duration {
+        self.candidate_wait_timeout
     }
 
     pub fn build_trace(
@@ -207,6 +246,68 @@ impl AarnnMirrorClient {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
+    }
+
+    fn start_worker_bus(&self, mut rx: mpsc::Receiver<AarnnMirrorJob>) {
+        let worker = self.clone();
+        let concurrency = self.worker_count.max(1);
+        tokio::spawn(async move {
+            let permits = Arc::new(Semaphore::new(concurrency));
+            while let Some(job) = rx.recv().await {
+                let permit = match permits.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                };
+                let worker = worker.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let trace = worker.mirror(job.exchange).await;
+                    if let Some(response) = job.response {
+                        let _ = response.send(trace);
+                    }
+                });
+            }
+        });
+    }
+
+    pub async fn enqueue(
+        &self,
+        exchange: AarnnMirrorExchange,
+        wait_for_trace: bool,
+    ) -> Option<oneshot::Receiver<AarnnMirrorInvocationTrace>> {
+        let (response_tx, response_rx) = if wait_for_trace {
+            let (tx, rx) = oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let direction = exchange.direction.clone();
+        let send = self.queue_tx.send(AarnnMirrorJob {
+            exchange,
+            response: response_tx,
+        });
+        match timeout(self.enqueue_timeout, send).await {
+            Ok(Ok(())) => response_rx,
+            Ok(Err(error)) => {
+                warn!(
+                    endpoint = %self.endpoint,
+                    direction = ?direction,
+                    error = %error,
+                    "AARNN mirror queue is closed; dropping exchange"
+                );
+                None
+            }
+            Err(_) => {
+                warn!(
+                    endpoint = %self.endpoint,
+                    direction = ?direction,
+                    queue_capacity = self.queue_capacity,
+                    enqueue_timeout_ms = self.enqueue_timeout.as_millis(),
+                    "AARNN mirror queue is saturated; dropping exchange"
+                );
+                None
+            }
+        }
     }
 
     pub async fn mirror(&self, exchange: AarnnMirrorExchange) -> AarnnMirrorInvocationTrace {
@@ -532,11 +633,17 @@ mod tests {
 
     #[test]
     fn candidate_promotion_requires_confident_non_duplicate_reply() {
+        let (queue_tx, _queue_rx) = mpsc::channel(1);
         let client = AarnnMirrorClient {
             client: Client::builder().build().expect("client"),
             endpoint: "http://example.invalid".to_string(),
             access_token: None,
             timeout: Duration::from_secs(1),
+            queue_tx,
+            queue_capacity: 1,
+            worker_count: 1,
+            enqueue_timeout: Duration::from_millis(10),
+            candidate_wait_timeout: Duration::from_millis(100),
             mirror_input: true,
             mirror_output: true,
             request_candidate_reply: true,
@@ -626,6 +733,59 @@ mod tests {
             })
             .await;
 
+        assert!(trace.accepted);
+        assert!(trace.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn enqueue_dispatches_non_blocking_worker_job() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/llm/mirror"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accepted": true,
+                "text_chars": 16,
+                "spike_count": 4
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = GailConfig::default();
+        config.aarnn_bridge.enabled = true;
+        config.aarnn_bridge.endpoint = Some(server.uri());
+        config.aarnn_bridge.queue_capacity = 8;
+        config.aarnn_bridge.worker_count = 2;
+        config.aarnn_bridge.enqueue_timeout_ms = 25;
+        let client = AarnnMirrorClient::from_config(
+            &config,
+            Client::builder().build().expect("client"),
+            &[],
+        )
+        .expect("bridge client");
+        let receiver = client
+            .enqueue(
+                AarnnMirrorExchange {
+                    request_id: "req-2".to_string(),
+                    conversation_id: "conv-2".to_string(),
+                    workflow: "assistant".to_string(),
+                    role: "assistant".to_string(),
+                    direction: AarnnMirrorDirection::Input,
+                    provider: Some("openai".to_string()),
+                    model: Some("gpt-4o-mini".to_string()),
+                    request_category: None,
+                    system: None,
+                    prompt_text: None,
+                    text: "queued hello".to_string(),
+                    message_roles: vec!["user".to_string()],
+                },
+                true,
+            )
+            .await
+            .expect("queued receiver");
+        let trace = timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("worker timeout")
+            .expect("worker trace");
         assert!(trace.accepted);
         assert!(trace.error.is_none());
     }

@@ -93,6 +93,19 @@ providers:
     roles: ["general", "planner", "reviewer", "researcher", "assistant"]
     specialties: ["local", "privacy", "code", "planning", "json", "review", "research"]
     weight: 0.15
+    priority_bias: 0.05
+    usage_penalty_decay_seconds: 600
+    # Set the same host_group across multiple Ollama instances that share a physical host.
+    host_group: "ollama-host-a"
+    max_concurrent_requests: 2
+    resource_cost_cpu: 2.0
+    resource_cost_ram_mb: 8192
+    resource_cost_vram_mb: 8192
+    host_cpu_budget: 16.0
+    host_ram_budget_mb: 65536
+    host_vram_budget_mb: 24576
+    nmc_agent_id: "tracey-ollama-host-a"
+    nmc_host: "ollama-host-a"
     source: "example"
 
 specialists:
@@ -123,6 +136,10 @@ aarnn_bridge:
   endpoint: "${GAIL_AARNN_BRIDGE_ENDPOINT}"
   access_token: "${GAIL_AARNN_BRIDGE_ACCESS_TOKEN}"
   timeout_seconds: 4.0
+  queue_capacity: 256
+  worker_count: 2
+  enqueue_timeout_ms: 35
+  candidate_wait_timeout_ms: 300
   mirror_input: true
   mirror_output: true
   request_candidate_reply: true
@@ -132,6 +149,15 @@ aarnn_bridge:
   network_id: "${GAIL_AARNN_BRIDGE_NETWORK_ID}"
   node_id: "${GAIL_AARNN_BRIDGE_NODE_ID}"
   max_text_chars: 8192
+
+nmc_telemetry:
+  enabled: false
+  base_url: "${GAIL_NMC_BASE_URL}"
+  access_token: "${GAIL_NMC_API_TOKEN}"
+  timeout_seconds: 2.0
+  cache_ttl_seconds: 5.0
+  stale_after_seconds: 300
+  adaptive_policy: "balanced"
 
 storage:
   metrics_path: "./data/provider_metrics.json"
@@ -157,6 +183,9 @@ trading:
   target_currencies: []
   fuzzy_confidence_threshold: ${GAIL_TRADING_CONFIDENCE_THRESHOLD}
   research_query_template: "cryptocurrency market sentiment {currency} {exchange} {date}"
+  research_index_name: "crypto"
+  research_site_hints: ["bloomberg.com", "reuters.com", "cnbc.com"]
+  research_max_parallel_queries: 3
   research_top_k: 5
   log_ring_size: 1000
   trade_ring_size: 200

@@ -296,8 +296,28 @@ async fn run_single_evaluation(
         .get_all_market_snapshots(&target_exchanges, &target_currencies, 20)
         .await;
 
-    // Fetch portfolio.
-    let portfolio = match octobot.get_portfolio().await {
+    // --- 2. Build research query ---
+    let best_snapshot = select_best_market_candidate(&market_snapshots);
+    let research_query = build_research_query(config, best_snapshot.as_ref());
+
+    // Run remaining service calls in parallel so one slow dependency
+    // does not serialize the whole evaluation cycle.
+    let (portfolio_result, open_orders_result, exchange_info_result, log_feedback_result, research) = tokio::join!(
+        octobot.get_portfolio(),
+        octobot.get_open_orders(),
+        octobot.get_exchange_info(),
+        octobot.get_recent_logs(25),
+        refiner.research_with_site_hints_best_effort(
+            &config.research_index_name,
+            &research_query,
+            &config.research_site_hints,
+            config.research_top_k,
+            config.research_max_parallel_queries,
+        ),
+    );
+
+    // Portfolio.
+    let portfolio = match portfolio_result {
         Ok(p) => {
             let mut s = state.0.lock().await;
             s.current_portfolio = Some(p.clone());
@@ -312,8 +332,8 @@ async fn run_single_evaluation(
         }
     };
 
-    // Fetch open orders.
-    match octobot.get_open_orders().await {
+    // Open orders.
+    match open_orders_result {
         Ok(orders) => {
             let mut s = state.0.lock().await;
             s.open_positions = orders;
@@ -323,8 +343,8 @@ async fn run_single_evaluation(
         }
     }
 
-    // Fetch exchange info for the dashboard.
-    match octobot.get_exchange_info().await {
+    // Exchange info for the dashboard.
+    match exchange_info_result {
         Ok(exchanges) => {
             let mut s = state.0.lock().await;
             s.available_exchanges = exchanges;
@@ -334,15 +354,14 @@ async fn run_single_evaluation(
         }
     }
 
-    process_octobot_feedback(config, state, octobot).await;
-
-    // --- 2. Build research query ---
-    let best_snapshot = select_best_market_candidate(&market_snapshots);
-    let research_query = build_research_query(config, best_snapshot.as_ref());
-
-    let research = refiner
-        .research_best_effort("crypto", &research_query, config.research_top_k)
-        .await;
+    let logs = match log_feedback_result {
+        Ok(logs) => logs,
+        Err(err) => {
+            debug!("trading: OctoBot log feedback fetch failed: {}", err);
+            Vec::new()
+        }
+    };
+    process_octobot_feedback(config, state, octobot, logs).await;
 
     // --- 3. Consult AI advisors in parallel ---
     let consensus = advisor
@@ -432,14 +451,8 @@ async fn process_octobot_feedback(
     config: &TradingConfig,
     state: &SharedTradingState,
     octobot: &OctobotClient,
+    logs: Vec<OctobotLogEntry>,
 ) {
-    let logs = match octobot.get_recent_logs(25).await {
-        Ok(logs) => logs,
-        Err(err) => {
-            debug!("trading: OctoBot log feedback fetch failed: {}", err);
-            Vec::new()
-        }
-    };
     let schema = octobot.api_schema_snapshot().await;
     let recommended_min = schema.numeric_hints.get("micro_trade_min_usd").copied();
 

@@ -279,6 +279,36 @@ impl MetricsStore {
         ((success_rate - 0.5) + stats.ewma_quality + latency_bonus * 1.0).round_to(6)
     }
 
+    pub async fn recent_usage_penalty(
+        &self,
+        candidate_id: &str,
+        workflow: &str,
+        role: &str,
+        decay_seconds: f64,
+    ) -> f64 {
+        let decay_seconds = decay_seconds.max(30.0);
+        let data = self.inner.lock().await;
+        let Some(bucket) = data.candidates.get(candidate_id) else {
+            return 0.0;
+        };
+        let role_key = format!("{workflow}:{role}");
+        let stats = bucket.roles.get(&role_key).unwrap_or(&bucket.stats);
+        if stats.total == 0 {
+            return 0.0;
+        }
+        let updated_at = stats.updated_at.unwrap_or(0.0);
+        if updated_at <= 0.0 {
+            return 0.0;
+        }
+        let age_seconds = (now_ts() - updated_at).max(0.0);
+        if age_seconds > decay_seconds * 8.0 {
+            return 0.0;
+        }
+        let recency = (-(age_seconds / decay_seconds)).exp();
+        let intensity = ((stats.total as f64).ln_1p() / 6.0).clamp(0.0, 1.5);
+        (intensity * recency).round_to(6)
+    }
+
     pub async fn summary(&self, limit: usize) -> MetricsSummary {
         let data = self.inner.lock().await;
         let mut candidates = data
@@ -493,5 +523,30 @@ mod tests {
         let rendered = store.prometheus_metrics().await;
         assert!(rendered.contains("gail_provider_candidate_successes_total"));
         assert!(rendered.contains("candidate_id=\"ollama/llama3.2\""));
+    }
+
+    #[tokio::test]
+    async fn recent_usage_penalty_decays_with_age() {
+        let path = tempfile::NamedTempFile::new()
+            .expect("temp file")
+            .into_temp_path();
+        let store = MetricsStore::new(path.to_path_buf()).await.expect("store");
+        let summary = summary("ollama", "llama3.2");
+        store
+            .record_result(
+                &summary,
+                "project_solver",
+                "planner",
+                true,
+                Some(42),
+                1.0,
+                None,
+            )
+            .await
+            .expect("record result");
+        let penalty = store
+            .recent_usage_penalty(&summary.candidate_id, "project_solver", "planner", 600.0)
+            .await;
+        assert!(penalty > 0.0);
     }
 }

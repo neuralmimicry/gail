@@ -16,6 +16,7 @@ pub struct GailConfig {
     pub security: SecurityConfig,
     pub orchestration: OrchestrationConfig,
     pub aarnn_bridge: AarnnBridgeConfig,
+    pub nmc_telemetry: NmcTelemetryConfig,
     pub providers: Vec<ProviderProfile>,
     pub specialists: Vec<SpecialistProfile>,
     pub storage: StorageConfig,
@@ -68,6 +69,10 @@ pub struct AarnnBridgeConfig {
     pub endpoint: Option<String>,
     pub access_token: Option<String>,
     pub timeout_seconds: f64,
+    pub queue_capacity: usize,
+    pub worker_count: usize,
+    pub enqueue_timeout_ms: u64,
+    pub candidate_wait_timeout_ms: u64,
     pub mirror_input: bool,
     pub mirror_output: bool,
     pub request_candidate_reply: bool,
@@ -77,6 +82,18 @@ pub struct AarnnBridgeConfig {
     pub network_id: Option<String>,
     pub node_id: Option<String>,
     pub max_text_chars: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NmcTelemetryConfig {
+    pub enabled: bool,
+    pub base_url: Option<String>,
+    pub access_token: Option<String>,
+    pub timeout_seconds: f64,
+    pub cache_ttl_seconds: f64,
+    pub stale_after_seconds: u64,
+    pub adaptive_policy: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -104,6 +121,18 @@ pub struct ProviderProfile {
     pub weight: f64,
     pub preferred: bool,
     pub source: Option<String>,
+    pub host_group: Option<String>,
+    pub priority_bias: f64,
+    pub usage_penalty_decay_seconds: f64,
+    pub max_concurrent_requests: Option<usize>,
+    pub resource_cost_cpu: f64,
+    pub resource_cost_ram_mb: u64,
+    pub resource_cost_vram_mb: u64,
+    pub host_cpu_budget: Option<f64>,
+    pub host_ram_budget_mb: Option<u64>,
+    pub host_vram_budget_mb: Option<u64>,
+    pub nmc_agent_id: Option<String>,
+    pub nmc_host: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -139,6 +168,7 @@ impl Default for GailConfig {
             security: SecurityConfig::default(),
             orchestration: OrchestrationConfig::default(),
             aarnn_bridge: AarnnBridgeConfig::default(),
+            nmc_telemetry: NmcTelemetryConfig::default(),
             providers: Vec::new(),
             specialists: Vec::new(),
             storage: StorageConfig::default(),
@@ -213,6 +243,10 @@ impl Default for AarnnBridgeConfig {
             endpoint: None,
             access_token: None,
             timeout_seconds: 4.0,
+            queue_capacity: 256,
+            worker_count: 2,
+            enqueue_timeout_ms: 35,
+            candidate_wait_timeout_ms: 300,
             mirror_input: true,
             mirror_output: true,
             request_candidate_reply: true,
@@ -222,6 +256,20 @@ impl Default for AarnnBridgeConfig {
             network_id: None,
             node_id: None,
             max_text_chars: 8192,
+        }
+    }
+}
+
+impl Default for NmcTelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: None,
+            access_token: None,
+            timeout_seconds: 2.0,
+            cache_ttl_seconds: 5.0,
+            stale_after_seconds: 300,
+            adaptive_policy: Some("balanced".to_string()),
         }
     }
 }
@@ -240,6 +288,18 @@ impl Default for ProviderProfile {
             weight: 0.0,
             preferred: false,
             source: None,
+            host_group: None,
+            priority_bias: 0.0,
+            usage_penalty_decay_seconds: 600.0,
+            max_concurrent_requests: None,
+            resource_cost_cpu: 0.0,
+            resource_cost_ram_mb: 0,
+            resource_cost_vram_mb: 0,
+            host_cpu_budget: None,
+            host_ram_budget_mb: None,
+            host_vram_budget_mb: None,
+            nmc_agent_id: None,
+            nmc_host: None,
         }
     }
 }
@@ -316,6 +376,12 @@ impl GailConfig {
             normalize_optional_string(self.aarnn_bridge.network_id.as_deref());
         self.aarnn_bridge.node_id = normalize_optional_string(self.aarnn_bridge.node_id.as_deref());
         self.aarnn_bridge.timeout_seconds = self.aarnn_bridge.timeout_seconds.max(0.2);
+        self.aarnn_bridge.queue_capacity = self.aarnn_bridge.queue_capacity.clamp(8, 32_768);
+        self.aarnn_bridge.worker_count = self.aarnn_bridge.worker_count.clamp(1, 128);
+        self.aarnn_bridge.enqueue_timeout_ms =
+            self.aarnn_bridge.enqueue_timeout_ms.clamp(1, 10_000);
+        self.aarnn_bridge.candidate_wait_timeout_ms =
+            self.aarnn_bridge.candidate_wait_timeout_ms.min(30_000);
         self.aarnn_bridge.candidate_confidence_threshold = self
             .aarnn_bridge
             .candidate_confidence_threshold
@@ -323,6 +389,16 @@ impl GailConfig {
         self.aarnn_bridge.candidate_min_reply_chars =
             self.aarnn_bridge.candidate_min_reply_chars.max(1);
         self.aarnn_bridge.max_text_chars = self.aarnn_bridge.max_text_chars.clamp(128, 65_536);
+        self.nmc_telemetry.base_url =
+            normalize_optional_url(self.nmc_telemetry.base_url.as_deref());
+        self.nmc_telemetry.access_token =
+            normalize_optional_string(self.nmc_telemetry.access_token.as_deref());
+        self.nmc_telemetry.timeout_seconds = self.nmc_telemetry.timeout_seconds.max(0.2);
+        self.nmc_telemetry.cache_ttl_seconds = self.nmc_telemetry.cache_ttl_seconds.max(0.2);
+        self.nmc_telemetry.stale_after_seconds =
+            self.nmc_telemetry.stale_after_seconds.clamp(5, 86_400);
+        self.nmc_telemetry.adaptive_policy =
+            normalize_nmc_policy(self.nmc_telemetry.adaptive_policy.as_deref());
         if self.storage.metrics_path.trim().is_empty() {
             self.storage.metrics_path = "data/provider_metrics.json".to_string();
         }
@@ -364,6 +440,42 @@ impl GailConfig {
                 .filter_map(|item| normalize_optional_string(Some(item.as_str())))
                 .collect();
             provider.source = normalize_optional_string(provider.source.as_deref());
+            provider.host_group = normalize_optional_string(provider.host_group.as_deref());
+            provider.priority_bias = provider.priority_bias.clamp(-10.0, 10.0);
+            provider.usage_penalty_decay_seconds = provider.usage_penalty_decay_seconds.max(30.0);
+            provider.max_concurrent_requests = provider.max_concurrent_requests.and_then(|value| {
+                if value == 0 {
+                    None
+                } else {
+                    Some(value.min(4096))
+                }
+            });
+            provider.resource_cost_cpu = provider.resource_cost_cpu.max(0.0);
+            provider.resource_cost_ram_mb = provider.resource_cost_ram_mb.min(16_777_216);
+            provider.resource_cost_vram_mb = provider.resource_cost_vram_mb.min(16_777_216);
+            provider.host_cpu_budget = provider.host_cpu_budget.and_then(|value| {
+                if value <= 0.0 {
+                    None
+                } else {
+                    Some(value.min(4096.0))
+                }
+            });
+            provider.host_ram_budget_mb = provider.host_ram_budget_mb.and_then(|value| {
+                if value == 0 {
+                    None
+                } else {
+                    Some(value.min(16_777_216))
+                }
+            });
+            provider.host_vram_budget_mb = provider.host_vram_budget_mb.and_then(|value| {
+                if value == 0 {
+                    None
+                } else {
+                    Some(value.min(16_777_216))
+                }
+            });
+            provider.nmc_agent_id = normalize_optional_string(provider.nmc_agent_id.as_deref());
+            provider.nmc_host = normalize_optional_string(provider.nmc_host.as_deref());
             if provider.source.is_none() {
                 provider.source = Some("config".to_string());
             }
@@ -403,6 +515,19 @@ fn normalize_optional_url(value: Option<&str>) -> Option<String> {
         Some(value.trim_end_matches('/').to_string())
     } else {
         Some(format!("http://{}", value.trim_end_matches('/')))
+    }
+}
+
+fn normalize_nmc_policy(value: Option<&str>) -> Option<String> {
+    let value = normalize_optional_string(value)?;
+    let normalized = value.to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "balanced" | "throughput" | "risk" | "energy"
+    ) {
+        Some(normalized)
+    } else {
+        None
     }
 }
 
