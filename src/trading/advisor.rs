@@ -319,6 +319,10 @@ async fn query_provider(
         timeout_seconds: Some(timeout_secs),
         reasoning_effort: None,
         request_category: Some("trading_advisory".to_string()),
+        workflow: Some("trading".to_string()),
+        role: Some("assistant".to_string()),
+        min_model_size_b: None,
+        strict_no_downgrade: None,
     };
 
     let weight = profile.weight;

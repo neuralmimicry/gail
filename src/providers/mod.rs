@@ -173,6 +173,10 @@ pub fn provider_request_from_profile(
         timeout_seconds: request.timeout_seconds,
         reasoning_effort: request.reasoning_effort.clone(),
         request_category: request.request_category.clone(),
+        workflow: request.workflow.clone(),
+        role: request.role.clone(),
+        min_model_size_b: request.min_model_size_b,
+        strict_no_downgrade: request.strict_no_downgrade,
     }
 }
 
@@ -661,6 +665,10 @@ pub fn build_internal_request(
         timeout_seconds,
         reasoning_effort,
         request_category,
+        workflow: None,
+        role: None,
+        min_model_size_b: None,
+        strict_no_downgrade: None,
     }
 }
 

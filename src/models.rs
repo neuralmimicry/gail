@@ -116,6 +116,10 @@ pub struct ProviderCompletionRequest {
     pub timeout_seconds: Option<u64>,
     pub reasoning_effort: Option<String>,
     pub request_category: Option<String>,
+    pub workflow: Option<String>,
+    pub role: Option<String>,
+    pub min_model_size_b: Option<f64>,
+    pub strict_no_downgrade: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

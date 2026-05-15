@@ -41,10 +41,20 @@ pub struct StatsBucket {
     pub failures: u64,
     pub total: u64,
     pub ewma_latency_ms: Option<f64>,
+    pub ewma_queue_wait_ms: Option<f64>,
+    pub ewma_inference_ms: Option<f64>,
+    pub ewma_tokens_estimate: Option<f64>,
     pub ewma_quality: f64,
     pub last_status: Option<String>,
     pub last_error: Option<String>,
     pub updated_at: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct LocalUsageTelemetry {
+    pub queue_wait_ms: Option<u64>,
+    pub inference_ms: Option<u64>,
+    pub total_tokens_estimate: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -69,6 +79,9 @@ pub struct CandidateMetricsSummary {
     pub total: u64,
     pub success_rate: Option<f64>,
     pub ewma_latency_ms: Option<f64>,
+    pub ewma_queue_wait_ms: Option<f64>,
+    pub ewma_inference_ms: Option<f64>,
+    pub ewma_tokens_estimate: Option<f64>,
     pub ewma_quality: f64,
     pub last_status: Option<String>,
     pub last_error: Option<String>,
@@ -210,6 +223,7 @@ impl MetricsStore {
         bucket: &mut StatsBucket,
         success: bool,
         latency_ms: Option<u64>,
+        telemetry: Option<&LocalUsageTelemetry>,
         quality: f64,
         error: Option<&str>,
     ) {
@@ -225,6 +239,26 @@ impl MetricsStore {
                 None => latency_ms as f64,
             });
         }
+        if let Some(telemetry) = telemetry {
+            if let Some(queue_wait_ms) = telemetry.queue_wait_ms {
+                bucket.ewma_queue_wait_ms = Some(match bucket.ewma_queue_wait_ms {
+                    Some(previous) => (previous * 0.75) + (queue_wait_ms as f64 * 0.25),
+                    None => queue_wait_ms as f64,
+                });
+            }
+            if let Some(inference_ms) = telemetry.inference_ms {
+                bucket.ewma_inference_ms = Some(match bucket.ewma_inference_ms {
+                    Some(previous) => (previous * 0.75) + (inference_ms as f64 * 0.25),
+                    None => inference_ms as f64,
+                });
+            }
+            if let Some(total_tokens_estimate) = telemetry.total_tokens_estimate {
+                bucket.ewma_tokens_estimate = Some(match bucket.ewma_tokens_estimate {
+                    Some(previous) => (previous * 0.75) + (total_tokens_estimate as f64 * 0.25),
+                    None => total_tokens_estimate as f64,
+                });
+            }
+        }
         bucket.ewma_quality = (bucket.ewma_quality * 0.75) + (quality * 0.25);
         bucket.last_status = Some(if success { "success" } else { "failure" }.to_string());
         bucket.last_error = error.map(|value| value.to_string());
@@ -238,6 +272,7 @@ impl MetricsStore {
         role: &str,
         success: bool,
         latency_ms: Option<u64>,
+        telemetry: Option<LocalUsageTelemetry>,
         quality: f64,
         error: Option<&str>,
     ) -> Result<()> {
@@ -251,10 +286,24 @@ impl MetricsStore {
         bucket.configured_model = Some(summary.configured_model.clone());
         bucket.resolved_model = Some(summary.resolved_model.clone());
         bucket.specialties = summary.specialties.clone();
-        Self::merge_stats(&mut bucket.stats, success, latency_ms, quality, error);
+        Self::merge_stats(
+            &mut bucket.stats,
+            success,
+            latency_ms,
+            telemetry.as_ref(),
+            quality,
+            error,
+        );
         let role_key = format!("{workflow}:{role}");
         let role_bucket = bucket.roles.entry(role_key).or_default();
-        Self::merge_stats(role_bucket, success, latency_ms, quality, error);
+        Self::merge_stats(
+            role_bucket,
+            success,
+            latency_ms,
+            telemetry.as_ref(),
+            quality,
+            error,
+        );
         data.updated_at = now_ts();
         let snapshot = data.clone();
         drop(data);
@@ -276,7 +325,23 @@ impl MetricsStore {
             .ewma_latency_ms
             .map(|latency| ((1500.0 - latency) / 3000.0).clamp(-0.35, 0.35))
             .unwrap_or(0.0);
-        ((success_rate - 0.5) + stats.ewma_quality + latency_bonus * 1.0).round_to(6)
+        let queue_wait_penalty = stats
+            .ewma_queue_wait_ms
+            .map(|queue_wait| (queue_wait / 1600.0).clamp(0.0, 0.45))
+            .unwrap_or(0.0);
+        let inference_penalty = stats
+            .ewma_inference_ms
+            .map(|inference| (inference / 8000.0).clamp(0.0, 0.45))
+            .unwrap_or(0.0);
+        let token_pressure_penalty = stats
+            .ewma_tokens_estimate
+            .map(|tokens| ((tokens - 1200.0).max(0.0) / 8000.0).clamp(0.0, 0.2))
+            .unwrap_or(0.0);
+        ((success_rate - 0.5) + stats.ewma_quality + latency_bonus
+            - queue_wait_penalty
+            - inference_penalty
+            - token_pressure_penalty)
+            .round_to(6)
     }
 
     pub async fn recent_usage_penalty(
@@ -333,6 +398,9 @@ impl MetricsStore {
                     None
                 },
                 ewma_latency_ms: bucket.stats.ewma_latency_ms,
+                ewma_queue_wait_ms: bucket.stats.ewma_queue_wait_ms,
+                ewma_inference_ms: bucket.stats.ewma_inference_ms,
+                ewma_tokens_estimate: bucket.stats.ewma_tokens_estimate,
                 ewma_quality: bucket.stats.ewma_quality.round_to(6),
                 last_status: bucket.stats.last_status.clone(),
                 last_error: bucket.stats.last_error.clone(),
@@ -404,6 +472,12 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
     out.push_str("# TYPE gail_provider_candidate_health_ok gauge\n");
     out.push_str("# HELP gail_provider_candidate_latency_ms Gail provider candidate EWMA latency in milliseconds.\n");
     out.push_str("# TYPE gail_provider_candidate_latency_ms gauge\n");
+    out.push_str("# HELP gail_provider_candidate_queue_wait_ms Gail provider candidate EWMA local queue wait in milliseconds.\n");
+    out.push_str("# TYPE gail_provider_candidate_queue_wait_ms gauge\n");
+    out.push_str("# HELP gail_provider_candidate_inference_ms Gail provider candidate EWMA local inference duration in milliseconds.\n");
+    out.push_str("# TYPE gail_provider_candidate_inference_ms gauge\n");
+    out.push_str("# HELP gail_provider_candidate_tokens_estimate Gail provider candidate EWMA token estimate.\n");
+    out.push_str("# TYPE gail_provider_candidate_tokens_estimate gauge\n");
     for (candidate_id, bucket) in &data.candidates {
         let labels = format!(
             "candidate_id=\"{}\",provider=\"{}\",model=\"{}\",health_mode=\"{}\"",
@@ -436,6 +510,24 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
             out.push_str(&format!(
                 "gail_provider_candidate_latency_ms{{{labels}}} {:.3}\n",
                 latency
+            ));
+        }
+        if let Some(queue_wait) = bucket.stats.ewma_queue_wait_ms {
+            out.push_str(&format!(
+                "gail_provider_candidate_queue_wait_ms{{{labels}}} {:.3}\n",
+                queue_wait
+            ));
+        }
+        if let Some(inference) = bucket.stats.ewma_inference_ms {
+            out.push_str(&format!(
+                "gail_provider_candidate_inference_ms{{{labels}}} {:.3}\n",
+                inference
+            ));
+        }
+        if let Some(tokens) = bucket.stats.ewma_tokens_estimate {
+            out.push_str(&format!(
+                "gail_provider_candidate_tokens_estimate{{{labels}}} {:.3}\n",
+                tokens
             ));
         }
     }
@@ -515,6 +607,11 @@ mod tests {
                 "planner",
                 true,
                 Some(42),
+                Some(LocalUsageTelemetry {
+                    queue_wait_ms: Some(10),
+                    inference_ms: Some(32),
+                    total_tokens_estimate: Some(128),
+                }),
                 1.0,
                 None,
             )
@@ -539,6 +636,7 @@ mod tests {
                 "planner",
                 true,
                 Some(42),
+                None,
                 1.0,
                 None,
             )
@@ -548,5 +646,58 @@ mod tests {
             .recent_usage_penalty(&summary.candidate_id, "project_solver", "planner", 600.0)
             .await;
         assert!(penalty > 0.0);
+    }
+
+    #[tokio::test]
+    async fn score_bonus_penalizes_queue_and_inference_pressure() {
+        let path = tempfile::NamedTempFile::new()
+            .expect("temp file")
+            .into_temp_path();
+        let store = MetricsStore::new(path.to_path_buf()).await.expect("store");
+        let fast = summary("ollama", "qwen2.5-coder:1.5b");
+        let slow = summary("ollama", "qwen2.5-coder:0.5b");
+
+        store
+            .record_result(
+                &fast,
+                "project_solver",
+                "reviewer",
+                true,
+                Some(120),
+                Some(LocalUsageTelemetry {
+                    queue_wait_ms: Some(5),
+                    inference_ms: Some(110),
+                    total_tokens_estimate: Some(900),
+                }),
+                1.0,
+                None,
+            )
+            .await
+            .expect("record fast result");
+        store
+            .record_result(
+                &slow,
+                "project_solver",
+                "reviewer",
+                true,
+                Some(1800),
+                Some(LocalUsageTelemetry {
+                    queue_wait_ms: Some(850),
+                    inference_ms: Some(3900),
+                    total_tokens_estimate: Some(3400),
+                }),
+                1.0,
+                None,
+            )
+            .await
+            .expect("record slow result");
+
+        let fast_score = store
+            .score_bonus(&fast.candidate_id, "project_solver", "reviewer")
+            .await;
+        let slow_score = store
+            .score_bonus(&slow.candidate_id, "project_solver", "reviewer")
+            .await;
+        assert!(fast_score > slow_score);
     }
 }

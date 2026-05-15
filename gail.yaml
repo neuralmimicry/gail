@@ -23,12 +23,18 @@ orchestration:
   enabled: true
   selection_mode: best
   max_parallel_candidates: 3
+  interactive_pool_max_in_flight: 8
+  solver_pool_max_in_flight: 4
+  workload_pool_wait_timeout_ms: 250
   include_configured_candidates: true
   health_ttl_seconds: 1800
   early_success_enabled: true
   early_success_settle_seconds: 0.75
   early_success_min_quality: 0.5
   candidate_timeout_cap_seconds: 45
+  interactive_model_floor_b: 0.5
+  solver_model_floor_b: 1.5
+  strict_no_downgrade: true
   always_route_specialists: false
 
 providers:

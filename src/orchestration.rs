@@ -9,7 +9,7 @@ use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::{
-    sync::{Mutex, oneshot},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot},
     task::JoinSet,
     time::{Instant, sleep},
 };
@@ -21,7 +21,7 @@ use crate::{
     adaptive_schema, aer, api_issues,
     config::{ApiTokenConfig, GailConfig, ProviderProfile},
     errors::{GailError, Result, message_indicates_quota},
-    metrics::{HealthBucket, MetricsStore},
+    metrics::{HealthBucket, LocalUsageTelemetry, MetricsStore},
     models::{
         AarnnMirrorDirection, AerDecodeRequest, AerDecodeResponse, AerEncodeRequest,
         AerEncodeResponse, AuthContext, CandidateInvocationSummary, CandidateSummary,
@@ -60,6 +60,8 @@ struct GailServiceInner {
     trading_bridge: Option<TradingBridge>,
     _trading_bridge_handle: Option<TradingBridgeHandle>,
     load_tracker: Arc<Mutex<LoadTracker>>,
+    interactive_pool: Arc<Semaphore>,
+    solver_pool: Arc<Semaphore>,
 }
 
 #[derive(Clone, Debug)]
@@ -135,6 +137,21 @@ struct LoadReservation {
     resource_cost_vram_mb: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkloadClass {
+    Interactive,
+    Solver,
+}
+
+impl WorkloadClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Solver => "solver",
+        }
+    }
+}
+
 impl GailService {
     pub async fn new(config: GailConfig) -> Result<Self> {
         adaptive_schema::configure_persistence(config.storage.adaptive_schema_path.clone()).await;
@@ -155,6 +172,26 @@ impl GailService {
         let aarnn_bridge = AarnnMirrorClient::from_config(&config, client.clone(), &specialists);
         let nmc_telemetry = NmcTelemetryClient::from_config(&config, client.clone());
         let load_tracker = Arc::new(Mutex::new(LoadTracker::default()));
+        let interactive_pool = Arc::new(Semaphore::new(
+            env_int_any(
+                &[
+                    "GAIL_INTERACTIVE_POOL_MAX_IN_FLIGHT",
+                    "REFINER_AI_INTERACTIVE_POOL_MAX_IN_FLIGHT",
+                ],
+                config.orchestration.interactive_pool_max_in_flight as u64,
+            )
+            .max(1) as usize,
+        ));
+        let solver_pool = Arc::new(Semaphore::new(
+            env_int_any(
+                &[
+                    "GAIL_SOLVER_POOL_MAX_IN_FLIGHT",
+                    "REFINER_AI_SOLVER_POOL_MAX_IN_FLIGHT",
+                ],
+                config.orchestration.solver_pool_max_in_flight as u64,
+            )
+            .max(1) as usize,
+        ));
 
         // Construct a preliminary service (without trading) to pass into the trading bridge.
         let preliminary = Self {
@@ -168,6 +205,8 @@ impl GailService {
                 trading_bridge: None,
                 _trading_bridge_handle: None,
                 load_tracker: load_tracker.clone(),
+                interactive_pool: interactive_pool.clone(),
+                solver_pool: solver_pool.clone(),
             }),
         };
 
@@ -192,6 +231,8 @@ impl GailService {
                 trading_bridge,
                 _trading_bridge_handle: trading_bridge_handle,
                 load_tracker,
+                interactive_pool,
+                solver_pool,
             }),
         })
     }
@@ -245,18 +286,53 @@ impl GailService {
         &self,
         request: ProviderCompletionRequest,
     ) -> Result<CompletionResponse> {
+        let mut effective_request = request.clone();
+        if effective_request.workflow.is_none() {
+            effective_request.workflow = Some("direct".to_string());
+        }
+        if effective_request.role.is_none() {
+            effective_request.role = Some("assistant".to_string());
+        }
+        if effective_request.min_model_size_b.is_none() {
+            effective_request.min_model_size_b = self.model_floor_b(WorkloadClass::Interactive);
+        }
+        if effective_request.strict_no_downgrade.is_none() {
+            effective_request.strict_no_downgrade = Some(self.strict_no_downgrade());
+        }
         let request_id = Uuid::new_v4().to_string();
-        let prompt_text = flatten_prompt_text(&request.messages, request.system.as_deref());
-        let expected_json = expected_json(&request.messages, request.system.as_deref());
+        let prompt_text = flatten_prompt_text(
+            &effective_request.messages,
+            effective_request.system.as_deref(),
+        );
+        let expected_json = expected_json(
+            &effective_request.messages,
+            effective_request.system.as_deref(),
+        );
         let mut profile = ProviderProfile::default();
-        profile.name = request.provider.clone();
-        profile.provider_type = request.provider.clone();
-        profile.model = request.model.clone();
-        profile.api_key = request.api_key.clone();
-        profile.access_token = request.access_token.clone();
-        profile.base_url = request.base_url.clone();
+        profile.name = effective_request.provider.clone();
+        profile.provider_type = effective_request.provider.clone();
+        profile.model = effective_request.model.clone();
+        profile.api_key = effective_request.api_key.clone();
+        profile.access_token = effective_request.access_token.clone();
+        profile.base_url = effective_request.base_url.clone();
         profile.source = Some("request_direct".to_string());
         let candidate = ProviderCandidate::from_profile(profile.clone());
+        let workload_permit = match self
+            .acquire_workload_permit(WorkloadClass::Interactive)
+            .await
+        {
+            Some(permit) => permit,
+            None => {
+                return Err(GailError::upstream(
+                    "gail",
+                    Some(StatusCode::SERVICE_UNAVAILABLE),
+                    format!(
+                        "interactive workload pool is saturated; retry after {}ms",
+                        self.workload_pool_wait_timeout_ms()
+                    ),
+                ));
+            }
+        };
         let mirror_input = self
             .spawn_aarnn_mirror(self.build_aarnn_exchange(
                 request_id.as_str(),
@@ -264,19 +340,20 @@ impl GailService {
                 "direct",
                 "assistant",
                 AarnnMirrorDirection::Input,
-                Some(request.provider.as_str()),
-                request.model.as_deref(),
-                request.request_category.as_deref(),
-                request.system.as_deref(),
+                Some(effective_request.provider.as_str()),
+                effective_request.model.as_deref(),
+                effective_request.request_category.as_deref(),
+                effective_request.system.as_deref(),
                 None,
                 prompt_text.as_str(),
-                &request.messages,
+                &effective_request.messages,
             ))
             .await;
         let adapter = build_adapter(self.inner.client.clone(), &profile)?;
-        let response = match adapter.complete(&request).await {
+        let response = match adapter.complete(&effective_request).await {
             Ok(response) => response,
             Err(error) => {
+                drop(workload_permit);
                 let category = runtime_failure_health_bucket(Some(&error.to_string()), None)
                     .mode
                     .unwrap_or_else(|| "runtime_error".to_string());
@@ -294,6 +371,7 @@ impl GailService {
                 return Err(error);
             }
         };
+        drop(workload_permit);
         api_issues::observe_provider_recovery(
             candidate.provider_type.as_str(),
             candidate.configured_model.as_str(),
@@ -308,11 +386,11 @@ impl GailService {
                 "assistant",
                 Some(response.provider.as_str()),
                 Some(response.model.as_str()),
-                request.request_category.as_deref(),
-                request.system.as_deref(),
+                effective_request.request_category.as_deref(),
+                effective_request.system.as_deref(),
                 Some(prompt_text.as_str()),
                 response.text.as_str(),
-                &request.messages,
+                &effective_request.messages,
             )
             .await;
         let mirror_input = self.await_aarnn_mirror_task(mirror_input).await;
@@ -388,6 +466,9 @@ impl GailService {
         let request_id = Uuid::new_v4().to_string();
         let workflow = normalize_key(request.workflow.as_deref().unwrap_or("general"), "general");
         let role = normalize_key(request.role.as_deref().unwrap_or("general"), "general");
+        let workload_class = classify_workload(workflow.as_str(), role.as_str());
+        let model_floor_b = self.model_floor_b(workload_class);
+        let strict_no_downgrade = self.strict_no_downgrade();
         let selection_mode = request
             .selection_mode
             .clone()
@@ -419,6 +500,10 @@ impl GailService {
             timeout_seconds: request.timeout_seconds,
             reasoning_effort: request.reasoning_effort.clone(),
             request_category: request.request_category.clone(),
+            workflow: Some(workflow.clone()),
+            role: Some(role.clone()),
+            min_model_size_b: model_floor_b,
+            strict_no_downgrade: Some(strict_no_downgrade),
         };
 
         let prompt_text = flatten_prompt_text(
@@ -492,9 +577,29 @@ impl GailService {
             .await;
 
         let mut candidates = self.build_candidates(&request, include_configured);
+        if let Some(min_model_size_b) = model_floor_b.filter(|value| *value > 0.0) {
+            let before = candidates.len();
+            candidates.retain(|candidate| candidate_meets_model_floor(candidate, min_model_size_b));
+            let removed = before.saturating_sub(candidates.len());
+            if removed > 0 {
+                info!(
+                    workflow = %workflow,
+                    role = %role,
+                    removed,
+                    min_model_size_b,
+                    "filtered candidates below configured model floor"
+                );
+            }
+        }
         if candidates.is_empty() {
             return Err(GailError::bad_request(
-                "no LLM providers are configured or supplied for orchestration",
+                if let Some(min_model_size_b) = model_floor_b.filter(|value| *value > 0.0) {
+                    format!(
+                        "no LLM providers are configured or supplied for orchestration after enforcing model floor >= {min_model_size_b:.2}b"
+                    )
+                } else {
+                    "no LLM providers are configured or supplied for orchestration".to_string()
+                },
             ));
         }
         let mut ranked = Vec::new();
@@ -639,6 +744,7 @@ impl GailService {
                         provider_request.clone(),
                         expected_json,
                         timeout_cap,
+                        workload_class,
                     )
                     .await,
                 ]
@@ -652,6 +758,7 @@ impl GailService {
                     early_success_settle_seconds,
                     early_success_min_quality,
                     timeout_cap,
+                    workload_class,
                 )
                 .await?
             };
@@ -699,6 +806,7 @@ impl GailService {
                     .score_bonus(candidate_summary.candidate_id.as_str(), &workflow, &role)
                     .await;
                 result.score = result.quality - latency_penalty.min(1.25) + metrics_bonus;
+                let telemetry = local_usage_telemetry(response);
                 self.inner
                     .metrics
                     .record_result(
@@ -707,6 +815,7 @@ impl GailService {
                         &role,
                         true,
                         Some(response.latency_ms),
+                        Some(telemetry),
                         result.quality,
                         None,
                     )
@@ -745,6 +854,7 @@ impl GailService {
                         &role,
                         false,
                         result.latency_ms,
+                        None,
                         -1.0,
                         result.error.as_deref(),
                     )
@@ -1145,7 +1255,13 @@ impl GailService {
             "routing_profiles_version": routing_profiles_version,
             "selection_mode": self.selection_mode(),
             "max_parallel_candidates": self.max_parallel_candidates(),
+            "interactive_pool_max_in_flight": self.inner.config.orchestration.interactive_pool_max_in_flight,
+            "solver_pool_max_in_flight": self.inner.config.orchestration.solver_pool_max_in_flight,
+            "workload_pool_wait_timeout_ms": self.workload_pool_wait_timeout_ms(),
             "health_ttl_seconds": self.health_ttl_seconds(),
+            "interactive_model_floor_b": self.model_floor_b(WorkloadClass::Interactive),
+            "solver_model_floor_b": self.model_floor_b(WorkloadClass::Solver),
+            "strict_no_downgrade": self.strict_no_downgrade(),
             "provider_count": providers.len(),
             "providers": providers,
             "engine_count": engines.len(),
@@ -1767,6 +1883,7 @@ impl GailService {
         early_success_settle_seconds: f64,
         early_success_min_quality: f64,
         timeout_cap: Option<u64>,
+        workload_class: WorkloadClass,
     ) -> Result<Vec<InvocationResult>> {
         let mut join_set = JoinSet::new();
         for candidate in selected.iter().cloned() {
@@ -1774,7 +1891,13 @@ impl GailService {
             let request = provider_request.clone();
             join_set.spawn(async move {
                 service
-                    .invoke_candidate(candidate, request, expected_json, timeout_cap)
+                    .invoke_candidate(
+                        candidate,
+                        request,
+                        expected_json,
+                        timeout_cap,
+                        workload_class,
+                    )
                     .await
             });
         }
@@ -1877,6 +2000,7 @@ impl GailService {
         provider_request: ProviderCompletionRequest,
         expected_json: bool,
         timeout_cap: Option<u64>,
+        workload_class: WorkloadClass,
     ) -> InvocationResult {
         if let Some(signal) = self.nmc_signal_for_candidate(&candidate).await {
             if signal.constrained {
@@ -1903,6 +2027,20 @@ impl GailService {
                 };
             }
         }
+        let Some(_workload_permit) = self.acquire_workload_permit(workload_class).await else {
+            return InvocationResult {
+                candidate,
+                response: None,
+                error: Some(format!(
+                    "{} workload pool is saturated; retry after {}ms",
+                    workload_class.label(),
+                    self.workload_pool_wait_timeout_ms(),
+                )),
+                latency_ms: None,
+                quality: -1.0,
+                score: f64::NEG_INFINITY,
+            };
+        };
         let Some(load_reservation) = self.reserve_candidate_load(&candidate).await else {
             return InvocationResult {
                 candidate,
@@ -1962,6 +2100,29 @@ impl GailService {
                         let latency_ms = started.elapsed().as_millis() as u64;
                         if response.text.trim().is_empty() && retry_empty && attempts < 2 {
                             continue;
+                        }
+                        if violates_strict_model_policy(
+                            effective.strict_no_downgrade.unwrap_or(false),
+                            effective.min_model_size_b,
+                            candidate_for_invocation.configured_model.as_str(),
+                            response.model.as_str(),
+                        ) {
+                            return InvocationResult {
+                                candidate: candidate_for_invocation.clone(),
+                                response: None,
+                                error: Some(format!(
+                                    "model selection violated strict no-downgrade policy (configured={}, resolved={}, min_floor_b={})",
+                                    candidate_for_invocation.configured_model,
+                                    response.model,
+                                    effective
+                                        .min_model_size_b
+                                        .map(|value| format!("{value:.2}"))
+                                        .unwrap_or_else(|| "none".to_string())
+                                )),
+                                latency_ms: Some(latency_ms),
+                                quality: -1.0,
+                                score: f64::NEG_INFINITY,
+                            };
                         }
                         let quality = quality_score(&response.text, expected_json);
                         return InvocationResult {
@@ -2061,6 +2222,64 @@ impl GailService {
             ],
             self.inner.config.orchestration.max_parallel_candidates as u64,
         ) as usize
+    }
+
+    fn workload_pool_wait_timeout_ms(&self) -> u64 {
+        env_int_any(
+            &[
+                "GAIL_WORKLOAD_POOL_WAIT_TIMEOUT_MS",
+                "REFINER_AI_WORKLOAD_POOL_WAIT_TIMEOUT_MS",
+            ],
+            self.inner
+                .config
+                .orchestration
+                .workload_pool_wait_timeout_ms,
+        )
+        .clamp(1, 60_000)
+    }
+
+    fn model_floor_b(&self, workload_class: WorkloadClass) -> Option<f64> {
+        let configured = match workload_class {
+            WorkloadClass::Interactive => self.inner.config.orchestration.interactive_model_floor_b,
+            WorkloadClass::Solver => self.inner.config.orchestration.solver_model_floor_b,
+        };
+        let env_floor = match workload_class {
+            WorkloadClass::Interactive => env_float_any(
+                &[
+                    "GAIL_INTERACTIVE_MODEL_FLOOR_B",
+                    "REFINER_AI_INTERACTIVE_MODEL_FLOOR_B",
+                ],
+                configured,
+            ),
+            WorkloadClass::Solver => env_float_any(
+                &[
+                    "GAIL_SOLVER_MODEL_FLOOR_B",
+                    "REFINER_AI_SOLVER_MODEL_FLOOR_B",
+                ],
+                configured,
+            ),
+        };
+        let floor = env_floor.max(0.0);
+        if floor > 0.0 { Some(floor) } else { None }
+    }
+
+    fn strict_no_downgrade(&self) -> bool {
+        env_bool_any(
+            &["GAIL_STRICT_NO_DOWNGRADE", "REFINER_AI_STRICT_NO_DOWNGRADE"],
+            self.inner.config.orchestration.strict_no_downgrade,
+        )
+    }
+
+    async fn acquire_workload_permit(&self, class: WorkloadClass) -> Option<OwnedSemaphorePermit> {
+        let wait_timeout = Duration::from_millis(self.workload_pool_wait_timeout_ms());
+        let semaphore = match class {
+            WorkloadClass::Interactive => self.inner.interactive_pool.clone(),
+            WorkloadClass::Solver => self.inner.solver_pool.clone(),
+        };
+        match tokio::time::timeout(wait_timeout, semaphore.acquire_owned()).await {
+            Ok(Ok(permit)) => Some(permit),
+            _ => None,
+        }
     }
 
     fn health_ttl_seconds(&self) -> f64 {
@@ -2631,6 +2850,7 @@ fn message_indicates_resource_saturation(message: &str) -> bool {
     let lowered = message.to_ascii_lowercase();
     lowered.contains("configured concurrency/resource budget is exhausted")
         || lowered.contains("resource budget exhausted")
+        || lowered.contains("workload pool is saturated")
 }
 
 fn message_indicates_nmc_constrained(message: &str) -> bool {
@@ -2843,6 +3063,103 @@ fn quality_score(text: &str, expected_json: bool) -> f64 {
         score -= 0.4;
     }
     score
+}
+
+fn local_usage_telemetry(response: &ProviderInvocationResponse) -> LocalUsageTelemetry {
+    let mut telemetry = LocalUsageTelemetry::default();
+    if let Some(raw) = response.raw.as_ref() {
+        if let Some(local_usage) = raw.get("gail_local_usage") {
+            telemetry.queue_wait_ms = local_usage
+                .get("queue_wait_ms")
+                .and_then(Value::as_u64)
+                .or_else(|| raw.get("gail_ollama_queue_wait_ms").and_then(Value::as_u64));
+            telemetry.inference_ms = local_usage
+                .get("inference_ms")
+                .and_then(Value::as_u64)
+                .or_else(|| raw.get("gail_ollama_inference_ms").and_then(Value::as_u64));
+            telemetry.total_tokens_estimate = local_usage
+                .get("total_tokens_estimate")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32)
+                .or_else(|| {
+                    raw.get("gail_ollama_total_tokens_estimate")
+                        .and_then(Value::as_u64)
+                        .map(|value| value as u32)
+                });
+        }
+    }
+    if telemetry.total_tokens_estimate.is_none() {
+        telemetry.total_tokens_estimate = response.usage.as_ref().and_then(|usage| {
+            usage.total.or_else(|| {
+                usage
+                    .prompt
+                    .zip(usage.completion)
+                    .map(|(prompt, completion)| prompt.saturating_add(completion))
+            })
+        });
+    }
+    telemetry
+}
+
+fn parse_model_size_billions(model: &str) -> Option<f64> {
+    let lowered = model.trim().to_ascii_lowercase();
+    for (index, ch) in lowered.char_indices() {
+        if ch != 'b' {
+            continue;
+        }
+        let mut start = index;
+        for (scan_index, scan) in lowered[..index].char_indices().rev() {
+            if scan.is_ascii_digit() || scan == '.' {
+                start = scan_index;
+            } else {
+                break;
+            }
+        }
+        if start < index {
+            let candidate = &lowered[start..index];
+            if candidate.chars().any(|ch| ch.is_ascii_digit()) {
+                if let Ok(parsed) = candidate.parse::<f64>() {
+                    return Some(parsed);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn candidate_meets_model_floor(candidate: &ProviderCandidate, min_model_size_b: f64) -> bool {
+    if min_model_size_b <= 0.0 {
+        return true;
+    }
+    parse_model_size_billions(candidate.configured_model.as_str())
+        .map(|size| size + 0.000_1 >= min_model_size_b)
+        .unwrap_or(true)
+}
+
+fn violates_strict_model_policy(
+    strict_no_downgrade: bool,
+    min_model_size_b: Option<f64>,
+    configured_model: &str,
+    resolved_model: &str,
+) -> bool {
+    if !strict_no_downgrade {
+        return false;
+    }
+    let configured_size = parse_model_size_billions(configured_model);
+    let resolved_size = parse_model_size_billions(resolved_model);
+    if let (Some(configured), Some(resolved)) = (configured_size, resolved_size) {
+        if resolved + 0.000_1 < configured {
+            return true;
+        }
+    }
+    if let (Some(minimum), Some(resolved)) =
+        (min_model_size_b.filter(|value| *value > 0.0), resolved_size)
+    {
+        if resolved + 0.000_1 < minimum {
+            return true;
+        }
+    }
+    false
 }
 
 fn flatten_prompt_text(messages: &[crate::models::ChatMessage], system: Option<&str>) -> String {
@@ -3086,8 +3403,34 @@ fn prompt_requests_manager_tool_call(prompt_text: &str) -> bool {
         && (lowered.contains("manager") || lowered.contains("tool"))
 }
 
+fn classify_workload(workflow: &str, role: &str) -> WorkloadClass {
+    if is_interactive_workflow(workflow, role) {
+        return WorkloadClass::Interactive;
+    }
+    let workflow = workflow.to_ascii_lowercase();
+    let role = role.to_ascii_lowercase();
+    if workflow.contains("solver")
+        || workflow.contains("refiner")
+        || workflow.contains("conductor")
+        || workflow.contains("automation")
+        || workflow.contains("batch")
+        || matches!(role.as_str(), "planner" | "reviewer" | "researcher")
+    {
+        WorkloadClass::Solver
+    } else {
+        WorkloadClass::Interactive
+    }
+}
+
 fn is_interactive_workflow(workflow: &str, role: &str) -> bool {
-    workflow.starts_with("assistant_") || role == "assistant"
+    let workflow = workflow.to_ascii_lowercase();
+    let role = role.to_ascii_lowercase();
+    role == "assistant"
+        || workflow.starts_with("assistant_")
+        || workflow.starts_with("direct")
+        || workflow.starts_with("ui_")
+        || workflow.starts_with("playground")
+        || workflow.contains("chat")
 }
 
 fn parse_bool(value: &str, default: bool) -> bool {
@@ -3464,5 +3807,39 @@ mod tests {
         let bucket = runtime_failure_health_bucket(Some(message), Some(7));
         assert_eq!(bucket.mode.as_deref(), Some("nmc_constrained"));
         assert!(message_indicates_provider_backoff(message));
+    }
+
+    #[test]
+    fn classify_workload_prefers_solver_for_project_solver_workflows() {
+        assert_eq!(
+            classify_workload("project_solver", "planner"),
+            WorkloadClass::Solver
+        );
+        assert_eq!(
+            classify_workload("direct", "assistant"),
+            WorkloadClass::Interactive
+        );
+    }
+
+    #[test]
+    fn strict_model_policy_rejects_downgrade_and_floor_violations() {
+        assert!(violates_strict_model_policy(
+            true,
+            Some(1.5),
+            "qwen2.5-coder:1.5b",
+            "qwen2.5-coder:0.5b"
+        ));
+        assert!(violates_strict_model_policy(
+            true,
+            Some(7.0),
+            "llama3.2:3b",
+            "llama3.2:3b"
+        ));
+        assert!(!violates_strict_model_policy(
+            true,
+            Some(1.5),
+            "qwen2.5-coder:1.5b",
+            "qwen2.5-coder:7b"
+        ));
     }
 }

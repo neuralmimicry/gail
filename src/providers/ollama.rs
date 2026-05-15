@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
     time::{Duration, Instant},
 };
@@ -21,7 +21,7 @@ use crate::{
 
 use super::{
     ProviderHealth, ProviderInvocationResponse, TranscriptionInput, data_url_parts, env_bool,
-    env_int, error_message, infer_capabilities_from_model, infer_capabilities_from_text,
+    env_float, env_int, error_message, infer_capabilities_from_model, infer_capabilities_from_text,
     is_model_not_found, post_json_with_retries, response_with_usage,
 };
 
@@ -31,6 +31,8 @@ const OLLAMA_SATURATION_BACKOFF_SECONDS: u64 = 20;
 static OLLAMA_REQUEST_SEMAPHORE: Lazy<Semaphore> =
     Lazy::new(|| Semaphore::new(env_int("GAIL_OLLAMA_MAX_CONCURRENT_REQUESTS", 2).max(1) as usize));
 static OLLAMA_SATURATED_UNTIL: Lazy<Mutex<Option<Instant>>> = Lazy::new(|| Mutex::new(None));
+static OLLAMA_ENDPOINT_SATURATED_UNTIL: Lazy<Mutex<HashMap<String, Instant>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone)]
 pub struct OllamaProvider {
@@ -53,6 +55,12 @@ struct ModelResolution {
     selected_model: Option<String>,
     requested_model: String,
     recommended_downloads: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LocalResourceSnapshot {
+    memory_available_mb: f64,
+    disk_available_mb: f64,
 }
 
 impl OllamaProvider {
@@ -140,6 +148,16 @@ impl OllamaProvider {
         let deadline = Instant::now() + Duration::from_secs(total_timeout_seconds);
         let mut last_error = None;
         for (index, base_url) in base_urls.iter().enumerate() {
+            if let Some(remaining) = ollama_endpoint_saturation_remaining(base_url).await {
+                tracing::info!(
+                    base_url = %base_url,
+                    endpoint_index = index,
+                    cooldown_seconds = remaining.as_secs().max(1),
+                    "skipping Ollama endpoint because it is in saturation cooldown"
+                );
+                last_error = Some(ollama_saturated_error(remaining));
+                continue;
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 last_error = Some(GailError::upstream(
@@ -209,10 +227,14 @@ impl OllamaProvider {
                     )
                     .await;
                     if message_indicates_ollama_saturation(&message) {
+                        let endpoint_backoff = mark_ollama_endpoint_saturated(base_url).await;
+                        let family_backoff = mark_ollama_saturated().await;
                         tracing::warn!(
                             base_url = %base_url,
                             endpoint_index = index,
                             error = %message,
+                            endpoint_backoff_seconds = endpoint_backoff.as_secs().max(1),
+                            family_backoff_seconds = family_backoff.as_secs().max(1),
                             "Ollama local model service saturated; backing off before retrying"
                         );
                         return Err(error);
@@ -236,8 +258,13 @@ impl OllamaProvider {
         &self,
         request: &ProviderCompletionRequest,
     ) -> Result<ProviderInvocationResponse> {
+        let base_url = request
+            .base_url
+            .clone()
+            .unwrap_or_else(|| self.base_url.clone());
         let queue_timeout =
             Duration::from_secs(env_int("GAIL_OLLAMA_QUEUE_TIMEOUT_SECONDS", 20).max(1));
+        let queue_started = Instant::now();
         let _permit =
             match tokio::time::timeout(queue_timeout, OLLAMA_REQUEST_SEMAPHORE.acquire()).await {
                 Ok(Ok(permit)) => permit,
@@ -249,7 +276,9 @@ impl OllamaProvider {
                     ));
                 }
                 Err(_) => {
-                    let backoff = mark_ollama_saturated().await;
+                    let endpoint_backoff = mark_ollama_endpoint_saturated(base_url.as_str()).await;
+                    let family_backoff = mark_ollama_saturated().await;
+                    let backoff = endpoint_backoff.max(family_backoff);
                     return Err(GailError::upstream(
                         "ollama",
                         None,
@@ -257,10 +286,7 @@ impl OllamaProvider {
                     ));
                 }
             };
-        let base_url = request
-            .base_url
-            .clone()
-            .unwrap_or_else(|| self.base_url.clone());
+        let queue_wait_ms = queue_started.elapsed().as_millis() as u64;
         let mut model = request.model.clone().unwrap_or_else(|| self.model.clone());
         let prompt = collapse_messages(request);
         let max_predict = env_int("GAIL_OLLAMA_MAX_PREDICT", 512).max(1) as u32;
@@ -294,7 +320,14 @@ impl OllamaProvider {
             .collect::<Vec<_>>();
         for attempt in 0..2 {
             let resolution = self
-                .resolve_model_for_request(&base_url, &model, &prompt, tags_timeout_seconds)
+                .resolve_model_for_request(
+                    &base_url,
+                    &model,
+                    &prompt,
+                    tags_timeout_seconds,
+                    request.min_model_size_b,
+                    request.strict_no_downgrade.unwrap_or(false),
+                )
                 .await?;
             let selected_model = resolution
                 .selected_model
@@ -324,10 +357,11 @@ impl OllamaProvider {
                 env_int("GAIL_OLLAMA_MAX_RETRIES", 0) as usize,
             )
             .await?;
-            let latency_ms = started.elapsed().as_millis() as u64;
+            let inference_ms = started.elapsed().as_millis() as u64;
+            let latency_ms = queue_wait_ms.saturating_add(inference_ms);
             let status = response.status();
             let body = response.text().await?;
-            let data: Value =
+            let mut data: Value =
                 serde_json::from_str(&body).unwrap_or_else(|_| json!({"message": body}));
             if !status.is_success() {
                 let message = error_message(&data);
@@ -345,23 +379,45 @@ impl OllamaProvider {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            let prompt_tokens_actual = data
+                .get("prompt_eval_count")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32);
+            let completion_tokens_actual = data
+                .get("eval_count")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32);
+            let prompt_tokens_estimate =
+                prompt_tokens_actual.unwrap_or_else(|| ((prompt.len().max(1) / 4) as u32).max(1));
+            let completion_tokens_estimate =
+                completion_tokens_actual.unwrap_or_else(|| ((text.len().max(1) / 4) as u32).max(1));
+            let total_tokens_estimate =
+                prompt_tokens_estimate.saturating_add(completion_tokens_estimate);
             let usage = Some(TokenUsage {
-                prompt: data
-                    .get("prompt_eval_count")
-                    .and_then(Value::as_u64)
-                    .map(|value| value as u32),
-                completion: data
-                    .get("eval_count")
-                    .and_then(Value::as_u64)
-                    .map(|value| value as u32),
+                prompt: Some(prompt_tokens_actual.unwrap_or(prompt_tokens_estimate)),
+                completion: Some(completion_tokens_actual.unwrap_or(completion_tokens_estimate)),
                 total: Some(
-                    data.get("prompt_eval_count")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0) as u32
-                        + data.get("eval_count").and_then(Value::as_u64).unwrap_or(0) as u32,
+                    prompt_tokens_actual
+                        .unwrap_or(prompt_tokens_estimate)
+                        .saturating_add(
+                            completion_tokens_actual.unwrap_or(completion_tokens_estimate),
+                        ),
                 ),
                 cached: None,
                 cost: None,
+            });
+            data["gail_ollama_queue_wait_ms"] = json!(queue_wait_ms);
+            data["gail_ollama_inference_ms"] = json!(inference_ms);
+            data["gail_ollama_total_tokens_estimate"] = json!(total_tokens_estimate);
+            data["gail_local_usage"] = json!({
+                "provider": "ollama",
+                "queue_wait_ms": queue_wait_ms,
+                "inference_ms": inference_ms,
+                "prompt_tokens_estimate": prompt_tokens_estimate,
+                "completion_tokens_estimate": completion_tokens_estimate,
+                "total_tokens_estimate": total_tokens_estimate,
+                "prompt_eval_count": prompt_tokens_actual,
+                "eval_count": completion_tokens_actual,
             });
             return Ok(response_with_usage(
                 text, data, latency_ms, "ollama", &model, usage,
@@ -723,6 +779,8 @@ impl OllamaProvider {
         requested_model: &str,
         prompt_text: &str,
         timeout_seconds: u64,
+        min_model_size_b: Option<f64>,
+        strict_no_downgrade: bool,
     ) -> Result<ModelResolution> {
         let tags = fetch_ollama_tags(&self.client, base_url, timeout_seconds).await?;
         let models = tags
@@ -730,43 +788,32 @@ impl OllamaProvider {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        if let Some(model) = select_matching_model_from_entries(&models, requested_model) {
+        let requested_size_b = model_size_billions(requested_model).unwrap_or(0.0);
+        let required_min_size_b = min_model_size_b.unwrap_or(0.0).max(if strict_no_downgrade {
+            requested_size_b
+        } else {
+            0.0
+        });
+        let resource_snapshot = local_resource_snapshot();
+        if let Some(model) =
+            select_matching_model_from_entries(&models, requested_model).filter(|model| {
+                model_meets_size_floor(model.as_str(), required_min_size_b)
+                    && model_fits_resources(model.as_str(), &resource_snapshot)
+            })
+        {
             return Ok(ModelResolution {
                 selected_model: Some(model),
                 requested_model: requested_model.to_string(),
                 recommended_downloads: Vec::new(),
             });
         }
-        let prompt_capabilities = infer_capabilities_from_text(prompt_text);
-        let requested_capabilities = infer_capabilities_from_model(requested_model);
-        let mut best: Option<(i32, String)> = None;
-        for entry in &models {
-            let Some(name) = entry.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            let capabilities = infer_capabilities_from_model(name);
-            let wanted = prompt_capabilities
-                .union(&requested_capabilities)
-                .cloned()
-                .collect::<HashSet<_>>();
-            let overlap = capabilities.intersection(&wanted).count() as i32;
-            let bonus = if name.to_ascii_lowercase().contains("coder")
-                && prompt_capabilities.contains("code")
-            {
-                2
-            } else {
-                0
-            };
-            let score = overlap + bonus;
-            if best
-                .as_ref()
-                .map(|(best_score, _)| score > *best_score)
-                .unwrap_or(true)
-            {
-                best = Some((score, name.to_string()));
-            }
-        }
-        if let Some((_, selected_model)) = best {
+        if let Some(selected_model) = select_best_local_model(
+            &models,
+            requested_model,
+            prompt_text,
+            required_min_size_b,
+            &resource_snapshot,
+        ) {
             return Ok(ModelResolution {
                 selected_model: Some(selected_model),
                 requested_model: requested_model.to_string(),
@@ -774,11 +821,249 @@ impl OllamaProvider {
             });
         }
         let allow_pull = env_bool("OLLAMA_ALLOW_AUTO_PULL", false);
+        let mut recommended_downloads = Vec::new();
+        if let Some(candidate) =
+            next_size_up_pull_candidate(requested_model, required_min_size_b.max(requested_size_b))
+        {
+            recommended_downloads.push(candidate);
+        }
+        if !recommended_downloads
+            .iter()
+            .any(|model| model.eq_ignore_ascii_case(requested_model))
+        {
+            recommended_downloads.push(requested_model.to_string());
+        }
+        if allow_pull {
+            let pull_timeout = env_int("GAIL_OLLAMA_PULL_TIMEOUT_SECONDS", 240).max(5);
+            for candidate in &recommended_downloads {
+                if !model_fits_resources(candidate.as_str(), &resource_snapshot) {
+                    continue;
+                }
+                if pull_ollama_model(
+                    &self.client,
+                    base_url,
+                    candidate.as_str(),
+                    Duration::from_secs(pull_timeout),
+                )
+                .await
+                .is_ok()
+                {
+                    return Ok(ModelResolution {
+                        selected_model: Some(candidate.clone()),
+                        requested_model: requested_model.to_string(),
+                        recommended_downloads: Vec::new(),
+                    });
+                }
+            }
+        }
+        if strict_no_downgrade && required_min_size_b > 0.0 {
+            return Ok(ModelResolution {
+                selected_model: None,
+                requested_model: requested_model.to_string(),
+                recommended_downloads,
+            });
+        }
         Ok(ModelResolution {
-            selected_model: allow_pull.then(|| requested_model.to_string()),
+            selected_model: if allow_pull {
+                Some(requested_model.to_string())
+            } else {
+                None
+            },
             requested_model: requested_model.to_string(),
-            recommended_downloads: vec![requested_model.to_string()],
+            recommended_downloads,
         })
+    }
+}
+
+fn model_size_billions(model: &str) -> Option<f64> {
+    let lowered = model.trim().to_ascii_lowercase();
+    for (index, ch) in lowered.char_indices() {
+        if ch != 'b' {
+            continue;
+        }
+        let mut start = index;
+        for (scan_index, scan) in lowered[..index].char_indices().rev() {
+            if scan.is_ascii_digit() || scan == '.' {
+                start = scan_index;
+            } else {
+                break;
+            }
+        }
+        if start < index {
+            let candidate = &lowered[start..index];
+            if candidate.chars().any(|ch| ch.is_ascii_digit()) {
+                if let Ok(parsed) = candidate.parse::<f64>() {
+                    return Some(parsed);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn model_meets_size_floor(model: &str, min_size_b: f64) -> bool {
+    if min_size_b <= 0.0 {
+        return true;
+    }
+    model_size_billions(model)
+        .map(|size| size + 0.000_1 >= min_size_b)
+        .unwrap_or(true)
+}
+
+fn local_resource_snapshot() -> LocalResourceSnapshot {
+    let system = System::new_all();
+    let memory_available_mb = system.available_memory() as f64 / (1024.0 * 1024.0);
+    let disks = Disks::new_with_refreshed_list();
+    let disk_available_bytes = disks
+        .iter()
+        .map(|disk| disk.available_space())
+        .max()
+        .unwrap_or(0);
+    let disk_available_mb = disk_available_bytes as f64 / (1024.0 * 1024.0);
+    LocalResourceSnapshot {
+        memory_available_mb,
+        disk_available_mb,
+    }
+}
+
+fn model_fits_resources(model: &str, resources: &LocalResourceSnapshot) -> bool {
+    let Some(size_b) = model_size_billions(model) else {
+        return true;
+    };
+    let ram_per_b_mb = env_float("GAIL_OLLAMA_RAM_MB_PER_B", 1400.0).max(256.0);
+    let disk_per_b_mb = env_float("GAIL_OLLAMA_DISK_MB_PER_B", 900.0).max(128.0);
+    let reserve_ratio = env_float("GAIL_OLLAMA_RESOURCE_RESERVE_RATIO", 1.15).clamp(1.0, 4.0);
+    let required_ram_mb = size_b * ram_per_b_mb * reserve_ratio;
+    let required_disk_mb = size_b * disk_per_b_mb * reserve_ratio;
+    resources.memory_available_mb >= required_ram_mb
+        && resources.disk_available_mb >= required_disk_mb
+}
+
+fn select_best_local_model(
+    models: &[Value],
+    requested_model: &str,
+    prompt_text: &str,
+    min_model_size_b: f64,
+    resources: &LocalResourceSnapshot,
+) -> Option<String> {
+    let prompt_capabilities = infer_capabilities_from_text(prompt_text);
+    let requested_capabilities = infer_capabilities_from_model(requested_model);
+    let wanted = prompt_capabilities
+        .union(&requested_capabilities)
+        .cloned()
+        .collect::<HashSet<_>>();
+    let requested_family = requested_model
+        .split_once(':')
+        .map(|(family, _)| family)
+        .unwrap_or(requested_model)
+        .to_ascii_lowercase();
+    let mut best: Option<(f64, String)> = None;
+    for entry in models {
+        let Some(name) = entry.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if !model_meets_size_floor(name, min_model_size_b) || !model_fits_resources(name, resources)
+        {
+            continue;
+        }
+        let capabilities = infer_capabilities_from_model(name);
+        let overlap = capabilities.intersection(&wanted).count() as f64;
+        let family = name
+            .split_once(':')
+            .map(|(value, _)| value)
+            .unwrap_or(name)
+            .to_ascii_lowercase();
+        let family_bonus = if family == requested_family {
+            1.25
+        } else {
+            0.0
+        };
+        let coder_bonus = if name.to_ascii_lowercase().contains("coder")
+            && prompt_capabilities.contains("code")
+        {
+            0.9
+        } else {
+            0.0
+        };
+        let size_penalty = model_size_billions(name)
+            .map(|size| {
+                if min_model_size_b > 0.0 {
+                    (size - min_model_size_b).abs() * 0.12
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
+        let score = (overlap * 1.6) + family_bonus + coder_bonus - size_penalty;
+        if best
+            .as_ref()
+            .map(|(best_score, _)| score > *best_score)
+            .unwrap_or(true)
+        {
+            best = Some((score, name.to_string()));
+        }
+    }
+    best.map(|(_, model)| model)
+}
+
+fn next_size_up_pull_candidate(requested_model: &str, min_size_b: f64) -> Option<String> {
+    let base = requested_model
+        .split_once(':')
+        .map(|(value, _)| value.to_string())
+        .unwrap_or_else(|| requested_model.to_string());
+    let canonical_sizes = [0.5_f64, 1.0, 1.5, 3.0, 7.0, 8.0, 14.0, 32.0, 70.0];
+    let threshold = min_size_b.max(model_size_billions(requested_model).unwrap_or(0.0));
+    canonical_sizes
+        .iter()
+        .copied()
+        .find(|size| *size + 0.000_1 >= threshold)
+        .map(|size| {
+            if (size.fract() - 0.0).abs() < f64::EPSILON {
+                format!("{base}:{}b", size as u32)
+            } else {
+                format!("{base}:{size:.1}b")
+            }
+        })
+}
+
+async fn pull_ollama_model(
+    client: &Client,
+    base_url: &str,
+    model: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let url = format!("{base_url}/api/pull");
+    let payload = json!({
+        "name": model,
+        "stream": false,
+    });
+    let response = client
+        .post(&url)
+        .timeout(timeout)
+        .json(&payload)
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let data: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({"message": body}));
+    if status.is_success() {
+        adaptive_schema::observe_success("ollama", "POST", &url, "pull model", &data).await;
+        Ok(())
+    } else {
+        adaptive_schema::observe_failure(
+            "ollama",
+            "POST",
+            &url,
+            "pull model",
+            Some(status.as_u16()),
+            &data.to_string(),
+        )
+        .await;
+        Err(GailError::upstream(
+            "ollama",
+            Some(status),
+            error_message(&data),
+        ))
     }
 }
 
@@ -836,6 +1121,27 @@ async fn mark_ollama_saturated() -> Duration {
     let backoff = ollama_saturation_backoff();
     let mut saturated_until = OLLAMA_SATURATED_UNTIL.lock().await;
     *saturated_until = Some(Instant::now() + backoff);
+    backoff
+}
+
+async fn ollama_endpoint_saturation_remaining(base_url: &str) -> Option<Duration> {
+    let key = normalize_base_url(base_url).unwrap_or_else(|| base_url.to_string());
+    let mut guard = OLLAMA_ENDPOINT_SATURATED_UNTIL.lock().await;
+    let until = guard.get(&key).copied()?;
+    let now = Instant::now();
+    if until <= now {
+        guard.remove(&key);
+        None
+    } else {
+        Some(until.saturating_duration_since(now))
+    }
+}
+
+async fn mark_ollama_endpoint_saturated(base_url: &str) -> Duration {
+    let backoff = ollama_saturation_backoff();
+    let key = normalize_base_url(base_url).unwrap_or_else(|| base_url.to_string());
+    let mut guard = OLLAMA_ENDPOINT_SATURATED_UNTIL.lock().await;
+    guard.insert(key, Instant::now() + backoff);
     backoff
 }
 
@@ -1051,6 +1357,21 @@ mod tests {
     }
 
     #[test]
+    fn model_size_parser_extracts_billion_suffix() {
+        assert_eq!(model_size_billions("qwen2.5-coder:0.5b"), Some(0.5));
+        assert_eq!(model_size_billions("llama3.2:3b"), Some(3.0));
+        assert_eq!(model_size_billions("mistral"), None);
+    }
+
+    #[test]
+    fn next_size_up_pull_candidate_respects_floor() {
+        assert_eq!(
+            next_size_up_pull_candidate("qwen2.5-coder:0.5b", 1.5).as_deref(),
+            Some("qwen2.5-coder:1.5b")
+        );
+    }
+
+    #[test]
     fn public_http_ollama_endpoint_adds_https_variant() {
         assert_eq!(
             endpoint_scheme_variants("http://ollama.neuralmimicry.ai"),
@@ -1112,6 +1433,10 @@ mod tests {
             timeout_seconds: Some(4),
             reasoning_effort: None,
             request_category: None,
+            workflow: None,
+            role: None,
+            min_model_size_b: None,
+            strict_no_downgrade: None,
         };
 
         let response = provider

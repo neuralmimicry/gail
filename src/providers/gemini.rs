@@ -192,6 +192,10 @@ impl GeminiProvider {
             timeout_seconds: input.timeout_seconds,
             reasoning_effort: None,
             request_category: None,
+            workflow: None,
+            role: None,
+            min_model_size_b: None,
+            strict_no_downgrade: None,
         };
         self.complete(&request).await
     }

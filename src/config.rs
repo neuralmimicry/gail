@@ -52,6 +52,9 @@ pub struct OrchestrationConfig {
     pub enabled: bool,
     pub selection_mode: SelectionMode,
     pub max_parallel_candidates: usize,
+    pub interactive_pool_max_in_flight: usize,
+    pub solver_pool_max_in_flight: usize,
+    pub workload_pool_wait_timeout_ms: u64,
     pub include_configured_candidates: bool,
     pub health_ttl_seconds: f64,
     pub early_success_enabled: bool,
@@ -59,6 +62,9 @@ pub struct OrchestrationConfig {
     pub early_success_min_quality: f64,
     pub candidate_timeout_cap_seconds: Option<u64>,
     pub automation_candidate_timeout_cap_seconds: Option<u64>,
+    pub interactive_model_floor_b: f64,
+    pub solver_model_floor_b: f64,
+    pub strict_no_downgrade: bool,
     pub always_route_specialists: bool,
 }
 
@@ -212,6 +218,9 @@ impl Default for OrchestrationConfig {
             enabled: true,
             selection_mode: SelectionMode::Best,
             max_parallel_candidates: 3,
+            interactive_pool_max_in_flight: 8,
+            solver_pool_max_in_flight: 4,
+            workload_pool_wait_timeout_ms: 250,
             include_configured_candidates: true,
             health_ttl_seconds: 1800.0,
             early_success_enabled: true,
@@ -219,6 +228,9 @@ impl Default for OrchestrationConfig {
             early_success_min_quality: 0.5,
             candidate_timeout_cap_seconds: Some(45),
             automation_candidate_timeout_cap_seconds: Some(12),
+            interactive_model_floor_b: 0.5,
+            solver_model_floor_b: 1.5,
+            strict_no_downgrade: true,
             always_route_specialists: false,
         }
     }
@@ -366,8 +378,24 @@ impl GailConfig {
         if self.orchestration.max_parallel_candidates == 0 {
             self.orchestration.max_parallel_candidates = 1;
         }
+        self.orchestration.interactive_pool_max_in_flight = self
+            .orchestration
+            .interactive_pool_max_in_flight
+            .clamp(1, 4096);
+        self.orchestration.solver_pool_max_in_flight =
+            self.orchestration.solver_pool_max_in_flight.clamp(1, 4096);
+        self.orchestration.workload_pool_wait_timeout_ms = self
+            .orchestration
+            .workload_pool_wait_timeout_ms
+            .clamp(1, 60_000);
         if self.orchestration.health_ttl_seconds < 30.0 {
             self.orchestration.health_ttl_seconds = 30.0;
+        }
+        self.orchestration.interactive_model_floor_b =
+            self.orchestration.interactive_model_floor_b.max(0.0);
+        self.orchestration.solver_model_floor_b = self.orchestration.solver_model_floor_b.max(0.0);
+        if self.orchestration.solver_model_floor_b < self.orchestration.interactive_model_floor_b {
+            self.orchestration.solver_model_floor_b = self.orchestration.interactive_model_floor_b;
         }
         self.aarnn_bridge.endpoint = normalize_optional_url(self.aarnn_bridge.endpoint.as_deref());
         self.aarnn_bridge.access_token =
