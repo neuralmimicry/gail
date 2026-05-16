@@ -769,11 +769,12 @@ impl GailService {
                 .iter()
                 .filter(|result| result.response.is_none())
                 .filter_map(|result| {
-                    result
-                        .error
-                        .as_deref()
-                        .filter(|error| message_indicates_provider_backoff(error))
-                        .map(|_| result.candidate.provider_type.clone())
+                    let error = result.error.as_deref()?;
+                    if error_should_backoff_provider_family(&result.candidate, error) {
+                        Some(result.candidate.provider_type.clone())
+                    } else {
+                        None
+                    }
                 })
                 .collect::<HashSet<_>>();
             if !backoff_providers.is_empty() {
@@ -1501,7 +1502,9 @@ impl GailService {
                 "request_fallback",
             ));
         }
-        if include_configured || candidates.is_empty() {
+        let include_configured_fallback =
+            should_include_configured_candidates(include_configured, request, !candidates.is_empty());
+        if include_configured_fallback {
             candidates.extend(
                 self.inner
                     .config
@@ -1564,8 +1567,8 @@ impl GailService {
             && self
                 .inner
                 .metrics
-                .provider_in_health_backoff(
-                    candidate.provider_type.as_str(),
+                .candidate_in_health_backoff(
+                    candidate_id.as_str(),
                     &["ollama_saturated"],
                     ollama_saturation_backoff_seconds(),
                 )
@@ -1578,15 +1581,16 @@ impl GailService {
                 message: Some("local Ollama is saturated; waiting before retry".to_string()),
                 mode: Some("ollama_saturated".to_string()),
             }
-        } else if self
-            .inner
-            .metrics
-            .provider_in_health_backoff(
-                candidate.provider_type.as_str(),
-                &["quota", "upstream", "timeout"],
-                self.health_ttl_seconds(),
-            )
-            .await
+        } else if !is_ollama_candidate(&candidate)
+            && self
+                .inner
+                .metrics
+                .provider_in_health_backoff(
+                    candidate.provider_type.as_str(),
+                    &["quota", "upstream", "timeout"],
+                    self.health_ttl_seconds(),
+                )
+                .await
         {
             ProviderHealth {
                 ok: false,
@@ -2502,15 +2506,35 @@ impl ProviderCandidate {
     }
 
     fn candidate_id(&self) -> String {
+        let endpoint_scope = self.endpoint_scope();
         format!(
-            "{}/{}",
+            "{}/{}{}",
             self.provider_type,
             if self.configured_model.trim().is_empty() {
                 "default"
             } else {
                 self.configured_model.trim()
-            }
+            },
+            endpoint_scope
+                .map(|scope| format!("@{scope}"))
+                .unwrap_or_default()
         )
+    }
+
+    fn endpoint_scope(&self) -> Option<String> {
+        if !is_ollama_candidate(self) {
+            return None;
+        }
+        let explicit_name = self.profile.name.trim();
+        if !explicit_name.is_empty()
+            && !explicit_name.eq_ignore_ascii_case(self.provider_type.as_str())
+        {
+            return Some(sanitize_candidate_scope(explicit_name, "endpoint"));
+        }
+        self.profile
+            .base_url
+            .as_deref()
+            .and_then(candidate_scope_from_base_url)
     }
 
     fn label(&self, resolved_model: Option<&str>) -> String {
@@ -2838,6 +2862,14 @@ fn message_indicates_provider_backoff(message: &str) -> bool {
         || message_indicates_nmc_constrained(message)
         || message_indicates_provider_auth_failure(message)
         || message_indicates_transient_provider_failure(message)
+}
+
+fn error_should_backoff_provider_family(candidate: &ProviderCandidate, message: &str) -> bool {
+    if is_ollama_candidate(candidate) {
+        return message_indicates_quota(message)
+            || message_indicates_provider_auth_failure(message);
+    }
+    message_indicates_provider_backoff(message)
 }
 
 fn message_indicates_ollama_saturation(message: &str) -> bool {
@@ -3179,6 +3211,52 @@ fn flatten_prompt_text(messages: &[crate::models::ChatMessage], system: Option<&
     parts.join("\n")
 }
 
+fn candidate_scope_from_base_url(base_url: &str) -> Option<String> {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    let parsed = reqwest::Url::parse(with_scheme.as_str()).ok()?;
+    let host = parsed.host_str()?;
+    let mut scope = host.to_ascii_lowercase();
+    if let Some(port) = parsed.port_or_known_default() {
+        scope.push('_');
+        scope.push_str(port.to_string().as_str());
+    }
+    let path = parsed.path().trim_matches('/');
+    if !path.is_empty() {
+        scope.push('_');
+        scope.push_str(path);
+    }
+    Some(sanitize_candidate_scope(scope.as_str(), "endpoint"))
+}
+
+fn sanitize_candidate_scope(value: &str, fallback: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('_');
+        }
+    }
+    let collapsed = out
+        .split('_')
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    if collapsed.is_empty() {
+        fallback.to_string()
+    } else {
+        collapsed
+    }
+}
+
 fn normalize_key(value: &str, fallback: &str) -> String {
     let cleaned = value.trim().to_ascii_lowercase();
     if cleaned.is_empty() {
@@ -3195,6 +3273,20 @@ where
     let mut items = values.into_iter().collect::<Vec<_>>();
     items.sort();
     items
+}
+
+fn should_include_configured_candidates(
+    include_configured: bool,
+    request: &CompletionRequest,
+    has_request_candidates: bool,
+) -> bool {
+    if include_configured {
+        return true;
+    }
+    if !has_request_candidates {
+        return true;
+    }
+    request.preferred_provider.is_some()
 }
 
 fn should_return_degraded_fallback(
@@ -3603,14 +3695,10 @@ mod tests {
             .iter()
             .map(|candidate| candidate.candidate_id())
             .collect::<Vec<_>>();
-        assert_eq!(
-            labels,
-            vec![
-                "nvidia/moonshotai/kimi-k2-instruct-0905".to_string(),
-                "ollama/llama3.2".to_string(),
-                "openai/gpt-4o-mini".to_string(),
-            ]
-        );
+        assert_eq!(labels.len(), 3);
+        assert_eq!(labels[0], "nvidia/moonshotai/kimi-k2-instruct-0905");
+        assert!(labels[1].starts_with("ollama/llama3.2"));
+        assert_eq!(labels[2], "openai/gpt-4o-mini");
     }
 
     #[test]
@@ -3649,13 +3737,9 @@ mod tests {
             .iter()
             .map(|candidate| candidate.candidate_id())
             .collect::<Vec<_>>();
-        assert_eq!(
-            labels,
-            vec![
-                "nvidia/moonshotai/kimi-k2-instruct-0905".to_string(),
-                "ollama/llama3.2".to_string(),
-            ]
-        );
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0], "nvidia/moonshotai/kimi-k2-instruct-0905");
+        assert!(labels[1].starts_with("ollama/llama3.2"));
     }
 
     #[test]
@@ -3700,8 +3784,50 @@ mod tests {
             .iter()
             .map(|candidate| candidate.candidate_id())
             .collect::<Vec<_>>();
-        assert!(labels.contains(&"ollama/llama3.2".to_string()));
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.starts_with("ollama/llama3.2"))
+        );
         assert_eq!(labels.len(), 3);
+    }
+
+    #[test]
+    fn candidate_id_scopes_ollama_endpoints() {
+        let first = ProviderCandidate::from_profile(ProviderProfile {
+            name: "ollama-openai-compat".to_string(),
+            provider_type: "ollama".to_string(),
+            model: Some("qwen2.5-coder:1.5b".to_string()),
+            base_url: Some(
+                "http://ollama-openai-compat.ollama.svc.cluster.local:11434".to_string(),
+            ),
+            ..ProviderProfile::default()
+        });
+        let second = ProviderCandidate::from_profile(ProviderProfile {
+            name: "ollama-native".to_string(),
+            provider_type: "ollama".to_string(),
+            model: Some("qwen2.5-coder:1.5b".to_string()),
+            base_url: Some("http://ollama.ollama.svc.cluster.local:11434".to_string()),
+            ..ProviderProfile::default()
+        });
+        let nvidia = ProviderCandidate::from_profile(ProviderProfile {
+            provider_type: "nvidia".to_string(),
+            model: Some("minimaxai/minimax-m2.7".to_string()),
+            ..ProviderProfile::default()
+        });
+
+        assert_ne!(first.candidate_id(), second.candidate_id());
+        assert!(
+            first
+                .candidate_id()
+                .starts_with("ollama/qwen2.5-coder:1.5b@")
+        );
+        assert!(
+            second
+                .candidate_id()
+                .starts_with("ollama/qwen2.5-coder:1.5b@")
+        );
+        assert_eq!(nvidia.candidate_id(), "nvidia/minimaxai/minimax-m2.7");
     }
 
     #[test]
@@ -3810,6 +3936,28 @@ mod tests {
     }
 
     #[test]
+    fn provider_family_backoff_does_not_throttle_all_ollama_endpoints_on_saturation() {
+        let ollama = ProviderCandidate::from_profile(ProviderProfile {
+            provider_type: "ollama".to_string(),
+            model: Some("qwen2.5-coder:1.5b".to_string()),
+            base_url: Some(
+                "http://ollama-openai-compat.ollama.svc.cluster.local:11434".to_string(),
+            ),
+            ..ProviderProfile::default()
+        });
+        let nvidia = ProviderCandidate::from_profile(ProviderProfile {
+            provider_type: "nvidia".to_string(),
+            model: Some("minimaxai/minimax-m2.7".to_string()),
+            ..ProviderProfile::default()
+        });
+        let saturation = "ollama upstream error: local Ollama request queue is saturated; backing off before retrying in 90s";
+        let upstream = "nvidia upstream error: error sending request for url (https://integrate.api.nvidia.com/v1/chat/completions)";
+
+        assert!(!error_should_backoff_provider_family(&ollama, saturation));
+        assert!(error_should_backoff_provider_family(&nvidia, upstream));
+    }
+
+    #[test]
     fn classify_workload_prefers_solver_for_project_solver_workflows() {
         assert_eq!(
             classify_workload("project_solver", "planner"),
@@ -3819,6 +3967,63 @@ mod tests {
             classify_workload("direct", "assistant"),
             WorkloadClass::Interactive
         );
+    }
+
+    #[test]
+    fn configured_candidates_are_included_for_preferred_provider_fallback() {
+        let request = CompletionRequest {
+            workflow: Some("project_solver".to_string()),
+            role: Some("planner".to_string()),
+            preferred_provider: Some("openai".to_string()),
+            preferred_model: Some("gpt-4o-mini".to_string()),
+            preferred_api_key: None,
+            preferred_access_token: None,
+            fallback_provider: None,
+            fallback_model: None,
+            fallback_api_key: None,
+            fallback_access_token: None,
+            base_url: None,
+            include_configured: Some(false),
+            selection_mode: None,
+            max_candidates: None,
+            messages: Vec::new(),
+            system: None,
+            max_tokens: None,
+            temperature: None,
+            timeout_seconds: None,
+            reasoning_effort: None,
+            request_category: None,
+        };
+        assert!(should_include_configured_candidates(false, &request, true));
+    }
+
+    #[test]
+    fn configured_candidates_respect_explicit_non_preferred_request_mode() {
+        let request = CompletionRequest {
+            workflow: Some("direct".to_string()),
+            role: Some("assistant".to_string()),
+            preferred_provider: None,
+            preferred_model: None,
+            preferred_api_key: None,
+            preferred_access_token: None,
+            fallback_provider: Some("ollama".to_string()),
+            fallback_model: Some("llama3.2:3b".to_string()),
+            fallback_api_key: None,
+            fallback_access_token: None,
+            base_url: None,
+            include_configured: Some(false),
+            selection_mode: None,
+            max_candidates: Some(1),
+            messages: Vec::new(),
+            system: None,
+            max_tokens: None,
+            temperature: None,
+            timeout_seconds: None,
+            reasoning_effort: None,
+            request_category: None,
+        };
+        assert!(!should_include_configured_candidates(false, &request, true));
+        assert!(should_include_configured_candidates(false, &request, false));
     }
 
     #[test]

@@ -157,6 +157,28 @@ impl MetricsStore {
             .await
     }
 
+    pub async fn candidate_in_health_backoff(
+        &self,
+        candidate_id: &str,
+        modes: &[&str],
+        ttl_seconds: f64,
+    ) -> bool {
+        let now = now_ts();
+        let data = self.inner.lock().await;
+        let Some(bucket) = data.candidates.get(candidate_id) else {
+            return false;
+        };
+        bucket
+            .health
+            .mode
+            .as_deref()
+            .is_some_and(|mode| modes.iter().any(|item| mode.eq_ignore_ascii_case(item)))
+            && bucket
+                .health
+                .checked_at
+                .is_some_and(|checked_at| now - checked_at < ttl_seconds)
+    }
+
     pub async fn provider_in_health_backoff(
         &self,
         provider: &str,
@@ -591,6 +613,39 @@ mod tests {
 
         assert!(store.provider_in_quota_backoff("nvidia", 1800.0).await);
         assert!(!store.provider_in_quota_backoff("ollama", 1800.0).await);
+    }
+
+    #[tokio::test]
+    async fn candidate_health_backoff_matches_exact_candidate() {
+        let path = tempfile::NamedTempFile::new()
+            .expect("temp file")
+            .into_temp_path();
+        let store = MetricsStore::new(path.to_path_buf()).await.expect("store");
+        let first = summary("ollama", "qwen2.5-coder:1.5b@openai_compat");
+        let second = summary("ollama", "qwen2.5-coder:1.5b@native");
+        store
+            .record_health(
+                &first,
+                HealthBucket {
+                    ok: Some(false),
+                    mode: Some("ollama_saturated".to_string()),
+                    checked_at: None,
+                    latency_ms: Some(10),
+                    message: Some("queue saturated".to_string()),
+                },
+            )
+            .await
+            .expect("record first");
+        assert!(
+            store
+                .candidate_in_health_backoff(&first.candidate_id, &["ollama_saturated"], 1800.0)
+                .await
+        );
+        assert!(
+            !store
+                .candidate_in_health_backoff(&second.candidate_id, &["ollama_saturated"], 1800.0)
+                .await
+        );
     }
 
     #[tokio::test]

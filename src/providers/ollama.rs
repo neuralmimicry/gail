@@ -145,8 +145,10 @@ impl OllamaProvider {
         &self,
         request: &ProviderCompletionRequest,
     ) -> Result<ProviderInvocationResponse> {
-        if let Some(remaining) = ollama_saturation_remaining().await {
-            return Err(ollama_saturated_error(remaining));
+        if ollama_family_saturation_enabled() {
+            if let Some(remaining) = ollama_saturation_remaining().await {
+                return Err(ollama_saturated_error(remaining));
+            }
         }
         let base_urls = self.base_url_candidates(request.base_url.as_deref());
         let total_timeout_seconds = request
@@ -236,16 +238,21 @@ impl OllamaProvider {
                     .await;
                     if message_indicates_ollama_saturation(&message) {
                         let endpoint_backoff = mark_ollama_endpoint_saturated(base_url).await;
-                        let family_backoff = mark_ollama_saturated().await;
+                        let family_backoff = if ollama_family_saturation_enabled() {
+                            Some(mark_ollama_saturated().await)
+                        } else {
+                            None
+                        };
                         tracing::warn!(
                             base_url = %base_url,
                             endpoint_index = index,
                             error = %message,
                             endpoint_backoff_seconds = endpoint_backoff.as_secs().max(1),
-                            family_backoff_seconds = family_backoff.as_secs().max(1),
+                            family_backoff_seconds = family_backoff.map(|value| value.as_secs().max(1)),
                             "Ollama local model service saturated; backing off before retrying"
                         );
-                        return Err(error);
+                        last_error = Some(error);
+                        continue;
                     }
                     tracing::warn!(
                         base_url = %base_url,
@@ -285,8 +292,11 @@ impl OllamaProvider {
                 }
                 Err(_) => {
                     let endpoint_backoff = mark_ollama_endpoint_saturated(base_url.as_str()).await;
-                    let family_backoff = mark_ollama_saturated().await;
-                    let backoff = endpoint_backoff.max(family_backoff);
+                    let backoff = if ollama_family_saturation_enabled() {
+                        endpoint_backoff.max(mark_ollama_saturated().await)
+                    } else {
+                        endpoint_backoff
+                    };
                     return Err(GailError::upstream(
                         "ollama",
                         None,
@@ -453,14 +463,16 @@ impl OllamaProvider {
     }
 
     pub async fn health(&self, timeout_seconds: Option<u64>) -> Result<ProviderHealth> {
-        if let Some(remaining) = ollama_saturation_remaining().await {
-            return Ok(ProviderHealth {
-                ok: false,
-                status_code: None,
-                latency_ms: None,
-                message: Some(ollama_saturated_message(remaining)),
-                mode: Some("ollama_saturated".to_string()),
-            });
+        if ollama_family_saturation_enabled() {
+            if let Some(remaining) = ollama_saturation_remaining().await {
+                return Ok(ProviderHealth {
+                    ok: false,
+                    status_code: None,
+                    latency_ms: None,
+                    message: Some(ollama_saturated_message(remaining)),
+                    mode: Some("ollama_saturated".to_string()),
+                });
+            }
         }
         let mut last_health = None;
         let mut last_error = None;
@@ -1173,6 +1185,10 @@ fn ollama_saturation_backoff() -> Duration {
         )
         .max(1) as u64,
     )
+}
+
+fn ollama_family_saturation_enabled() -> bool {
+    env_bool("GAIL_OLLAMA_FAMILY_SATURATION_BACKOFF", false)
 }
 
 async fn ollama_saturation_remaining() -> Option<Duration> {
