@@ -97,13 +97,21 @@ impl OllamaProvider {
 
     fn base_url_candidates(&self, request_base_url: Option<&str>) -> Vec<String> {
         let mut candidates = Vec::new();
-        push_base_url_candidate(&mut candidates, request_base_url);
+        let request_base = request_base_url.and_then(normalize_base_url);
+        let has_explicit_request_base = request_base.is_some();
+        push_base_url_candidate(&mut candidates, request_base.as_deref());
         push_base_url_candidate(&mut candidates, Some(self.base_url.as_str()));
-        for value in env_base_url_list("GAIL_OLLAMA_FALLBACK_BASE_URLS")
-            .into_iter()
-            .chain(env_base_url_list("OLLAMA_FALLBACK_BASE_URLS"))
-        {
-            push_base_url_candidate(&mut candidates, Some(value.as_str()));
+        let allow_cross_endpoint_fallback = env_bool(
+            "GAIL_OLLAMA_ALLOW_CROSS_ENDPOINT_FALLBACK",
+            !has_explicit_request_base,
+        );
+        if allow_cross_endpoint_fallback {
+            for value in env_base_url_list("GAIL_OLLAMA_FALLBACK_BASE_URLS")
+                .into_iter()
+                .chain(env_base_url_list("OLLAMA_FALLBACK_BASE_URLS"))
+            {
+                push_base_url_candidate(&mut candidates, Some(value.as_str()));
+            }
         }
         if candidates.is_empty()
             || candidates
@@ -318,6 +326,11 @@ impl OllamaProvider {
                     .collect::<Vec<_>>(),
             })
             .collect::<Vec<_>>();
+        if model_looks_non_generative(model.as_str()) {
+            return Err(GailError::bad_request(format!(
+                "Ollama model {model} does not support text generation via /api/generate"
+            )));
+        }
         for attempt in 0..2 {
             let resolution = self
                 .resolve_model_for_request(
@@ -536,6 +549,36 @@ impl OllamaProvider {
         }
 
         if !env_bool("GAIL_OLLAMA_HEALTH_GENERATE_PROBE", false) {
+            let configured = self.model.as_str();
+            let default_model = self.default_model.as_str();
+            let configured_installed = select_matching_installed_model(&payload, configured);
+            let default_installed = select_matching_installed_model(&payload, default_model);
+            let selected_for_health = configured_installed.clone().or(default_installed.clone());
+            if let Some(model_name) = selected_for_health {
+                if model_looks_non_generative(model_name.as_str()) {
+                    return Ok(ProviderHealth {
+                        ok: false,
+                        status_code: Some(status.as_u16()),
+                        latency_ms: Some(tags_latency_ms),
+                        message: Some(format!(
+                            "Ollama model {} is embedding-only and does not support generate",
+                            model_name
+                        )),
+                        mode: Some("missing_endpoint".to_string()),
+                    });
+                }
+            } else {
+                return Ok(ProviderHealth {
+                    ok: false,
+                    status_code: Some(status.as_u16()),
+                    latency_ms: Some(tags_latency_ms),
+                    message: Some(format!(
+                        "configured model {} (or default {}) is not installed on {}",
+                        configured, default_model, base_url
+                    )),
+                    mode: Some("missing_endpoint".to_string()),
+                });
+            }
             return Ok(ProviderHealth {
                 ok: true,
                 status_code: Some(status.as_u16()),
@@ -788,6 +831,17 @@ impl OllamaProvider {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let generative_models = models
+            .iter()
+            .filter(|entry| {
+                entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(|name| !model_looks_non_generative(name))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         let requested_size_b = model_size_billions(requested_model).unwrap_or(0.0);
         let required_min_size_b = min_model_size_b.unwrap_or(0.0).max(if strict_no_downgrade {
             requested_size_b
@@ -795,8 +849,8 @@ impl OllamaProvider {
             0.0
         });
         let resource_snapshot = local_resource_snapshot();
-        if let Some(model) =
-            select_matching_model_from_entries(&models, requested_model).filter(|model| {
+        if let Some(model) = select_matching_model_from_entries(&generative_models, requested_model)
+            .filter(|model| {
                 model_meets_size_floor(model.as_str(), required_min_size_b)
                     && model_fits_resources(model.as_str(), &resource_snapshot)
             })
@@ -808,7 +862,7 @@ impl OllamaProvider {
             });
         }
         if let Some(selected_model) = select_best_local_model(
-            &models,
+            &generative_models,
             requested_model,
             prompt_text,
             required_min_size_b,
@@ -822,6 +876,13 @@ impl OllamaProvider {
         }
         let allow_pull = env_bool("OLLAMA_ALLOW_AUTO_PULL", false);
         let mut recommended_downloads = Vec::new();
+        if model_looks_non_generative(requested_model) {
+            return Ok(ModelResolution {
+                selected_model: None,
+                requested_model: requested_model.to_string(),
+                recommended_downloads: vec![requested_model.to_string()],
+            });
+        }
         if let Some(candidate) =
             next_size_up_pull_candidate(requested_model, required_min_size_b.max(requested_size_b))
         {
@@ -908,6 +969,15 @@ fn model_meets_size_floor(model: &str, min_size_b: f64) -> bool {
     model_size_billions(model)
         .map(|size| size + 0.000_1 >= min_size_b)
         .unwrap_or(true)
+}
+
+fn model_looks_non_generative(model: &str) -> bool {
+    let lowered = model.trim().to_ascii_lowercase();
+    lowered.contains("embed")
+        || lowered.contains("embedding")
+        || lowered.contains("rerank")
+        || lowered.contains("re-rank")
+        || lowered.contains("retrieval")
 }
 
 fn local_resource_snapshot() -> LocalResourceSnapshot {
@@ -1364,6 +1434,20 @@ mod tests {
     }
 
     #[test]
+    fn model_floor_keeps_unknown_size_aliases_eligible() {
+        assert!(model_meets_size_floor("llama3.2:3b", 1.5));
+        assert!(!model_meets_size_floor("llama3.2:1b", 1.5));
+        assert!(model_meets_size_floor("mistral", 1.5));
+    }
+
+    #[test]
+    fn non_generative_model_detection_matches_embedding_families() {
+        assert!(model_looks_non_generative("nomic-embed-text"));
+        assert!(model_looks_non_generative("bge-rerank-v2"));
+        assert!(!model_looks_non_generative("qwen2.5-coder:1.5b"));
+    }
+
+    #[test]
     fn next_size_up_pull_candidate_respects_floor() {
         assert_eq!(
             next_size_up_pull_candidate("qwen2.5-coder:0.5b", 1.5).as_deref(),
@@ -1380,6 +1464,26 @@ mod tests {
         assert!(
             endpoint_scheme_variants("http://ollama.ollama.svc.cluster.local:11434").is_empty()
         );
+    }
+
+    #[test]
+    fn select_best_local_model_excludes_embedding_only_candidates() {
+        let models = vec![
+            json!({"name": "nomic-embed-text:latest"}),
+            json!({"name": "llama3.2:3b"}),
+        ];
+        let resources = LocalResourceSnapshot {
+            memory_available_mb: 1_000_000.0,
+            disk_available_mb: 1_000_000.0,
+        };
+        let selected = select_best_local_model(
+            &models,
+            "qwen2.5-coder:7b",
+            "Reply with exactly: OK",
+            0.0,
+            &resources,
+        );
+        assert_eq!(selected.as_deref(), Some("llama3.2:3b"));
     }
 
     #[tokio::test]
@@ -1447,5 +1551,60 @@ mod tests {
         let raw = response.raw.expect("raw metadata");
         assert_eq!(raw["gail_ollama_base_url"], good.uri());
         assert_eq!(raw["gail_ollama_endpoint_failover"], true);
+    }
+
+    #[tokio::test]
+    async fn completion_skips_embedding_only_inventory_for_generate_requests() {
+        let endpoint = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "nomic-embed-text:latest"}]
+            })))
+            .mount(&endpoint)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "should not be used"
+            })))
+            .expect(0)
+            .mount(&endpoint)
+            .await;
+
+        let provider = OllamaProvider {
+            client: Client::new(),
+            model: "qwen2.5-coder:7b".to_string(),
+            default_model: "qwen2.5-coder:7b".to_string(),
+            base_url: endpoint.uri(),
+        };
+        let request = ProviderCompletionRequest {
+            provider: "ollama".to_string(),
+            model: Some("qwen2.5-coder:7b".to_string()),
+            api_key: None,
+            access_token: None,
+            base_url: Some(endpoint.uri()),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: MessageContent::Text("hello".to_string()),
+            }],
+            system: None,
+            max_tokens: Some(8),
+            temperature: Some(0.0),
+            timeout_seconds: Some(4),
+            reasoning_effort: None,
+            request_category: None,
+            workflow: None,
+            role: None,
+            min_model_size_b: Some(1.5),
+            strict_no_downgrade: Some(true),
+        };
+
+        let error = provider.complete(&request).await.expect_err("should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("is not safely available locally")
+        );
     }
 }
