@@ -389,10 +389,49 @@ async fn run_single_evaluation(
     );
 
     // --- 5. Make decision ---
-    let decision = {
+    let mut decision = {
         let s = state.0.lock().await;
         decision_engine.decide(&fuzzy_out, &consensus, best_snapshot.as_ref(), &s, config)
     };
+
+    if !decision.override_applied
+        && !matches!(decision.action, TradeAction::Hold | TradeAction::Cancel)
+    {
+        if let Some(reason) = degraded_live_execution_reason(&consensus, config) {
+            let previous_action = decision.action.clone();
+            let previous_confidence = decision.confidence;
+            let previous_amount = decision.amount_usd;
+            warn!(
+                "trading: live execution gated by AI quality checks: {}",
+                reason
+            );
+            state
+                .log(
+                    "warn",
+                    "decision",
+                    format!("Execution gated: {reason}"),
+                    json!({
+                        "previous_action": previous_action.to_string(),
+                        "previous_confidence": previous_confidence,
+                        "previous_amount_usd": previous_amount,
+                        "responders": consensus.responders,
+                        "failures": consensus.failures,
+                        "coverage": consensus_coverage(&consensus),
+                        "average_risk": consensus_average_risk(&consensus),
+                        "agreement": consensus_agreement(&consensus),
+                    }),
+                )
+                .await;
+            decision = TradeDecision {
+                action: TradeAction::Hold,
+                exchange: String::new(),
+                symbol: String::new(),
+                amount_usd: 0.0,
+                rationale: format!("Execution gated: {reason}"),
+                ..decision
+            };
+        }
+    }
 
     info!(
         "trading: decision = {:?} exchange={} symbol={} amount=${:.2} confidence={:.2}",
@@ -559,6 +598,91 @@ fn adaptive_schema_has_observations(schema: &adaptive_schema::AdaptiveApiSchema)
         || !schema.semantic_hints.is_empty()
         || !schema.numeric_hints.is_empty()
         || !schema.recent_adjustments.is_empty()
+}
+
+pub(crate) fn degraded_live_execution_reason(
+    consensus: &advisor::AiConsensus,
+    config: &TradingConfig,
+) -> Option<String> {
+    if consensus.responders == 0 {
+        return Some("No advisor responses available".to_string());
+    }
+
+    let requested = config.max_parallel_advisors.max(1);
+    let attempted = (consensus.responders + consensus.failures).max(1);
+    let expected = requested.min(attempted);
+    if expected >= 2 && consensus.responders * 2 < expected {
+        return Some(format!(
+            "Advisor quorum too low ({}/{} responders)",
+            consensus.responders, expected
+        ));
+    }
+
+    let coverage = consensus_coverage(consensus);
+    if consensus.failures > 0 && coverage < 0.5 {
+        return Some(format!(
+            "Advisor coverage too low after failures ({:.0}% coverage)",
+            coverage * 100.0
+        ));
+    }
+
+    let average_risk = consensus_average_risk(consensus);
+    if average_risk >= 0.72 {
+        return Some(format!(
+            "Consensus risk too high ({average_risk:.2} >= 0.72)"
+        ));
+    }
+
+    let agreement = consensus_agreement(consensus);
+    if consensus.responders >= 3 && agreement < 0.30 {
+        return Some(format!(
+            "Advisor disagreement too high ({agreement:.2} agreement)"
+        ));
+    }
+
+    None
+}
+
+fn consensus_coverage(consensus: &advisor::AiConsensus) -> f64 {
+    let total = consensus.responders + consensus.failures;
+    if total == 0 {
+        0.0
+    } else {
+        consensus.responders as f64 / total as f64
+    }
+}
+
+fn consensus_agreement(consensus: &advisor::AiConsensus) -> f64 {
+    consensus
+        .vote_distribution
+        .get("agreement")
+        .and_then(serde_json::Value::as_f64)
+        .map(|value| value.clamp(0.0, 1.0))
+        .unwrap_or(1.0)
+}
+
+fn consensus_average_risk(consensus: &advisor::AiConsensus) -> f64 {
+    if let Some(value) = consensus
+        .vote_distribution
+        .get("average_risk")
+        .and_then(serde_json::Value::as_f64)
+        .map(|value| value.clamp(0.0, 1.0))
+    {
+        return value;
+    }
+
+    let mut weighted_risk = 0.0;
+    let mut weighted_total = 0.0;
+    for advice in consensus.advices.iter().filter(|advice| advice.parsed_ok) {
+        let weight = advice.weight.max(0.05);
+        weighted_risk += advice.risk_score.clamp(0.0, 1.0) * weight;
+        weighted_total += weight;
+    }
+    if weighted_total > 0.0 {
+        (weighted_risk / weighted_total).clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
 }
 
 // ---------------------------------------------------------------------------

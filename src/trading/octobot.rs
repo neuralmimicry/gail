@@ -7,16 +7,17 @@
 ///
 /// Endpoint coverage:
 ///   Portfolio, open orders, trade history, exchange/symbol listings,
-///   order cancellation, market snapshots, and general status. Direct market
-///   order placement is intentionally refused until a supported OctoBot
-///   trading-mode or user-command bridge is configured.
-use std::{sync::Arc, time::Duration};
+///   order cancellation, market snapshots, and general status. Live order
+///   placement is attempted through known `/api/orders` and `/api/user_command`
+///   variants to support native OctoBot and custom bridge extensions.
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use reqwest::{Client, ClientBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
+use tokio::time::sleep;
 use tracing::{debug, warn};
 
 use crate::{
@@ -457,8 +458,134 @@ impl OctobotClient {
         side: &str,
         amount_usd: f64,
     ) -> Result<OctobotOrderResult, String> {
-        let _ = (exchange, symbol, side, amount_usd);
-        Err("OctoBot's web API does not expose direct market order placement; configure an OctoBot trading mode or user-command bridge before enabling Gail live execution".to_string())
+        let normalized_side = normalize_order_side(side)
+            .ok_or_else(|| format!("Unsupported trade side `{side}`: expected buy or sell"))?;
+        if !amount_usd.is_finite() || amount_usd <= 0.0 {
+            return Err(format!(
+                "Invalid trade amount `{amount_usd}`: expected a positive finite USD value"
+            ));
+        }
+
+        let rounded_amount = ((amount_usd * 100.0).round() / 100.0).max(0.01);
+        let baseline = self.capture_order_baseline().await;
+        let request_started_at = current_unix_timestamp_f64();
+
+        let canonical_order = json!({
+            "exchange": exchange,
+            "symbol": symbol,
+            "side": normalized_side,
+            "type": "market",
+            "order_type": "market",
+            "amount": rounded_amount,
+            "amount_usd": rounded_amount,
+            "quantity": rounded_amount,
+            "cost": rounded_amount,
+            "price": serde_json::Value::Null,
+        });
+
+        let mut attempts = Vec::new();
+
+        let direct_attempts = vec![
+            (
+                "/api/orders?action=create_order",
+                canonical_order.clone(),
+                "create order",
+            ),
+            (
+                "/api/orders?action=create_orders",
+                json!([canonical_order.clone()]),
+                "create orders",
+            ),
+            (
+                "/api/orders",
+                json!({
+                    "action": "create_order",
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "side": normalized_side,
+                    "type": "market",
+                    "amount": rounded_amount,
+                    "amount_usd": rounded_amount,
+                }),
+                "create order",
+            ),
+            ("/api/orders", canonical_order.clone(), "create order"),
+        ];
+
+        for (path, payload, label) in direct_attempts {
+            if let Some(result) = self
+                .attempt_order_submission(
+                    path,
+                    &payload,
+                    label,
+                    exchange,
+                    symbol,
+                    normalized_side,
+                    rounded_amount,
+                    &baseline,
+                    request_started_at,
+                    &mut attempts,
+                )
+                .await?
+            {
+                return Ok(result);
+            }
+        }
+
+        let user_command_attempts = vec![
+            json!({
+                "subject": "trading",
+                "action": "create_order",
+                "data": canonical_order,
+            }),
+            json!({
+                "subject": "gail_trading",
+                "action": "create_order",
+                "data": {
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "side": normalized_side,
+                    "amount_usd": rounded_amount,
+                    "type": "market",
+                },
+            }),
+            json!({
+                "subject": "trading_bridge",
+                "action": "create_order",
+                "data": {
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "side": normalized_side,
+                    "amount": rounded_amount,
+                    "order_type": "market",
+                },
+            }),
+        ];
+
+        for payload in user_command_attempts {
+            if let Some(result) = self
+                .attempt_order_submission(
+                    "/api/user_command",
+                    &payload,
+                    "user command order",
+                    exchange,
+                    symbol,
+                    normalized_side,
+                    rounded_amount,
+                    &baseline,
+                    request_started_at,
+                    &mut attempts,
+                )
+                .await?
+            {
+                return Ok(result);
+            }
+        }
+
+        Err(format!(
+            "OctoBot order placement failed for {exchange} {symbol} {normalized_side} ${rounded_amount:.2}. Tried: {}",
+            attempts.join(" | ")
+        ))
     }
 
     pub async fn cancel_order(&self, order_id: &str) -> Result<(), String> {
@@ -474,6 +601,174 @@ impl OctobotClient {
                 status.as_u16()
             ))
         }
+    }
+
+    async fn attempt_order_submission(
+        &self,
+        path: &str,
+        payload: &Value,
+        label: &str,
+        exchange: &str,
+        symbol: &str,
+        side: &str,
+        amount_usd: f64,
+        baseline: &OrderPlacementBaseline,
+        request_started_at: f64,
+        attempts: &mut Vec<String>,
+    ) -> Result<Option<OctobotOrderResult>, String> {
+        let (status, body) = self.post_json_with_status(path, payload, label).await?;
+        if !status.is_success() {
+            attempts.push(format!(
+                "{path} => HTTP {} {}",
+                status.as_u16(),
+                summarize_order_attempt_body(&body)
+            ));
+            return Ok(None);
+        }
+
+        if let Some(result) =
+            parse_order_result_body(&body, exchange, symbol, side, amount_usd, path)
+        {
+            attempts.push(format!(
+                "{path} => acknowledged ({})",
+                summarize_order_attempt_body(&body)
+            ));
+            return Ok(Some(result));
+        }
+
+        if let Some(result) = self
+            .wait_for_order_side_effects(
+                exchange,
+                symbol,
+                side,
+                amount_usd,
+                baseline,
+                request_started_at,
+            )
+            .await
+        {
+            attempts.push(format!("{path} => accepted (observed order side-effects)"));
+            return Ok(Some(result));
+        }
+
+        attempts.push(format!(
+            "{path} => HTTP {} without order acknowledgement",
+            status.as_u16()
+        ));
+        Ok(None)
+    }
+
+    async fn capture_order_baseline(&self) -> OrderPlacementBaseline {
+        let mut baseline = OrderPlacementBaseline {
+            captured_at: current_unix_timestamp_f64(),
+            ..OrderPlacementBaseline::default()
+        };
+
+        if let Ok(orders) = self.get_open_orders().await {
+            baseline.open_orders_captured = true;
+            baseline
+                .open_order_ids
+                .extend(orders.into_iter().map(|order| order.id));
+        }
+
+        if let Ok(trades) = self.get_trade_history(50).await {
+            baseline.trades_captured = true;
+            baseline.latest_trade_ts = trades
+                .iter()
+                .filter_map(|trade| trade.timestamp)
+                .reduce(f64::max);
+            baseline.trade_ids.extend(
+                trades
+                    .into_iter()
+                    .filter_map(|trade| trade.id)
+                    .filter(|id| !id.trim().is_empty()),
+            );
+        }
+
+        baseline
+    }
+
+    async fn wait_for_order_side_effects(
+        &self,
+        exchange: &str,
+        symbol: &str,
+        side: &str,
+        amount_usd: f64,
+        baseline: &OrderPlacementBaseline,
+        request_started_at: f64,
+    ) -> Option<OctobotOrderResult> {
+        const ORDER_POLL_ATTEMPTS: usize = 6;
+        const ORDER_POLL_DELAY_MS: u64 = 500;
+
+        for _ in 0..ORDER_POLL_ATTEMPTS {
+            if let Ok(open_orders) = self.get_open_orders().await
+                && let Some(order) = open_orders.into_iter().find(|order| {
+                    order.symbol.eq_ignore_ascii_case(symbol)
+                        && side_matches(&order.side, side)
+                        && is_new_open_order(order, baseline, request_started_at)
+                })
+            {
+                return Some(OctobotOrderResult {
+                    order_id: order.id,
+                    symbol: if order.symbol.is_empty() {
+                        symbol.to_string()
+                    } else {
+                        order.symbol
+                    },
+                    side: if order.side.is_empty() {
+                        side.to_string()
+                    } else {
+                        order.side
+                    },
+                    amount: if order.amount > 0.0 {
+                        order.amount
+                    } else {
+                        amount_usd
+                    },
+                    price: order.price,
+                    status: if order.status.is_empty() {
+                        "submitted".to_string()
+                    } else {
+                        order.status
+                    },
+                });
+            }
+
+            if let Ok(trades) = self.get_trade_history(30).await
+                && let Some(trade) = trades.into_iter().find(|trade| {
+                    trade.symbol.eq_ignore_ascii_case(symbol)
+                        && side_matches(&trade.side, side)
+                        && is_new_trade(trade, baseline, request_started_at)
+                })
+            {
+                let ts = trade.timestamp.unwrap_or_else(current_unix_timestamp_f64);
+                return Some(OctobotOrderResult {
+                    order_id: trade.id.unwrap_or_else(|| format!("filled-{ts:.3}")),
+                    symbol: if trade.symbol.is_empty() {
+                        symbol.to_string()
+                    } else {
+                        trade.symbol
+                    },
+                    side: if trade.side.is_empty() {
+                        side.to_string()
+                    } else {
+                        trade.side
+                    },
+                    amount: if trade.amount > 0.0 {
+                        trade.amount
+                    } else {
+                        amount_usd
+                    },
+                    price: Some(trade.price),
+                    status: "filled".to_string(),
+                });
+            }
+
+            sleep(Duration::from_millis(ORDER_POLL_DELAY_MS)).await;
+        }
+
+        let _ = exchange;
+        None
     }
 
     // -----------------------------------------------------------------------
@@ -619,6 +914,230 @@ impl OctobotClient {
             .await;
         }
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct OrderPlacementBaseline {
+    captured_at: f64,
+    open_order_ids: HashSet<String>,
+    open_orders_captured: bool,
+    trade_ids: HashSet<String>,
+    latest_trade_ts: Option<f64>,
+    trades_captured: bool,
+}
+
+fn normalize_order_side(raw: &str) -> Option<&'static str> {
+    let lowered = raw.to_ascii_lowercase();
+    if lowered.contains("buy") {
+        Some("buy")
+    } else if lowered.contains("sell") {
+        Some("sell")
+    } else {
+        None
+    }
+}
+
+fn side_matches(candidate: &str, expected: &str) -> bool {
+    normalize_order_side(candidate) == normalize_order_side(expected)
+}
+
+fn is_new_open_order(
+    order: &OctobotOrder,
+    baseline: &OrderPlacementBaseline,
+    request_started_at: f64,
+) -> bool {
+    if baseline.open_orders_captured {
+        return !baseline.open_order_ids.contains(&order.id);
+    }
+    order
+        .timestamp
+        .is_some_and(|ts| ts + 1.0 >= baseline.captured_at || ts + 1.0 >= request_started_at)
+}
+
+fn is_new_trade(
+    trade: &OctobotTrade,
+    baseline: &OrderPlacementBaseline,
+    request_started_at: f64,
+) -> bool {
+    if let Some(id) = trade.id.as_deref().filter(|value| !value.trim().is_empty()) {
+        if baseline.trades_captured {
+            return !baseline.trade_ids.contains(id);
+        }
+        return true;
+    }
+
+    if baseline.trades_captured {
+        return match (trade.timestamp, baseline.latest_trade_ts) {
+            (Some(ts), Some(last_ts)) => ts > last_ts + 0.001,
+            (Some(_), None) => true,
+            _ => false,
+        };
+    }
+
+    trade
+        .timestamp
+        .is_some_and(|ts| ts + 1.0 >= baseline.captured_at || ts + 1.0 >= request_started_at)
+}
+
+fn summarize_order_attempt_body(body: &Value) -> String {
+    match body {
+        Value::Null => "empty-body".to_string(),
+        Value::String(text) => {
+            let compact = text.replace('\n', " ").trim().to_string();
+            if compact.is_empty() {
+                "empty-string".to_string()
+            } else {
+                format!("message={}", compact.chars().take(120).collect::<String>())
+            }
+        }
+        Value::Object(object) => {
+            if object.is_empty() {
+                "empty-object".to_string()
+            } else {
+                let keys = object.keys().take(6).cloned().collect::<Vec<_>>().join(",");
+                format!("keys={keys}")
+            }
+        }
+        Value::Array(array) => format!("array(len={})", array.len()),
+        _ => format!("{}-body", body.as_str().unwrap_or("scalar")),
+    }
+}
+
+fn parse_order_result_body(
+    body: &Value,
+    default_exchange: &str,
+    default_symbol: &str,
+    default_side: &str,
+    default_amount: f64,
+    source_hint: &str,
+) -> Option<OctobotOrderResult> {
+    match body {
+        Value::Array(items) => items.iter().find_map(|entry| {
+            parse_order_result_body(
+                entry,
+                default_exchange,
+                default_symbol,
+                default_side,
+                default_amount,
+                source_hint,
+            )
+        }),
+        Value::Object(object) => parse_order_result_object(
+            object,
+            default_exchange,
+            default_symbol,
+            default_side,
+            default_amount,
+            source_hint,
+        ),
+        _ => None,
+    }
+}
+
+fn parse_order_result_object(
+    object: &serde_json::Map<String, Value>,
+    default_exchange: &str,
+    default_symbol: &str,
+    default_side: &str,
+    default_amount: f64,
+    source_hint: &str,
+) -> Option<OctobotOrderResult> {
+    for nested_key in [
+        "order",
+        "result",
+        "data",
+        "created_order",
+        "created_orders",
+        "payload",
+    ] {
+        if let Some(nested) = object.get(nested_key)
+            && let Some(result) = parse_order_result_body(
+                nested,
+                default_exchange,
+                default_symbol,
+                default_side,
+                default_amount,
+                source_hint,
+            )
+        {
+            return Some(result);
+        }
+    }
+
+    if let Some(entries) = object.get("orders").and_then(Value::as_array)
+        && let Some(result) = entries.iter().find_map(|entry| {
+            parse_order_result_body(
+                entry,
+                default_exchange,
+                default_symbol,
+                default_side,
+                default_amount,
+                source_hint,
+            )
+        })
+    {
+        return Some(result);
+    }
+
+    let order_id = order_result_string_field(object, &["order_id", "id", "exchange_order_id"])?;
+    let symbol = order_result_string_field(object, &["symbol", "pair", "market"])
+        .map(|value| value.replace('|', "/"))
+        .unwrap_or_else(|| default_symbol.to_string());
+    let side = order_result_string_field(object, &["side", "order_side", "type"])
+        .and_then(|value| normalize_order_side(&value).map(str::to_string))
+        .unwrap_or_else(|| default_side.to_string());
+    let amount = order_result_numeric_field(
+        object,
+        &["amount", "quantity", "size", "cost", "amount_usd"],
+    )
+    .unwrap_or(default_amount)
+    .max(0.0);
+    let price = order_result_numeric_field(
+        object,
+        &["price", "avg_price", "average_price", "filled_price"],
+    );
+    let status = order_result_string_field(object, &["status", "state", "result"])
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("submitted via {}", source_hint));
+
+    Some(OctobotOrderResult {
+        order_id,
+        symbol,
+        side,
+        amount,
+        price,
+        status,
+    })
+}
+
+fn order_result_string_field(
+    object: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter().find_map(|key| {
+        object.get(*key).and_then(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+    })
+}
+
+fn order_result_numeric_field(
+    object: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<f64> {
+    keys.iter().find_map(|key| {
+        object.get(*key).and_then(|value| {
+            value.as_f64().or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|text| text.trim().parse::<f64>().ok())
+            })
+        })
+    })
 }
 
 fn parse_exchange_info_array(body: &Value) -> Vec<OctobotExchange> {

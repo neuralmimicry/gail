@@ -16,6 +16,7 @@ mod tests {
     use crate::trading::advisor::{AiAdvice, AiConsensus};
     use crate::trading::config::{TradingConfig, TradingConfigOverride};
     use crate::trading::decision::DecisionEngine;
+    use crate::trading::degraded_live_execution_reason;
     use crate::trading::fuzzy::{FuzzyEngine, FuzzyInputs};
     use crate::trading::octobot::{
         CurrencyBalance, MarketSnapshot, OctobotOrder, OctobotPortfolio,
@@ -920,6 +921,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn degraded_execution_guard_blocks_when_no_advisors_respond() {
+        let config = default_config();
+        let consensus = AiConsensus {
+            action: "hold".to_string(),
+            confidence: 0.0,
+            signal: 0.0,
+            vote_distribution: json!({}),
+            advices: Vec::new(),
+            responders: 0,
+            failures: 2,
+        };
+        let reason = degraded_live_execution_reason(&consensus, &config);
+        assert!(
+            reason.is_some(),
+            "guard should block execution when no advisor responds"
+        );
+    }
+
+    #[test]
+    fn degraded_execution_guard_blocks_high_risk_consensus() {
+        let config = default_config();
+        let consensus = AiConsensus {
+            action: "buy".to_string(),
+            confidence: 0.8,
+            signal: 0.5,
+            vote_distribution: json!({
+                "average_risk": 0.85,
+                "coverage": 1.0,
+                "agreement": 1.0
+            }),
+            advices: vec![make_advice("buy", 0.8, 1.0)],
+            responders: 1,
+            failures: 0,
+        };
+        let reason = degraded_live_execution_reason(&consensus, &config);
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|value| value.contains("risk")),
+            "guard should block high-risk consensus, reason={reason:?}"
+        );
+    }
+
+    #[test]
+    fn degraded_execution_guard_allows_stable_low_risk_consensus() {
+        let config = default_config();
+        let consensus = AiConsensus {
+            action: "buy".to_string(),
+            confidence: 0.8,
+            signal: 0.5,
+            vote_distribution: json!({
+                "average_risk": 0.2,
+                "coverage": 1.0,
+                "agreement": 1.0
+            }),
+            advices: vec![make_advice("buy", 0.8, 1.0)],
+            responders: 1,
+            failures: 0,
+        };
+        let reason = degraded_live_execution_reason(&consensus, &config);
+        assert!(reason.is_none(), "stable consensus should not be blocked");
+    }
+
     // -----------------------------------------------------------------------
     // DecisionEngine tests
     // -----------------------------------------------------------------------
@@ -1670,6 +1735,90 @@ mod tests {
         assert_eq!(orders[0].side, "buy");
         assert_eq!(orders[0].order_type, "BUY LIMIT");
         assert_eq!(orders[0].timestamp, Some(1_777_777_777.0));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_place_buy_order_uses_create_order_endpoint() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/trades"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/orders"))
+            .and(query_param("action", "create_order"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "created-order-123",
+                "symbol": "BTC/USDT",
+                "side": "buy",
+                "amount": 5.0,
+                "price": 65000.0,
+                "status": "submitted"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let result = client
+            .place_buy_order("binance", "BTC/USDT", 5.0)
+            .await
+            .expect("place buy order");
+        assert_eq!(result.order_id, "created-order-123");
+        assert_eq!(result.symbol, "BTC/USDT");
+        assert_eq!(result.side, "buy");
+        assert_eq!(result.amount, 5.0);
+        assert_eq!(result.price, Some(65000.0));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_place_order_reports_attempts_when_all_paths_fail() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/orders"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("not available"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/trades"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("not available"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/orders"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unsupported"))
+            .expect(4)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/user_command"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unsupported"))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let err = client
+            .place_sell_order("binance", "ETH/USDT", 4.0)
+            .await
+            .expect_err("order placement should fail");
+        assert!(err.contains("OctoBot order placement failed"));
+        assert!(err.contains("/api/orders"));
+        assert!(err.contains("/api/user_command"));
         server.verify().await;
     }
 
