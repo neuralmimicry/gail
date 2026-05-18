@@ -66,10 +66,8 @@ BINARY_SUFFIX="${BINARY_SUFFIX:-$(nm_default_binary_suffix "$PLATFORM") }"
 BINARY_SUFFIX="$(nm_trim "$BINARY_SUFFIX")"
 BUILD_AS_USER="$(nm_resolve_build_user || true)"
 BIN_DIR="$(nm_binary_dir "$REPO_ROOT" "$TARGET_TRIPLE")"
-GAIL_BIN="${BIN_DIR}/GAIL${BINARY_SUFFIX}"
-LOADER_BIN="${BIN_DIR}/GAIL-loader${BINARY_SUFFIX}"
-GAIL_BIN_NAME="GAIL${BINARY_SUFFIX}"
-LOADER_BIN_NAME="GAIL-loader${BINARY_SUFFIX}"
+GAIL_BIN="${BIN_DIR}/gail${BINARY_SUFFIX}"
+GAIL_BIN_NAME="gail${BINARY_SUFFIX}"
 artifacts=()
 STAGE_ROOT=
 SIGN_DIR=
@@ -110,7 +108,7 @@ run_preflight_checks() {
 build_binaries() {
   run_preflight_checks
   local args cmd
-  args=(cargo build --locked --release --bin GAIL --bin GAIL-loader)
+  args=(cargo build --locked --release --bin gail)
   [[ -n "$TARGET_TRIPLE" ]] && args+=(--target "$TARGET_TRIPLE")
   printf -v cmd '%q ' "${args[@]}"
   cmd="cd $(printf '%q' "$REPO_ROOT") && ${cmd% }"
@@ -150,42 +148,40 @@ create_debian_package() {
   deb_version="$(nm_debian_package_version "$VERSION")"
   DEB_STAGE_ROOT="${OUTPUT_DIR}/.deb-stage"
   deb_root="${DEB_STAGE_ROOT}/root"
-  deb_path="${OUTPUT_DIR}/GAIL_${deb_version}_${DEB_ARCH}.deb"
+  deb_path="${OUTPUT_DIR}/gail_${deb_version}_${DEB_ARCH}.deb"
 
   rm -rf "$DEB_STAGE_ROOT"
-  install -d -m 0755 "$deb_root/DEBIAN" "$deb_root/usr/bin" "$deb_root/usr/share/doc/GAIL"
-  install -m 0755 "$GAIL_BIN" "$deb_root/usr/bin/GAIL"
-  install -m 0755 "$LOADER_BIN" "$deb_root/usr/bin/GAIL-loader"
-  install -m 0644 "$REPO_ROOT/README.md" "$deb_root/usr/share/doc/GAIL/README.md"
-  install -m 0644 "$REPO_ROOT/docs/OPERATIONS.md" "$deb_root/usr/share/doc/GAIL/OPERATIONS.md"
+  install -d -m 0755 "$deb_root/DEBIAN" "$deb_root/usr/bin" "$deb_root/usr/share/doc/gail"
+  install -m 0755 "$GAIL_BIN" "$deb_root/usr/bin/gail"
+  install -m 0644 "$REPO_ROOT/README.md" "$deb_root/usr/share/doc/gail/README.md"
+  install -m 0644 "$REPO_ROOT/docs/OPERATIONS.md" "$deb_root/usr/share/doc/gail/OPERATIONS.md"
 
-  depends="$(nm_compute_deb_depends "$deb_root/usr/bin/GAIL" "$deb_root/usr/bin/GAIL-loader")"
+  depends="$(nm_compute_deb_depends "$deb_root/usr/bin/gail" )"
   {
-    printf 'Package: GAIL\n'
+    printf 'Package: gail\n'
     printf 'Version: %s\n' "$deb_version"
     printf 'Section: admin\n'
     printf 'Priority: optional\n'
     printf 'Architecture: %s\n' "$DEB_ARCH"
     [[ -n "$depends" ]] && printf 'Depends: %s\n' "$depends"
     printf 'Maintainer: NeuralMimicry <opensource@neuralmimicry.ai>\n'
-    printf 'Homepage: https://github.com/neuralmimicry/GAIL\n'
-    printf 'Description: GAIL loader and anomaly detection runtime\n'
-    printf ' GAIL packages the core agent and GAIL-loader for Linux hosts.\n'
+    printf 'Homepage: https://github.com/neuralmimicry/gail\n'
+    printf 'Description: Gateway to AI Libraries\n'
+    printf ' Gail packages the core agent and Gail trading for Linux hosts.\n'
   } >"$deb_root/DEBIAN/control"
 
   dpkg-deb --build --root-owner-group "$deb_root" "$deb_path" >/dev/null
   artifacts+=("$deb_path")
 }
 
-if (( ! SKIP_BUILD )) || [[ ! -x "$GAIL_BIN" || ! -x "$LOADER_BIN" ]]; then
+if (( ! SKIP_BUILD )) || [[ ! -x "$GAIL_BIN" ]]; then
   build_binaries
 fi
 
 [[ -x "$GAIL_BIN" ]] || nm_die "missing GAIL binary: $GAIL_BIN"
-[[ -x "$LOADER_BIN" ]] || nm_die "missing GAIL-loader binary: $LOADER_BIN"
 (( SIGN_UPDATE == 0 )) || [[ -n "${GAIL_UPDATE_KEY:-}" ]] || nm_die "GAIL_UPDATE_KEY must be set when --sign-update is used"
 
-ARCHIVE_BASENAME="GAIL-${VERSION}-${PLATFORM}"
+ARCHIVE_BASENAME="gail-${VERSION}-${PLATFORM}"
 OUTPUT_DIR="$(mkdir -p "$OUTPUT_DIR" && cd "$OUTPUT_DIR" && pwd)"
 STAGE_ROOT="${OUTPUT_DIR}/.stage"
 PAYLOAD_DIR="${STAGE_ROOT}/${ARCHIVE_BASENAME}"
@@ -210,7 +206,7 @@ if (( SIGN_UPDATE )); then
   mkdir -p "$SIGN_DIR"
   (cd "$REPO_ROOT" && GAIL_UPDATE_KEY="$GAIL_UPDATE_KEY" "$GAIL_BIN" sign-update --bundle "$GAIL_BIN" --version "$VERSION" --channel production --out "$SIGN_DIR")
   for suffix in update update.meta.json update.sig; do
-    mv "$SIGN_DIR/GAIL.${suffix}" "$OUTPUT_DIR/${ARCHIVE_BASENAME}.${suffix}"
+    mv "$SIGN_DIR/gail.${suffix}" "$OUTPUT_DIR/${ARCHIVE_BASENAME}.${suffix}"
     artifacts+=("$OUTPUT_DIR/${ARCHIVE_BASENAME}.${suffix}")
   done
 fi
@@ -227,7 +223,7 @@ checksum_cmd="$(nm_checksum_tool)"
 )
 
 nm_log ''
-nm_log 'packaged GAIL release artifacts:'
+nm_log 'packaged Gail release artifacts:'
 for artifact in "${artifacts[@]}" "$CHECKSUM_PATH"; do
   nm_log "  $artifact"
 done
