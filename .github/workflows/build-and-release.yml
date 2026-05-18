@@ -297,18 +297,18 @@ jobs:
           DEB_ARCH: ${{ matrix.deb_arch }}
         run: |
           set -euo pipefail
-          deb_path="$(find dist -maxdepth 1 -type f -name 'GAIL_*.deb' | head -n 1)"
+          deb_path="$(find dist -maxdepth 1 -type f -name 'gail_*.deb' | head -n 1)"
           if [[ -z "$deb_path" ]]; then
             echo "::error::Expected a Debian package under dist/"
             exit 1
           fi
 
-          expected_version="$(basename "$deb_path" | sed -E 's/^GAIL_(.*)_[^_]+\.deb$/\1/')"
+          expected_version="$(basename "$deb_path" | sed -E 's/^gail_(.*)_[^_]+\.deb$/\1/')"
           actual_package="$(dpkg-deb -f "$deb_path" Package)"
           actual_version="$(dpkg-deb -f "$deb_path" Version)"
           actual_arch="$(dpkg-deb -f "$deb_path" Architecture)"
 
-          [[ "$actual_package" == "GAIL" ]]
+          [[ "$actual_package" == "gail" ]]
           [[ "$actual_version" == "$expected_version" ]]
           [[ "$actual_arch" == "$DEB_ARCH" ]]
 
@@ -320,8 +320,7 @@ jobs:
         run: |
           set -euo pipefail
           bin_dir="./target/${RUST_TARGET}/release"
-          "${bin_dir}/GAIL${BINARY_SUFFIX}" --version
-          "${bin_dir}/GAIL-loader${BINARY_SUFFIX}" --version
+          "${bin_dir}/gail${BINARY_SUFFIX}" --version
 
       - name: Upload packaged artifacts
         uses: actions/upload-artifact@v7
