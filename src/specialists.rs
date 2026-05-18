@@ -366,9 +366,10 @@ impl SpecialistEngine {
             ),
         ];
         if let Some(description) = self.profile.description.as_deref()
-            && !description.trim().is_empty() {
-                lines.push(format!("- Description: {description}"));
-            }
+            && !description.trim().is_empty()
+        {
+            lines.push(format!("- Description: {description}"));
+        }
         for guidance in &self.profile.guidance_lines {
             let cleaned = guidance.trim();
             if cleaned.is_empty() {
@@ -657,9 +658,10 @@ pub fn build_specialist_engines(config: &GailConfig, client: Client) -> Vec<Spec
     if !engines
         .iter()
         .any(|engine| engine.profile.engine_type.eq_ignore_ascii_case("aarnn"))
-        && let Some(legacy) = legacy_aarnn_engine(client) {
-            engines.push(legacy);
-        }
+        && let Some(legacy) = legacy_aarnn_engine(client)
+    {
+        engines.push(legacy);
+    }
     engines
 }
 
@@ -679,9 +681,10 @@ pub async fn specialist_engine_summaries(
         .specialists
         .iter()
         .any(|profile| profile.engine_type.eq_ignore_ascii_case("aarnn"))
-        && let Some(legacy) = legacy_aarnn_engine(client.clone()) {
-            summaries.push(legacy.summary(probe_health).await);
-        }
+        && let Some(legacy) = legacy_aarnn_engine(client.clone())
+    {
+        summaries.push(legacy.summary(probe_health).await);
+    }
     summaries
 }
 
@@ -1086,9 +1089,10 @@ fn env_bool_any(names: &[&str], default: bool) -> bool {
 fn env_int_any(names: &[&str], default: u64) -> u64 {
     for name in names {
         if let Ok(value) = env::var(name)
-            && let Ok(parsed) = value.trim().parse::<u64>() {
-                return parsed;
-            }
+            && let Ok(parsed) = value.trim().parse::<u64>()
+        {
+            return parsed;
+        }
     }
     default
 }
@@ -1096,9 +1100,10 @@ fn env_int_any(names: &[&str], default: u64) -> u64 {
 fn env_float_any(names: &[&str], default: f64) -> f64 {
     for name in names {
         if let Ok(value) = env::var(name)
-            && let Ok(parsed) = value.trim().parse::<f64>() {
-                return parsed;
-            }
+            && let Ok(parsed) = value.trim().parse::<f64>()
+        {
+            return parsed;
+        }
     }
     default
 }

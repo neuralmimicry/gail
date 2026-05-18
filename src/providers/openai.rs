@@ -252,19 +252,21 @@ impl OpenAIProvider {
                     .get("incomplete_details")
                     .and_then(|value| value.get("reason"))
                     .and_then(Value::as_str)
-                    && reason == "max_output_tokens" && attempt < 2 {
-                        max_tokens = Some(max_tokens.unwrap_or(1024).saturating_mul(2).max(1024));
-                        replay_response_id = data
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned);
-                        replay_prompt = Some(
+                    && reason == "max_output_tokens"
+                    && attempt < 2
+                {
+                    max_tokens = Some(max_tokens.unwrap_or(1024).saturating_mul(2).max(1024));
+                    replay_response_id = data
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    replay_prompt = Some(
                             env::var("OPENAI_RESPONSES_REPLAY_PROMPT").unwrap_or_else(|_| {
                                 "Replay your previous answer in full, preserving the exact format. Do not omit steps or add commentary.".to_string()
                             }),
                         );
-                        continue;
-                    }
+                    continue;
+                }
                 let text = extract_openai_response_text(&data);
                 let usage = extract_openai_usage(&data);
                 if text.trim().is_empty() {
@@ -313,9 +315,9 @@ impl OpenAIProvider {
             if self.supports_prompt_cache
                 && let Some(cache_key) =
                     prompt_cache_key(request.system.as_deref(), Some(&model), "chat")
-                {
-                    payload["prompt_cache_key"] = json!(cache_key);
-                }
+            {
+                payload["prompt_cache_key"] = json!(cache_key);
+            }
             let started = Instant::now();
             let response = post_json_with_retries(
                 self.provider_name.as_str(),
@@ -536,29 +538,30 @@ impl OpenAIProvider {
             let mut data: Value =
                 serde_json::from_str(&body).unwrap_or_else(|_| json!({"message": body}));
             if status == StatusCode::ACCEPTED
-                && let Some(request_id) = extract_async_request_id(&data) {
-                    data = poll_async_status(
-                        self.provider_name.as_str(),
-                        &self.client,
-                        &headers,
-                        &self.base_url,
-                        request_id.as_str(),
-                        timeout,
-                    )
-                    .await?;
-                    let final_status = data
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| "ok".to_string());
-                    return Ok(ProviderHealth {
-                        ok: true,
-                        status_code: Some(StatusCode::OK.as_u16()),
-                        latency_ms: Some(latency_ms),
-                        message: Some(final_status),
-                        mode: Some("http".to_string()),
-                    });
-                }
+                && let Some(request_id) = extract_async_request_id(&data)
+            {
+                data = poll_async_status(
+                    self.provider_name.as_str(),
+                    &self.client,
+                    &headers,
+                    &self.base_url,
+                    request_id.as_str(),
+                    timeout,
+                )
+                .await?;
+                let final_status = data
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "ok".to_string());
+                return Ok(ProviderHealth {
+                    ok: true,
+                    status_code: Some(StatusCode::OK.as_u16()),
+                    latency_ms: Some(latency_ms),
+                    message: Some(final_status),
+                    mode: Some("http".to_string()),
+                });
+            }
             return Ok(ProviderHealth {
                 ok: status.is_success(),
                 status_code: Some(status.as_u16()),
@@ -663,9 +666,9 @@ fn build_responses_payload(
     if prompt_cache_enabled
         && let Some(cache_key) =
             prompt_cache_key(request.system.as_deref(), Some(model), "responses")
-        {
-            payload["prompt_cache_key"] = json!(cache_key);
-        }
+    {
+        payload["prompt_cache_key"] = json!(cache_key);
+    }
     if background_enabled(
         total_input_chars(&request.messages, request.system.as_deref()),
         max_tokens,
@@ -860,9 +863,10 @@ fn endpoint(base_url: &str, path: impl AsRef<str>) -> String {
 
 fn extract_openai_response_text(data: &Value) -> String {
     if let Some(output_text) = data.get("output_text").and_then(Value::as_str)
-        && !output_text.trim().is_empty() {
-            return output_text.to_string();
-        }
+        && !output_text.trim().is_empty()
+    {
+        return output_text.to_string();
+    }
     let mut chunks = Vec::new();
     fn extract(value: &Value, chunks: &mut Vec<String>) {
         match value {
@@ -871,10 +875,11 @@ fn extract_openai_response_text(data: &Value) -> String {
             Value::Object(map) => {
                 for key in ["text", "output_text", "summary", "refusal"] {
                     if let Some(Value::String(text)) = map.get(key)
-                        && !text.trim().is_empty() {
-                            chunks.push(text.clone());
-                            return;
-                        }
+                        && !text.trim().is_empty()
+                    {
+                        chunks.push(text.clone());
+                        return;
+                    }
                 }
                 if let Some(content) = map.get("content") {
                     extract(content, chunks);

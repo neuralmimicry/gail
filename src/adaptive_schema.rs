@@ -588,14 +588,15 @@ fn spawn_save(save: Option<SaveRequest>) {
     };
     tokio::spawn(async move {
         if let Some(parent) = save.path.parent()
-            && let Err(error) = fs::create_dir_all(parent).await {
-                tracing::warn!(
-                    path = %save.path.display(),
-                    error = %error,
-                    "failed to create adaptive API schema directory"
-                );
-                return;
-            }
+            && let Err(error) = fs::create_dir_all(parent).await
+        {
+            tracing::warn!(
+                path = %save.path.display(),
+                error = %error,
+                "failed to create adaptive API schema directory"
+            );
+            return;
+        }
         match serde_json::to_string_pretty(&save.snapshot) {
             Ok(rendered) => {
                 if let Err(error) = fs::write(&save.path, rendered).await {

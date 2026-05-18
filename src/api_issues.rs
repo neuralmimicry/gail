@@ -228,9 +228,9 @@ impl ApiIssueRegistry {
                     .provider
                     .as_deref()
                     .is_some_and(|value| value.eq_ignore_ascii_case(provider))
-                {
-                    continue;
-                }
+            {
+                continue;
+            }
             issue.active = false;
             issue.status = "resolved".to_string();
             issue.resolved_at = Some(now);

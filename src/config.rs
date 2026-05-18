@@ -169,7 +169,6 @@ pub struct SpecialistProfile {
     pub prefer_aarnn_designs: bool,
 }
 
-
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -188,7 +187,6 @@ impl Default for SecurityConfig {
         }
     }
 }
-
 
 impl Default for OrchestrationConfig {
     fn default() -> Self {

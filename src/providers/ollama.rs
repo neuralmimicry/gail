@@ -146,9 +146,10 @@ impl OllamaProvider {
         request: &ProviderCompletionRequest,
     ) -> Result<ProviderInvocationResponse> {
         if ollama_family_saturation_enabled()
-            && let Some(remaining) = ollama_saturation_remaining().await {
-                return Err(ollama_saturated_error(remaining));
-            }
+            && let Some(remaining) = ollama_saturation_remaining().await
+        {
+            return Err(ollama_saturated_error(remaining));
+        }
         let base_urls = self.base_url_candidates(request.base_url.as_deref());
         let total_timeout_seconds = request
             .timeout_seconds
@@ -463,15 +464,16 @@ impl OllamaProvider {
 
     pub async fn health(&self, timeout_seconds: Option<u64>) -> Result<ProviderHealth> {
         if ollama_family_saturation_enabled()
-            && let Some(remaining) = ollama_saturation_remaining().await {
-                return Ok(ProviderHealth {
-                    ok: false,
-                    status_code: None,
-                    latency_ms: None,
-                    message: Some(ollama_saturated_message(remaining)),
-                    mode: Some("ollama_saturated".to_string()),
-                });
-            }
+            && let Some(remaining) = ollama_saturation_remaining().await
+        {
+            return Ok(ProviderHealth {
+                ok: false,
+                status_code: None,
+                latency_ms: None,
+                message: Some(ollama_saturated_message(remaining)),
+                mode: Some("ollama_saturated".to_string()),
+            });
+        }
         let mut last_health = None;
         let mut last_error = None;
         for (index, base_url) in self.base_url_candidates(None).iter().enumerate() {
@@ -963,9 +965,10 @@ fn model_size_billions(model: &str) -> Option<f64> {
         if start < index {
             let candidate = &lowered[start..index];
             if candidate.chars().any(|ch| ch.is_ascii_digit())
-                && let Ok(parsed) = candidate.parse::<f64>() {
-                    return Some(parsed);
-                }
+                && let Ok(parsed) = candidate.parse::<f64>()
+            {
+                return Some(parsed);
+            }
         }
     }
     None

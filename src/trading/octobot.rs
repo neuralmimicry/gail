@@ -832,9 +832,10 @@ impl OctobotClient {
             && let Some(first) = self
                 .get_optional_json("/dashboard/first_symbol", "first symbol")
                 .await?
-            && let Some(symbol) = first.get("symbol").and_then(Value::as_str) {
-                symbols.push(symbol.replace('|', "/"));
-            }
+            && let Some(symbol) = first.get("symbol").and_then(Value::as_str)
+        {
+            symbols.push(symbol.replace('|', "/"));
+        }
         symbols.sort();
         symbols.dedup();
         Ok(symbols)
@@ -1547,8 +1548,7 @@ impl OctobotClient {
 // ---------------------------------------------------------------------------
 
 /// Request body for starting an OctoBot backtesting run.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct BacktestStartRequest {
     /// Paths to OctoBot `.data` files (relative to OctoBot root), e.g.
     /// `"user/backtesting/collector/binance_BTC_USDT_1h.data"`.
@@ -1562,7 +1562,6 @@ pub struct BacktestStartRequest {
     /// Whether to emit verbose logs from the backtesting run.
     pub enable_logs: bool,
 }
-
 
 /// Parsed report returned by `GET /backtesting?update_type=backtesting_report`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

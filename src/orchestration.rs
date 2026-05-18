@@ -403,21 +403,22 @@ impl GailService {
         let mut final_source = "llm".to_string();
         if let (Some(bridge), Some(output_trace)) = (self.aarnn_bridge(), mirror_output.as_ref())
             && bridge.should_promote_candidate(output_trace, response.text.as_str())
-                && let Some(reply_text) = bridge.promoted_reply(output_trace) {
-                    text = reply_text;
-                    provider = "aarnn".to_string();
-                    model = bridge.response_model().to_string();
-                    latency_ms = latency_ms.saturating_add(output_trace.latency_ms);
-                    usage = None;
-                    raw = Some(json!({
-                        "selected_source": "aarnn",
-                        "aarnn_candidate": output_trace.candidate.clone(),
-                        "llm_provider": response.provider,
-                        "llm_model": response.model,
-                        "llm_raw": response.raw,
-                    }));
-                    final_source = "aarnn".to_string();
-                }
+            && let Some(reply_text) = bridge.promoted_reply(output_trace)
+        {
+            text = reply_text;
+            provider = "aarnn".to_string();
+            model = bridge.response_model().to_string();
+            latency_ms = latency_ms.saturating_add(output_trace.latency_ms);
+            usage = None;
+            raw = Some(json!({
+                "selected_source": "aarnn",
+                "aarnn_candidate": output_trace.candidate.clone(),
+                "llm_provider": response.provider,
+                "llm_model": response.model,
+                "llm_raw": response.raw,
+            }));
+            final_source = "aarnn".to_string();
+        }
         let trace = if mirror_input.is_some() || mirror_output.is_some() {
             Some(CompletionTrace {
                 workflow: "direct".to_string(),
@@ -1014,21 +1015,22 @@ impl GailService {
         let mut final_source = "llm".to_string();
         if let (Some(bridge), Some(output_trace)) = (self.aarnn_bridge(), mirror_output.as_ref())
             && bridge.should_promote_candidate(output_trace, chosen_response.text.as_str())
-                && let Some(reply_text) = bridge.promoted_reply(output_trace) {
-                    text = reply_text;
-                    provider = "aarnn".to_string();
-                    model = bridge.response_model().to_string();
-                    latency_ms = latency_ms.saturating_add(output_trace.latency_ms);
-                    usage = None;
-                    raw = Some(json!({
-                        "selected_source": "aarnn",
-                        "aarnn_candidate": output_trace.candidate.clone(),
-                        "llm_provider": chosen_response.provider,
-                        "llm_model": chosen_response.model,
-                        "llm_raw": chosen_response.raw,
-                    }));
-                    final_source = "aarnn".to_string();
-                }
+            && let Some(reply_text) = bridge.promoted_reply(output_trace)
+        {
+            text = reply_text;
+            provider = "aarnn".to_string();
+            model = bridge.response_model().to_string();
+            latency_ms = latency_ms.saturating_add(output_trace.latency_ms);
+            usage = None;
+            raw = Some(json!({
+                "selected_source": "aarnn",
+                "aarnn_candidate": output_trace.candidate.clone(),
+                "llm_provider": chosen_response.provider,
+                "llm_model": chosen_response.model,
+                "llm_raw": chosen_response.raw,
+            }));
+            final_source = "aarnn".to_string();
+        }
 
         let trace = CompletionTrace {
             workflow: workflow.clone(),
@@ -1337,9 +1339,10 @@ impl GailService {
                 continue;
             }
             if let Ok(adapter) = build_adapter(self.inner.client.clone(), profile)
-                && let Some(inventory) = adapter.ollama_inventory(&self.inner.config).await {
-                    return serde_json::to_value(inventory).unwrap_or(Value::Null);
-                }
+                && let Some(inventory) = adapter.ollama_inventory(&self.inner.config).await
+            {
+                return serde_json::to_value(inventory).unwrap_or(Value::Null);
+            }
         }
         Value::Null
     }
@@ -1935,9 +1938,13 @@ impl GailService {
                         join_set.abort_all();
                         if deadline_kind == DeadlineKind::HardTimeout {
                             let timeout_seconds = timeout_cap.unwrap_or_default().max(1);
-                            for candidate in selected.iter().filter(|&candidate| {
-                                pending_candidate_ids.contains(&candidate.candidate_id())
-                            }).cloned() {
+                            for candidate in selected
+                                .iter()
+                                .filter(|&candidate| {
+                                    pending_candidate_ids.contains(&candidate.candidate_id())
+                                })
+                                .cloned()
+                            {
                                 results.push(InvocationResult {
                                     candidate,
                                     response: None,
@@ -2005,29 +2012,30 @@ impl GailService {
         workload_class: WorkloadClass,
     ) -> InvocationResult {
         if let Some(signal) = self.nmc_signal_for_candidate(&candidate).await
-            && signal.constrained {
-                let agent = if signal.agent_id.trim().is_empty() {
-                    "unknown"
-                } else {
-                    signal.agent_id.as_str()
-                };
-                let host = if signal.host.trim().is_empty() {
-                    "unknown"
-                } else {
-                    signal.host.as_str()
-                };
-                return InvocationResult {
-                    candidate,
-                    response: None,
-                    error: Some(format!(
-                        "candidate skipped because NMC/Tracey telemetry reports constrained capacity (agent={agent}, host={host}, status={}, mode={}, optimize_status={}, pressure_ratio={:.2})",
-                        signal.status, signal.mode, signal.optimize_status, signal.pressure_ratio,
-                    )),
-                    latency_ms: None,
-                    quality: -1.0,
-                    score: f64::NEG_INFINITY,
-                };
-            }
+            && signal.constrained
+        {
+            let agent = if signal.agent_id.trim().is_empty() {
+                "unknown"
+            } else {
+                signal.agent_id.as_str()
+            };
+            let host = if signal.host.trim().is_empty() {
+                "unknown"
+            } else {
+                signal.host.as_str()
+            };
+            return InvocationResult {
+                candidate,
+                response: None,
+                error: Some(format!(
+                    "candidate skipped because NMC/Tracey telemetry reports constrained capacity (agent={agent}, host={host}, status={}, mode={}, optimize_status={}, pressure_ratio={:.2})",
+                    signal.status, signal.mode, signal.optimize_status, signal.pressure_ratio,
+                )),
+                latency_ms: None,
+                quality: -1.0,
+                score: f64::NEG_INFINITY,
+            };
+        }
         let Some(_workload_permit) = self.acquire_workload_permit(workload_class).await else {
             return InvocationResult {
                 candidate,
@@ -3097,25 +3105,26 @@ fn quality_score(text: &str, expected_json: bool) -> f64 {
 fn local_usage_telemetry(response: &ProviderInvocationResponse) -> LocalUsageTelemetry {
     let mut telemetry = LocalUsageTelemetry::default();
     if let Some(raw) = response.raw.as_ref()
-        && let Some(local_usage) = raw.get("gail_local_usage") {
-            telemetry.queue_wait_ms = local_usage
-                .get("queue_wait_ms")
-                .and_then(Value::as_u64)
-                .or_else(|| raw.get("gail_ollama_queue_wait_ms").and_then(Value::as_u64));
-            telemetry.inference_ms = local_usage
-                .get("inference_ms")
-                .and_then(Value::as_u64)
-                .or_else(|| raw.get("gail_ollama_inference_ms").and_then(Value::as_u64));
-            telemetry.total_tokens_estimate = local_usage
-                .get("total_tokens_estimate")
-                .and_then(Value::as_u64)
-                .map(|value| value as u32)
-                .or_else(|| {
-                    raw.get("gail_ollama_total_tokens_estimate")
-                        .and_then(Value::as_u64)
-                        .map(|value| value as u32)
-                });
-        }
+        && let Some(local_usage) = raw.get("gail_local_usage")
+    {
+        telemetry.queue_wait_ms = local_usage
+            .get("queue_wait_ms")
+            .and_then(Value::as_u64)
+            .or_else(|| raw.get("gail_ollama_queue_wait_ms").and_then(Value::as_u64));
+        telemetry.inference_ms = local_usage
+            .get("inference_ms")
+            .and_then(Value::as_u64)
+            .or_else(|| raw.get("gail_ollama_inference_ms").and_then(Value::as_u64));
+        telemetry.total_tokens_estimate = local_usage
+            .get("total_tokens_estimate")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32)
+            .or_else(|| {
+                raw.get("gail_ollama_total_tokens_estimate")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as u32)
+            });
+    }
     if telemetry.total_tokens_estimate.is_none() {
         telemetry.total_tokens_estimate = response.usage.as_ref().and_then(|usage| {
             usage.total.or_else(|| {
@@ -3146,9 +3155,10 @@ fn parse_model_size_billions(model: &str) -> Option<f64> {
         if start < index {
             let candidate = &lowered[start..index];
             if candidate.chars().any(|ch| ch.is_ascii_digit())
-                && let Ok(parsed) = candidate.parse::<f64>() {
-                    return Some(parsed);
-                }
+                && let Ok(parsed) = candidate.parse::<f64>()
+            {
+                return Some(parsed);
+            }
         }
     }
     None
@@ -3175,14 +3185,16 @@ fn violates_strict_model_policy(
     let configured_size = parse_model_size_billions(configured_model);
     let resolved_size = parse_model_size_billions(resolved_model);
     if let (Some(configured), Some(resolved)) = (configured_size, resolved_size)
-        && resolved + 0.000_1 < configured {
-            return true;
-        }
+        && resolved + 0.000_1 < configured
+    {
+        return true;
+    }
     if let (Some(minimum), Some(resolved)) =
         (min_model_size_b.filter(|value| *value > 0.0), resolved_size)
-        && resolved + 0.000_1 < minimum {
-            return true;
-        }
+        && resolved + 0.000_1 < minimum
+    {
+        return true;
+    }
     false
 }
 
@@ -3556,9 +3568,10 @@ fn env_string_any(names: &[&str]) -> Option<String> {
 fn env_int_any(names: &[&str], default: u64) -> u64 {
     for name in names {
         if let Ok(value) = env::var(name)
-            && let Ok(parsed) = value.trim().parse::<u64>() {
-                return parsed;
-            }
+            && let Ok(parsed) = value.trim().parse::<u64>()
+        {
+            return parsed;
+        }
     }
     default
 }
@@ -3566,9 +3579,10 @@ fn env_int_any(names: &[&str], default: u64) -> u64 {
 fn env_float_any(names: &[&str], default: f64) -> f64 {
     for name in names {
         if let Ok(value) = env::var(name)
-            && let Ok(parsed) = value.trim().parse::<f64>() {
-                return parsed;
-            }
+            && let Ok(parsed) = value.trim().parse::<f64>()
+        {
+            return parsed;
+        }
     }
     default
 }

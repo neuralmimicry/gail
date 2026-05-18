@@ -199,9 +199,10 @@ pub fn flatten_prompt_text(
 ) -> String {
     let mut parts = Vec::new();
     if let Some(system) = system
-        && !system.trim().is_empty() {
-            parts.push(system.trim().to_string());
-        }
+        && !system.trim().is_empty()
+    {
+        parts.push(system.trim().to_string());
+    }
     for message in messages {
         let text = message.flattened_text();
         if !text.trim().is_empty() {
@@ -231,8 +232,7 @@ pub fn prompt_cache_key(system: Option<&str>, model: Option<&str>, kind: &str) -
     if !env_bool(
         "OPENAI_PROMPT_CACHE_KEY_AUTO",
         env_bool("PROMPT_CACHE_KEY_AUTO", true),
-    )
-    {
+    ) {
         return None;
     }
     let mode = env::var("OPENAI_PROMPT_CACHE_KEY_MODE").unwrap_or_else(|_| "system".to_string());
@@ -245,10 +245,7 @@ pub fn prompt_cache_key(system: Option<&str>, model: Option<&str>, kind: &str) -
     }
     let mut digest = Sha256::new();
     digest.update(format!("{kind}:{basis}"));
-    Some(format!(
-        "pcache:{}",
-        &hex::encode(digest.finalize())[..16]
-    ))
+    Some(format!("pcache:{}", &hex::encode(digest.finalize())[..16]))
 }
 
 pub fn env_bool(name: &str, default: bool) -> bool {
@@ -680,9 +677,10 @@ pub fn response_with_usage(
     mut usage: Option<TokenUsage>,
 ) -> ProviderInvocationResponse {
     if let Some(ref mut usage) = usage
-        && usage.cost.is_none() {
-            usage.cost = extract_cost(usage, provider, model);
-        }
+        && usage.cost.is_none()
+    {
+        usage.cost = extract_cost(usage, provider, model);
+    }
     ProviderInvocationResponse {
         text,
         raw: Some(raw),

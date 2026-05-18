@@ -396,40 +396,41 @@ async fn run_single_evaluation(
 
     if !decision.override_applied
         && !matches!(decision.action, TradeAction::Hold | TradeAction::Cancel)
-        && let Some(reason) = degraded_live_execution_reason(&consensus, config) {
-            let previous_action = decision.action.clone();
-            let previous_confidence = decision.confidence;
-            let previous_amount = decision.amount_usd;
-            warn!(
-                "trading: live execution gated by AI quality checks: {}",
-                reason
-            );
-            state
-                .log(
-                    "warn",
-                    "decision",
-                    format!("Execution gated: {reason}"),
-                    json!({
-                        "previous_action": previous_action.to_string(),
-                        "previous_confidence": previous_confidence,
-                        "previous_amount_usd": previous_amount,
-                        "responders": consensus.responders,
-                        "failures": consensus.failures,
-                        "coverage": consensus_coverage(&consensus),
-                        "average_risk": consensus_average_risk(&consensus),
-                        "agreement": consensus_agreement(&consensus),
-                    }),
-                )
-                .await;
-            decision = TradeDecision {
-                action: TradeAction::Hold,
-                exchange: String::new(),
-                symbol: String::new(),
-                amount_usd: 0.0,
-                rationale: format!("Execution gated: {reason}"),
-                ..decision
-            };
-        }
+        && let Some(reason) = degraded_live_execution_reason(&consensus, config)
+    {
+        let previous_action = decision.action.clone();
+        let previous_confidence = decision.confidence;
+        let previous_amount = decision.amount_usd;
+        warn!(
+            "trading: live execution gated by AI quality checks: {}",
+            reason
+        );
+        state
+            .log(
+                "warn",
+                "decision",
+                format!("Execution gated: {reason}"),
+                json!({
+                    "previous_action": previous_action.to_string(),
+                    "previous_confidence": previous_confidence,
+                    "previous_amount_usd": previous_amount,
+                    "responders": consensus.responders,
+                    "failures": consensus.failures,
+                    "coverage": consensus_coverage(&consensus),
+                    "average_risk": consensus_average_risk(&consensus),
+                    "agreement": consensus_agreement(&consensus),
+                }),
+            )
+            .await;
+        decision = TradeDecision {
+            action: TradeAction::Hold,
+            exchange: String::new(),
+            symbol: String::new(),
+            amount_usd: 0.0,
+            rationale: format!("Execution gated: {reason}"),
+            ..decision
+        };
+    }
 
     info!(
         "trading: decision = {:?} exchange={} symbol={} amount=${:.2} confidence={:.2}",
