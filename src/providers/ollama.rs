@@ -38,6 +38,11 @@ async fn acquire_ollama_request_permit(base_url: &str) -> Result<SemaphorePermit
         )),
         Err(_) => {
             let endpoint_backoff = mark_ollama_endpoint_saturated(base_url).await;
+            tracing::warn!(
+                base_url = %base_url,
+                endpoint_backoff_seconds = endpoint_backoff.as_secs().max(1),
+                "Ollama endpoint timed out; placing endpoint into saturation cooldown"
+            );
             let backoff = if ollama_family_saturation_enabled() {
                 endpoint_backoff.max(mark_ollama_saturated().await)
             } else {
@@ -56,7 +61,7 @@ const PROVIDER_HEALTH_FALLBACK_TIMEOUT_SECONDS: u64 = 12;
 const OLLAMA_SATURATION_BACKOFF_SECONDS: u64 = 20;
 
 static OLLAMA_REQUEST_SEMAPHORE: Lazy<Semaphore> =
-    Lazy::new(|| Semaphore::new(env_int("GAIL_OLLAMA_MAX_CONCURRENT_REQUESTS", 2).max(1) as usize));
+    Lazy::new(|| Semaphore::new(env_int("GAIL_OLLAMA_MAX_CONCURRENT_REQUESTS", 1).max(1) as usize));
 static OLLAMA_SATURATED_UNTIL: Lazy<Mutex<Option<Instant>>> = Lazy::new(|| Mutex::new(None));
 static OLLAMA_ENDPOINT_SATURATED_UNTIL: Lazy<Mutex<HashMap<String, Instant>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -187,7 +192,7 @@ impl OllamaProvider {
         let queue_wait_ms = 0;
         let total_timeout_seconds = request
             .timeout_seconds
-            .unwrap_or_else(|| env_int("GAIL_OLLAMA_TIMEOUT_SECONDS", 30))
+            .unwrap_or_else(|| env_int("GAIL_OLLAMA_TIMEOUT_SECONDS", 90))
             .max(1);
         let deadline = Instant::now() + Duration::from_secs(total_timeout_seconds);
         let mut last_error = None;
@@ -347,7 +352,7 @@ impl OllamaProvider {
             .max_tokens
             .map(|value| value.max(1).min(max_predict))
             .unwrap_or(max_predict);
-        let default_timeout = env_int("GAIL_OLLAMA_TIMEOUT_SECONDS", 30).max(1);
+        let default_timeout = env_int("GAIL_OLLAMA_TIMEOUT_SECONDS", 90).max(1);
         let timeout_seconds = request
             .timeout_seconds
             .map(|seconds| seconds.max(1).min(default_timeout))
@@ -1281,6 +1286,10 @@ fn message_indicates_ollama_saturation(message: &str) -> bool {
     let lowered = message.to_ascii_lowercase();
     lowered.contains("local ollama request queue is saturated")
         || lowered.contains("local model service is saturated")
+        || lowered.contains("adaptive endpoint budget exhausted")
+        || lowered.contains("candidate timed out")
+        || lowered.contains("operation timed out")
+        || lowered.contains("request timed out")
 }
 
 fn normalize_base_url(value: &str) -> Option<String> {

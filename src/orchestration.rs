@@ -2064,7 +2064,7 @@ impl GailService {
             };
         };
         let quota_retries = env_int_any(&["LLM_RATE_LIMIT_RETRIES"], 2) as usize;
-        let timeout_retries = env_int_any(&["LLM_TIMEOUT_RETRIES"], 1) as usize;
+        let timeout_retries = env_int_any(&["LLM_TIMEOUT_RETRIES"], 0) as usize;
         let quota_backoff_base = env_float_any(&["LLM_RATE_LIMIT_BACKOFF_BASE"], 1.0).max(0.1);
         let timeout_backoff_base = env_float_any(&["LLM_TIMEOUT_BACKOFF_BASE"], 1.0).max(0.1);
         let retry_empty = env_bool_any(
