@@ -2,9 +2,13 @@
 #
 # Gail runtime image.
 #
-# This image intentionally does not compile Gail from source.  It installs the
+# This image intentionally does not compile Gail from source. It installs the
 # architecture-matching Debian package published on github.com/neuralmimicry/gail
 # releases, defaulting to the latest release asset.
+#
+# Runtime configuration is copied from the repository build context rather than
+# assuming the Debian package ships /etc/gail/gail.yaml. This keeps the image
+# compatible with both binary-only .deb assets and fuller system packages.
 
 FROM debian:bookworm-slim
 
@@ -21,7 +25,14 @@ ARG APP_GID=10001
 LABEL org.opencontainers.image.source="https://github.com/neuralmimicry/gail" \
       org.opencontainers.image.description="Gail runtime image installed from the published Debian release package"
 
+# Copy runtime defaults from the source checkout/build context. These files are
+# runtime inputs, not source-build inputs, so this does not reintroduce an
+# in-container Gail compilation path.
+COPY gail.yaml /tmp/gail-defaults/gail.yaml
+COPY config/ai-routing-profiles.json /tmp/gail-defaults/ai-routing-profiles.json
+
 RUN set -eu; \
+    export DEBIAN_FRONTEND=noninteractive; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -118,9 +129,24 @@ RUN set -eu; \
     apt-get install -y --no-install-recommends /tmp/gail.deb; \
     rm -f /tmp/gail.deb; \
     mkdir -p /app/config /app/data /var/lib/gail; \
-    cp /etc/gail/gail.yaml /app/config/gail.yaml; \
-    cp /etc/gail/ai-routing-profiles.json /app/config/ai-routing-profiles.json; \
+    if [ -f /tmp/gail-defaults/gail.yaml ]; then \
+        cp /tmp/gail-defaults/gail.yaml /app/config/gail.yaml; \
+    elif [ -f /etc/gail/gail.yaml ]; then \
+        cp /etc/gail/gail.yaml /app/config/gail.yaml; \
+    else \
+        echo "Missing Gail runtime config: expected gail.yaml in build context or /etc/gail/gail.yaml from package" >&2; \
+        exit 2; \
+    fi; \
+    if [ -f /tmp/gail-defaults/ai-routing-profiles.json ]; then \
+        cp /tmp/gail-defaults/ai-routing-profiles.json /app/config/ai-routing-profiles.json; \
+    elif [ -f /etc/gail/ai-routing-profiles.json ]; then \
+        cp /etc/gail/ai-routing-profiles.json /app/config/ai-routing-profiles.json; \
+    else \
+        echo "Missing Gail routing profiles: expected config/ai-routing-profiles.json in build context or /etc/gail/ai-routing-profiles.json from package" >&2; \
+        exit 2; \
+    fi; \
     chown -R "${APP_UID}:${APP_GID}" /app /var/lib/gail; \
+    rm -rf /tmp/gail-defaults; \
     apt-get purge -y --auto-remove jq; \
     rm -rf /var/lib/apt/lists/*
 
