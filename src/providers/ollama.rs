@@ -234,7 +234,7 @@ impl OllamaProvider {
                 endpoint_budget,
                 self.complete_once(&scoped_request, queue_wait_ms),
             )
-                .await;
+            .await;
             match result {
                 Err(_) => {
                     let message = format!(
