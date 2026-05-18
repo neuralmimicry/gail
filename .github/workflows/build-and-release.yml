@@ -109,12 +109,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          GAIL_version="$(cargo run --locked --bin GAIL -- --version)"
+          GAIL_version="$(cargo run --locked --bin gail -- --version)"
           if [[ "$GAIL_version" != "${GAIL_VERSION}" ]]; then
             echo "::error::GAIL --version returned ${GAIL_version}; expected ${GAIL_VERSION}"
             exit 1
           fi
-          cargo run --locked --bin GAIL -- --version >/dev/null
+          cargo run --locked --bin gail -- --version >/dev/null
 
       - name: Validate shell scripts
         run: >-
