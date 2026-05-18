@@ -179,16 +179,33 @@ impl OllamaProvider {
                 ));
                 break;
             }
+
+            let endpoints_remaining = base_urls.len().saturating_sub(index).max(1);
+            let endpoint_budget = if endpoints_remaining > 1 {
+                // Preserve budget for later adaptive fallback endpoints instead of allowing
+                // the current endpoint to consume the full request deadline.
+                (remaining / endpoints_remaining as u32)
+                    .max(Duration::from_secs(1))
+                    .min(remaining)
+            } else {
+                remaining
+            };
+
             let mut scoped_request = request.clone();
             scoped_request.base_url = Some(base_url.clone());
             scoped_request.timeout_seconds =
-                Some(remaining.as_secs().max(1).min(total_timeout_seconds));
-            let result = tokio::time::timeout(remaining, self.complete_once(&scoped_request)).await;
+                Some(endpoint_budget.as_secs().max(1).min(total_timeout_seconds));
+
+            let result =
+                tokio::time::timeout(endpoint_budget, self.complete_once(&scoped_request)).await;
             match result {
                 Err(_) => {
                     let message = format!(
-                        "Ollama adaptive endpoint budget exhausted after {total_timeout_seconds}s"
+                        "Ollama adaptive endpoint budget exhausted for endpoint {base_url} within {}s of total {}s budget",
+                        endpoint_budget.as_secs().max(1),
+                        total_timeout_seconds,
                     );
+
                     adaptive_schema::observe_failure(
                         "ollama",
                         "POST",
@@ -198,11 +215,19 @@ impl OllamaProvider {
                         &message,
                     )
                     .await;
+
                     last_error = Some(GailError::upstream(
                         "ollama",
                         Some(StatusCode::GATEWAY_TIMEOUT),
                         message,
                     ));
+
+                    if index + 1 < base_urls.len()
+                        && !deadline.saturating_duration_since(Instant::now()).is_zero()
+                    {
+                        continue;
+                    }
+
                     break;
                 }
                 Ok(Ok(mut response)) => {
@@ -1509,14 +1534,6 @@ mod tests {
             .and(path("/api/tags"))
             .respond_with(ResponseTemplate::new(502).set_body_json(json!({
                 "error": "bad gateway"
-            })))
-            .mount(&bad)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/tags"))
-            .respond_with(ResponseTemplate::new(504).set_body_json(json!({
-                "error": "gateway timeout"
             })))
             .mount(&bad)
             .await;
