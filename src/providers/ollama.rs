@@ -1513,6 +1513,14 @@ mod tests {
             .mount(&bad)
             .await;
 
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(504).set_body_json(json!({
+                "error": "gateway timeout"
+            })))
+            .mount(&bad)
+            .await;
+
         let good = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/tags"))
