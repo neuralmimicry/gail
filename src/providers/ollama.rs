@@ -10,7 +10,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sysinfo::{Disks, System};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 
 use crate::{
     adaptive_schema,
@@ -25,6 +25,33 @@ use super::{
     is_model_not_found, post_json_with_retries, response_with_usage,
 };
 
+async fn acquire_ollama_request_permit(base_url: &str) -> Result<SemaphorePermit<'static>> {
+    let queue_timeout =
+        Duration::from_secs(env_int("GAIL_OLLAMA_QUEUE_TIMEOUT_SECONDS", 20).max(1));
+
+    match tokio::time::timeout(queue_timeout, OLLAMA_REQUEST_SEMAPHORE.acquire()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(GailError::upstream(
+            "ollama",
+            None,
+            "Ollama request limiter is closed",
+        )),
+        Err(_) => {
+            let endpoint_backoff = mark_ollama_endpoint_saturated(base_url).await;
+            let backoff = if ollama_family_saturation_enabled() {
+                endpoint_backoff.max(mark_ollama_saturated().await)
+            } else {
+                endpoint_backoff
+            };
+
+            Err(GailError::upstream(
+                "ollama",
+                None,
+                ollama_saturated_message(backoff),
+            ))
+        }
+    }
+}
 const PROVIDER_HEALTH_FALLBACK_TIMEOUT_SECONDS: u64 = 12;
 const OLLAMA_SATURATION_BACKOFF_SECONDS: u64 = 20;
 
@@ -151,6 +178,13 @@ impl OllamaProvider {
             return Err(ollama_saturated_error(remaining));
         }
         let base_urls = self.base_url_candidates(request.base_url.as_deref());
+        let first_base_url = base_urls
+            .first()
+            .map(String::as_str)
+            .unwrap_or(self.base_url.as_str());
+
+        let _permit = acquire_ollama_request_permit(first_base_url).await?;
+        let queue_wait_ms = 0;
         let total_timeout_seconds = request
             .timeout_seconds
             .unwrap_or_else(|| env_int("GAIL_OLLAMA_TIMEOUT_SECONDS", 30))
@@ -185,7 +219,7 @@ impl OllamaProvider {
                 // Preserve budget for later adaptive fallback endpoints instead of allowing
                 // the current endpoint to consume the full request deadline.
                 (remaining / endpoints_remaining as u32)
-                    .max(Duration::from_secs(1))
+                    .max(Duration::from_secs(2))
                     .min(remaining)
             } else {
                 remaining
@@ -196,8 +230,11 @@ impl OllamaProvider {
             scoped_request.timeout_seconds =
                 Some(endpoint_budget.as_secs().max(1).min(total_timeout_seconds));
 
-            let result =
-                tokio::time::timeout(endpoint_budget, self.complete_once(&scoped_request)).await;
+            let result = tokio::time::timeout(
+                endpoint_budget,
+                self.complete_once(&scoped_request, queue_wait_ms),
+            )
+                .await;
             match result {
                 Err(_) => {
                     let message = format!(
@@ -297,39 +334,12 @@ impl OllamaProvider {
     async fn complete_once(
         &self,
         request: &ProviderCompletionRequest,
+        queue_wait_ms: u64,
     ) -> Result<ProviderInvocationResponse> {
         let base_url = request
             .base_url
             .clone()
             .unwrap_or_else(|| self.base_url.clone());
-        let queue_timeout =
-            Duration::from_secs(env_int("GAIL_OLLAMA_QUEUE_TIMEOUT_SECONDS", 20).max(1));
-        let queue_started = Instant::now();
-        let _permit =
-            match tokio::time::timeout(queue_timeout, OLLAMA_REQUEST_SEMAPHORE.acquire()).await {
-                Ok(Ok(permit)) => permit,
-                Ok(Err(_)) => {
-                    return Err(GailError::upstream(
-                        "ollama",
-                        None,
-                        "Ollama request limiter is closed",
-                    ));
-                }
-                Err(_) => {
-                    let endpoint_backoff = mark_ollama_endpoint_saturated(base_url.as_str()).await;
-                    let backoff = if ollama_family_saturation_enabled() {
-                        endpoint_backoff.max(mark_ollama_saturated().await)
-                    } else {
-                        endpoint_backoff
-                    };
-                    return Err(GailError::upstream(
-                        "ollama",
-                        None,
-                        ollama_saturated_message(backoff),
-                    ));
-                }
-            };
-        let queue_wait_ms = queue_started.elapsed().as_millis() as u64;
         let mut model = request.model.clone().unwrap_or_else(|| self.model.clone());
         let prompt = collapse_messages(request);
         let max_predict = env_int("GAIL_OLLAMA_MAX_PREDICT", 512).max(1) as u32;
