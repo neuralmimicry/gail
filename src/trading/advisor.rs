@@ -646,8 +646,8 @@ fn extract_advisory_json(raw: &str) -> Option<Value> {
         .trim_end_matches("```")
         .trim();
     serde_json::from_str::<Value>(cleaned).ok().or_else(|| {
-        let start = cleaned.find(|ch| ch == '{' || ch == '[')?;
-        let end = cleaned.rfind(|ch| ch == '}' || ch == ']')?;
+        let start = cleaned.find(['{', '['])?;
+        let end = cleaned.rfind(['}', ']'])?;
         if end <= start {
             return None;
         }

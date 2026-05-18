@@ -223,15 +223,14 @@ impl ApiIssueRegistry {
             if issue.endpoint != endpoint {
                 continue;
             }
-            if let Some(provider) = provider {
-                if !issue
+            if let Some(provider) = provider
+                && !issue
                     .provider
                     .as_deref()
                     .is_some_and(|value| value.eq_ignore_ascii_case(provider))
                 {
                     continue;
                 }
-            }
             issue.active = false;
             issue.status = "resolved".to_string();
             issue.resolved_at = Some(now);

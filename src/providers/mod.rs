@@ -198,11 +198,10 @@ pub fn flatten_prompt_text(
     system: Option<&str>,
 ) -> String {
     let mut parts = Vec::new();
-    if let Some(system) = system {
-        if !system.trim().is_empty() {
+    if let Some(system) = system
+        && !system.trim().is_empty() {
             parts.push(system.trim().to_string());
         }
-    }
     for message in messages {
         let text = message.flattened_text();
         if !text.trim().is_empty() {
@@ -229,10 +228,10 @@ pub fn looks_like_json_request(
 }
 
 pub fn prompt_cache_key(system: Option<&str>, model: Option<&str>, kind: &str) -> Option<String> {
-    if env_bool(
+    if !env_bool(
         "OPENAI_PROMPT_CACHE_KEY_AUTO",
         env_bool("PROMPT_CACHE_KEY_AUTO", true),
-    ) == false
+    )
     {
         return None;
     }
@@ -248,7 +247,7 @@ pub fn prompt_cache_key(system: Option<&str>, model: Option<&str>, kind: &str) -
     digest.update(format!("{kind}:{basis}"));
     Some(format!(
         "pcache:{}",
-        hex::encode(digest.finalize())[..16].to_string()
+        &hex::encode(digest.finalize())[..16]
     ))
 }
 
@@ -680,11 +679,10 @@ pub fn response_with_usage(
     model: &str,
     mut usage: Option<TokenUsage>,
 ) -> ProviderInvocationResponse {
-    if let Some(ref mut usage) = usage {
-        if usage.cost.is_none() {
+    if let Some(ref mut usage) = usage
+        && usage.cost.is_none() {
             usage.cost = extract_cost(usage, provider, model);
         }
-    }
     ProviderInvocationResponse {
         text,
         raw: Some(raw),

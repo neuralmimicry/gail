@@ -95,11 +95,10 @@ fn normalize_site_hints(site_hints: &[String]) -> Vec<String> {
     let mut normalized: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for hint in site_hints {
-        if let Some(host) = normalize_site_hint(hint) {
-            if seen.insert(host.clone()) {
+        if let Some(host) = normalize_site_hint(hint)
+            && seen.insert(host.clone()) {
                 normalized.push(host);
             }
-        }
     }
     normalized
 }
@@ -214,13 +213,11 @@ fn parse_timestamp_string(raw: &str) -> Option<i64> {
     if trimmed.is_empty() {
         return None;
     }
-    if (10..=16).contains(&trimmed.len()) && trimmed.chars().all(|ch| ch.is_ascii_digit()) {
-        if let Ok(parsed) = trimmed.parse::<i64>() {
-            if let Some(ts) = normalize_unix_ts(parsed) {
+    if (10..=16).contains(&trimmed.len()) && trimmed.chars().all(|ch| ch.is_ascii_digit())
+        && let Ok(parsed) = trimmed.parse::<i64>()
+            && let Some(ts) = normalize_unix_ts(parsed) {
                 return Some(ts);
             }
-        }
-    }
     parse_yyyy_mm_dd_timestamp(trimmed)
 }
 
@@ -334,26 +331,23 @@ fn infer_match_timestamp(
     ];
     if let Some(obj) = raw.as_object() {
         for key in &timestamp_fields {
-            if let Some(value) = obj.get(*key) {
-                if let Some(ts) = parse_timestamp_value(value) {
+            if let Some(value) = obj.get(*key)
+                && let Some(ts) = parse_timestamp_value(value) {
                     candidates.push(ts);
                 }
-            }
         }
         if let Some(metadata) = obj.get("metadata").and_then(serde_json::Value::as_object) {
             for (key, value) in metadata {
                 let lowered = key.to_ascii_lowercase();
-                if lowered.contains("time")
+                if (lowered.contains("time")
                     || lowered.contains("date")
                     || lowered.contains("publish")
                     || lowered.contains("update")
                     || lowered.contains("create")
-                    || lowered.contains("stamp")
-                {
-                    if let Some(ts) = parse_timestamp_value(value) {
+                    || lowered.contains("stamp"))
+                    && let Some(ts) = parse_timestamp_value(value) {
                         candidates.push(ts);
                     }
-                }
             }
         }
     }
@@ -1008,7 +1002,7 @@ mod tests {
         let merged = merge_research_contexts(
             "btc market sentiment",
             "crypto",
-            &vec!["bloomberg.com".to_string()],
+            &["bloomberg.com".to_string()],
             5,
             contexts,
         );
@@ -1095,11 +1089,9 @@ mod tests {
             .research_with_site_hints(
                 "crypto",
                 "btc market sentiment",
-                &vec![
-                    "bloomberg.com".to_string(),
+                &["bloomberg.com".to_string(),
                     "reuters.com".to_string(),
-                    "cnbc.com".to_string(),
-                ],
+                    "cnbc.com".to_string()],
                 5,
                 3,
             )

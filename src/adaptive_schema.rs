@@ -587,8 +587,8 @@ fn spawn_save(save: Option<SaveRequest>) {
         return;
     };
     tokio::spawn(async move {
-        if let Some(parent) = save.path.parent() {
-            if let Err(error) = fs::create_dir_all(parent).await {
+        if let Some(parent) = save.path.parent()
+            && let Err(error) = fs::create_dir_all(parent).await {
                 tracing::warn!(
                     path = %save.path.display(),
                     error = %error,
@@ -596,7 +596,6 @@ fn spawn_save(save: Option<SaveRequest>) {
                 );
                 return;
             }
-        }
         match serde_json::to_string_pretty(&save.snapshot) {
             Ok(rendered) => {
                 if let Err(error) = fs::write(&save.path, rendered).await {

@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=scripts/release-common.sh
-source "${SCRIPT_DIR}/release-common.sh"
-
 usage() {
   cat >&2 <<'USAGE'
 Usage: scripts/set-release-version.sh VERSION
@@ -16,14 +12,24 @@ USAGE
 }
 
 version="${1:-}"
-[[ -n "$version" ]] || { usage; exit 2; }
-nm_validate_cargo_semver "$version"
 
-REPO_ROOT=$(nm_repo_root)
-cd "$REPO_ROOT"
-[[ -f Cargo.toml && -f Cargo.lock ]] || nm_die "run this script from the Gail repository root, or keep it under scripts/"
+if [[ -z "${version}" ]]; then
+  usage
+  exit 2
+fi
 
-export GAIL_RELEASE_VERSION="$version"
+if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?(\+[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+  echo "Invalid release version: ${version}" >&2
+  usage
+  exit 2
+fi
+
+if [[ ! -f Cargo.toml || ! -f Cargo.lock ]]; then
+  echo "Run this script from the Gail repository root." >&2
+  exit 2
+fi
+
+export GAIL_RELEASE_VERSION="${version}"
 
 perl -0pi -e '
   our $updated;
@@ -39,5 +45,6 @@ perl -0pi -e '
   END { die "failed to update gail package version in Cargo.lock\n" unless $updated; }
 ' Cargo.lock
 
-nm_run cargo metadata --locked --no-deps --format-version=1 >/dev/null
-printf 'Gail release version set to %s\n' "$version"
+cargo metadata --locked --no-deps --format-version=1 >/dev/null
+
+echo "Gail release version set to ${version}"

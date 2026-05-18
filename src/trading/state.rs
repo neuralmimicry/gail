@@ -356,8 +356,8 @@ impl SharedTradingState {
                 }
             }
         };
-        if let Some(parent) = path.parent() {
-            if let Err(err) = fs::create_dir_all(parent).await {
+        if let Some(parent) = path.parent()
+            && let Err(err) = fs::create_dir_all(parent).await {
                 warn!(
                     "trading: failed to create state dir {}: {}",
                     parent.display(),
@@ -365,7 +365,6 @@ impl SharedTradingState {
                 );
                 return;
             }
-        }
         if let Err(err) = fs::write(path, snapshot).await {
             warn!(
                 "trading: failed to write state to {}: {}",

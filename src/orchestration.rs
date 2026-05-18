@@ -401,9 +401,9 @@ impl GailService {
         let mut usage = response.usage.clone();
         let mut raw = response.raw.clone();
         let mut final_source = "llm".to_string();
-        if let (Some(bridge), Some(output_trace)) = (self.aarnn_bridge(), mirror_output.as_ref()) {
-            if bridge.should_promote_candidate(output_trace, response.text.as_str()) {
-                if let Some(reply_text) = bridge.promoted_reply(output_trace) {
+        if let (Some(bridge), Some(output_trace)) = (self.aarnn_bridge(), mirror_output.as_ref())
+            && bridge.should_promote_candidate(output_trace, response.text.as_str())
+                && let Some(reply_text) = bridge.promoted_reply(output_trace) {
                     text = reply_text;
                     provider = "aarnn".to_string();
                     model = bridge.response_model().to_string();
@@ -418,8 +418,6 @@ impl GailService {
                     }));
                     final_source = "aarnn".to_string();
                 }
-            }
-        }
         let trace = if mirror_input.is_some() || mirror_output.is_some() {
             Some(CompletionTrace {
                 workflow: "direct".to_string(),
@@ -1014,9 +1012,9 @@ impl GailService {
         let mut usage = chosen_response.usage.clone();
         let mut raw = chosen_response.raw.clone();
         let mut final_source = "llm".to_string();
-        if let (Some(bridge), Some(output_trace)) = (self.aarnn_bridge(), mirror_output.as_ref()) {
-            if bridge.should_promote_candidate(output_trace, chosen_response.text.as_str()) {
-                if let Some(reply_text) = bridge.promoted_reply(output_trace) {
+        if let (Some(bridge), Some(output_trace)) = (self.aarnn_bridge(), mirror_output.as_ref())
+            && bridge.should_promote_candidate(output_trace, chosen_response.text.as_str())
+                && let Some(reply_text) = bridge.promoted_reply(output_trace) {
                     text = reply_text;
                     provider = "aarnn".to_string();
                     model = bridge.response_model().to_string();
@@ -1031,8 +1029,6 @@ impl GailService {
                     }));
                     final_source = "aarnn".to_string();
                 }
-            }
-        }
 
         let trace = CompletionTrace {
             workflow: workflow.clone(),
@@ -1245,10 +1241,10 @@ impl GailService {
         let routing_profiles_version = default_routing_profiles().version;
         let aarnn_bridge = AarnnMirrorClient::status(&self.inner.config, &self.inner.specialists);
         let nmc_telemetry = if let Some(client) = self.nmc_telemetry() {
-            serde_json::to_value(client.status().await).unwrap_or_else(|_| Value::Null)
+            serde_json::to_value(client.status().await).unwrap_or(Value::Null)
         } else {
             serde_json::to_value(NmcTelemetryClient::status_from_config(&self.inner.config))
-                .unwrap_or_else(|_| Value::Null)
+                .unwrap_or(Value::Null)
         };
         json!({
             "enabled": self.inner.config.orchestration.enabled,
@@ -1340,11 +1336,10 @@ impl GailService {
             if normalize_provider_type(profile.provider_type.as_str()) != "ollama" {
                 continue;
             }
-            if let Ok(adapter) = build_adapter(self.inner.client.clone(), profile) {
-                if let Some(inventory) = adapter.ollama_inventory(&self.inner.config).await {
+            if let Ok(adapter) = build_adapter(self.inner.client.clone(), profile)
+                && let Some(inventory) = adapter.ollama_inventory(&self.inner.config).await {
                     return serde_json::to_value(inventory).unwrap_or(Value::Null);
                 }
-            }
         }
         Value::Null
     }
@@ -1772,10 +1767,10 @@ impl GailService {
             cpu: current.cpu + candidate.resource_cost_cpu.max(0.0),
             ram_mb: current
                 .ram_mb
-                .saturating_add(candidate.resource_cost_ram_mb.max(0)),
+                .saturating_add(candidate.resource_cost_ram_mb),
             vram_mb: current
                 .vram_mb
-                .saturating_add(candidate.resource_cost_vram_mb.max(0)),
+                .saturating_add(candidate.resource_cost_vram_mb),
         });
         let host_budget_ratio = projected_host_usage
             .as_ref()
@@ -1820,10 +1815,10 @@ impl GailService {
                 cpu: current.cpu + candidate.resource_cost_cpu.max(0.0),
                 ram_mb: current
                     .ram_mb
-                    .saturating_add(candidate.resource_cost_ram_mb.max(0)),
+                    .saturating_add(candidate.resource_cost_ram_mb),
                 vram_mb: current
                     .vram_mb
-                    .saturating_add(candidate.resource_cost_vram_mb.max(0)),
+                    .saturating_add(candidate.resource_cost_vram_mb),
             };
             if host_budget_exceeded(candidate, &projected) {
                 return None;
@@ -1839,8 +1834,8 @@ impl GailService {
             candidate_id,
             host_group: candidate.host_group.clone(),
             resource_cost_cpu: candidate.resource_cost_cpu.max(0.0),
-            resource_cost_ram_mb: candidate.resource_cost_ram_mb.max(0),
-            resource_cost_vram_mb: candidate.resource_cost_vram_mb.max(0),
+            resource_cost_ram_mb: candidate.resource_cost_ram_mb,
+            resource_cost_vram_mb: candidate.resource_cost_vram_mb,
         })
     }
 
@@ -1868,10 +1863,10 @@ impl GailService {
                 current.cpu = (current.cpu - reservation.resource_cost_cpu).max(0.0);
                 current.ram_mb = current
                     .ram_mb
-                    .saturating_sub(reservation.resource_cost_ram_mb.max(0));
+                    .saturating_sub(reservation.resource_cost_ram_mb);
                 current.vram_mb = current
                     .vram_mb
-                    .saturating_sub(reservation.resource_cost_vram_mb.max(0));
+                    .saturating_sub(reservation.resource_cost_vram_mb);
                 should_remove = current.requests == 0;
             }
             if should_remove {
@@ -1940,9 +1935,9 @@ impl GailService {
                         join_set.abort_all();
                         if deadline_kind == DeadlineKind::HardTimeout {
                             let timeout_seconds = timeout_cap.unwrap_or_default().max(1);
-                            for candidate in selected.iter().cloned().filter(|candidate| {
+                            for candidate in selected.iter().filter(|&candidate| {
                                 pending_candidate_ids.contains(&candidate.candidate_id())
-                            }) {
+                            }).cloned() {
                                 results.push(InvocationResult {
                                     candidate,
                                     response: None,
@@ -2009,8 +2004,8 @@ impl GailService {
         timeout_cap: Option<u64>,
         workload_class: WorkloadClass,
     ) -> InvocationResult {
-        if let Some(signal) = self.nmc_signal_for_candidate(&candidate).await {
-            if signal.constrained {
+        if let Some(signal) = self.nmc_signal_for_candidate(&candidate).await
+            && signal.constrained {
                 let agent = if signal.agent_id.trim().is_empty() {
                     "unknown"
                 } else {
@@ -2033,7 +2028,6 @@ impl GailService {
                     score: f64::NEG_INFINITY,
                 };
             }
-        }
         let Some(_workload_permit) = self.acquire_workload_permit(workload_class).await else {
             return InvocationResult {
                 candidate,
@@ -2477,8 +2471,8 @@ impl ProviderCandidate {
         let usage_penalty_decay_seconds = profile.usage_penalty_decay_seconds.max(30.0);
         let max_concurrent_requests = profile.max_concurrent_requests.map(|value| value.max(1));
         let resource_cost_cpu = profile.resource_cost_cpu.max(0.0);
-        let resource_cost_ram_mb = profile.resource_cost_ram_mb.max(0);
-        let resource_cost_vram_mb = profile.resource_cost_vram_mb.max(0);
+        let resource_cost_ram_mb = profile.resource_cost_ram_mb;
+        let resource_cost_vram_mb = profile.resource_cost_vram_mb;
         let host_cpu_budget = profile.host_cpu_budget.filter(|value| *value > 0.0);
         let host_ram_budget_mb = profile.host_ram_budget_mb.filter(|value| *value > 0);
         let host_vram_budget_mb = profile.host_vram_budget_mb.filter(|value| *value > 0);
@@ -3102,8 +3096,8 @@ fn quality_score(text: &str, expected_json: bool) -> f64 {
 
 fn local_usage_telemetry(response: &ProviderInvocationResponse) -> LocalUsageTelemetry {
     let mut telemetry = LocalUsageTelemetry::default();
-    if let Some(raw) = response.raw.as_ref() {
-        if let Some(local_usage) = raw.get("gail_local_usage") {
+    if let Some(raw) = response.raw.as_ref()
+        && let Some(local_usage) = raw.get("gail_local_usage") {
             telemetry.queue_wait_ms = local_usage
                 .get("queue_wait_ms")
                 .and_then(Value::as_u64)
@@ -3122,7 +3116,6 @@ fn local_usage_telemetry(response: &ProviderInvocationResponse) -> LocalUsageTel
                         .map(|value| value as u32)
                 });
         }
-    }
     if telemetry.total_tokens_estimate.is_none() {
         telemetry.total_tokens_estimate = response.usage.as_ref().and_then(|usage| {
             usage.total.or_else(|| {
@@ -3152,11 +3145,10 @@ fn parse_model_size_billions(model: &str) -> Option<f64> {
         }
         if start < index {
             let candidate = &lowered[start..index];
-            if candidate.chars().any(|ch| ch.is_ascii_digit()) {
-                if let Ok(parsed) = candidate.parse::<f64>() {
+            if candidate.chars().any(|ch| ch.is_ascii_digit())
+                && let Ok(parsed) = candidate.parse::<f64>() {
                     return Some(parsed);
                 }
-            }
         }
     }
     None
@@ -3182,18 +3174,15 @@ fn violates_strict_model_policy(
     }
     let configured_size = parse_model_size_billions(configured_model);
     let resolved_size = parse_model_size_billions(resolved_model);
-    if let (Some(configured), Some(resolved)) = (configured_size, resolved_size) {
-        if resolved + 0.000_1 < configured {
+    if let (Some(configured), Some(resolved)) = (configured_size, resolved_size)
+        && resolved + 0.000_1 < configured {
             return true;
         }
-    }
     if let (Some(minimum), Some(resolved)) =
         (min_model_size_b.filter(|value| *value > 0.0), resolved_size)
-    {
-        if resolved + 0.000_1 < minimum {
+        && resolved + 0.000_1 < minimum {
             return true;
         }
-    }
     false
 }
 
@@ -3566,22 +3555,20 @@ fn env_string_any(names: &[&str]) -> Option<String> {
 
 fn env_int_any(names: &[&str], default: u64) -> u64 {
     for name in names {
-        if let Ok(value) = env::var(name) {
-            if let Ok(parsed) = value.trim().parse::<u64>() {
+        if let Ok(value) = env::var(name)
+            && let Ok(parsed) = value.trim().parse::<u64>() {
                 return parsed;
             }
-        }
     }
     default
 }
 
 fn env_float_any(names: &[&str], default: f64) -> f64 {
     for name in names {
-        if let Ok(value) = env::var(name) {
-            if let Ok(parsed) = value.trim().parse::<f64>() {
+        if let Ok(value) = env::var(name)
+            && let Ok(parsed) = value.trim().parse::<f64>() {
                 return parsed;
             }
-        }
     }
     default
 }

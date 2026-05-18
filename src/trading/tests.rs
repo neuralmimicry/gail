@@ -1312,7 +1312,7 @@ mod tests {
             &config,
         );
         // Expected: 1.0 * 0.4 + (-1.0) * 0.6 = -0.2 → sell threshold
-        let expected = 1.0 * 0.4 + (-1.0) * 0.6;
+        let expected = 1.0 * 0.4 + -0.6;
         assert!(
             (decision.blended_signal - expected).abs() < 0.01,
             "blended_signal should be {expected:.3} got {:.3}",

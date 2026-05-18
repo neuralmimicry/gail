@@ -396,8 +396,7 @@ async fn run_single_evaluation(
 
     if !decision.override_applied
         && !matches!(decision.action, TradeAction::Hold | TradeAction::Cancel)
-    {
-        if let Some(reason) = degraded_live_execution_reason(&consensus, config) {
+        && let Some(reason) = degraded_live_execution_reason(&consensus, config) {
             let previous_action = decision.action.clone();
             let previous_confidence = decision.confidence;
             let previous_amount = decision.amount_usd;
@@ -431,7 +430,6 @@ async fn run_single_evaluation(
                 ..decision
             };
         }
-    }
 
     info!(
         "trading: decision = {:?} exchange={} symbol={} amount=${:.2} confidence={:.2}",

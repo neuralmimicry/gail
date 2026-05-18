@@ -101,12 +101,11 @@ impl OpenAIResponseSchemaContext {
             context.push_str(instructions);
             context.push('\n');
         }
-        if let Some(format) = request.response_format.as_ref() {
-            if let Ok(text) = serde_json::to_string(format) {
+        if let Some(format) = request.response_format.as_ref()
+            && let Ok(text) = serde_json::to_string(format) {
                 context.push_str(&text);
                 context.push('\n');
             }
-        }
         for message in &request.messages {
             context.push_str(&message.flattened_text());
             context.push('\n');
@@ -1307,20 +1306,18 @@ fn parse_openai_input_items(items: &[Value]) -> Result<(Option<String>, Vec<Chat
 
     for item in items {
         match item {
-            Value::String(text) => {
-                if !text.trim().is_empty() {
+            Value::String(text)
+                if !text.trim().is_empty() => {
                     messages.push(user_text_message(text));
                 }
-            }
             Value::Object(object) => {
                 if let Some(item_type) = object.get("type").and_then(Value::as_str) {
                     match item_type {
                         "input_text" | "text" | "output_text" => {
-                            if let Some(text) = object.get("text").and_then(Value::as_str) {
-                                if !text.trim().is_empty() {
+                            if let Some(text) = object.get("text").and_then(Value::as_str)
+                                && !text.trim().is_empty() {
                                     messages.push(user_text_message(text));
                                 }
-                            }
                             continue;
                         }
                         "message" => {
@@ -1359,11 +1356,10 @@ fn parse_openai_input_items(items: &[Value]) -> Result<(Option<String>, Vec<Chat
                     if let Some(message) = message {
                         messages.push(message);
                     }
-                } else if let Some(text) = object.get("text").and_then(Value::as_str) {
-                    if !text.trim().is_empty() {
+                } else if let Some(text) = object.get("text").and_then(Value::as_str)
+                    && !text.trim().is_empty() {
                         messages.push(user_text_message(text));
                     }
-                }
             }
             _ => {}
         }
@@ -1415,19 +1411,17 @@ fn openai_message_content_from_value(value: &Value) -> Result<Option<MessageCont
             if converted.is_empty() {
                 return Ok(None);
             }
-            if converted.len() == 1 {
-                if let ContentPart::Text { text } = &converted[0] {
+            if converted.len() == 1
+                && let ContentPart::Text { text } = &converted[0] {
                     return Ok(Some(MessageContent::Text(text.clone())));
                 }
-            }
             Ok(Some(MessageContent::Parts(converted)))
         }
         Value::Object(object) => {
-            if let Some(text) = object.get("text").and_then(Value::as_str) {
-                if !text.trim().is_empty() {
+            if let Some(text) = object.get("text").and_then(Value::as_str)
+                && !text.trim().is_empty() {
                     return Ok(Some(MessageContent::Text(text.to_string())));
                 }
-            }
             if let Some(url) = extract_image_url(object) {
                 return Ok(Some(MessageContent::Parts(vec![ContentPart::ImageUrl {
                     image_url: ImageUrlValue { url },
@@ -1469,13 +1463,12 @@ fn openai_content_part_from_value(value: &Value) -> Result<Option<ContentPart>> 
                     }))
                 }
                 _ => {
-                    if let Some(text) = object.get("text").and_then(Value::as_str) {
-                        if !text.trim().is_empty() {
+                    if let Some(text) = object.get("text").and_then(Value::as_str)
+                        && !text.trim().is_empty() {
                             return Ok(Some(ContentPart::Text {
                                 text: text.to_string(),
                             }));
                         }
-                    }
                     Ok(extract_image_url(object).map(|url| ContentPart::ImageUrl {
                         image_url: ImageUrlValue { url },
                     }))
@@ -2152,11 +2145,10 @@ fn tool_call_from_object(
     if object.is_empty() && context.contains("finish") {
         return Some(("finish".to_string(), json!({})));
     }
-    if object.contains_key("team_name") || object.contains_key("current_results") {
-        if context.contains("finish") {
+    if (object.contains_key("team_name") || object.contains_key("current_results"))
+        && context.contains("finish") {
             return Some(("finish".to_string(), json!({})));
         }
-    }
     if object.contains_key("agent_name") && context.contains("run_agent") {
         return Some(("run_agent".to_string(), Value::Object(object)));
     }
@@ -2306,7 +2298,7 @@ fn extract_arrow_field(text: &str, name: &str) -> Option<String> {
         return Some(stripped[..end].to_string());
     }
     let end = rest
-        .find(|ch: char| ch == ',' || ch == '}')
+        .find([',', '}'])
         .unwrap_or(rest.len());
     let value = rest[..end].trim();
     (!value.is_empty()).then(|| value.to_string())
@@ -2365,8 +2357,8 @@ fn extract_arrow_args(text: &str) -> Vec<(String, String)> {
 fn extract_json_value(text: &str) -> Option<Value> {
     let trimmed = text.trim();
     serde_json::from_str::<Value>(trimmed).ok().or_else(|| {
-        let start = trimmed.find(|ch| ch == '{' || ch == '[')?;
-        let end = trimmed.rfind(|ch| ch == '}' || ch == ']')?;
+        let start = trimmed.find(['{', '['])?;
+        let end = trimmed.rfind(['}', ']'])?;
         if end <= start {
             return None;
         }

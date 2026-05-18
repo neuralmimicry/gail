@@ -11,6 +11,7 @@ use crate::{
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct GailConfig {
     pub server: ServerConfig,
     pub security: SecurityConfig,
@@ -40,6 +41,7 @@ pub struct SecurityConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct ApiTokenConfig {
     pub client_id: String,
     pub token: String,
@@ -167,21 +169,6 @@ pub struct SpecialistProfile {
     pub prefer_aarnn_designs: bool,
 }
 
-impl Default for GailConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            security: SecurityConfig::default(),
-            orchestration: OrchestrationConfig::default(),
-            aarnn_bridge: AarnnBridgeConfig::default(),
-            nmc_telemetry: NmcTelemetryConfig::default(),
-            providers: Vec::new(),
-            specialists: Vec::new(),
-            storage: StorageConfig::default(),
-            trading: TradingConfig::default(),
-        }
-    }
-}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -202,15 +189,6 @@ impl Default for SecurityConfig {
     }
 }
 
-impl Default for ApiTokenConfig {
-    fn default() -> Self {
-        Self {
-            client_id: String::new(),
-            token: String::new(),
-            scopes: Vec::new(),
-        }
-    }
-}
 
 impl Default for OrchestrationConfig {
     fn default() -> Self {

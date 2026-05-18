@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=scripts/release-common.sh
-source "${SCRIPT_DIR}/release-common.sh"
-
 usage() {
   cat >&2 <<'USAGE'
 Usage: scripts/build-deb.sh --version VERSION --arch amd64|arm64 --binary PATH [options]
@@ -17,51 +13,111 @@ Options:
 USAGE
 }
 
-REPO_ROOT=$(nm_repo_root)
+root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 version="${VERSION:-}"
 deb_version="${DEB_VERSION:-}"
 deb_arch="${DEB_ARCH:-}"
 binary_path="${BINARY_PATH:-}"
 out_dir="${OUT_DIR:-dist}"
-config_path="${CONFIG_PATH:-${REPO_ROOT}/gail.yaml}"
-routing_path="${ROUTING_PROFILES_PATH:-${REPO_ROOT}/config/ai-routing-profiles.json}"
+config_path="${CONFIG_PATH:-${root_dir}/gail.yaml}"
+routing_path="${ROUTING_PROFILES_PATH:-${root_dir}/config/ai-routing-profiles.json}"
 
-while (($#)); do
+while [[ $# -gt 0 ]]; do
   case "$1" in
-    --version) shift; (($#)) || nm_die "--version requires a value"; version="$1" ;;
-    --deb-version) shift; (($#)) || nm_die "--deb-version requires a value"; deb_version="$1" ;;
-    --arch) shift; (($#)) || nm_die "--arch requires a value"; deb_arch="$1" ;;
-    --binary) shift; (($#)) || nm_die "--binary requires a value"; binary_path="$1" ;;
-    --out-dir) shift; (($#)) || nm_die "--out-dir requires a value"; out_dir="$1" ;;
-    --config) shift; (($#)) || nm_die "--config requires a value"; config_path="$1" ;;
-    --routing) shift; (($#)) || nm_die "--routing requires a value"; routing_path="$1" ;;
-    -h|--help) usage; exit 0 ;;
-    *) nm_die "unknown argument: $1" ;;
+    --version)
+      version="$2"
+      shift 2
+      ;;
+    --deb-version)
+      deb_version="$2"
+      shift 2
+      ;;
+    --arch)
+      deb_arch="$2"
+      shift 2
+      ;;
+    --binary)
+      binary_path="$2"
+      shift 2
+      ;;
+    --out-dir)
+      out_dir="$2"
+      shift 2
+      ;;
+    --config)
+      config_path="$2"
+      shift 2
+      ;;
+    --routing)
+      routing_path="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage
+      exit 2
+      ;;
   esac
-  shift
 done
 
-[[ -n "$version" && -n "$deb_arch" && -n "$binary_path" ]] || { usage; exit 2; }
-deb_version="${deb_version:-$version}"
-nm_validate_deb_arch "$deb_arch"
-nm_validate_deb_version "$deb_version"
-[[ -x "$binary_path" ]] || nm_die "binary is missing or not executable: $binary_path"
-[[ -f "$config_path" ]] || nm_die "config file is missing: $config_path"
-[[ -f "$routing_path" ]] || nm_die "routing profiles file is missing: $routing_path"
-[[ -f "${REPO_ROOT}/packaging/deb/gail.service" ]] || nm_die "systemd service file is missing: ${REPO_ROOT}/packaging/deb/gail.service"
-nm_require_command dpkg-deb
+if [[ -z "${version}" || -z "${deb_arch}" || -z "${binary_path}" ]]; then
+  usage
+  exit 2
+fi
+
+if [[ -z "${deb_version}" ]]; then
+  deb_version="${version}"
+fi
+
+case "${deb_arch}" in
+  amd64|arm64)
+    ;;
+  *)
+    echo "Unsupported Debian architecture: ${deb_arch}" >&2
+    exit 2
+    ;;
+esac
+
+if [[ ! "${deb_version}" =~ ^[0-9][0-9A-Za-z.+~-]*$ ]]; then
+  echo "Invalid Debian package version: ${deb_version}" >&2
+  exit 2
+fi
+
+if [[ ! -x "${binary_path}" ]]; then
+  echo "Binary is missing or not executable: ${binary_path}" >&2
+  exit 2
+fi
+
+if [[ ! -f "${config_path}" ]]; then
+  echo "Config file is missing: ${config_path}" >&2
+  exit 2
+fi
+
+if [[ ! -f "${routing_path}" ]]; then
+  echo "Routing profiles file is missing: ${routing_path}" >&2
+  exit 2
+fi
+
+if ! command -v dpkg-deb >/dev/null 2>&1; then
+  echo "dpkg-deb is required to build Debian packages." >&2
+  exit 2
+fi
 
 tmp_dir="$(mktemp -d)"
-trap 'rm -rf "$tmp_dir"' EXIT
+trap 'rm -rf "${tmp_dir}"' EXIT
 
 package_root="${tmp_dir}/gail"
 control_dir="${package_root}/DEBIAN"
-install -d -m 0755 "$control_dir"
+mkdir -p "${control_dir}"
 
-install -D -m 0755 "$binary_path" "${package_root}/usr/bin/gail"
-install -D -m 0644 "$config_path" "${package_root}/etc/gail/gail.yaml"
-install -D -m 0644 "$routing_path" "${package_root}/etc/gail/ai-routing-profiles.json"
-install -D -m 0644 "${REPO_ROOT}/packaging/deb/gail.service" "${package_root}/lib/systemd/system/gail.service"
+install -D -m 0755 "${binary_path}" "${package_root}/usr/bin/gail"
+install -D -m 0644 "${config_path}" "${package_root}/etc/gail/gail.yaml"
+install -D -m 0644 "${routing_path}" "${package_root}/etc/gail/ai-routing-profiles.json"
+install -D -m 0644 "${root_dir}/packaging/deb/gail.service" "${package_root}/lib/systemd/system/gail.service"
 install -d -m 0750 "${package_root}/var/lib/gail/data"
 
 cat > "${package_root}/etc/gail/gail.env" <<'ENV'
@@ -159,11 +215,10 @@ fi
 
 exit 0
 POSTRM
+
 chmod 0755 "${control_dir}/postinst" "${control_dir}/prerm" "${control_dir}/postrm"
 
-installed_size="$(du -sk "$package_root" | awk '{print $1}')"
-depends="$(nm_compute_deb_depends "${package_root}/usr/bin/gail")"
-[[ -n "$depends" ]] || depends='ca-certificates, libc6, libgcc-s1'
+installed_size="$(du -sk "${package_root}" | awk '{print $1}')"
 
 cat > "${control_dir}/control" <<CONTROL
 Package: gail
@@ -172,7 +227,7 @@ Section: net
 Priority: optional
 Architecture: ${deb_arch}
 Maintainer: NeuralMimicry <support@neuralmimicry.ai>
-Depends: ${depends}
+Depends: ca-certificates, libc6, libgcc-s1
 Installed-Size: ${installed_size}
 Homepage: https://github.com/neuralmimicry/gail
 Description: Gateway AI and neuromorphic middleware for NeuralMimicry services
@@ -181,7 +236,8 @@ Description: Gateway AI and neuromorphic middleware for NeuralMimicry services
  integration behind one Rust HTTP service.
 CONTROL
 
-mkdir -p "$out_dir"
+mkdir -p "${out_dir}"
 package_file="${out_dir}/gail_${deb_version}_${deb_arch}.deb"
-dpkg-deb --build --root-owner-group "$package_root" "$package_file" >/dev/null
-printf '%s\n' "$package_file"
+dpkg-deb --build --root-owner-group "${package_root}" "${package_file}" >/dev/null
+
+echo "${package_file}"
