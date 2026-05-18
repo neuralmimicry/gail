@@ -1,0 +1,454 @@
+---
+name: Build, Version, and Release
+
+"on":
+  pull_request:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Create or update the GitHub release for this ref."
+        required: true
+        type: boolean
+        default: false
+      release_tag:
+        description: "Optional tag to use when publishing. Defaults to v<build-version>."
+        required: false
+        type: string
+      sign_update_bundle:
+        description: "Attach signed GAIL.update artifacts when GAIL_UPDATE_KEY is configured."
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+concurrency:
+  group: build-version-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Version metadata
+    runs-on: ubuntu-latest
+    outputs:
+      release_version: ${{ steps.version.outputs.release_version }}
+      build_version: ${{ steps.version.outputs.build_version }}
+      build_number: ${{ steps.version.outputs.build_number }}
+      git_commit: ${{ steps.version.outputs.git_commit }}
+      commit_short: ${{ steps.version.outputs.commit_short }}
+      version_source: ${{ steps.version.outputs.version_source }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Derive GAIL version metadata
+        id: version
+        shell: bash
+        run: bash scripts/derive-version.sh --github-output
+
+  verify:
+    name: Verify (${{ matrix.arch }})
+    needs: version
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs_on: '["self-hosted","Linux","X64"]'
+          - arch: arm64
+            runs_on: '["self-hosted","Linux","ARM64"]'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: verify-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            verify-${{ runner.os }}-${{ runner.arch }}-
+            verify-${{ runner.os }}-
+
+      - name: Run canonical CI preflight
+        env:
+          GAIL_VERSION: ${{ needs.version.outputs.build_version }}
+          GAIL_BUILD_NUMBER: ${{ needs.version.outputs.build_number }}
+          GAIL_GIT_COMMIT: ${{ github.sha }}
+        run: bash scripts/preflight.sh --ci
+
+      - name: Smoke test command surfaces
+        env:
+          GAIL_VERSION: ${{ needs.version.outputs.build_version }}
+          GAIL_BUILD_NUMBER: ${{ needs.version.outputs.build_number }}
+          GAIL_GIT_COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          GAIL_version="$(cargo run --locked --bin GAIL -- --version)"
+          if [[ "$GAIL_version" != "${GAIL_VERSION}" ]]; then
+            echo "::error::GAIL --version returned ${GAIL_version}; expected ${GAIL_VERSION}"
+            exit 1
+          fi
+          cargo run --locked --bin GAIL -- --tui --help >/dev/null
+          cargo run --locked --bin GAIL-loader -- --version >/dev/null
+          cargo run --locked --bin GAIL-top -- --help >/dev/null
+
+      - name: Validate shell scripts
+        run: bash -n scripts/preflight.sh scripts/derive-version.sh scripts/install-service.sh scripts/package-release.sh
+
+  create-version-tag:
+    name: Create version tag
+    needs:
+      - version
+      - verify
+      - package
+    if: >-
+      ${{
+        (
+          github.event_name == 'push' &&
+          startsWith(github.ref, 'refs/heads/') &&
+          github.ref_name == github.event.repository.default_branch
+        ) ||
+        (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Create immutable tag for this commit
+        id: tag
+        shell: bash
+        env:
+          DEFAULT_TAG: ${{ needs.version.outputs.tag }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+          BUILD_VERSION: ${{ needs.version.outputs.build_version }}
+        run: |
+          set -euo pipefail
+          tag="${REQUESTED_TAG:-$DEFAULT_TAG}"
+
+          git check-ref-format "refs/tags/${tag}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --force --tags origin
+
+          if git show-ref --tags --verify --quiet "refs/tags/${tag}"; then
+            existing_commit="$(git rev-list -n 1 "${tag}")"
+            if [[ "${existing_commit}" != "${GITHUB_SHA}" ]]; then
+              echo "::error::Tag ${tag} already points to ${existing_commit}, not ${GITHUB_SHA}"
+              exit 1
+            fi
+            echo "Tag ${tag} already exists for ${GITHUB_SHA}"
+          else
+            git tag -a "${tag}" "${GITHUB_SHA}" \
+              -m "GAIL ${BUILD_VERSION} (${GITHUB_SHA})"
+            git push origin "refs/tags/${tag}"
+          fi
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+  package:
+    name: Package (${{ matrix.platform }})
+    needs:
+      - version
+      - verify
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event_name == 'push' &&
+          startsWith(github.ref, 'refs/heads/') &&
+          github.ref_name == github.event.repository.default_branch
+        )
+      }}
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runs_on: '["self-hosted","Linux","X64"]'
+            rust_target: x86_64-unknown-linux-gnu
+            platform: linux-amd64
+            archive_format: tar.gz
+            binary_suffix: ""
+            deb_arch: amd64
+            can_execute: true
+          - os: linux
+            arch: arm64
+            runs_on: '["self-hosted","Linux","ARM64"]'
+            rust_target: aarch64-unknown-linux-gnu
+            platform: linux-arm64
+            archive_format: tar.gz
+            binary_suffix: ""
+            deb_arch: arm64
+            can_execute: true
+          - os: windows
+            arch: amd64
+            runs_on: '["windows-2025"]'
+            rust_target: x86_64-pc-windows-msvc
+            platform: windows-amd64
+            archive_format: zip
+            binary_suffix: ".exe"
+            deb_arch: ""
+            can_execute: true
+          - os: windows
+            arch: arm64
+            runs_on: '["windows-11-arm"]'
+            rust_target: aarch64-pc-windows-msvc
+            platform: windows-arm64
+            archive_format: zip
+            binary_suffix: ".exe"
+            deb_arch: ""
+            can_execute: true
+          - os: ios
+            arch: amd64
+            runs_on: '["macos-15-intel"]'
+            rust_target: x86_64-apple-ios
+            platform: ios-amd64
+            archive_format: tar.gz
+            binary_suffix: ""
+            deb_arch: ""
+            can_execute: false
+          - os: ios
+            arch: arm64
+            runs_on: '["macos-15"]'
+            rust_target: aarch64-apple-ios
+            platform: ios-arm64
+            archive_format: tar.gz
+            binary_suffix: ""
+            deb_arch: ""
+            can_execute: false
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --target "${{ matrix.rust_target }}"
+          rustup default stable
+
+      - name: Configure iOS linker
+        if: ${{ matrix.os == 'ios' }}
+        run: |
+          set -euo pipefail
+          case "${{ matrix.rust_target }}" in
+            aarch64-apple-ios)
+              sdk=iphoneos
+              min_flag=-miphoneos-version-min=13.0
+              ;;
+            x86_64-apple-ios)
+              sdk=iphonesimulator
+              min_flag=-mios-simulator-version-min=13.0
+              ;;
+            *)
+              echo "::error::Unsupported iOS Rust target: ${{ matrix.rust_target }}"
+              exit 1
+              ;;
+          esac
+
+          sdk_path="$(xcrun --sdk "$sdk" --show-sdk-path)"
+          clang_path="$(xcrun --sdk "$sdk" --find clang)"
+          ar_path="$(xcrun --sdk "$sdk" --find ar)"
+          target_env="$(printf '%s' "${{ matrix.rust_target }}" | tr '[:lower:]-' '[:upper:]_')"
+          cc_env="$(printf '%s' "${{ matrix.rust_target }}" | tr '-' '_')"
+
+          {
+            echo "SDKROOT=$sdk_path"
+            echo "CARGO_TARGET_${target_env}_LINKER=$clang_path"
+            echo "CARGO_TARGET_${target_env}_RUSTFLAGS=-C link-arg=-isysroot -C link-arg=$sdk_path -C link-arg=$min_flag"
+            echo "CC_${cc_env}=$clang_path"
+            echo "AR_${cc_env}=$ar_path"
+          } >> "$GITHUB_ENV"
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: package-${{ runner.os }}-${{ runner.arch }}-${{ matrix.platform }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            package-${{ runner.os }}-${{ runner.arch }}-${{ matrix.platform }}-
+            package-${{ runner.os }}-${{ runner.arch }}-
+            package-${{ runner.os }}-
+
+      - name: Build and package release artifacts
+        env:
+          GAIL_VERSION: ${{ needs.version.outputs.build_version }}
+          GAIL_BUILD_NUMBER: ${{ needs.version.outputs.build_number }}
+          GAIL_GIT_COMMIT: ${{ github.sha }}
+          GAIL_UPDATE_KEY: ${{ secrets.GAIL_UPDATE_KEY }}
+          SIGN_UPDATE_BUNDLE: >-
+            ${{ github.event_name != 'workflow_dispatch' || inputs.sign_update_bundle }}
+          RELEASE_VERSION: ${{ needs.version.outputs.build_version }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCHIVE_FORMAT: ${{ matrix.archive_format }}
+          BINARY_SUFFIX: ${{ matrix.binary_suffix }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
+        run: |
+          set -euo pipefail
+          args=(
+            --version "${RELEASE_VERSION}"
+            --output-dir "./dist"
+            --target-triple "${RUST_TARGET}"
+            --platform "${PLATFORM}"
+            --archive-format "${ARCHIVE_FORMAT}"
+            --binary-suffix "${BINARY_SUFFIX}"
+            --skip-preflight
+          )
+
+          if [[ -n "${DEB_ARCH}" ]]; then
+            args+=(--deb-arch "${DEB_ARCH}")
+          fi
+          if [[ "${SIGN_UPDATE_BUNDLE}" == "true" && -n "${GAIL_UPDATE_KEY:-}" ]]; then
+            args+=(--sign-update)
+          fi
+
+          bash scripts/package-release.sh "${args[@]}"
+
+      - name: Validate Debian package metadata
+        if: ${{ matrix.deb_arch != '' }}
+        env:
+          DEB_ARCH: ${{ matrix.deb_arch }}
+        run: |
+          set -euo pipefail
+          deb_path="$(find dist -maxdepth 1 -type f -name 'GAIL_*.deb' | head -n 1)"
+          if [[ -z "$deb_path" ]]; then
+            echo "::error::Expected a Debian package under dist/"
+            exit 1
+          fi
+
+          expected_version="$(basename "$deb_path" | sed -E 's/^GAIL_(.*)_[^_]+\.deb$/\1/')"
+          actual_package="$(dpkg-deb -f "$deb_path" Package)"
+          actual_version="$(dpkg-deb -f "$deb_path" Version)"
+          actual_arch="$(dpkg-deb -f "$deb_path" Architecture)"
+
+          [[ "$actual_package" == "GAIL" ]]
+          [[ "$actual_version" == "$expected_version" ]]
+          [[ "$actual_arch" == "$DEB_ARCH" ]]
+
+      - name: Smoke test packaged binaries
+        if: ${{ matrix.can_execute }}
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          BINARY_SUFFIX: ${{ matrix.binary_suffix }}
+        run: |
+          set -euo pipefail
+          bin_dir="./target/${RUST_TARGET}/release"
+          "${bin_dir}/GAIL${BINARY_SUFFIX}" --version
+          "${bin_dir}/GAIL-loader${BINARY_SUFFIX}" --version
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: GAIL-${{ needs.version.outputs.build_version }}-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-release:
+    name: Publish GitHub release
+    needs:
+      - version
+      - create-version-tag
+      - package
+    if: >-
+      ${{
+        (
+          github.event_name == 'push' &&
+          startsWith(github.ref, 'refs/heads/') &&
+          github.ref_name == github.event.repository.default_branch
+        ) ||
+        (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: ./dist
+          pattern: GAIL-${{ needs.version.outputs.build_version }}-*
+          merge-multiple: true
+
+      - name: Create or update GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.create-version-tag.outputs.tag }}
+          BUILD_VERSION: ${{ needs.version.outputs.build_version }}
+          RELEASE_VERSION: ${{ needs.version.outputs.release_version }}
+          COMMIT_SHORT: ${{ needs.version.outputs.commit_short }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' files < <(find dist -type f -print0 | sort -z)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "::error::No packaged artifacts were downloaded"
+            exit 1
+          fi
+
+          notes="$(mktemp)"
+          cat >"$notes" <<NOTES
+          Automated GAIL release for ${GITHUB_SHA}.
+
+          Build version: ${BUILD_VERSION}
+          Cargo package version: ${RELEASE_VERSION}
+          Commit: ${COMMIT_SHORT}
+          Workflow run: ${GITHUB_RUN_ID}
+          NOTES
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" "${files[@]}" --clobber
+            gh release edit "${RELEASE_TAG}" \
+              --target "${GITHUB_SHA}" \
+              --title "GAIL ${BUILD_VERSION}" \
+              --notes-file "$notes"
+          else
+            gh release create "${RELEASE_TAG}" "${files[@]}" \
+              --target "${GITHUB_SHA}" \
+              --title "GAIL ${BUILD_VERSION}" \
+              --notes-file "$notes"
+          fi
