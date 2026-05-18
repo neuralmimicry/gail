@@ -1502,8 +1502,11 @@ impl GailService {
                 "request_fallback",
             ));
         }
-        let include_configured_fallback =
-            should_include_configured_candidates(include_configured, request, !candidates.is_empty());
+        let include_configured_fallback = should_include_configured_candidates(
+            include_configured,
+            request,
+            !candidates.is_empty(),
+        );
         if include_configured_fallback {
             candidates.extend(
                 self.inner
