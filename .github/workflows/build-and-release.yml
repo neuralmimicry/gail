@@ -442,6 +442,8 @@ jobs:
       COMMIT_SHORT: ${{ needs.version.outputs.commit_short }}
       RELEASE_REPOSITORY: ${{ github.repository }}
       RELEASE_TOKEN: ${{ github.token }}
+      GHCR_USERNAME: ${{ (secrets.GHCR_USERNAME != '' && secrets.GHCR_USERNAME) || github.actor }}
+      GHCR_TOKEN: ${{ (secrets.GHCR_TOKEN != '' && secrets.GHCR_TOKEN) || github.token }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -455,8 +457,8 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          username: ${{ env.GHCR_USERNAME }}
+          password: ${{ env.GHCR_TOKEN }}
 
       - name: Build and push multi-arch image
         uses: docker/build-push-action@v6
