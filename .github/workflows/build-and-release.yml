@@ -104,16 +104,17 @@ jobs:
       - name: Smoke test command surfaces
         env:
           GAIL_VERSION: ${{ needs.version.outputs.build_version }}
+          GAIL_RELEASE_VERSION: ${{ needs.version.outputs.release_version }}
           GAIL_BUILD_NUMBER: ${{ needs.version.outputs.build_number }}
           GAIL_GIT_COMMIT: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
-          GAIL_version="$(cargo run --locked --bin gail -- --version)"
-          if [[ "$GAIL_version" != "${GAIL_VERSION}" ]]; then
-            echo "::error::GAIL --version returned ${GAIL_version}; expected ${GAIL_VERSION}"
+          gail_version="$(cargo run --locked --bin gail -- --version)"
+          if [[ "$gail_version" != "${GAIL_RELEASE_VERSION}" && "$gail_version" != "gail ${GAIL_RELEASE_VERSION}" ]]; then
+            echo "::error::gail --version returned ${gail_version}; expected ${GAIL_RELEASE_VERSION} (or 'gail ${GAIL_RELEASE_VERSION}')"
+            exit 1
           fi
-          cargo run --locked --bin gail -- --version >/dev/null
 
       - name: Validate shell scripts
         run: >-
@@ -121,7 +122,6 @@ jobs:
           scripts/release-common.sh
           scripts/preflight.sh
           scripts/derive-version.sh
-          scripts/install-service.sh
           scripts/package-release.sh
           scripts/build-deb.sh
           scripts/set-release-version.sh
