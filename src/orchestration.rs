@@ -654,64 +654,99 @@ impl GailService {
                 .filter(|item| !ranked_candidate_is_in_provider_backoff(item))
                 .cloned()
                 .collect::<Vec<_>>();
+            let mut forced_selected: Option<Vec<ProviderCandidate>> = None;
             if remaining.is_empty() && !unattempted.is_empty() {
-                if results.is_empty() {
-                    let message = "all suitable providers are currently in adaptive backoff; retry after the recorded mitigation window".to_string();
-                    api_issues::observe_orchestration_failure(
-                        &workflow,
-                        &role,
-                        &message,
-                        json!({
-                            "attempted_candidate_count": attempted_candidate_ids.len(),
-                            "throttled_provider_types": sorted_strings(throttled_provider_types.clone()),
-                            "backoff_candidates": unattempted
-                                .iter()
-                                .map(|item| item.candidate.candidate_id())
-                                .collect::<Vec<_>>(),
-                        }),
-                    )
-                    .await;
-                    if should_return_degraded_fallback(
-                        &request,
-                        include_configured,
+                if results.is_empty()
+                    && should_probe_transient_backoff_candidates(
                         &workflow,
                         &role,
                         expected_json,
                         &task_tags,
                         &prompt_text,
-                    ) {
+                    )
+                {
+                    let transient_backoff = unattempted
+                        .iter()
+                        .filter(|item| ranked_candidate_is_transient_backoff(item))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !transient_backoff.is_empty() {
                         info!(
                             workflow = %workflow,
                             role = %role,
-                            "returning Gail degraded safety fallback because every provider is in adaptive backoff"
+                            backoff_candidates = %preview_labels(
+                                transient_backoff
+                                    .iter()
+                                    .map(|item| item.candidate.candidate_id())
+                                    .collect::<Vec<_>>(),
+                                6
+                            ),
+                            "all providers are in transient adaptive backoff; forcing a probe attempt"
                         );
-                        return Ok(self.degraded_completion_response(
-                            request_id,
+                        forced_selected = Some(select_ranked_candidates(transient_backoff, 1));
+                    }
+                }
+                if results.is_empty() {
+                    let no_forced_probe =
+                        forced_selected.as_ref().map(|items| items.is_empty()) != Some(false);
+                    if remaining.is_empty() && no_forced_probe {
+                        let message = "all suitable providers are currently in adaptive backoff; retry after the recorded mitigation window".to_string();
+                        api_issues::observe_orchestration_failure(
                             &workflow,
                             &role,
-                            &task_tags,
-                            &selection_mode,
-                            returned_early,
-                            early_success_enabled,
-                            early_success_settle_seconds,
+                            &message,
+                            json!({
+                                "attempted_candidate_count": attempted_candidate_ids.len(),
+                                "throttled_provider_types": sorted_strings(throttled_provider_types.clone()),
+                                "backoff_candidates": unattempted
+                                    .iter()
+                                    .map(|item| item.candidate.candidate_id())
+                                    .collect::<Vec<_>>(),
+                            }),
+                        )
+                        .await;
+                        if should_return_degraded_fallback(
+                            &request,
+                            include_configured,
+                            &workflow,
+                            &role,
                             expected_json,
+                            &task_tags,
                             &prompt_text,
-                            vec![message],
-                            ranked_candidate_summaries(&unattempted),
-                            specialist_meta.as_ref(),
-                            attempted_candidate_ids.len(),
-                            sorted_strings(throttled_provider_types.clone()),
+                        ) {
+                            info!(
+                                workflow = %workflow,
+                                role = %role,
+                                "returning Gail degraded safety fallback because every provider is in adaptive backoff"
+                            );
+                            return Ok(self.degraded_completion_response(
+                                request_id,
+                                &workflow,
+                                &role,
+                                &task_tags,
+                                &selection_mode,
+                                returned_early,
+                                early_success_enabled,
+                                early_success_settle_seconds,
+                                expected_json,
+                                &prompt_text,
+                                vec![message],
+                                ranked_candidate_summaries(&unattempted),
+                                specialist_meta.as_ref(),
+                                attempted_candidate_ids.len(),
+                                sorted_strings(throttled_provider_types.clone()),
+                            ));
+                        }
+                        return Err(GailError::upstream(
+                            "gail",
+                            Some(StatusCode::SERVICE_UNAVAILABLE),
+                            message,
                         ));
                     }
-                    return Err(GailError::upstream(
-                        "gail",
-                        Some(StatusCode::SERVICE_UNAVAILABLE),
-                        message,
-                    ));
                 }
-                break;
             }
-            let selected = select_ranked_candidates(remaining, wave_size);
+            let selected =
+                forced_selected.unwrap_or_else(|| select_ranked_candidates(remaining, wave_size));
             if selected.is_empty() {
                 if results.is_empty() {
                     return Err(GailError::bad_request(
@@ -1479,26 +1514,50 @@ impl GailService {
     ) -> Vec<ProviderCandidate> {
         let mut candidates = Vec::new();
         if let Some(provider) = request.preferred_provider.as_ref() {
-            candidates.push(self.request_candidate(
+            if request_candidate_model_allowed(
+                &self.inner.config,
                 provider,
-                request.preferred_model.clone(),
-                request.preferred_api_key.clone(),
-                request.preferred_access_token.clone(),
-                request.base_url.clone(),
-                true,
-                "request_primary",
-            ));
+                request.preferred_model.as_deref(),
+            ) {
+                candidates.push(self.request_candidate(
+                    provider,
+                    request.preferred_model.clone(),
+                    request.preferred_api_key.clone(),
+                    request.preferred_access_token.clone(),
+                    request.base_url.clone(),
+                    true,
+                    "request_primary",
+                ));
+            } else {
+                tracing::warn!(
+                    provider = %provider,
+                    requested_model = ?request.preferred_model,
+                    "ignoring unconfigured Ollama request model; using configured provider profiles"
+                );
+            }
         }
         if let Some(provider) = request.fallback_provider.as_ref() {
-            candidates.push(self.request_candidate(
+            if request_candidate_model_allowed(
+                &self.inner.config,
                 provider,
-                request.fallback_model.clone(),
-                request.fallback_api_key.clone(),
-                request.fallback_access_token.clone(),
-                request.base_url.clone(),
-                false,
-                "request_fallback",
-            ));
+                request.fallback_model.as_deref(),
+            ) {
+                candidates.push(self.request_candidate(
+                    provider,
+                    request.fallback_model.clone(),
+                    request.fallback_api_key.clone(),
+                    request.fallback_access_token.clone(),
+                    request.base_url.clone(),
+                    false,
+                    "request_fallback",
+                ));
+            } else {
+                tracing::warn!(
+                    provider = %provider,
+                    requested_model = ?request.fallback_model,
+                    "ignoring unconfigured Ollama fallback model; using configured provider profiles"
+                );
+            }
         }
         let include_configured_fallback = should_include_configured_candidates(
             include_configured,
@@ -1671,16 +1730,11 @@ impl GailService {
             .metrics
             .health_snapshot(candidate.candidate_id().as_str())
             .await;
-        let health_ttl_seconds = if is_ollama_candidate(candidate)
-            && cached
-                .mode
-                .as_deref()
-                .is_some_and(|mode| mode.eq_ignore_ascii_case("ollama_saturated"))
-        {
-            ollama_saturation_backoff_seconds()
-        } else {
-            self.health_ttl_seconds()
-        };
+        let health_ttl_seconds = cached_health_ttl_seconds(
+            is_ollama_candidate(candidate),
+            cached.mode.as_deref(),
+            self.health_ttl_seconds(),
+        );
         if !self
             .inner
             .metrics
@@ -2789,6 +2843,28 @@ fn ollama_saturation_backoff_seconds() -> f64 {
     env_float_any(&["GAIL_OLLAMA_SATURATION_BACKOFF_SECONDS"], 20.0).max(1.0)
 }
 
+fn ollama_transient_health_ttl_seconds() -> f64 {
+    env_float_any(&["GAIL_OLLAMA_TRANSIENT_HEALTH_TTL_SECONDS"], 30.0).max(1.0)
+}
+
+fn cached_health_ttl_seconds(is_ollama: bool, mode: Option<&str>, default_ttl: f64) -> f64 {
+    if !is_ollama {
+        return default_ttl;
+    }
+    match mode.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(mode) if mode == "ollama_saturated" => ollama_saturation_backoff_seconds(),
+        Some(mode)
+            if matches!(
+                mode.as_str(),
+                "timeout" | "upstream" | "resource_saturated" | "runtime_error" | "error"
+            ) =>
+        {
+            ollama_transient_health_ttl_seconds()
+        }
+        _ => default_ttl,
+    }
+}
+
 fn host_budget_ratio(candidate: &ProviderCandidate, usage: &HostLoad) -> f64 {
     let mut ratios = Vec::new();
     if let Some(cpu_budget) = candidate.host_cpu_budget.filter(|value| *value > 0.0) {
@@ -2858,6 +2934,53 @@ fn ranked_candidate_is_in_provider_backoff(item: &RankedCandidate) -> bool {
                 .iter()
                 .any(|item| mode.eq_ignore_ascii_case(item))
             }))
+}
+
+fn ranked_candidate_is_transient_backoff(item: &RankedCandidate) -> bool {
+    !item.health_ok
+        && item.health_mode.as_deref().is_some_and(|mode| {
+            [
+                "upstream",
+                "timeout",
+                "ollama_saturated",
+                "resource_saturated",
+                "provider_backoff",
+                "nmc_constrained",
+            ]
+            .iter()
+            .any(|item| mode.eq_ignore_ascii_case(item))
+        })
+}
+
+fn should_probe_transient_backoff_candidates(
+    workflow: &str,
+    role: &str,
+    expected_json: bool,
+    task_tags: &HashSet<String>,
+    prompt_text: &str,
+) -> bool {
+    if env_bool_any(
+        &[
+            "GAIL_DISABLE_TRANSIENT_BACKOFF_PROBE",
+            "REFINER_AI_DISABLE_TRANSIENT_BACKOFF_PROBE",
+        ],
+        false,
+    ) {
+        return false;
+    }
+    if env_bool_any(
+        &[
+            "GAIL_ALWAYS_TRANSIENT_BACKOFF_PROBE",
+            "REFINER_AI_ALWAYS_TRANSIENT_BACKOFF_PROBE",
+        ],
+        false,
+    ) {
+        return true;
+    }
+    if is_interactive_workflow(workflow, role) {
+        return false;
+    }
+    expected_json || text_or_tags_indicate_automation(workflow, role, task_tags, prompt_text)
 }
 
 fn message_indicates_provider_backoff(message: &str) -> bool {
@@ -3291,6 +3414,71 @@ fn should_include_configured_candidates(
         return true;
     }
     request.preferred_provider.is_some()
+}
+
+fn allow_unconfigured_ollama_request_models() -> bool {
+    env_bool_any(
+        &[
+            "GAIL_ALLOW_UNCONFIGURED_OLLAMA_REQUEST_MODELS",
+            "GAIL_ALLOW_UNCONFIGURED_OLLAMA_REQUEST_MODEL",
+            "REFINER_AI_ALLOW_UNCONFIGURED_OLLAMA_REQUEST_MODELS",
+        ],
+        false,
+    )
+}
+
+fn request_candidate_model_allowed(
+    config: &GailConfig,
+    provider: &str,
+    model: Option<&str>,
+) -> bool {
+    request_candidate_model_allowed_with_policy(
+        config,
+        provider,
+        model,
+        allow_unconfigured_ollama_request_models(),
+    )
+}
+
+fn request_candidate_model_allowed_with_policy(
+    config: &GailConfig,
+    provider: &str,
+    model: Option<&str>,
+    allow_unconfigured_ollama_models: bool,
+) -> bool {
+    if allow_unconfigured_ollama_models {
+        return true;
+    }
+    if normalize_provider_type(provider) != "ollama" {
+        return true;
+    }
+
+    let Some(requested_model) = model
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"))
+    else {
+        return true;
+    };
+    let requested_model = requested_model
+        .strip_prefix("ollama/")
+        .unwrap_or(requested_model)
+        .to_ascii_lowercase();
+
+    let configured_ollama_models = config
+        .providers
+        .iter()
+        .filter(|profile| normalize_provider_type(profile.provider_type.as_str()) == "ollama")
+        .filter_map(|profile| profile.model.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+
+    if configured_ollama_models.is_empty() {
+        return true;
+    }
+
+    configured_ollama_models.contains(&requested_model)
 }
 
 fn should_return_degraded_fallback(
@@ -3940,6 +4128,22 @@ mod tests {
     }
 
     #[test]
+    fn cached_health_ttl_keeps_ollama_transient_failures_short_lived() {
+        let default_ttl = 1800.0;
+        let timeout_ttl = cached_health_ttl_seconds(true, Some("timeout"), default_ttl);
+        let upstream_ttl = cached_health_ttl_seconds(true, Some("upstream"), default_ttl);
+        let saturation_ttl = cached_health_ttl_seconds(true, Some("ollama_saturated"), default_ttl);
+
+        assert!(timeout_ttl >= 1.0 && timeout_ttl <= 120.0);
+        assert!(upstream_ttl >= 1.0 && upstream_ttl <= 120.0);
+        assert!(saturation_ttl >= 1.0 && saturation_ttl <= 120.0);
+        assert_eq!(
+            cached_health_ttl_seconds(false, Some("timeout"), default_ttl),
+            default_ttl
+        );
+    }
+
+    #[test]
     fn provider_family_backoff_does_not_throttle_all_ollama_endpoints_on_saturation() {
         let ollama = ProviderCandidate::from_profile(ProviderProfile {
             provider_type: "ollama".to_string(),
@@ -4028,6 +4232,61 @@ mod tests {
         };
         assert!(!should_include_configured_candidates(false, &request, true));
         assert!(should_include_configured_candidates(false, &request, false));
+    }
+
+    #[test]
+    fn request_candidate_model_allowed_rejects_unconfigured_ollama_model_by_default() {
+        let config = GailConfig {
+            providers: vec![ProviderProfile {
+                name: "ollama-native".to_string(),
+                provider_type: "ollama".to_string(),
+                model: Some("llama3.2:3b".to_string()),
+                ..ProviderProfile::default()
+            }],
+            ..GailConfig::default()
+        };
+        assert!(!request_candidate_model_allowed_with_policy(
+            &config,
+            "ollama",
+            Some("qwen2.5-coder:1.5b"),
+            false,
+        ));
+        assert!(request_candidate_model_allowed_with_policy(
+            &config,
+            "ollama",
+            Some("ollama/llama3.2:3b"),
+            false,
+        ));
+    }
+
+    #[test]
+    fn request_candidate_model_allowed_can_permit_unconfigured_ollama_model() {
+        let config = GailConfig {
+            providers: vec![ProviderProfile {
+                name: "ollama-native".to_string(),
+                provider_type: "ollama".to_string(),
+                model: Some("llama3.2:3b".to_string()),
+                ..ProviderProfile::default()
+            }],
+            ..GailConfig::default()
+        };
+        assert!(request_candidate_model_allowed_with_policy(
+            &config,
+            "ollama",
+            Some("qwen2.5-coder:1.5b"),
+            true,
+        ));
+    }
+
+    #[test]
+    fn request_candidate_model_allowed_keeps_non_ollama_requests() {
+        let config = GailConfig::default();
+        assert!(request_candidate_model_allowed_with_policy(
+            &config,
+            "openai",
+            Some("gpt-4o-mini"),
+            false,
+        ));
     }
 
     #[test]

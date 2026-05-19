@@ -376,6 +376,11 @@ trading:
   advisor_timeout_seconds: 30.0
   backtesting_enabled: false             # requires OctoBot .data files
   backtest_data_files: []                # explicit .data files, or auto-discovered when enabled
+  backtest_data_catalog_path: "./data/backtest_data_catalog.json"   # persistent discovered-file cache
+  backtest_data_collection_enabled: true  # auto-trigger OctoBot collector when files are missing
+  backtest_data_collection_exchange: "binance"
+  backtest_data_collection_time_frames: ["1h", "1d"]
+  backtest_data_collection_cooldown_seconds: 3600
 ```
 
 Runtime-mutable fields (via `POST /v1/trading/config`, no restart required):

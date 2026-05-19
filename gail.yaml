@@ -202,3 +202,8 @@ trading:
   refiner_timeout_seconds: 15.0
   advisor_timeout_seconds: 30.0
   backtesting_enabled: false
+  backtest_data_catalog_path: "./data/backtest_data_catalog.json"
+  backtest_data_collection_enabled: true
+  backtest_data_collection_exchange: "binance"
+  backtest_data_collection_time_frames: ["1h", "1d"]
+  backtest_data_collection_cooldown_seconds: 3600

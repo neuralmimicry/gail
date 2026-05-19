@@ -12,7 +12,9 @@
 ///   variants to support native OctoBot and custom bridge extensions.
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
-use reqwest::{Client, ClientBuilder, StatusCode};
+use once_cell::sync::Lazy;
+use regex::Regex;
+use reqwest::{Client, ClientBuilder, StatusCode, header::CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -1547,6 +1549,18 @@ impl OctobotClient {
 // Backtesting API
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DataCollectorStartRequest {
+    exchange: String,
+    symbols: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_frames: Option<Vec<String>>,
+    #[serde(rename = "startTimestamp", skip_serializing_if = "Option::is_none")]
+    start_timestamp: Option<i64>,
+    #[serde(rename = "endTimestamp", skip_serializing_if = "Option::is_none")]
+    end_timestamp: Option<i64>,
+}
+
 /// Request body for starting an OctoBot backtesting run.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct BacktestStartRequest {
@@ -1686,6 +1700,93 @@ impl OctobotClient {
         }
     }
 
+    /// Trigger OctoBot historical data collection for backtesting.
+    ///
+    /// Maps to: `POST /data_collector?action_type=start_collector`
+    pub async fn start_data_collector(
+        &self,
+        exchange: &str,
+        symbols: &[String],
+        time_frames: &[String],
+        start_timestamp: Option<i64>,
+        end_timestamp: Option<i64>,
+    ) -> Result<(), String> {
+        let exchange = exchange.trim();
+        if exchange.is_empty() {
+            return Err("OctoBot start_data_collector requires a non-empty exchange".to_string());
+        }
+        let symbols = symbols
+            .iter()
+            .map(|symbol| symbol.trim().to_string())
+            .filter(|symbol| !symbol.is_empty())
+            .collect::<Vec<_>>();
+        if symbols.is_empty() {
+            return Err("OctoBot start_data_collector requires at least one symbol".to_string());
+        }
+        let time_frames = time_frames
+            .iter()
+            .map(|time_frame| time_frame.trim().to_string())
+            .filter(|time_frame| !time_frame.is_empty())
+            .collect::<Vec<_>>();
+
+        let request = DataCollectorStartRequest {
+            exchange: exchange.to_string(),
+            symbols,
+            time_frames: if time_frames.is_empty() {
+                None
+            } else {
+                Some(time_frames)
+            },
+            start_timestamp,
+            end_timestamp,
+        };
+
+        let url = format!(
+            "{}/data_collector?action_type=start_collector",
+            self.base_url
+        );
+        let path = "/data_collector?action_type=start_collector";
+        let resp = match self.client.post(&url).json(&request).send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                self.observe_failure("POST", path, "start data collector", None, &err.to_string())
+                    .await;
+                return Err(format!(
+                    "OctoBot start_data_collector request failed: {err}"
+                ));
+            }
+        };
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            self.observe_success(
+                "POST",
+                path,
+                "start data collector",
+                &json!({
+                    "status": status.as_u16(),
+                    "message": text.trim(),
+                }),
+            )
+            .await;
+            Ok(())
+        } else {
+            self.observe_failure(
+                "POST",
+                path,
+                "start data collector",
+                Some(status.as_u16()),
+                text.trim(),
+            )
+            .await;
+            Err(format!(
+                "OctoBot start_data_collector failed: HTTP {}: {}",
+                status.as_u16(),
+                text.trim()
+            ))
+        }
+    }
+
     /// Poll for the backtesting report.  Returns `None` if no report is
     /// available yet (backtest still running or not started).
     ///
@@ -1800,64 +1901,90 @@ impl OctobotClient {
     ///
     /// Maps to: `GET /backtesting?update_type=backtesting_data_files&source=backtesting`
     pub async fn list_backtest_data_files(&self) -> Result<Vec<String>, String> {
-        let url = format!(
-            "{}/backtesting?update_type=backtesting_data_files&source=backtesting",
-            self.base_url
-        );
-        let path = "/backtesting?update_type=backtesting_data_files&source=backtesting";
+        let candidates = [
+            ("/data_collector", "data collector page"),
+            (
+                "/backtesting?update_type=backtesting_data_files&source=backtesting",
+                "backtest data files",
+            ),
+        ];
+        let mut last_error = None;
+        let mut saw_successful_endpoint = false;
+
+        for (path, label) in candidates {
+            match self.list_backtest_data_files_from_path(path, label).await {
+                Ok(files) => {
+                    saw_successful_endpoint = true;
+                    if !files.is_empty() {
+                        return Ok(files);
+                    }
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        if saw_successful_endpoint {
+            Ok(Vec::new())
+        } else {
+            Err(last_error
+                .unwrap_or_else(|| "OctoBot list_backtest_data_files failed: no compatible endpoint responded successfully".to_string()))
+        }
+    }
+
+    async fn list_backtest_data_files_from_path(
+        &self,
+        path: &str,
+        label: &str,
+    ) -> Result<Vec<String>, String> {
+        let url = format!("{}{}", self.base_url, path);
         let resp = match self.client.get(&url).send().await {
             Ok(resp) => resp,
             Err(err) => {
-                self.observe_failure("GET", path, "backtest data files", None, &err.to_string())
+                self.observe_failure("GET", path, label, None, &err.to_string())
                     .await;
                 return Err(format!(
-                    "OctoBot list_backtest_data_files request failed: {err}"
+                    "OctoBot list_backtest_data_files request failed via {path}: {err}"
                 ));
             }
         };
         let status = resp.status();
-        let body: Value = match resp.json().await {
-            Ok(body) => body,
-            Err(err) => {
-                let message = format!("OctoBot list_backtest_data_files parse failed: {err}");
-                self.observe_failure(
-                    "GET",
-                    path,
-                    "backtest data files",
-                    Some(status.as_u16()),
-                    &message,
-                )
-                .await;
-                return Err(message);
-            }
-        };
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let text = resp.text().await.unwrap_or_default();
+
         if !status.is_success() {
-            self.observe_failure(
-                "GET",
-                path,
-                "backtest data files",
-                Some(status.as_u16()),
-                &body.to_string(),
-            )
-            .await;
+            self.observe_failure("GET", path, label, Some(status.as_u16()), text.trim())
+                .await;
             return Err(format!(
-                "OctoBot list_backtest_data_files failed: HTTP {}",
+                "OctoBot list_backtest_data_files failed via {path}: HTTP {}",
                 status.as_u16()
             ));
         }
-        self.observe_success("GET", path, "backtest data files", &body)
-            .await;
-        // Response may be an array directly or wrapped in {"data_files": [...]}.
-        let files = body
-            .as_array()
-            .or_else(|| body.get("data_files").and_then(Value::as_array))
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+
+        if let Ok(body) = serde_json::from_str::<Value>(&text) {
+            self.observe_success("GET", path, label, &body).await;
+            return Ok(extract_backtest_data_files_from_json(&body));
+        }
+
+        let files = extract_backtest_data_files_from_text(&text);
+        self.observe_success(
+            "GET",
+            path,
+            label,
+            &json!({
+                "status": status.as_u16(),
+                "content_type": content_type,
+                "files_discovered": files.len(),
+                "mode": "text",
+            }),
+        )
+        .await;
         Ok(files)
     }
 }
@@ -1953,6 +2080,105 @@ fn extract_portfolio_totals(value: Option<&Value>) -> std::collections::HashMap<
             Some((exchange.clone(), total))
         })
         .collect()
+}
+
+fn extract_backtest_data_files_from_json(body: &Value) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_backtest_data_files(body, &mut files);
+    dedupe_backtest_data_file_paths(files)
+}
+
+fn collect_backtest_data_files(value: &Value, output: &mut Vec<String>) {
+    match value {
+        Value::String(text) => {
+            if is_backtest_data_file_path(text) {
+                output.push(text.to_string());
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_backtest_data_files(item, output);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                collect_backtest_data_files(value, output);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_backtest_data_files_from_text(text: &str) -> Vec<String> {
+    static DATA_FILE_PATH_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"([A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*\.data)($|["'<>,\s])"#)
+            .expect("valid backtest data-file regex")
+    });
+
+    let files = DATA_FILE_PATH_RE
+        .captures_iter(text)
+        .filter_map(|caps| caps.get(1).map(|matched| matched.as_str().to_string()))
+        .filter(|candidate| is_backtest_data_file_path(candidate))
+        .collect::<Vec<_>>();
+    dedupe_backtest_data_file_paths(files)
+}
+
+fn dedupe_backtest_data_file_paths(files: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for file in files {
+        let trimmed = file.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            deduped.push(trimmed.to_string());
+        }
+    }
+    deduped
+}
+
+fn is_backtest_data_file_path(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('<')
+        || trimmed.contains('>')
+        || trimmed.contains('?')
+        || trimmed.contains('#')
+        || trimmed.contains('\\')
+        || trimmed.contains("://")
+        || trimmed.starts_with("//")
+    {
+        return false;
+    }
+
+    static SAFE_BACKTEST_DATA_FILE_PATH_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"^/?[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*\.data$")
+            .expect("valid safe backtest data-file path regex")
+    });
+
+    if !SAFE_BACKTEST_DATA_FILE_PATH_RE.is_match(trimmed) {
+        return false;
+    }
+
+    // Reject CDN-like or URL host-like captures such as
+    // `cdn.example.net/path/to/file.data`.
+    if trimmed.contains('/') {
+        let normalized = trimmed.trim_start_matches('/');
+        let first_segment = normalized.split('/').next().unwrap_or_default();
+        if first_segment.contains('.') {
+            return false;
+        }
+    } else {
+        // Plain `.data` names from OctoBot are collector artifacts. Reject
+        // generic tokens (for example CDN host fragments like `cdn.data`).
+        let lower = trimmed.to_ascii_lowercase();
+        if !lower.contains("collector") && !lower.contains("backtest") {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn parse_orders_array(body: &Value) -> Result<Vec<OctobotOrder>, String> {

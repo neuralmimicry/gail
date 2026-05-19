@@ -119,6 +119,10 @@ impl TradingAdvisor {
             warn!("trading: no providers available for AI advisory");
             return AiConsensus::uncertain();
         }
+        let mut attempted_provider_ids = providers
+            .iter()
+            .map(provider_identity)
+            .collect::<HashSet<_>>();
 
         let prompt = build_advisory_prompt(market_snapshots, research, portfolio);
         let system = advisory_system_prompt();
@@ -148,6 +152,31 @@ impl TradingAdvisor {
                     }
                 }
                 Err(_) => failures += 1,
+            }
+        }
+
+        if !advices.iter().any(|advice| advice.parsed_ok) {
+            let fallback_candidates = self.select_providers(max_advisors.max(1).saturating_add(3));
+            for profile in fallback_candidates {
+                if !attempted_provider_ids.insert(provider_identity(&profile)) {
+                    continue;
+                }
+                let advice = query_provider(
+                    self.service.clone(),
+                    profile,
+                    prompt.clone(),
+                    system.clone(),
+                    timeout_secs,
+                )
+                .await;
+                if !advice.parsed_ok {
+                    failures += 1;
+                }
+                let parsed_ok = advice.parsed_ok;
+                advices.push(advice);
+                if parsed_ok {
+                    break;
+                }
             }
         }
 
@@ -247,7 +276,57 @@ fn provider_advisor_score(profile: &ProviderProfile) -> f64 {
             score += 0.03;
         }
     }
+    score += ollama_trading_profile_adjustment(profile);
+    score += model_trading_adjustment(profile);
     score
+}
+
+fn ollama_trading_profile_adjustment(profile: &ProviderProfile) -> f64 {
+    if normalize_provider_type(profile.provider_type.as_str()) != "ollama" {
+        return 0.0;
+    }
+
+    let specialties = profile
+        .specialties
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let integration = specialties
+        .iter()
+        .find_map(|value| value.strip_prefix("integration:"));
+
+    let mut adjustment = match integration {
+        Some("native") => 0.28,
+        Some("openai_compat") => 0.08,
+        Some("langchain" | "llamaindex" | "opencode" | "claude" | "codex") => -0.18,
+        Some(_) => -0.06,
+        None => 0.0,
+    };
+
+    if specialties.iter().any(|value| {
+        value.contains("tool_use") || value.contains("workflows") || value.contains("orchestration")
+    }) {
+        adjustment -= 0.04;
+    }
+
+    adjustment
+}
+
+fn model_trading_adjustment(profile: &ProviderProfile) -> f64 {
+    let Some(model) = profile.model.as_deref() else {
+        return 0.0;
+    };
+    let model = model.to_ascii_lowercase();
+    let mut adjustment = 0.0;
+
+    if model.contains("coder") || model.contains("code") {
+        adjustment -= 0.12;
+    }
+    if model.contains("llama3") || model.contains("chat") || model.contains("instruct") {
+        adjustment += 0.03;
+    }
+
+    adjustment
 }
 
 fn provider_can_advise(profile: &ProviderProfile) -> bool {
@@ -938,6 +1017,33 @@ mod tests {
         assert!(provider_types.contains("nvidia"));
         assert!(provider_types.contains("gemini"));
         assert!(provider_types.contains("ollama"));
+    }
+
+    #[test]
+    fn select_trading_profiles_prefers_native_ollama_for_trading() {
+        let mut native = profile("ollama-native", "ollama", 0.05);
+        native.model = Some("llama3.2:3b".to_string());
+        native.specialties = vec!["integration:native".to_string(), "local".to_string()];
+
+        let mut openai_compat = profile("ollama-openai-compat", "ollama", 0.11);
+        openai_compat.model = Some("llama3.2:3b".to_string());
+        openai_compat.specialties = vec![
+            "integration:openai_compat".to_string(),
+            "structured_output".to_string(),
+        ];
+
+        let mut claude_bridge = profile("ollama-claude", "ollama", 0.20);
+        claude_bridge.model = Some("qwen2.5-coder:1.5b".to_string());
+        claude_bridge.specialties = vec!["integration:claude".to_string(), "analysis".to_string()];
+
+        let mut codex_bridge = profile("ollama-codex", "ollama", 0.19);
+        codex_bridge.model = Some("qwen2.5-coder:1.5b".to_string());
+        codex_bridge.specialties = vec!["integration:codex".to_string(), "reasoning".to_string()];
+
+        let selected =
+            select_trading_profiles(&[claude_bridge, codex_bridge, openai_compat, native], 1);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "ollama-native");
     }
 
     #[test]

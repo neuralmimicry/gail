@@ -118,6 +118,23 @@ pub struct TradingConfig {
     /// How many days of historical data to include in each backtest window.
     pub backtest_lookback_days: u32,
 
+    /// Optional path to persist discovered OctoBot backtest `.data` files (JSON).
+    /// Empty means "derive from `data_path` parent directory".
+    pub backtest_data_catalog_path: String,
+
+    /// Whether Gail may trigger OctoBot's historical data collector when
+    /// no matching backtest `.data` files are available.
+    pub backtest_data_collection_enabled: bool,
+
+    /// Exchange used for OctoBot historical data-collector requests.
+    pub backtest_data_collection_exchange: String,
+
+    /// Time frames requested when Gail triggers OctoBot historical collection.
+    pub backtest_data_collection_time_frames: Vec<String>,
+
+    /// Cooldown between automatic OctoBot collector requests (seconds).
+    pub backtest_data_collection_cooldown_seconds: u64,
+
     /// If `true` and the most recent backtest assessment is `Unprofitable`,
     /// the live trading loop will be paused automatically until the approach is reviewed.
     pub backtest_pause_on_failure: bool,
@@ -167,6 +184,11 @@ impl Default for TradingConfig {
             backtest_data_files: Vec::new(),
             backtest_symbols: vec!["BTC/USDT".to_string()],
             backtest_lookback_days: 30,
+            backtest_data_catalog_path: String::new(),
+            backtest_data_collection_enabled: true,
+            backtest_data_collection_exchange: "binance".to_string(),
+            backtest_data_collection_time_frames: vec!["1h".to_string(), "1d".to_string()],
+            backtest_data_collection_cooldown_seconds: 3_600,
             backtest_pause_on_failure: false,
             live_execution_enabled: true,
         }
@@ -220,6 +242,25 @@ impl TradingConfig {
             self.backtest_profitability_threshold.clamp(-100.0, 100.0);
         self.backtest_interval_seconds = self.backtest_interval_seconds.max(300); // at least 5 min
         self.backtest_lookback_days = self.backtest_lookback_days.clamp(1, 365);
+        self.backtest_data_catalog_path = self.backtest_data_catalog_path.trim().to_string();
+        self.backtest_data_collection_exchange =
+            self.backtest_data_collection_exchange.trim().to_string();
+        if self.backtest_data_collection_exchange.is_empty() {
+            self.backtest_data_collection_exchange = "binance".to_string();
+        }
+        let mut seen_backtest_time_frames: HashSet<String> = HashSet::new();
+        self.backtest_data_collection_time_frames = self
+            .backtest_data_collection_time_frames
+            .iter()
+            .map(|time_frame| time_frame.trim().to_string())
+            .filter(|time_frame| !time_frame.is_empty())
+            .filter(|time_frame| seen_backtest_time_frames.insert(time_frame.to_ascii_lowercase()))
+            .collect();
+        if self.backtest_data_collection_time_frames.is_empty() {
+            self.backtest_data_collection_time_frames = vec!["1h".to_string(), "1d".to_string()];
+        }
+        self.backtest_data_collection_cooldown_seconds =
+            self.backtest_data_collection_cooldown_seconds.max(60);
     }
 }
 

@@ -9,20 +9,39 @@
 ///   POST /backtesting?action_type=start_backtesting  — start a run
 ///   GET  /backtesting?update_type=backtesting_report — poll for results
 ///   GET  /backtesting?update_type=backtesting_data_files — list data files
+///   POST /data_collector?action_type=start_collector — collect missing data
 ///   GET  /backtesting_run_id                         — latest run ID
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
+use tokio::fs;
 use tracing::{debug, info, warn};
 
 use super::config::TradingConfig;
 use super::octobot::{BacktestRunReport, BacktestStartRequest, OctobotClient};
+
+const DEFAULT_BACKTEST_CATALOG_FILENAME: &str = "backtest_data_catalog.json";
+const DEFAULT_BACKTEST_COLLECTION_SYMBOL: &str = "BTC/USDT";
 
 fn now_ts() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct BacktestDataCatalog {
+    #[serde(default)]
+    files: Vec<String>,
+    #[serde(default)]
+    updated_at: f64,
+    #[serde(default)]
+    last_collection_requested_at: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -202,20 +221,33 @@ impl BacktestEngine {
         );
 
         // 1. Start the backtest.
+        let mut started_new_run = true;
         if let Err(err) = self.octobot.start_backtest(request).await {
-            warn!("trading: could not start backtest: {}", err);
-            return BacktestSummary::incomplete(format!("start failed: {err}"));
+            if is_already_running_backtest_error(&err) {
+                started_new_run = false;
+                info!(
+                    "trading: OctoBot reports a backtest is already running; polling existing run"
+                );
+            } else {
+                warn!("trading: could not start backtest: {}", err);
+                return BacktestSummary::incomplete(format!("start failed: {err}"));
+            }
         }
-        info!("trading: OctoBot backtest started");
+        if started_new_run {
+            info!("trading: OctoBot backtest started");
+        }
 
-        // 2. Get the run ID (best-effort).
-        let run_id = self.octobot.get_backtest_run_id().await.ok().flatten();
-
-        // 3. Poll for results.
+        // 2. Poll for results.
+        // Retrieve run_id only once a report is available to reduce noisy
+        // transient run-id endpoint failures while OctoBot is still starting.
+        let mut run_id = None;
         for attempt in 0..self.max_polls {
             tokio::time::sleep(self.poll_interval).await;
             match self.octobot.get_backtest_report().await {
                 Ok(Some(report)) => {
+                    if run_id.is_none() {
+                        run_id = self.octobot.get_backtest_run_id().await.ok().flatten();
+                    }
                     let summary =
                         BacktestSummary::from_report(&report, self.profitability_threshold, run_id);
                     info!(
@@ -270,33 +302,150 @@ impl BacktestEngine {
             return Ok(config.backtest_data_files.clone());
         }
 
-        let available = self.octobot.list_backtest_data_files().await?;
-        let selected = select_backtest_data_files(available, &config.backtest_symbols);
-        if selected.is_empty() {
-            return Err("no OctoBot backtesting .data files matched Gail's configured backtest symbols; collect or configure backtest data files before enabling Gail backtesting".to_string());
+        let catalog_path = resolve_backtest_catalog_path(config);
+        let mut catalog = load_backtest_data_catalog(&catalog_path).await;
+
+        match self.octobot.list_backtest_data_files().await {
+            Ok(available) => {
+                let available = dedupe_backtest_data_files(available);
+                let selected =
+                    select_backtest_data_files(available.clone(), &config.backtest_symbols);
+                if !available.is_empty() {
+                    catalog.files = available;
+                    catalog.updated_at = now_ts();
+                    catalog.last_collection_requested_at = None;
+                    persist_backtest_data_catalog(&catalog_path, &catalog).await;
+                }
+                if !selected.is_empty() {
+                    return Ok(selected);
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "trading: OctoBot backtest data-file discovery failed: {}",
+                    err
+                );
+            }
         }
-        Ok(selected)
+
+        let cached_selected =
+            select_backtest_data_files(catalog.files.clone(), &config.backtest_symbols);
+        if !cached_selected.is_empty() {
+            info!(
+                "trading: using cached backtest data-file catalog path={} files={}",
+                catalog_path.display(),
+                cached_selected.len()
+            );
+            return Ok(cached_selected);
+        }
+
+        if config.backtest_data_collection_enabled {
+            let now = now_ts();
+            let cooldown_seconds = config.backtest_data_collection_cooldown_seconds as f64;
+            if let Some(last_request_at) = catalog.last_collection_requested_at
+                && cooldown_seconds > 0.0
+                && now - last_request_at < cooldown_seconds
+            {
+                let retry_after_seconds =
+                    (cooldown_seconds - (now - last_request_at)).ceil() as u64;
+                return Err(format!(
+                    "no OctoBot backtesting .data files matched Gail's configured backtest symbols; waiting for OctoBot collector output (retry in ~{retry_after_seconds}s)"
+                ));
+            }
+
+            let collector_symbols = if config.backtest_symbols.is_empty() {
+                vec![DEFAULT_BACKTEST_COLLECTION_SYMBOL.to_string()]
+            } else {
+                config.backtest_symbols.clone()
+            };
+            let now_ms = (now * 1000.0) as i64;
+            let start_ms = now_ms - (config.backtest_lookback_days as i64) * 86_400_000;
+
+            match self
+                .octobot
+                .start_data_collector(
+                    &config.backtest_data_collection_exchange,
+                    &collector_symbols,
+                    &config.backtest_data_collection_time_frames,
+                    Some(start_ms),
+                    Some(now_ms),
+                )
+                .await
+            {
+                Ok(()) => {
+                    catalog.last_collection_requested_at = Some(now);
+                    persist_backtest_data_catalog(&catalog_path, &catalog).await;
+                    return Err(format!(
+                        "no OctoBot backtesting .data files matched Gail's configured backtest symbols; started OctoBot historical data collection for {} on {} [{}]",
+                        collector_symbols.join(", "),
+                        config.backtest_data_collection_exchange,
+                        config.backtest_data_collection_time_frames.join(", ")
+                    ));
+                }
+                Err(err) => {
+                    let err_lower = err.to_ascii_lowercase();
+                    if err_lower.contains("already running") {
+                        catalog.last_collection_requested_at = Some(now);
+                        persist_backtest_data_catalog(&catalog_path, &catalog).await;
+                        return Err(
+                            "no OctoBot backtesting .data files matched Gail's configured backtest symbols; OctoBot data collector is already running"
+                                .to_string(),
+                        );
+                    }
+                    return Err(format!(
+                        "no OctoBot backtesting .data files matched Gail's configured backtest symbols; failed to start OctoBot data collector: {err}"
+                    ));
+                }
+            }
+        }
+
+        Err("no OctoBot backtesting .data files matched Gail's configured backtest symbols; collect or configure backtest data files before enabling Gail backtesting".to_string())
     }
 }
 
 fn select_backtest_data_files(available: Vec<String>, symbols: &[String]) -> Vec<String> {
+    let available = dedupe_backtest_data_files(available);
     let wanted = symbols
         .iter()
         .map(|symbol| normalize_symbol_for_data_file(symbol))
         .filter(|symbol| !symbol.is_empty())
         .collect::<Vec<_>>();
-    available
-        .into_iter()
+    if wanted.is_empty() {
+        return available;
+    }
+
+    let symbol_matches = available
+        .iter()
         .filter(|file| {
-            if wanted.is_empty() {
-                return true;
-            }
             let normalized_file = normalize_symbol_for_data_file(file);
             wanted
                 .iter()
                 .any(|symbol| normalized_file.contains(symbol.as_str()))
         })
-        .collect()
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if !symbol_matches.is_empty() {
+        return symbol_matches;
+    }
+
+    if available
+        .iter()
+        .all(|file| is_generic_octobot_collector_file(file))
+    {
+        let mut generic_files = available;
+        generic_files.sort_by(|left, right| {
+            let left_timestamp = generic_collector_file_timestamp(left).unwrap_or(0.0);
+            let right_timestamp = generic_collector_file_timestamp(right).unwrap_or(0.0);
+            right_timestamp
+                .partial_cmp(&left_timestamp)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| right.cmp(left))
+        });
+        return generic_files.into_iter().take(1).collect();
+    }
+
+    Vec::new()
 }
 
 fn normalize_symbol_for_data_file(value: &str) -> String {
@@ -314,6 +463,124 @@ fn normalize_symbol_for_data_file(value: &str) -> String {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("_")
+}
+
+fn is_already_running_backtest_error(err: &str) -> bool {
+    let normalized = err.to_ascii_lowercase();
+    normalized.contains("already running")
+        || normalized.contains("already started")
+        || normalized.contains("backtesting is running")
+}
+
+fn is_generic_octobot_collector_file(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let filename = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    let normalized = filename.to_ascii_lowercase();
+    normalized.starts_with("exchangehistorydatacollector_") && normalized.ends_with(".data")
+}
+
+fn generic_collector_file_timestamp(value: &str) -> Option<f64> {
+    if !is_generic_octobot_collector_file(value) {
+        return None;
+    }
+    let trimmed = value.trim();
+    let filename = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    let prefix = "ExchangeHistoryDataCollector_";
+    let suffix = ".data";
+    let timestamp = filename
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(suffix))?;
+    timestamp.parse::<f64>().ok()
+}
+
+fn resolve_backtest_catalog_path(config: &TradingConfig) -> PathBuf {
+    if !config.backtest_data_catalog_path.trim().is_empty() {
+        return PathBuf::from(config.backtest_data_catalog_path.trim());
+    }
+
+    let data_path = PathBuf::from(config.data_path.trim());
+    if let Some(parent) = data_path.parent() {
+        return parent.join(DEFAULT_BACKTEST_CATALOG_FILENAME);
+    }
+    PathBuf::from(format!("./data/{DEFAULT_BACKTEST_CATALOG_FILENAME}"))
+}
+
+async fn load_backtest_data_catalog(path: &PathBuf) -> BacktestDataCatalog {
+    match fs::read_to_string(path).await {
+        Ok(raw) => match serde_json::from_str::<BacktestDataCatalog>(&raw) {
+            Ok(mut catalog) => {
+                catalog.files = dedupe_backtest_data_files(catalog.files);
+                catalog
+            }
+            Err(err) => {
+                warn!(
+                    "trading: failed to parse backtest data catalog from {}: {}",
+                    path.display(),
+                    err
+                );
+                BacktestDataCatalog::default()
+            }
+        },
+        Err(_) => BacktestDataCatalog::default(),
+    }
+}
+
+async fn persist_backtest_data_catalog(path: &PathBuf, catalog: &BacktestDataCatalog) {
+    let payload = match serde_json::to_string_pretty(catalog) {
+        Ok(payload) => payload,
+        Err(err) => {
+            warn!(
+                "trading: failed to serialize backtest data catalog for {}: {}",
+                path.display(),
+                err
+            );
+            return;
+        }
+    };
+
+    if let Some(parent) = path.parent()
+        && let Err(err) = fs::create_dir_all(parent).await
+    {
+        warn!(
+            "trading: failed to create backtest catalog directory {}: {}",
+            parent.display(),
+            err
+        );
+        return;
+    }
+
+    if let Err(err) = fs::write(path, payload).await {
+        warn!(
+            "trading: failed to write backtest data catalog to {}: {}",
+            path.display(),
+            err
+        );
+    } else {
+        debug!(
+            "trading: persisted backtest data catalog to {}",
+            path.display()
+        );
+    }
+}
+
+fn dedupe_backtest_data_files(files: Vec<String>) -> Vec<String> {
+    let mut deduped = Vec::new();
+    let mut seen = HashSet::new();
+
+    for file in files {
+        let trimmed = file.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            deduped.push(trimmed.to_string());
+        }
+    }
+
+    deduped
 }
 
 // ---------------------------------------------------------------------------
@@ -424,5 +691,55 @@ mod tests {
         ];
         let selected = select_backtest_data_files(available.clone(), &[]);
         assert_eq!(selected, available);
+    }
+
+    #[test]
+    fn backtest_file_selection_accepts_generic_octobot_collector_files() {
+        let available = vec![
+            "ExchangeHistoryDataCollector_1779194033.964632.data".to_string(),
+            "ExchangeHistoryDataCollector_1779194074.4955919.data".to_string(),
+        ];
+        let selected = select_backtest_data_files(available.clone(), &["BTC/USDT".to_string()]);
+        assert_eq!(
+            selected,
+            vec!["ExchangeHistoryDataCollector_1779194074.4955919.data"]
+        );
+    }
+
+    #[test]
+    fn backtest_file_selection_rejects_non_matching_non_collector_files() {
+        let available = vec!["other_provider_snapshot.data".to_string()];
+        let selected = select_backtest_data_files(available, &["BTC/USDT".to_string()]);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn catalog_path_defaults_to_data_path_parent() {
+        let config = TradingConfig {
+            data_path: "/app/data/trading_state.json".to_string(),
+            ..TradingConfig::default()
+        };
+        let path = resolve_backtest_catalog_path(&config);
+        assert_eq!(
+            path.to_string_lossy(),
+            "/app/data/backtest_data_catalog.json"
+        );
+    }
+
+    #[test]
+    fn dedupe_backtest_files_removes_empty_and_duplicates() {
+        let deduped = dedupe_backtest_data_files(vec![
+            "".to_string(),
+            "user/backtesting/collector/binance_BTC_USDT_1h.data".to_string(),
+            "user/backtesting/collector/binance_BTC_USDT_1h.data".to_string(),
+            " user/backtesting/collector/binance_ETH_USDT_1h.data ".to_string(),
+        ]);
+        assert_eq!(
+            deduped,
+            vec![
+                "user/backtesting/collector/binance_BTC_USDT_1h.data".to_string(),
+                "user/backtesting/collector/binance_ETH_USDT_1h.data".to_string(),
+            ]
+        );
     }
 }

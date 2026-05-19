@@ -271,6 +271,9 @@ mod tests {
         assert_eq!(cfg.research_max_parallel_queries, 3);
         assert!(cfg.live_execution_enabled);
         assert!(!cfg.backtesting_enabled);
+        assert!(cfg.backtest_data_collection_enabled);
+        assert_eq!(cfg.backtest_data_collection_exchange, "binance");
+        assert_eq!(cfg.backtest_data_collection_time_frames, vec!["1h", "1d"]);
     }
 
     #[test]
@@ -319,6 +322,13 @@ mod tests {
             research_top_k: 0,
             log_ring_size: 0,
             trade_ring_size: 0,
+            backtest_data_collection_exchange: "  ".to_string(),
+            backtest_data_collection_time_frames: vec![
+                " 1h ".to_string(),
+                "".to_string(),
+                "1H".to_string(),
+            ],
+            backtest_data_collection_cooldown_seconds: 0,
             ..TradingConfig::default()
         };
         cfg.normalize();
@@ -338,6 +348,9 @@ mod tests {
         assert_eq!(cfg.research_top_k, 1);
         assert!(cfg.log_ring_size >= 10);
         assert!(cfg.trade_ring_size >= 10);
+        assert_eq!(cfg.backtest_data_collection_exchange, "binance");
+        assert_eq!(cfg.backtest_data_collection_time_frames, vec!["1h"]);
+        assert!(cfg.backtest_data_collection_cooldown_seconds >= 60);
     }
 
     #[test]
@@ -1680,7 +1693,8 @@ mod tests {
     use crate::trading::backtest::{ApproachAssessment, BacktestEngine, BacktestSummary};
     use crate::trading::octobot::{BacktestStartRequest, OctobotClient};
     use std::time::Duration;
-    use wiremock::matchers::{method, path, path_regex, query_param};
+    use tempfile::tempdir;
+    use wiremock::matchers::{body_string_contains, method, path, path_regex, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
@@ -2208,6 +2222,462 @@ mod tests {
         server.verify().await;
     }
 
+    #[tokio::test]
+    async fn backtest_client_list_data_files_accepts_wrapped_json() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_data_files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data_files": [
+                    "user/backtesting/collector/binance_BTC_USDT_1h.data",
+                    "user/backtesting/collector/binance_ETH_USDT_1h.data"
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let files = client.list_backtest_data_files().await.unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|file| file.contains("BTC_USDT")));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn backtest_client_list_data_files_parses_html_backtesting_page() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_data_files"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string(
+                        r#"<input type="checkbox" class="dataFileCheckbox" data-file="user/backtesting/collector/binance_BTC_USDT_1h.data">"#,
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let files = client.list_backtest_data_files().await.unwrap();
+        assert_eq!(
+            files,
+            vec!["user/backtesting/collector/binance_BTC_USDT_1h.data"]
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn backtest_client_list_data_files_accepts_plain_collector_filenames() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_data_files"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string(
+                        r#"<input type="checkbox" class="dataFileCheckbox" data-file="ExchangeHistoryDataCollector_1779190560.6877387.data">"#,
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let files = client.list_backtest_data_files().await.unwrap();
+        assert_eq!(
+            files,
+            vec!["ExchangeHistoryDataCollector_1779190560.6877387.data"]
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn backtest_client_list_data_files_ignores_non_backtesting_data_assets() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_data_files"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string(
+                        r#"
+                        <script src="https://cdn.datatables.net/2.0.8/css/dataTables.data"></script>
+                        <td>user/backtesting/collector/binance_BTC_USDT_1h.data</td>
+                        "#,
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let files = client.list_backtest_data_files().await.unwrap();
+        assert_eq!(
+            files,
+            vec!["user/backtesting/collector/binance_BTC_USDT_1h.data"]
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn backtest_client_list_data_files_ignores_partial_dot_data_tokens_from_cdn_hosts() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_data_files"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string(
+                        r#"
+                        <link rel="stylesheet" href="https://cdn.datatables.net/2.0.8/css/dataTables.dataTables.min.css">
+                        <td>ExchangeHistoryDataCollector_1779194074.4955919.data</td>
+                        "#,
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let files = client.list_backtest_data_files().await.unwrap();
+        assert_eq!(
+            files,
+            vec!["ExchangeHistoryDataCollector_1779194074.4955919.data"]
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn backtest_client_list_data_files_prefers_data_collector_page_when_available() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_data_files"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string("<html><body>No explicit list endpoint</body></html>"),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/data_collector"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string(
+                        r#"<td>user/backtesting/collector/binance_ETH_USDT_1h.data</td>"#,
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let files = client.list_backtest_data_files().await.unwrap();
+        assert_eq!(
+            files,
+            vec!["user/backtesting/collector/binance_ETH_USDT_1h.data"]
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn backtest_client_start_data_collector_request_format() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/data_collector"))
+            .and(query_param("action_type", "start_collector"))
+            .and(body_string_contains("\"exchange\":\"binance\""))
+            .and(body_string_contains("\"symbols\":[\"BTC/USDT\"]"))
+            .and(body_string_contains("\"time_frames\":[\"1h\"]"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json("Historical data collection started."),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let started = client
+            .start_data_collector(
+                "binance",
+                &["BTC/USDT".to_string()],
+                &["1h".to_string()],
+                Some(1_700_000_000_000),
+                Some(1_700_086_400_000),
+            )
+            .await;
+        assert!(
+            started.is_ok(),
+            "start_data_collector should succeed: {started:?}"
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn backtest_engine_run_with_config_uses_cached_catalog_when_discovery_fails() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_data_files"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("not available"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/backtesting"))
+            .and(query_param("action_type", "start_backtesting"))
+            .and(body_string_contains("binance_BTC_USDT_1h.data"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("\"Backtesting started\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting_run_id"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "backtesting_id": 77 })),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_report"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(octobot_report_body(6.0, 2.0, 9)),
+            )
+            .mount(&server)
+            .await;
+
+        let temp = tempdir().expect("tempdir");
+        let catalog_path = temp.path().join("backtest_data_catalog.json");
+        std::fs::write(
+            &catalog_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "files": ["user/backtesting/collector/binance_BTC_USDT_1h.data"],
+                "updated_at": 1_700_000_000.0
+            }))
+            .expect("catalog json"),
+        )
+        .expect("write catalog");
+
+        let mut config = TradingConfig {
+            data_path: temp
+                .path()
+                .join("trading_state.json")
+                .to_string_lossy()
+                .to_string(),
+            backtest_data_catalog_path: catalog_path.to_string_lossy().to_string(),
+            backtest_symbols: vec!["BTC/USDT".to_string()],
+            backtest_data_collection_enabled: false,
+            ..TradingConfig::default()
+        };
+        config.normalize();
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let engine = BacktestEngine::with_poll_params(client, 0.0, Duration::from_millis(1), 5);
+        let summary = engine.run_with_config(&config).await;
+
+        assert_eq!(summary.assessment, ApproachAssessment::Viable);
+        assert_eq!(summary.run_id, Some(77));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn backtest_engine_run_with_config_starts_collector_when_no_files_available() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_data_files"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string("<html><body>No data files yet</body></html>"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/data_collector"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string("<html><body>collector page</body></html>"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/data_collector"))
+            .and(query_param("action_type", "start_collector"))
+            .and(body_string_contains("\"symbols\":[\"BTC/USDT\"]"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json("Historical data collection started."),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let temp = tempdir().expect("tempdir");
+        let catalog_path = temp.path().join("backtest_data_catalog.json");
+        let mut config = TradingConfig {
+            data_path: temp
+                .path()
+                .join("trading_state.json")
+                .to_string_lossy()
+                .to_string(),
+            backtest_data_catalog_path: catalog_path.to_string_lossy().to_string(),
+            backtest_symbols: vec!["BTC/USDT".to_string()],
+            backtest_data_collection_enabled: true,
+            backtest_data_collection_exchange: "binance".to_string(),
+            backtest_data_collection_time_frames: vec!["1h".to_string()],
+            backtest_data_collection_cooldown_seconds: 300,
+            ..TradingConfig::default()
+        };
+        config.normalize();
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let engine = BacktestEngine::with_poll_params(client, 0.0, Duration::from_millis(1), 5);
+        let summary = engine.run_with_config(&config).await;
+
+        assert_eq!(summary.assessment, ApproachAssessment::Incomplete);
+        assert!(
+            summary
+                .notes
+                .contains("started OctoBot historical data collection"),
+            "summary notes should mention collector start: {}",
+            summary.notes
+        );
+        let persisted_catalog = std::fs::read_to_string(catalog_path).expect("catalog persisted");
+        assert!(
+            persisted_catalog.contains("last_collection_requested_at"),
+            "catalog should include collection request timestamp"
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn backtest_engine_run_with_config_uses_generic_collector_files_without_retriggering_collection()
+     {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_data_files"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string(
+                        r#"<td>ExchangeHistoryDataCollector_1779194074.4955919.data</td>"#,
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/data_collector"))
+            .and(query_param("action_type", "start_collector"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json("Historical data collection started."),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/backtesting"))
+            .and(query_param("action_type", "start_backtesting"))
+            .and(body_string_contains(
+                "ExchangeHistoryDataCollector_1779194074.4955919.data",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("\"Backtesting started\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting_run_id"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "backtesting_id": 88 })),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_report"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(octobot_report_body(4.0, 2.0, 6)),
+            )
+            .mount(&server)
+            .await;
+
+        let temp = tempdir().expect("tempdir");
+        let catalog_path = temp.path().join("backtest_data_catalog.json");
+        let mut config = TradingConfig {
+            data_path: temp
+                .path()
+                .join("trading_state.json")
+                .to_string_lossy()
+                .to_string(),
+            backtest_data_catalog_path: catalog_path.to_string_lossy().to_string(),
+            backtest_symbols: vec!["BTC/USDT".to_string()],
+            backtest_data_collection_enabled: true,
+            backtest_data_collection_exchange: "binance".to_string(),
+            backtest_data_collection_time_frames: vec!["1h".to_string()],
+            backtest_data_collection_cooldown_seconds: 300,
+            ..TradingConfig::default()
+        };
+        config.normalize();
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let engine = BacktestEngine::with_poll_params(client, 0.0, Duration::from_millis(1), 5);
+        let summary = engine.run_with_config(&config).await;
+
+        assert_eq!(summary.assessment, ApproachAssessment::Viable);
+        assert_eq!(summary.run_id, Some(88));
+        assert!(
+            !summary
+                .notes
+                .contains("started OctoBot historical data collection"),
+            "collector should not be retriggered when generic collector files are available: {}",
+            summary.notes
+        );
+        let persisted_catalog = std::fs::read_to_string(catalog_path).expect("catalog persisted");
+        assert!(
+            persisted_catalog.contains("ExchangeHistoryDataCollector_1779194074.4955919.data"),
+            "catalog should persist discovered generic collector file names"
+        );
+        server.verify().await;
+    }
+
     // -----------------------------------------------------------------------
     // BacktestEngine: full run with mock OctoBot — profitable approach
     // -----------------------------------------------------------------------
@@ -2320,9 +2790,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/backtesting"))
             .and(query_param("action_type", "start_backtesting"))
-            .respond_with(
-                ResponseTemplate::new(500).set_body_string("\"A backtesting is already running\""),
-            )
+            .respond_with(ResponseTemplate::new(500).set_body_string("\"Internal server error\""))
             .expect(1)
             .mount(&server)
             .await;
@@ -2334,6 +2802,51 @@ mod tests {
 
         assert_eq!(summary.assessment, ApproachAssessment::Incomplete);
         assert!(summary.notes.contains("start failed"));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn backtest_engine_already_running_reuses_existing_run() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/backtesting"))
+            .and(query_param("action_type", "start_backtesting"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string("\"A backtesting is already running\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting_run_id"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "backtesting_id": 123 })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_report"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(octobot_report_body(7.0, 2.0, 9)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let engine = BacktestEngine::with_poll_params(client, 0.0, Duration::from_millis(1), 5);
+        let req = BacktestStartRequest::default();
+        let summary = engine.run(&req).await;
+
+        assert_eq!(summary.assessment, ApproachAssessment::Viable);
+        assert_eq!(summary.run_id, Some(123));
+        assert!(summary.notes.contains("Profitable"));
         server.verify().await;
     }
 

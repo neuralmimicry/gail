@@ -1,0 +1,667 @@
+ANSIBLE_SSH_ARGS='-o ForwardAgent=yes' ansible-playbook -i inventory/hosts.ini -l rk1 continuum_tenant_gail_site.yml -e @host_vars/spirit.yml -e 'continuum_tenant_nmchain_build_image=true continuum_tenant_ollama_build_image=true continuum_tenant_gail_build_image=true continuum_tenant_customers_build_image=true continuum_tenant_billing_build_image=true continuum_tenant_nmstt_build_image=true continuum_tenant_refiner_build_image=true continuum_tenant_webots_build_image=true continuum_tenant_octobot_build_image=true continuum_tenant_aarnn_build_image=true conductor_build_image=true continuum_ollama_tracey_assert_requirement_presence=false continuum_ollama_tracey_assert_agent_presence=false continuum_tenant_gail_force_rebuild=true'
+
+PLAY [Mount shared NFS build storage for Continuum tenant builds] *
+
+TASK [Gathering Facts] 
+[WARNING]: Platform linux on host spirit is using the discovered Python interpreter at /usr/bin/python3.12, but future installation of another Python interpreter
+could change the meaning of that path. See https://docs.ansible.com/ansible-core/2.18/reference_appendices/interpreter_discovery.html for more information.
+ok: [spirit]
+
+TASK [Skip shared build storage setup when disabled] 
+skipping: [spirit]
+
+TASK [rk1_shared_build_storage : Assert shared build storage mount settings are configured] *
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [rk1_shared_build_storage : Update apt cache for shared build storage prerequisites] *
+ok: [spirit]
+
+TASK [rk1_shared_build_storage : Install shared build storage prerequisites] 
+ok: [spirit]
+
+TASK [rk1_shared_build_storage : Ensure shared build storage mount path exists] *
+ok: [spirit]
+
+TASK [rk1_shared_build_storage : Inspect mounted shared build storage before attempting mount] 
+ok: [spirit]
+
+TASK [rk1_shared_build_storage : Derive whether shared build storage is already active] *
+ok: [spirit]
+
+TASK [rk1_shared_build_storage : Probe shared build storage export visibility before mounting] 
+skipping: [spirit]
+
+TASK [rk1_shared_build_storage : Derive whether shared build storage export is reachable] *
+ok: [spirit]
+
+TASK [rk1_shared_build_storage : Mount shared build storage export] *
+skipping: [spirit]
+
+TASK [rk1_shared_build_storage : Inspect mounted shared build storage] 
+ok: [spirit]
+
+TASK [rk1_shared_build_storage : Derive final shared build storage mount status] 
+ok: [spirit]
+
+TASK [rk1_shared_build_storage : Assert shared build storage mount is active] *
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [rk1_shared_build_storage : Report shared build storage fallback to local storage] *
+skipping: [spirit]
+
+PLAY [Deploy Gail as a Continuum tenant workload] *
+
+TASK [Gathering Facts] 
+ok: [spirit]
+
+TASK [Skip Gail tenant deployment when disabled] 
+skipping: [spirit]
+
+TASK [continuum_shared_service_accounts : Ensure shared Customers service-account secret directory exists] 
+[WARNING]: Platform linux on host spirit is using the discovered Python interpreter at /usr/bin/python3.13, but future installation of another Python interpreter
+could change the meaning of that path. See https://docs.ansible.com/ansible-core/2.18/reference_appendices/interpreter_discovery.html for more information.
+ok: [spirit -> localhost]
+
+TASK [continuum_shared_service_accounts : Normalise shared service accounts for bootstrap] 
+ok: [spirit]
+
+TASK [continuum_shared_service_accounts : Assert shared service-account bootstrap entries are valid] 
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_shared_service_accounts : Derive shared service-account bootstrap tokens] *
+ok: [spirit]
+
+TASK [continuum_shared_service_accounts : Index shared service-account tokens by id] 
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Update apt cache for Gail prerequisites] 
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Install Gail deployment prerequisites] 
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Resolve effective Gail client user] *
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Resolve Gail client home directory] *
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Resolve Gail client primary group] 
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Set Gail client identity facts] *
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Assert Gail client context resolved] 
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_gail : Ensure Gail workspace directories exist] 
+ok: [spirit] => (item={'path': '/home/continuum-shared-storage/tenant-builds/src', 'owner': 'pbisaacs', 'group': 'pbisaacs', 'mode': '0755'})
+ok: [spirit] => (item={'path': '/home/continuum-shared-storage/tenant-builds/tenant-apps', 'owner': 'pbisaacs', 'group': 'pbisaacs', 'mode': '0755'})
+changed: [spirit] => (item={'path': '/home/continuum-shared-storage/tenant-builds/src/gail', 'owner': 'pbisaacs', 'group': 'pbisaacs', 'mode': '0755'})
+ok: [spirit] => (item={'path': '/home/continuum-shared-storage/tenant-builds/tenant-apps/gail', 'owner': 'pbisaacs', 'group': 'pbisaacs', 'mode': '0755'})
+
+TASK [Resolve Gail image rollout strategy] 
+included: continuum_shared_image_resolution for spirit
+
+TASK [continuum_shared_image_resolution : Assert supported shared image resolution mode is selected] 
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_shared_image_resolution : Resolve single-image rollout strategy] 
+included: /home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible/roles/continuum_shared_image_resolution/tasks/single_image.yml for spirit
+
+TASK [continuum_shared_image_resolution : Resolve repository commit inputs for single-image rollout strategy] *
+included: /home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible/roles/continuum_shared_image_resolution/tasks/_resolve_repo_commit.yml for spirit
+
+TASK [continuum_shared_image_resolution : Derive shared image-resolution repository inputs] *
+ok: [spirit]
+
+TASK [continuum_shared_image_resolution : Parse GitHub repository coordinates for shared image resolution] 
+ok: [spirit]
+
+TASK [continuum_shared_image_resolution : Query latest successful GitHub Actions run via REST API] 
+skipping: [spirit]
+
+TASK [continuum_shared_image_resolution : Extract latest successful GitHub Actions commit from REST API result] *
+ok: [spirit]
+
+TASK [continuum_shared_image_resolution : Query latest successful GitHub Actions run via gh CLI fallback] *
+skipping: [spirit]
+
+TASK [continuum_shared_image_resolution : Promote gh CLI latest successful commit fallback result] 
+ok: [spirit]
+
+TASK [continuum_shared_image_resolution : Verify latest successful GitHub Actions commit is fetchable from git] *
+skipping: [spirit]
+
+TASK [continuum_shared_image_resolution : Promote fetch-verified latest successful GitHub Actions commit] *
+skipping: [spirit]
+
+TASK [continuum_shared_image_resolution : Clear latest successful GitHub Actions commit when it is not fetchable] *
+skipping: [spirit]
+
+TASK [continuum_shared_image_resolution : Resolve repository branch head through git ls-remote fallback] 
+ok: [spirit -> localhost]
+
+TASK [continuum_shared_image_resolution : Resolve repository explicit ref through git ls-remote fallback] *
+skipping: [spirit]
+
+TASK [continuum_shared_image_resolution : Normalize repository fallback query outputs] 
+ok: [spirit]
+
+TASK [continuum_shared_image_resolution : Derive final repository commit and branch-tag aliases for image resolution] *
+ok: [spirit]
+
+TASK [continuum_shared_image_resolution : Derive repository commit short alias from the final resolved commit] 
+ok: [spirit]
+
+TASK [continuum_shared_image_resolution : Check whether skopeo is available on the Ansible controller] 
+ok: [spirit -> localhost]
+
+TASK [continuum_shared_image_resolution : Select single-image inspection host] 
+ok: [spirit]
+
+TASK [continuum_shared_image_resolution : Normalize single-image rollout inputs] 
+ok: [spirit]
+
+TASK [continuum_shared_image_resolution : Derive single-image candidate refs] *
+ok: [spirit]
+
+TASK [continuum_shared_image_resolution : Derive single-image rollout mode and candidate tags] 
+ok: [spirit]
+
+TASK [continuum_shared_image_resolution : Derive single-image revision build tag] *
+skipping: [spirit]
+
+TASK [continuum_shared_image_resolution : Probe candidate built image refs for single-image rollout strategy] *
+skipping: [spirit]
+
+TASK [continuum_shared_image_resolution : Normalize single-image probe result] 
+ok: [spirit]
+
+TASK [continuum_shared_image_resolution : Derive final single-image rollout strategy] *
+ok: [spirit]
+
+TASK [continuum_shared_image_resolution : Publish single-image rollout facts] *
+ok: [spirit]
+
+TASK [continuum_shared_image_resolution : Publish single-image push fact when configured] *
+ok: [spirit]
+
+TASK [continuum_shared_image_resolution : Report resolved single-image rollout strategy] 
+skipping: [spirit]
+
+TASK [continuum_shared_image_resolution : Resolve AARNN workload rollout strategy] 
+skipping: [spirit]
+
+TASK [continuum_tenant_gail : Determine whether Gail source checkout is required] *
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Probe local Gail development source] 
+ok: [spirit -> localhost]
+
+TASK [continuum_tenant_gail : Select Gail source mode] 
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Assert git source is configured when local Gail source is unavailable] 
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_gail : Synchronize local Gail source tree] *
+skipping: [spirit]
+
+TASK [continuum_tenant_gail : Fix ownership of synced Gail repository] 
+skipping: [spirit]
+
+TASK [continuum_tenant_gail : Probe existing Gail source repository path for git metadata] 
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Remove non-git Gail source repository path before checkout] *
+skipping: [spirit]
+
+TASK [continuum_tenant_gail : Checkout Gail source repository] 
+changed: [spirit]
+
+TASK [continuum_tenant_gail : Clean Gail source repository working tree] 
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Define required Gail packaging files] *
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Check required Gail packaging files] 
+ok: [spirit] => (item=/home/continuum-shared-storage/tenant-builds/src/gail/Cargo.toml)
+ok: [spirit] => (item=/home/continuum-shared-storage/tenant-builds/src/gail/src/main.rs)
+ok: [spirit] => (item=/home/continuum-shared-storage/tenant-builds/src/gail/Containerfile)
+ok: [spirit] => (item=/home/continuum-shared-storage/tenant-builds/src/gail/README.md)
+ok: [spirit] => (item=/home/continuum-shared-storage/tenant-builds/src/gail/gail.yaml)
+
+TASK [continuum_tenant_gail : Derive Gail packaging validity] *
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Validate local Gail development fallback path] 
+skipping: [spirit]
+
+TASK [continuum_tenant_gail : Assert local Gail development fallback is available] 
+skipping: [spirit]
+
+TASK [continuum_tenant_gail : Remove invalid Gail repository] *
+skipping: [spirit]
+
+TASK [continuum_tenant_gail : Recreate Gail repository path] 
+skipping: [spirit]
+
+TASK [continuum_tenant_gail : Synchronize local Gail development repository fallback to managed host] *
+skipping: [spirit]
+
+TASK [continuum_tenant_gail : Fix ownership of Gail repository after fallback sync] *
+skipping: [spirit]
+
+TASK [continuum_tenant_gail : Re-check required Gail packaging files after fallback] 
+ok: [spirit] => (item=/home/continuum-shared-storage/tenant-builds/src/gail/Cargo.toml)
+ok: [spirit] => (item=/home/continuum-shared-storage/tenant-builds/src/gail/src/main.rs)
+ok: [spirit] => (item=/home/continuum-shared-storage/tenant-builds/src/gail/Containerfile)
+ok: [spirit] => (item=/home/continuum-shared-storage/tenant-builds/src/gail/README.md)
+ok: [spirit] => (item=/home/continuum-shared-storage/tenant-builds/src/gail/gail.yaml)
+
+TASK [continuum_tenant_gail : Assert Gail source is packaged correctly] *
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_gail : Derive effective Gail deployment values] 
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Compose default Gail API tokens] 
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Merge effective Gail API tokens] 
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Derive effective Gail probe token] 
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Assert secure Gail token configuration is complete] *
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_gail : Seed Gail Ollama instance inventory input] 
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Initialize Gail normalized Ollama instance inventory] *
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Normalize Gail Ollama instance inventory entries] *
+ok: [spirit] => (item=native)
+ok: [spirit] => (item=openai-compat)
+ok: [spirit] => (item=langchain)
+ok: [spirit] => (item=llamaindex)
+ok: [spirit] => (item=opencode)
+ok: [spirit] => (item=claude)
+ok: [spirit] => (item=codex)
+
+TASK [continuum_tenant_gail : Initialize generated Gail Ollama provider profiles] *
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Generate Gail Ollama provider profiles per instance model] 
+ok: [spirit] => (item=native -> llama3.2:3b)
+ok: [spirit] => (item=openai-compat -> llama3.2:3b)
+ok: [spirit] => (item=langchain -> llama3.2:3b)
+ok: [spirit] => (item=langchain -> qwen2.5-coder:1.5b)
+ok: [spirit] => (item=llamaindex -> llama3.2:3b)
+skipping: [spirit] => (item=llamaindex -> nomic-embed-text) 
+ok: [spirit] => (item=opencode -> qwen2.5-coder:1.5b)
+ok: [spirit] => (item=claude -> qwen2.5-coder:1.5b)
+ok: [spirit] => (item=codex -> qwen2.5-coder:1.5b)
+
+TASK [continuum_tenant_gail : Derive primary Gail Ollama profile from generated instances] 
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Derive effective Gail Ollama base endpoint/model from generated instances] 
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Merge Gail extra provider profiles with generated Ollama profiles] 
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Compose default Gail provider profiles] *
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Merge effective Gail provider profiles] *
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Compose default Gail environment variables] *
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Merge effective Gail environment variables] *
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Normalize Gail environment variables] *
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Assert Gail environment variable names are valid] *
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_gail : Derive effective Gail trading bridge settings] 
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Derive effective Gail AARNN bridge settings] 
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Derive effective Gail NMC telemetry settings] *
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Assert Gail AARNN bridge settings are complete when enabled] 
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_gail : Assert Gail bridge network aligns with shared AARNN startup network] 
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_gail : Assert Gail NMC telemetry settings are complete when enabled] *
+skipping: [spirit]
+
+TASK [continuum_tenant_gail : Compose effective Gail configuration payload] *
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Serialize effective Gail configuration] *
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Assert Gail image reference is configured] 
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_gail : Assert Gail data persistence settings are complete when enabled] 
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_gail : Check if Containerfile exists for Gail image build] *
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Assert Containerfile exists when Gail image build is enabled] *
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_gail : Resolve Gail build temporary directory path] 
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Ensure Gail build temporary directory exists] *
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Build effective Gail container environment] *
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Build effective Gail container build args] 
+ok: [spirit]
+
+TASK [continuum_tenant_gail : Assert Gail image build args include a release selector] 
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_gail : Assert release token is available for Gail release package fetches] *
+skipping: [spirit]
+
+TASK [continuum_tenant_gail : Assert registry credentials are available when pushing the Gail image] 
+skipping: [spirit]
+
+TASK [continuum_tenant_gail : Clear builder cache before Gail image build] 
+changed: [spirit]
+
+TASK [continuum_tenant_gail : Remove local Gail image before rebuild] *
+changed: [spirit]
+
+TASK [continuum_tenant_gail : Build Gail container image] *
+changed: [spirit]
+
+TASK [continuum_tenant_gail : Log in to container registry for Gail image push] *
+skipping: [spirit]
+
+TASK [continuum_tenant_gail : Push Gail container image to registry] 
+skipping: [spirit]
+
+TASK [Deploy Gail cluster stack] 
+included: continuum_tenant_k8s_app for spirit
+
+TASK [continuum_tenant_k8s_app : Assert required tenant app variables are configured] *
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_k8s_app : Update apt cache for tenant application prerequisites] *
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Install tenant application prerequisites] 
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Resolve effective tenant application client user] 
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Resolve tenant application client home directory] 
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Resolve tenant application client primary group] *
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Set tenant application client identity facts] 
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Assert tenant application client context resolved] *
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_k8s_app : Set effective kubeconfig user path for tenant application] *
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Ensure tenant application workspace directories exist] *
+ok: [spirit] => (item={'path': '/home/continuum-shared-storage/tenant-builds/tenant-apps', 'owner': 'pbisaacs', 'group': 'pbisaacs', 'mode': '0755'})
+ok: [spirit] => (item={'path': '/home/continuum-shared-storage/tenant-builds/tenant-apps/gail', 'owner': 'pbisaacs', 'group': 'pbisaacs', 'mode': '0755'})
+ok: [spirit] => (item={'path': '/home/pbisaacs/.kube', 'owner': 'pbisaacs', 'group': 'pbisaacs', 'mode': '0700'})
+
+TASK [continuum_tenant_k8s_app : Check source kubeconfig for tenant application] 
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Assert source kubeconfig exists for tenant application] 
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_k8s_app : Install user-accessible kubeconfig copy for tenant application] 
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Finalize effective kubeconfig for tenant application] 
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Build kubectl argv base for tenant application] 
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Assert kubectl is available for tenant application deployment] *
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Render tenant application manifest] 
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Validate tenant application manifest with kubectl dry-run] *
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Derive whether tenant app manifest validation should retry without OpenAPI schema fetch] *
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Retry tenant app manifest validation without OpenAPI schema fetch] *
+skipping: [spirit]
+
+TASK [continuum_tenant_k8s_app : Select final tenant app manifest validation result] 
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Assert tenant application manifest validation succeeded] *
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_k8s_app : Apply tenant application manifest] *
+changed: [spirit]
+
+TASK [continuum_tenant_k8s_app : Derive whether tenant application apply should retry after clearing legacy last-applied annotations] *
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Clear legacy last-applied annotations for tenant application manifest resources] *
+skipping: [spirit]
+
+TASK [continuum_tenant_k8s_app : Retry tenant application manifest apply after clearing legacy last-applied annotations] 
+skipping: [spirit]
+
+TASK [continuum_tenant_k8s_app : Select final tenant application apply result] 
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Assert tenant application manifest apply succeeded] 
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_k8s_app : Force rollout restart for tenant application workload targets] *
+changed: [spirit] => (item=deployment/gail)
+
+TASK [continuum_tenant_k8s_app : Wait for tenant application rollout targets] *
+ok: [spirit] => (item=deployment/gail)
+
+TASK [continuum_tenant_k8s_app : Assert ingress hostname is configured when ingress creation is enabled] 
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_k8s_app : Render tenant application ingress manifest] 
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Apply tenant application ingress manifest] *
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Assert DNS settings are configured when DNS registration is enabled] *
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_k8s_app : Derive effective DNS server targets for tenant application] 
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Assert DNS registration has at least one target DNS server] 
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_k8s_app : Build DNS delegation map from ansible_host values for tenant application] 
+ok: [spirit] => (item=maas-controller)
+skipping: [spirit] => (item=localhost) 
+ok: [spirit] => (item=baremetal1)
+ok: [spirit] => (item=baremetal2)
+ok: [spirit] => (item=openstack-controller)
+ok: [spirit] => (item=compute1)
+ok: [spirit] => (item=compute2)
+ok: [spirit] => (item=ceph-node1)
+ok: [spirit] => (item=ceph-node2)
+ok: [spirit] => (item=ceph-node3)
+ok: [spirit] => (item=lustre-server)
+ok: [spirit] => (item=lustre-client1)
+ok: [spirit] => (item=lustre-client2)
+ok: [spirit] => (item=k8s-master)
+ok: [spirit] => (item=k8s-node1)
+ok: [spirit] => (item=k8s-node2)
+ok: [spirit] => (item=slurm-controller)
+ok: [spirit] => (item=slurm-compute1)
+ok: [spirit] => (item=slurm-compute2)
+ok: [spirit] => (item=monitoring-server)
+ok: [spirit] => (item=cortex)
+ok: [spirit] => (item=logging-server)
+ok: [spirit] => (item=security-server)
+ok: [spirit] => (item=vega)
+ok: [spirit] => (item=spirit)
+ok: [spirit] => (item=qc01)
+
+TASK [continuum_tenant_k8s_app : Derive effective DNS delegation targets for tenant application] 
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Assert tenant DNS delegation has at least one target host] *
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_k8s_app : Check tenant DNS registration script on DNS servers] *
+ok: [spirit] => (item=spirit)
+
+TASK [continuum_tenant_k8s_app : Derive tenant DNS registration script validation facts] 
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Assert tenant DNS registration script is present on all DNS servers] *
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [continuum_tenant_k8s_app : Register tenant service in DNS for FQDN access] 
+changed: [spirit] => (item=spirit)
+
+TASK [continuum_tenant_k8s_app : Gather tenant application service endpoint summary] 
+ok: [spirit]
+
+TASK [continuum_tenant_k8s_app : Report tenant application deployment summary] 
+ok: [spirit] => {
+    "msg": [
+        "Tenant app: gail",
+        "Namespace: gail",
+        "Manifest: /home/continuum-shared-storage/tenant-builds/tenant-apps/gail/gail.yaml",
+        "Ingress: gail.neuralmimicry.ai",
+        "DNS: gail.neuralmimicry.ai",
+        "Service: 10.43.27.209:http=8080 "
+    ]
+}
+
+TASK [Restart Gail deployment to apply updated runtime config] 
+changed: [spirit]
+
+TASK [Wait for Gail rollout after config restart] *
+ok: [spirit]
+
+PLAY RECAP 
+spirit                     : ok=141  changed=9    unreachable=0    failed=0    skipped=30   rescued=0    ignored=0   
