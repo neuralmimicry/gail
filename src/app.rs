@@ -1024,23 +1024,53 @@ async fn dispatch_openai_chat_completion(
     ]);
 
     let completion_request = build_completion_request(
-        route,
-        request.workflow,
-        role,
-        request_category,
-        messages,
-        system,
+        route.clone(),
+        request.workflow.clone(),
+        role.clone(),
+        request_category.clone(),
+        messages.clone(),
+        system.clone(),
         request.max_tokens,
         request.temperature,
-        request.reasoning.and_then(|reasoning| reasoning.effort),
+        request
+            .reasoning
+            .clone()
+            .and_then(|reasoning| reasoning.effort),
         request.include_configured,
         request.selection_mode,
         request.max_candidates,
-        request.api_key,
-        request.access_token,
-        request.base_url,
+        request.api_key.clone(),
+        request.access_token.clone(),
+        request.base_url.clone(),
     );
-    Ok((public_model, service.complete(completion_request).await?))
+    let response = match route {
+        OpenAIResolvedRoute::Orchestrated { .. } => service.complete(completion_request).await?,
+        OpenAIResolvedRoute::Explicit {
+            provider,
+            model,
+            profile,
+            ..
+        } => {
+            let direct_request = build_direct_provider_request(
+                provider,
+                model,
+                profile,
+                request.workflow,
+                role,
+                request_category,
+                messages,
+                system,
+                request.max_tokens,
+                request.temperature,
+                request.reasoning.and_then(|reasoning| reasoning.effort),
+                request.api_key,
+                request.access_token,
+                request.base_url,
+            );
+            service.direct_complete(direct_request).await?
+        }
+    };
+    Ok((public_model, response))
 }
 
 async fn dispatch_openai_responses(
@@ -1063,23 +1093,91 @@ async fn dispatch_openai_responses(
     ]);
 
     let completion_request = build_completion_request(
-        route,
-        request.workflow,
-        role,
-        request_category,
-        messages,
-        system,
+        route.clone(),
+        request.workflow.clone(),
+        role.clone(),
+        request_category.clone(),
+        messages.clone(),
+        system.clone(),
         request.max_output_tokens,
         request.temperature,
-        request.reasoning.and_then(|reasoning| reasoning.effort),
+        request
+            .reasoning
+            .clone()
+            .and_then(|reasoning| reasoning.effort),
         request.include_configured,
         request.selection_mode,
         request.max_candidates,
-        request.api_key,
-        request.access_token,
-        request.base_url,
+        request.api_key.clone(),
+        request.access_token.clone(),
+        request.base_url.clone(),
     );
-    Ok((public_model, service.complete(completion_request).await?))
+    let response = match route {
+        OpenAIResolvedRoute::Orchestrated { .. } => service.complete(completion_request).await?,
+        OpenAIResolvedRoute::Explicit {
+            provider,
+            model,
+            profile,
+            ..
+        } => {
+            let direct_request = build_direct_provider_request(
+                provider,
+                model,
+                profile,
+                request.workflow,
+                role,
+                request_category,
+                messages,
+                system,
+                request.max_output_tokens,
+                request.temperature,
+                request.reasoning.and_then(|reasoning| reasoning.effort),
+                request.api_key,
+                request.access_token,
+                request.base_url,
+            );
+            service.direct_complete(direct_request).await?
+        }
+    };
+    Ok((public_model, response))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_direct_provider_request(
+    provider: String,
+    model: Option<String>,
+    profile: Option<ProviderProfile>,
+    workflow: Option<String>,
+    role: Option<String>,
+    request_category: Option<String>,
+    messages: Vec<ChatMessage>,
+    system: Option<String>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    reasoning_effort: Option<String>,
+    api_key: Option<String>,
+    access_token: Option<String>,
+    base_url: Option<String>,
+) -> ProviderCompletionRequest {
+    ProviderCompletionRequest {
+        provider,
+        model: model.or_else(|| profile.as_ref().and_then(|item| item.model.clone())),
+        api_key: api_key.or_else(|| profile.as_ref().and_then(|item| item.api_key.clone())),
+        access_token: access_token
+            .or_else(|| profile.as_ref().and_then(|item| item.access_token.clone())),
+        base_url: base_url.or_else(|| profile.as_ref().and_then(|item| item.base_url.clone())),
+        messages,
+        system,
+        max_tokens,
+        temperature,
+        timeout_seconds: None,
+        reasoning_effort,
+        request_category,
+        workflow,
+        role,
+        min_model_size_b: None,
+        strict_no_downgrade: None,
+    }
 }
 
 fn build_completion_request(

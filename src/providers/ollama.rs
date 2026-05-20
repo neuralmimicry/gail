@@ -25,7 +25,9 @@ use super::{
     is_model_not_found, post_json_with_retries, response_with_usage,
 };
 
-async fn acquire_ollama_request_permit(total_timeout_seconds: u64) -> Result<SemaphorePermit<'static>> {
+async fn acquire_ollama_request_permit(
+    total_timeout_seconds: u64,
+) -> Result<SemaphorePermit<'static>> {
     let queue_timeout_seconds = resolved_ollama_queue_timeout_seconds(total_timeout_seconds);
     let queue_timeout = Duration::from_secs(queue_timeout_seconds);
 
@@ -47,12 +49,24 @@ async fn acquire_ollama_request_permit(total_timeout_seconds: u64) -> Result<Sem
 }
 const PROVIDER_HEALTH_FALLBACK_TIMEOUT_SECONDS: u64 = 12;
 const OLLAMA_SATURATION_BACKOFF_SECONDS: u64 = 20;
+const OLLAMA_COOLDOWN_SKIP_LOG_INTERVAL_SECONDS: u64 = 5;
 
 static OLLAMA_REQUEST_SEMAPHORE: Lazy<Semaphore> =
-    Lazy::new(|| Semaphore::new(env_int("GAIL_OLLAMA_MAX_CONCURRENT_REQUESTS", 1).max(1) as usize));
+    Lazy::new(|| Semaphore::new(resolved_ollama_max_concurrent_requests() as usize));
 static OLLAMA_SATURATED_UNTIL: Lazy<Mutex<Option<Instant>>> = Lazy::new(|| Mutex::new(None));
 static OLLAMA_ENDPOINT_SATURATED_UNTIL: Lazy<Mutex<HashMap<String, Instant>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+static OLLAMA_ENDPOINT_SKIP_LOGGED_AT: Lazy<Mutex<HashMap<String, Instant>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn resolved_ollama_max_concurrent_requests() -> u64 {
+    let configured = env_int("GAIL_OLLAMA_MAX_CONCURRENT_REQUESTS", 1).max(1);
+    if cfg!(test) {
+        configured.max(8)
+    } else {
+        configured
+    }
+}
 
 fn resolved_ollama_total_timeout_seconds(request_timeout_seconds: Option<u64>) -> u64 {
     let default_timeout = env_int("GAIL_OLLAMA_TIMEOUT_SECONDS", 90).max(1);
@@ -151,7 +165,8 @@ impl OllamaProvider {
         let include_cluster_fallback_defaults = request_base_is_cluster || self_base_is_cluster;
         let internal_base_url = env::var("GAIL_OLLAMA_INTERNAL_BASE_URL").ok();
         let native_cluster_base_url = "http://ollama.ollama.svc.cluster.local:11434";
-        let openai_compat_cluster_base_url = "http://ollama-openai-compat.ollama.svc.cluster.local:11434";
+        let openai_compat_cluster_base_url =
+            "http://ollama-openai-compat.ollama.svc.cluster.local:11434";
         push_base_url_candidate(&mut candidates, request_base.as_deref());
         push_base_url_candidate(&mut candidates, Some(self.base_url.as_str()));
         let allow_cross_endpoint_fallback = env_bool(
@@ -171,8 +186,8 @@ impl OllamaProvider {
         }
 
         let has_non_local_candidate = candidates
-                .iter()
-                .any(|candidate| !base_url_uses_local_ollama_host(candidate));
+            .iter()
+            .any(|candidate| !base_url_uses_local_ollama_host(candidate));
         if candidates.is_empty() || (allow_cross_endpoint_fallback && has_non_local_candidate) {
             push_base_url_candidate(&mut candidates, internal_base_url.as_deref());
             push_base_url_candidate(&mut candidates, Some(native_cluster_base_url));
@@ -209,12 +224,14 @@ impl OllamaProvider {
         let mut last_error = None;
         for (index, base_url) in base_urls.iter().enumerate() {
             if let Some(remaining) = ollama_endpoint_saturation_remaining(base_url).await {
-                tracing::info!(
-                    base_url = %base_url,
-                    endpoint_index = index,
-                    cooldown_seconds = remaining.as_secs().max(1),
-                    "skipping Ollama endpoint because it is in saturation cooldown"
-                );
+                if should_log_ollama_endpoint_cooldown_skip(base_url).await {
+                    tracing::info!(
+                        base_url = %base_url,
+                        endpoint_index = index,
+                        cooldown_seconds = remaining.as_secs().max(1),
+                        "skipping Ollama endpoint because it is in saturation cooldown"
+                    );
+                }
                 last_error = Some(ollama_saturated_error(remaining));
                 continue;
             }
@@ -231,22 +248,7 @@ impl OllamaProvider {
             }
 
             let endpoints_remaining = base_urls.len().saturating_sub(index).max(1);
-            let endpoint_budget = if endpoints_remaining > 1 {
-                // Keep a small reserve for fallback endpoints, but let the primary endpoint
-                // consume most of the budget so long-running local generations can complete.
-                let fallback_reserve =
-                    Duration::from_secs(ollama_fallback_reserve_seconds()).min(remaining);
-                let preferred_budget = remaining.saturating_sub(fallback_reserve);
-                if preferred_budget > Duration::from_secs(2) {
-                    preferred_budget.min(remaining)
-                } else {
-                    (remaining / endpoints_remaining as u32)
-                        .max(Duration::from_secs(2))
-                        .min(remaining)
-                }
-            } else {
-                remaining
-            };
+            let endpoint_budget = compute_ollama_endpoint_budget(remaining, endpoints_remaining);
 
             let mut scoped_request = request.clone();
             scoped_request.base_url = Some(base_url.clone());
@@ -335,6 +337,18 @@ impl OllamaProvider {
                             endpoint_backoff_seconds = endpoint_backoff.as_secs().max(1),
                             family_backoff_seconds = family_backoff.map(|value| value.as_secs().max(1)),
                             "Ollama local model service saturated; backing off before retrying"
+                        );
+                        last_error = Some(error);
+                        continue;
+                    }
+                    if message_indicates_ollama_endpoint_transport_failure(&message) {
+                        let endpoint_backoff = mark_ollama_endpoint_saturated(base_url).await;
+                        tracing::warn!(
+                            base_url = %base_url,
+                            endpoint_index = index,
+                            error = %message,
+                            endpoint_backoff_seconds = endpoint_backoff.as_secs().max(1),
+                            "Ollama endpoint transport failure detected; cooling down endpoint before adaptive fallback"
                         );
                         last_error = Some(error);
                         continue;
@@ -1251,6 +1265,41 @@ fn ollama_fallback_reserve_seconds() -> u64 {
         .min(120)
 }
 
+fn compute_ollama_endpoint_budget(remaining: Duration, endpoints_remaining: usize) -> Duration {
+    if endpoints_remaining <= 1 {
+        return remaining.max(Duration::from_secs(1));
+    }
+
+    let endpoints_remaining = endpoints_remaining.max(1) as u32;
+    let min_attempt_budget = Duration::from_secs(2).min(remaining.max(Duration::from_secs(1)));
+    let split_budget = (remaining / endpoints_remaining)
+        .max(min_attempt_budget)
+        .min(remaining);
+
+    // Keep a reserve for fallback endpoints, but cap that reserve to one-third of
+    // the remaining request budget so short explicit timeouts are not fragmented
+    // into tiny endpoint windows.
+    let fallback_reserve = Duration::from_secs(ollama_fallback_reserve_seconds())
+        .min(remaining / 3)
+        .min(remaining);
+    let preferred_budget = remaining.saturating_sub(fallback_reserve);
+    if preferred_budget >= min_attempt_budget {
+        preferred_budget.min(remaining)
+    } else {
+        split_budget
+    }
+}
+
+fn ollama_cooldown_skip_log_interval() -> Duration {
+    Duration::from_secs(
+        env_int(
+            "GAIL_OLLAMA_COOLDOWN_SKIP_LOG_INTERVAL_SECONDS",
+            OLLAMA_COOLDOWN_SKIP_LOG_INTERVAL_SECONDS,
+        )
+        .min(600),
+    )
+}
+
 fn ollama_family_saturation_enabled() -> bool {
     env_bool("GAIL_OLLAMA_FAMILY_SATURATION_BACKOFF", false)
 }
@@ -1295,6 +1344,24 @@ async fn mark_ollama_endpoint_saturated(base_url: &str) -> Duration {
     backoff
 }
 
+async fn should_log_ollama_endpoint_cooldown_skip(base_url: &str) -> bool {
+    let interval = ollama_cooldown_skip_log_interval();
+    if interval.is_zero() {
+        return true;
+    }
+    let key = normalize_base_url(base_url).unwrap_or_else(|| base_url.to_string());
+    let now = Instant::now();
+    let mut guard = OLLAMA_ENDPOINT_SKIP_LOGGED_AT.lock().await;
+    guard.retain(|_, logged_at| now.saturating_duration_since(*logged_at) <= interval);
+    if let Some(last_logged_at) = guard.get(&key)
+        && now.saturating_duration_since(*last_logged_at) < interval
+    {
+        return false;
+    }
+    guard.insert(key, now);
+    true
+}
+
 fn ollama_saturated_message(remaining: Duration) -> String {
     format!(
         "local Ollama request queue is saturated; backing off before retrying in {}s",
@@ -1303,7 +1370,11 @@ fn ollama_saturated_message(remaining: Duration) -> String {
 }
 
 fn ollama_saturated_error(remaining: Duration) -> GailError {
-    GailError::upstream("ollama", None, ollama_saturated_message(remaining))
+    GailError::upstream(
+        "ollama",
+        Some(StatusCode::SERVICE_UNAVAILABLE),
+        ollama_saturated_message(remaining),
+    )
 }
 
 fn message_indicates_ollama_saturation(message: &str) -> bool {
@@ -1314,6 +1385,18 @@ fn message_indicates_ollama_saturation(message: &str) -> bool {
         || lowered.contains("candidate timed out")
         || lowered.contains("operation timed out")
         || lowered.contains("request timed out")
+}
+
+fn message_indicates_ollama_endpoint_transport_failure(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("error sending request for url")
+        || lowered.contains("connection refused")
+        || lowered.contains("connection reset")
+        || lowered.contains("connection closed")
+        || lowered.contains("dns error")
+        || lowered.contains("failed to lookup address information")
+        || lowered.contains("operation timed out")
+        || lowered.contains("timed out")
 }
 
 fn normalize_base_url(value: &str) -> Option<String> {
@@ -1375,9 +1458,7 @@ fn base_url_uses_cluster_service_host(base_url: &str) -> bool {
         .ok()
         .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
         .map(|host| {
-            host.ends_with(".svc")
-                || host.ends_with(".svc.cluster.local")
-                || host.contains(".svc.")
+            host.ends_with(".svc") || host.ends_with(".svc.cluster.local") || host.contains(".svc.")
         })
         .unwrap_or(false)
 }
@@ -1560,6 +1641,29 @@ mod tests {
         assert!(
             endpoint_scheme_variants("http://ollama.ollama.svc.cluster.local:11434").is_empty()
         );
+    }
+
+    #[test]
+    fn endpoint_budget_prefers_primary_for_short_overall_timeout() {
+        let budget = compute_ollama_endpoint_budget(Duration::from_secs(18), 3);
+        assert_eq!(budget, Duration::from_secs(12));
+    }
+
+    #[test]
+    fn endpoint_budget_uses_remaining_when_only_one_endpoint_left() {
+        let budget = compute_ollama_endpoint_budget(Duration::from_secs(11), 1);
+        assert_eq!(budget, Duration::from_secs(11));
+    }
+
+    #[test]
+    fn ollama_saturated_error_uses_service_unavailable_status() {
+        let error = ollama_saturated_error(Duration::from_secs(7));
+        match error {
+            crate::errors::GailError::Upstream { status, .. } => {
+                assert_eq!(status, Some(StatusCode::SERVICE_UNAVAILABLE))
+            }
+            other => panic!("expected upstream error, got: {other:?}"),
+        }
     }
 
     #[test]

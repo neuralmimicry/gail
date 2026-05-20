@@ -1,4 +1,4 @@
-FROM rust:1-bookworm AS source-deb
+FROM docker.io/library/rust:1-bookworm AS source-deb
 
 ARG GAIL_VERSION=source
 
@@ -32,7 +32,7 @@ RUN set -eu; \
         --binary target/release/gail \
         --out-dir /out
 
-FROM debian:bookworm-slim
+FROM docker.io/library/debian:bookworm-slim
 
 ARG TARGETARCH
 ARG GAIL_VERSION=source

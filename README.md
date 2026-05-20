@@ -74,16 +74,23 @@ Gail exposes the following endpoints:
 
 ## Local Development
 
-Run Gail directly:
+Run Gail API service:
 
 ```bash
-cargo run -- --config gail.yaml
+cargo run -- --config gail.yaml --role serve
 ```
 
 Run the Rust tests:
 
 ```bash
 cargo test
+```
+
+Run the dedicated workers:
+
+```bash
+cargo run -- --config gail.yaml --role mirror-worker
+cargo run -- --config gail.yaml --role trainer-worker
 ```
 
 The bundled [`gail.yaml`](./gail.yaml) is an example configuration. It supports `${ENV_VAR}` interpolation so secrets can stay outside the file.
@@ -171,6 +178,11 @@ Provider credentials, Gail bearer tokens, Ollama endpoints, and trading defaults
 - `specialists`: explicit neuromorphic engines. Use this when you have named SNN/AARNN backends to register.
 - `aarnn_bridge`: mirrored Gail-to-AARNN LLM I/O bridge. Gail mirrors prompt-side and response-side text plus translated AER payloads to `POST /api/llm/mirror` and can optionally promote a future AARNN reply.
 - `aarnn_bridge` queue controls (`queue_capacity`, `worker_count`, `enqueue_timeout_ms`, `candidate_wait_timeout_ms`) keep LLM↔SNN mirroring non-blocking while still allowing short bounded waits for candidate reply promotion.
+- `llm_ledger`: bounded non-blocking ledger queue for persisting every LLM interaction to JSONL and (optionally) Postgres.
+- `mirror_worker`: separate polling worker that reads pending interactions from Postgres and mirrors them to AARNN/SNN.
+- `trainer`: separate polling worker that snapshots interaction datasets, runs an external training command, and can rotate/register snapshots in Ollama.
+- `trainer.command_template` placeholders: `{snapshot}`, `{dataset}`, `{output}`, `{algorithm}`, `{device}`, `{cpu_threads}`, `{gpu_count}`.
+- `scripts/trainer/qlora_sft.py`: reference QLoRA SFT trainer command for GPU nodes (requires Python ML dependencies in the runtime image).
 - `nmc_telemetry`: optional NMC/Tracey feed (`/tracey/adaptive`) that contributes live host pressure and constraint signals to provider ranking/execution decisions.
 - `config/ai-routing-profiles.json`: shared workflow/keyword/provider routing contract used by Gail and mirrored in Refiner for offline fallback.
 - `GAIL_ROUTING_PROFILES_PATH`: optional override for the routing contract path.
@@ -179,6 +191,8 @@ Provider credentials, Gail bearer tokens, Ollama endpoints, and trading defaults
 - `storage.adaptive_schema_path`: persisted adaptive API registry for provider, Refiner, AARNN, specialist, OctoBot, and trading feedback observations.
 - `storage.api_issues_path`: persisted issue registry for provider/API failures, mitigations, recoveries, and Prometheus/dashboard visibility.
 - `storage.postgres_dsn` or `GAIL_POSTGRES_DSN`: optional Postgres persistence for `gail_api_issues` and `gail_api_issue_snapshots`.
+- `storage.llm_ledger_path`: local JSONL ledger path for recorded LLM interactions.
+- `storage.trainer_output_path`: root directory for trainer datasets/snapshots/pipeline reports.
 - `security.allow_unauthenticated_metrics`: allows Prometheus to scrape `/metrics` without sharing a bearer token. Keep it enabled only on trusted network paths.
 - `orchestration.health_ttl_seconds`: cached provider-health TTL. Runtime quota health remains in backoff until this TTL expires, so later requests skip rate-limited candidates before probing them again.
 - `storage.ollama_model_store_path`: cached Ollama model inventory summary.
@@ -326,6 +340,10 @@ State is persisted to `data_path` (default `./data/trading_state.json`) every 5 
 | --- | --- |
 | `src/adaptive_schema.rs` | Generic adaptive API registry shared by Gail providers, Refiner, AARNN, specialists, and trading |
 | `src/api_issues.rs` | Persistent provider/API issue registry, mitigation log, Postgres sync, and Prometheus metric rendering |
+| `src/llm_ledger.rs` | Durable LLM interaction ledger (JSONL + optional Postgres) used by mirror/trainer workers |
+| `src/mirror_worker.rs` | Postgres-backed LLM→SNN mirror worker runtime |
+| `src/trainer_worker.rs` | Postgres-backed trainer/snapshot/rotation worker runtime |
+| `src/hardware.rs` | Runtime CPU/GPU detection and scheduling hints |
 | `src/trading/mod.rs` | `TradingBridge`, background loop, evaluation pipeline, execution |
 | `src/trading/config.rs` | `TradingConfig`, `TradingConfigOverride` |
 | `src/trading/state.rs` | `TradingState`, `SharedTradingState`, ring buffers, persistence |
@@ -342,8 +360,44 @@ storage:
   metrics_path: "./data/provider_metrics.json"
   adaptive_schema_path: "./data/adaptive_api_schema.json"
   api_issues_path: "./data/api_issues.json"
+  llm_ledger_path: "./data/llm_interactions.jsonl"
+  trainer_output_path: "./data/training"
   postgres_dsn: "${GAIL_POSTGRES_DSN}"
   ollama_model_store_path: "./data/ollama_model_inventory.json"
+
+llm_ledger:
+  enabled: true
+  queue_capacity: 4096
+  enqueue_timeout_ms: 25
+  max_prompt_chars: 65536
+  max_response_chars: 65536
+
+mirror_worker:
+  enabled: true
+  poll_interval_ms: 2000
+  batch_size: 64
+  max_attempts: 6
+  retry_backoff_seconds: 60
+
+trainer:
+  enabled: false
+  poll_interval_seconds: 300
+  min_samples: 128
+  max_samples_per_snapshot: 1024
+  include_degraded: false
+  max_attempts: 6
+  retry_backoff_seconds: 300
+  algorithm: "qlora_sft"
+  command_template: ""                  # optional external trainer command
+  command_timeout_seconds: 86400
+  model_prefix: "gail-inhouse"
+  model_alias: "gail-inhouse:latest"
+  ollama_base_model: "qwen2.5-coder:1.5b"
+  rotate_keep: 6
+  register_with_ollama: true
+  ollama_cli: "ollama"
+  ollama_host: null
+  output_root: "./data/training"
 
 trading:
   enabled: false                          # master switch

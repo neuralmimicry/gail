@@ -30,6 +30,7 @@ LABEL org.opencontainers.image.source="https://github.com/neuralmimicry/gail" \
 # in-container Gail compilation path.
 COPY gail.yaml /tmp/gail-defaults/gail.yaml
 COPY config/ai-routing-profiles.json /tmp/gail-defaults/ai-routing-profiles.json
+COPY scripts/trainer /app/scripts/trainer
 
 RUN set -eu; \
     export DEBIAN_FRONTEND=noninteractive; \
@@ -128,7 +129,7 @@ RUN set -eu; \
     apt-get update; \
     apt-get install -y --no-install-recommends /tmp/gail.deb; \
     rm -f /tmp/gail.deb; \
-    mkdir -p /app/config /app/data /var/lib/gail; \
+    mkdir -p /app/config /app/data /var/lib/gail /app/scripts; \
     if [ -f /tmp/gail-defaults/gail.yaml ]; then \
         cp /tmp/gail-defaults/gail.yaml /app/config/gail.yaml; \
     elif [ -f /etc/gail/gail.yaml ]; then \

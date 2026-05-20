@@ -21,6 +21,8 @@ use crate::{
     adaptive_schema, aer, api_issues,
     config::{ApiTokenConfig, GailConfig, ProviderProfile},
     errors::{GailError, Result, message_indicates_quota},
+    hardware::{detect_hardware, log_hardware_profile},
+    llm_ledger::{LlmLedger, LlmLedgerRecord},
     metrics::{HealthBucket, LocalUsageTelemetry, MetricsStore},
     models::{
         AarnnMirrorDirection, AerDecodeRequest, AerDecodeResponse, AerEncodeRequest,
@@ -54,6 +56,7 @@ struct GailServiceInner {
     config: GailConfig,
     client: Client,
     metrics: MetricsStore,
+    llm_ledger: Option<LlmLedger>,
     specialists: Vec<SpecialistEngine>,
     aarnn_bridge: Option<AarnnMirrorClient>,
     nmc_telemetry: Option<NmcTelemetryClient>,
@@ -167,18 +170,31 @@ impl GailService {
             .tcp_keepalive(Duration::from_secs(30))
             .user_agent(format!("gail/{}", env!("CARGO_PKG_VERSION")))
             .build()?;
+        let hardware = detect_hardware().await;
+        log_hardware_profile("api_service", &hardware);
+        let llm_ledger = LlmLedger::from_config(&config).await;
         let metrics = MetricsStore::new(config.storage.metrics_path.clone()).await?;
         let specialists = build_specialist_engines(&config, client.clone());
         let aarnn_bridge = AarnnMirrorClient::from_config(&config, client.clone(), &specialists);
         let nmc_telemetry = NmcTelemetryClient::from_config(&config, client.clone());
         let load_tracker = Arc::new(Mutex::new(LoadTracker::default()));
+        let suggested_interactive_pool = suggested_pool_size(
+            hardware.cpu_cores,
+            config.orchestration.interactive_pool_max_in_flight,
+            2,
+        );
+        let suggested_solver_pool = suggested_pool_size(
+            hardware.cpu_cores,
+            config.orchestration.solver_pool_max_in_flight,
+            3,
+        );
         let interactive_pool = Arc::new(Semaphore::new(
             env_int_any(
                 &[
                     "GAIL_INTERACTIVE_POOL_MAX_IN_FLIGHT",
                     "REFINER_AI_INTERACTIVE_POOL_MAX_IN_FLIGHT",
                 ],
-                config.orchestration.interactive_pool_max_in_flight as u64,
+                suggested_interactive_pool as u64,
             )
             .max(1) as usize,
         ));
@@ -188,10 +204,15 @@ impl GailService {
                     "GAIL_SOLVER_POOL_MAX_IN_FLIGHT",
                     "REFINER_AI_SOLVER_POOL_MAX_IN_FLIGHT",
                 ],
-                config.orchestration.solver_pool_max_in_flight as u64,
+                suggested_solver_pool as u64,
             )
             .max(1) as usize,
         ));
+        tracing::info!(
+            interactive_pool_size = interactive_pool.available_permits(),
+            solver_pool_size = solver_pool.available_permits(),
+            "configured workload pool capacities"
+        );
 
         // Construct a preliminary service (without trading) to pass into the trading bridge.
         let preliminary = Self {
@@ -199,6 +220,7 @@ impl GailService {
                 config: config.clone(),
                 client: client.clone(),
                 metrics: metrics.clone(),
+                llm_ledger: llm_ledger.clone(),
                 specialists: specialists.clone(),
                 aarnn_bridge: aarnn_bridge.clone(),
                 nmc_telemetry: nmc_telemetry.clone(),
@@ -225,6 +247,7 @@ impl GailService {
                 config,
                 client,
                 metrics,
+                llm_ledger,
                 specialists,
                 aarnn_bridge,
                 nmc_telemetry,
@@ -243,6 +266,10 @@ impl GailService {
 
     fn aarnn_bridge(&self) -> Option<&AarnnMirrorClient> {
         self.inner.aarnn_bridge.as_ref()
+    }
+
+    fn llm_ledger(&self) -> Option<&LlmLedger> {
+        self.inner.llm_ledger.as_ref()
     }
 
     fn nmc_telemetry(&self) -> Option<&NmcTelemetryClient> {
@@ -368,6 +395,35 @@ impl GailService {
                     Some(self.health_ttl_seconds()),
                 )
                 .await;
+                self.record_llm_interaction(LlmLedgerRecord {
+                    request_id: request_id.clone(),
+                    conversation_id: request_id.clone(),
+                    workflow: "direct".to_string(),
+                    role: "assistant".to_string(),
+                    provider_requested: Some(effective_request.provider.clone()),
+                    model_requested: effective_request.model.clone(),
+                    provider_resolved: None,
+                    model_resolved: None,
+                    request_category: effective_request.request_category.clone(),
+                    system_prompt: effective_request.system.clone(),
+                    prompt_text: prompt_text.clone(),
+                    response_text: None,
+                    message_roles: effective_request
+                        .messages
+                        .iter()
+                        .map(|message| message.role.clone())
+                        .collect(),
+                    status: "error".to_string(),
+                    error_text: Some(error.to_string()),
+                    latency_ms: None,
+                    usage: None,
+                    raw: None,
+                    metadata: Some(json!({
+                        "source": "direct_complete",
+                    })),
+                    created_ts: current_ts(),
+                })
+                .await;
                 return Err(error);
             }
         };
@@ -449,7 +505,7 @@ impl GailService {
         } else {
             None
         };
-        Ok(CompletionResponse {
+        let completion_response = CompletionResponse {
             request_id,
             text,
             provider,
@@ -458,7 +514,44 @@ impl GailService {
             usage,
             trace,
             raw,
+        };
+        self.record_llm_interaction(LlmLedgerRecord {
+            request_id: completion_response.request_id.clone(),
+            conversation_id: completion_response.request_id.clone(),
+            workflow: "direct".to_string(),
+            role: "assistant".to_string(),
+            provider_requested: Some(effective_request.provider),
+            model_requested: effective_request.model,
+            provider_resolved: Some(completion_response.provider.clone()),
+            model_resolved: Some(completion_response.model.clone()),
+            request_category: effective_request.request_category,
+            system_prompt: effective_request.system,
+            prompt_text,
+            response_text: Some(completion_response.text.clone()),
+            message_roles: effective_request
+                .messages
+                .iter()
+                .map(|message| message.role.clone())
+                .collect(),
+            status: "ok".to_string(),
+            error_text: None,
+            latency_ms: Some(completion_response.latency_ms),
+            usage: completion_response
+                .usage
+                .as_ref()
+                .and_then(|value| serde_json::to_value(value).ok()),
+            raw: completion_response.raw.clone(),
+            metadata: Some(json!({
+                "source": "direct_complete",
+                "final_source": completion_response
+                    .trace
+                    .as_ref()
+                    .map(|trace| trace.final_source.clone()),
+            })),
+            created_ts: current_ts(),
         })
+        .await;
+        Ok(completion_response)
     }
 
     pub async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
@@ -719,7 +812,7 @@ impl GailService {
                                 role = %role,
                                 "returning Gail degraded safety fallback because every provider is in adaptive backoff"
                             );
-                            return Ok(self.degraded_completion_response(
+                            let degraded = self.degraded_completion_response(
                                 request_id,
                                 &workflow,
                                 &role,
@@ -735,7 +828,18 @@ impl GailService {
                                 specialist_meta.as_ref(),
                                 attempted_candidate_ids.len(),
                                 sorted_strings(throttled_provider_types.clone()),
-                            ));
+                            );
+                            self.record_completion_interaction(
+                                &request,
+                                &provider_request,
+                                mirrored_prompt_text.as_str(),
+                                workflow.as_str(),
+                                role.as_str(),
+                                &degraded,
+                                "degraded",
+                            )
+                            .await;
+                            return Ok(degraded);
                         }
                         return Err(GailError::upstream(
                             "gail",
@@ -957,7 +1061,7 @@ impl GailService {
                     role = %role,
                     "returning Gail degraded safety fallback because every provider failed"
                 );
-                return Ok(self.degraded_completion_response(
+                let degraded = self.degraded_completion_response(
                     request_id,
                     &workflow,
                     &role,
@@ -973,9 +1077,24 @@ impl GailService {
                     specialist_meta.as_ref(),
                     attempted_candidate_ids.len(),
                     sorted_strings(throttled_provider_types.clone()),
-                ));
+                );
+                self.record_completion_interaction(
+                    &request,
+                    &provider_request,
+                    mirrored_prompt_text.as_str(),
+                    workflow.as_str(),
+                    role.as_str(),
+                    &degraded,
+                    "degraded",
+                )
+                .await;
+                return Ok(degraded);
             }
-            return Err(GailError::upstream("gail", None, message));
+            return Err(GailError::upstream(
+                "gail",
+                orchestration_failure_status(message.as_str()),
+                message,
+            ));
         };
 
         let chosen = results.swap_remove(chosen_index);
@@ -1089,7 +1208,7 @@ impl GailService {
                 .map(|bridge| bridge.build_trace(mirror_input.clone(), mirror_output.clone())),
         };
 
-        Ok(CompletionResponse {
+        let completion_response = CompletionResponse {
             request_id,
             text,
             provider,
@@ -1098,7 +1217,18 @@ impl GailService {
             usage,
             trace: Some(trace),
             raw,
-        })
+        };
+        self.record_completion_interaction(
+            &request,
+            &provider_request,
+            mirrored_prompt_text.as_str(),
+            workflow.as_str(),
+            role.as_str(),
+            &completion_response,
+            "ok",
+        )
+        .await;
+        Ok(completion_response)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1485,6 +1615,71 @@ impl GailService {
                 .map(|message| message.role.clone())
                 .collect(),
         }
+    }
+
+    async fn record_llm_interaction(&self, record: LlmLedgerRecord) {
+        if let Some(ledger) = self.llm_ledger() {
+            ledger.record(record).await;
+        }
+    }
+
+    async fn record_completion_interaction(
+        &self,
+        request: &CompletionRequest,
+        provider_request: &ProviderCompletionRequest,
+        prompt_text: &str,
+        workflow: &str,
+        role: &str,
+        response: &CompletionResponse,
+        status: &str,
+    ) {
+        let final_source = response
+            .trace
+            .as_ref()
+            .map(|trace| trace.final_source.clone());
+        self.record_llm_interaction(LlmLedgerRecord {
+            request_id: response.request_id.clone(),
+            conversation_id: response.request_id.clone(),
+            workflow: workflow.to_string(),
+            role: role.to_string(),
+            provider_requested: request
+                .preferred_provider
+                .clone()
+                .or_else(|| Some(provider_request.provider.clone())),
+            model_requested: request
+                .preferred_model
+                .clone()
+                .or_else(|| provider_request.model.clone()),
+            provider_resolved: Some(response.provider.clone()),
+            model_resolved: Some(response.model.clone()),
+            request_category: provider_request
+                .request_category
+                .clone()
+                .or_else(|| request.request_category.clone()),
+            system_prompt: provider_request.system.clone(),
+            prompt_text: prompt_text.to_string(),
+            response_text: Some(response.text.clone()),
+            message_roles: provider_request
+                .messages
+                .iter()
+                .map(|message| message.role.clone())
+                .collect(),
+            status: status.to_string(),
+            error_text: None,
+            latency_ms: Some(response.latency_ms),
+            usage: response
+                .usage
+                .as_ref()
+                .and_then(|value| serde_json::to_value(value).ok()),
+            raw: response.raw.clone(),
+            metadata: Some(json!({
+                "source": "orchestrated_complete",
+                "selection_mode": response.trace.as_ref().map(|trace| trace.selection_mode.clone()),
+                "final_source": final_source,
+            })),
+            created_ts: current_ts(),
+        })
+        .await;
     }
 
     fn matching_token<'a>(
@@ -2816,6 +3011,23 @@ fn select_ranked_candidates(
     ensure_local_fallback_selected(selected, local_fallback, target)
 }
 
+fn suggested_pool_size(cpu_cores: usize, configured: usize, divisor: usize) -> usize {
+    let derived = if divisor == 0 {
+        cpu_cores
+    } else {
+        cpu_cores / divisor
+    }
+    .clamp(1, 4096);
+    configured.max(derived).clamp(1, 4096)
+}
+
+fn current_ts() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 fn best_local_fallback_candidate(ranked: &[RankedCandidate]) -> Option<ProviderCandidate> {
     ranked
         .iter()
@@ -3111,6 +3323,29 @@ fn severity_for_issue_category(category: &str) -> &'static str {
         "quota" | "upstream" | "timeout" => "warning",
         "unconfigured" | "missing_endpoint" => "critical",
         _ => "warning",
+    }
+}
+
+fn orchestration_failure_status(message: &str) -> Option<StatusCode> {
+    let mode = runtime_failure_health_bucket(Some(message), None)
+        .mode
+        .unwrap_or_default();
+    match mode.as_str() {
+        "quota" => Some(StatusCode::TOO_MANY_REQUESTS),
+        "timeout" => Some(StatusCode::GATEWAY_TIMEOUT),
+        "resource_saturated" | "ollama_saturated" | "nmc_constrained" => {
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        }
+        "upstream" => Some(StatusCode::BAD_GATEWAY),
+        "unconfigured" | "missing_endpoint" => Some(StatusCode::BAD_GATEWAY),
+        _ => {
+            let lowered = message.to_ascii_lowercase();
+            if lowered.contains("adaptive backoff") || lowered.contains("retry after") {
+                Some(StatusCode::SERVICE_UNAVAILABLE)
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -4056,6 +4291,24 @@ mod tests {
         let bucket = runtime_failure_health_bucket(Some(message), Some(34));
         assert_eq!(bucket.mode.as_deref(), Some("upstream"));
         assert!(message_indicates_provider_backoff(message));
+    }
+
+    #[test]
+    fn orchestration_failure_status_maps_adaptive_backoff_to_503() {
+        let message = "all suitable providers are currently in adaptive backoff; retry after the recorded mitigation window";
+        assert_eq!(
+            orchestration_failure_status(message),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    #[test]
+    fn orchestration_failure_status_keeps_transient_upstream_as_502() {
+        let message = "nvidia upstream error: error sending request for url (https://integrate.api.nvidia.com/v1/chat/completions)";
+        assert_eq!(
+            orchestration_failure_status(message),
+            Some(StatusCode::BAD_GATEWAY)
+        );
     }
 
     #[test]

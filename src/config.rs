@@ -16,6 +16,9 @@ pub struct GailConfig {
     pub server: ServerConfig,
     pub security: SecurityConfig,
     pub orchestration: OrchestrationConfig,
+    pub llm_ledger: LlmLedgerConfig,
+    pub mirror_worker: MirrorWorkerConfig,
+    pub trainer: TrainerConfig,
     pub aarnn_bridge: AarnnBridgeConfig,
     pub nmc_telemetry: NmcTelemetryConfig,
     pub providers: Vec<ProviderProfile>,
@@ -106,10 +109,55 @@ pub struct NmcTelemetryConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
+pub struct LlmLedgerConfig {
+    pub enabled: bool,
+    pub queue_capacity: usize,
+    pub enqueue_timeout_ms: u64,
+    pub max_prompt_chars: usize,
+    pub max_response_chars: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MirrorWorkerConfig {
+    pub enabled: bool,
+    pub poll_interval_ms: u64,
+    pub batch_size: usize,
+    pub max_attempts: u32,
+    pub retry_backoff_seconds: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrainerConfig {
+    pub enabled: bool,
+    pub poll_interval_seconds: u64,
+    pub min_samples: usize,
+    pub max_samples_per_snapshot: usize,
+    pub include_degraded: bool,
+    pub max_attempts: u32,
+    pub retry_backoff_seconds: u64,
+    pub algorithm: String,
+    pub command_template: Option<String>,
+    pub command_timeout_seconds: u64,
+    pub model_prefix: String,
+    pub model_alias: String,
+    pub ollama_base_model: String,
+    pub rotate_keep: usize,
+    pub register_with_ollama: bool,
+    pub ollama_cli: String,
+    pub ollama_host: Option<String>,
+    pub output_root: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StorageConfig {
     pub metrics_path: String,
     pub adaptive_schema_path: String,
     pub api_issues_path: String,
+    pub llm_ledger_path: String,
+    pub trainer_output_path: String,
     pub postgres_dsn: Option<String>,
     pub ollama_model_store_path: Option<String>,
 }
@@ -218,8 +266,59 @@ impl Default for StorageConfig {
             metrics_path: "data/provider_metrics.json".to_string(),
             adaptive_schema_path: "data/adaptive_api_schema.json".to_string(),
             api_issues_path: "data/api_issues.json".to_string(),
+            llm_ledger_path: "data/llm_interactions.jsonl".to_string(),
+            trainer_output_path: "data/training".to_string(),
             postgres_dsn: None,
             ollama_model_store_path: None,
+        }
+    }
+}
+
+impl Default for LlmLedgerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            queue_capacity: 4096,
+            enqueue_timeout_ms: 25,
+            max_prompt_chars: 65_536,
+            max_response_chars: 65_536,
+        }
+    }
+}
+
+impl Default for MirrorWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_ms: 2_000,
+            batch_size: 64,
+            max_attempts: 6,
+            retry_backoff_seconds: 60,
+        }
+    }
+}
+
+impl Default for TrainerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval_seconds: 60,
+            min_samples: 64,
+            max_samples_per_snapshot: 512,
+            include_degraded: false,
+            max_attempts: 6,
+            retry_backoff_seconds: 300,
+            algorithm: "qlora_sft".to_string(),
+            command_template: None,
+            command_timeout_seconds: 86_400,
+            model_prefix: "gail-inhouse".to_string(),
+            model_alias: "gail-inhouse:latest".to_string(),
+            ollama_base_model: "qwen2.5-coder:1.5b".to_string(),
+            rotate_keep: 6,
+            register_with_ollama: true,
+            ollama_cli: "ollama".to_string(),
+            ollama_host: None,
+            output_root: "data/training".to_string(),
         }
     }
 }
@@ -344,6 +443,12 @@ impl GailConfig {
     }
 
     fn normalize(&mut self) -> Result<()> {
+        let trainer_command_env = std::env::var("GAIL_TRAINER_COMMAND")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let ollama_host_env = std::env::var("OLLAMA_HOST")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
         if self.server.bind_addr.trim().is_empty() {
             return Err(GailError::invalid_config(
                 "server.bind_addr must not be empty",
@@ -412,6 +517,12 @@ impl GailConfig {
         if self.storage.api_issues_path.trim().is_empty() {
             self.storage.api_issues_path = "data/api_issues.json".to_string();
         }
+        if self.storage.llm_ledger_path.trim().is_empty() {
+            self.storage.llm_ledger_path = "data/llm_interactions.jsonl".to_string();
+        }
+        if self.storage.trainer_output_path.trim().is_empty() {
+            self.storage.trainer_output_path = "data/training".to_string();
+        }
         if self
             .storage
             .postgres_dsn
@@ -425,6 +536,53 @@ impl GailConfig {
                 .or_else(|| std::env::var("DATABASE_URL").ok())
                 .filter(|value| !value.trim().is_empty());
         }
+        self.llm_ledger.queue_capacity = self.llm_ledger.queue_capacity.clamp(128, 131_072);
+        self.llm_ledger.enqueue_timeout_ms = self.llm_ledger.enqueue_timeout_ms.clamp(1, 60_000);
+        self.llm_ledger.max_prompt_chars = self.llm_ledger.max_prompt_chars.clamp(256, 262_144);
+        self.llm_ledger.max_response_chars = self.llm_ledger.max_response_chars.clamp(256, 262_144);
+        self.mirror_worker.poll_interval_ms =
+            self.mirror_worker.poll_interval_ms.clamp(100, 60_000);
+        self.mirror_worker.batch_size = self.mirror_worker.batch_size.clamp(1, 4096);
+        self.mirror_worker.max_attempts = self.mirror_worker.max_attempts.clamp(1, 1_000);
+        self.mirror_worker.retry_backoff_seconds =
+            self.mirror_worker.retry_backoff_seconds.clamp(1, 86_400);
+        self.trainer.poll_interval_seconds = self.trainer.poll_interval_seconds.clamp(5, 86_400);
+        self.trainer.min_samples = self.trainer.min_samples.clamp(1, 1_000_000);
+        self.trainer.max_samples_per_snapshot =
+            self.trainer.max_samples_per_snapshot.clamp(1, 1_000_000);
+        self.trainer.max_attempts = self.trainer.max_attempts.clamp(1, 1_000);
+        self.trainer.retry_backoff_seconds = self.trainer.retry_backoff_seconds.clamp(1, 604_800);
+        self.trainer.algorithm = normalize_optional_string(Some(self.trainer.algorithm.as_str()))
+            .unwrap_or_else(|| "qlora_sft".to_string());
+        self.trainer.command_template = normalize_optional_string(
+            self.trainer
+                .command_template
+                .as_deref()
+                .or(trainer_command_env.as_deref()),
+        );
+        self.trainer.command_timeout_seconds =
+            self.trainer.command_timeout_seconds.clamp(30, 604_800);
+        self.trainer.model_prefix =
+            normalize_optional_string(Some(self.trainer.model_prefix.as_str()))
+                .unwrap_or_else(|| "gail-inhouse".to_string());
+        self.trainer.model_alias =
+            normalize_optional_string(Some(self.trainer.model_alias.as_str()))
+                .unwrap_or_else(|| "gail-inhouse:latest".to_string());
+        self.trainer.ollama_base_model =
+            normalize_optional_string(Some(self.trainer.ollama_base_model.as_str()))
+                .unwrap_or_else(|| "qwen2.5-coder:1.5b".to_string());
+        self.trainer.rotate_keep = self.trainer.rotate_keep.clamp(1, 128);
+        self.trainer.ollama_cli = normalize_optional_string(Some(self.trainer.ollama_cli.as_str()))
+            .unwrap_or_else(|| "ollama".to_string());
+        self.trainer.ollama_host = normalize_optional_url(
+            self.trainer
+                .ollama_host
+                .as_deref()
+                .or(ollama_host_env.as_deref()),
+        );
+        self.trainer.output_root =
+            normalize_optional_string(Some(self.trainer.output_root.as_str()))
+                .unwrap_or_else(|| self.storage.trainer_output_path.clone());
         for provider in &mut self.providers {
             provider.provider_type =
                 normalize_optional_string(Some(provider.provider_type.as_str()))

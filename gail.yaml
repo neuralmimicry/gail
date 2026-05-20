@@ -169,8 +169,44 @@ storage:
   metrics_path: "./data/provider_metrics.json"
   adaptive_schema_path: "./data/adaptive_api_schema.json"
   api_issues_path: "./data/api_issues.json"
+  llm_ledger_path: "./data/llm_interactions.jsonl"
+  trainer_output_path: "./data/training"
   postgres_dsn: "${GAIL_POSTGRES_DSN}"
   ollama_model_store_path: "./data/ollama_model_inventory.json"
+
+llm_ledger:
+  enabled: true
+  queue_capacity: 4096
+  enqueue_timeout_ms: 25
+  max_prompt_chars: 65536
+  max_response_chars: 65536
+
+mirror_worker:
+  enabled: true
+  poll_interval_ms: 2000
+  batch_size: 64
+  max_attempts: 6
+  retry_backoff_seconds: 60
+
+trainer:
+  enabled: false
+  poll_interval_seconds: 300
+  min_samples: 128
+  max_samples_per_snapshot: 1024
+  include_degraded: false
+  max_attempts: 6
+  retry_backoff_seconds: 300
+  algorithm: "qlora_sft"
+  command_template: ""
+  command_timeout_seconds: 86400
+  model_prefix: "gail-inhouse"
+  model_alias: "gail-inhouse:latest"
+  ollama_base_model: "${GAIL_OLLAMA_MODEL}"
+  rotate_keep: 6
+  register_with_ollama: true
+  ollama_cli: "ollama"
+  ollama_host: "${OLLAMA_HOST}"
+  output_root: "./data/training"
 
 trading:
   enabled: ${GAIL_TRADING_ENABLED}
