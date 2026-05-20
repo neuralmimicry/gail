@@ -484,19 +484,17 @@ impl OctobotClient {
         let request_started_at = current_unix_timestamp_f64();
 
         let canonical_order = json!({
-        "exchange": exchange,
-        "symbol": symbol,
-        "side": normalized_side,
-        "type": "market",
-        "order_type": "market",
-        "amount": rounded_amount,
-        "amount_usd": rounded_amount,
-        "price": serde_json::Value::Null,
-    });
+            "exchange": exchange,
+            "symbol": symbol,
+            "side": normalized_side,
+            "type": "market",
+            "order_type": "market",
+            "amount": rounded_amount,
+            "amount_usd": rounded_amount,
+            "price": serde_json::Value::Null,
+        });
 
-        let preferred_mode = {
-            *self.preferred_order_submission_mode.lock().await
-        };
+        let preferred_mode = { *self.preferred_order_submission_mode.lock().await };
 
         let modes = ordered_submission_modes(preferred_mode);
         let mut attempts = Vec::new();
@@ -534,37 +532,37 @@ impl OctobotClient {
                     }
 
                     debug!(
-                    ?mode,
-                    exchange = %exchange,
-                    symbol = %symbol,
-                    side = %normalized_side,
-                    amount_usd = rounded_amount,
-                    "trading: selected OctoBot order submission mode"
-                );
+                        ?mode,
+                        exchange = %exchange,
+                        symbol = %symbol,
+                        side = %normalized_side,
+                        amount_usd = rounded_amount,
+                        "trading: selected OctoBot order submission mode"
+                    );
 
                     return Ok(result);
                 }
 
                 OrderSubmissionAttempt::Rejected => {
                     debug!(
-                    ?mode,
-                    exchange = %exchange,
-                    symbol = %symbol,
-                    side = %normalized_side,
-                    amount_usd = rounded_amount,
-                    "trading: OctoBot order submission mode rejected order; trying next candidate"
-                );
+                        ?mode,
+                        exchange = %exchange,
+                        symbol = %symbol,
+                        side = %normalized_side,
+                        amount_usd = rounded_amount,
+                        "trading: OctoBot order submission mode rejected order; trying next candidate"
+                    );
                 }
 
                 OrderSubmissionAttempt::AmbiguousAccepted => {
                     warn!(
-                    ?mode,
-                    exchange = %exchange,
-                    symbol = %symbol,
-                    side = %normalized_side,
-                    amount_usd = rounded_amount,
-                    "trading: OctoBot order endpoint returned success without acknowledgement; refusing fallback to avoid duplicate order"
-                );
+                        ?mode,
+                        exchange = %exchange,
+                        symbol = %symbol,
+                        side = %normalized_side,
+                        amount_usd = rounded_amount,
+                        "trading: OctoBot order endpoint returned success without acknowledgement; refusing fallback to avoid duplicate order"
+                    );
 
                     return Err(format!(
                         "OctoBot order submission via {mode:?} returned HTTP success but no order acknowledgement or observable side-effect. Refusing to try additional mutating endpoints to avoid duplicate orders. Tried: {}",
@@ -969,7 +967,6 @@ fn default_order_submission_mode_candidates() -> Vec<OctobotOrderSubmissionMode>
         OctobotOrderSubmissionMode::UserCommandTrading,
         OctobotOrderSubmissionMode::UserCommandGailTrading,
         OctobotOrderSubmissionMode::UserCommandTradingBridge,
-
         // Keep direct modes as fallbacks for native/custom OctoBot deployments.
         OctobotOrderSubmissionMode::DirectCreateOrder,
         OctobotOrderSubmissionMode::DirectCreateOrders,
@@ -1031,11 +1028,9 @@ fn build_order_submission(
             "create order",
         ),
 
-        OctobotOrderSubmissionMode::DirectOrdersCanonicalBody => (
-            "/api/orders",
-            canonical_order.clone(),
-            "create order",
-        ),
+        OctobotOrderSubmissionMode::DirectOrdersCanonicalBody => {
+            ("/api/orders", canonical_order.clone(), "create order")
+        }
 
         OctobotOrderSubmissionMode::UserCommandTrading => (
             "/api/user_command",
