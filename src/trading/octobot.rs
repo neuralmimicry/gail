@@ -136,6 +136,13 @@ pub struct OctobotClient {
     base_url: String,
     password: Option<String>,
     api_schema: Arc<Mutex<AdaptiveApiSchema>>,
+
+    /// Cached successful order-submission mode.
+    ///
+    /// Gail discovers this automatically by trying candidate modes in a safe
+    /// order. Once one mode is positively acknowledged, future orders try it
+    /// first, but can still fall back if that mode later fails.
+    preferred_order_submission_mode: Arc<Mutex<Option<OctobotOrderSubmissionMode>>>,
 }
 
 impl OctobotClient {
@@ -160,11 +167,13 @@ impl OctobotClient {
             .timeout(Duration::from_secs_f64(timeout_seconds))
             .build()
             .unwrap_or_default();
+
         Self {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
             password: password.map(str::to_string),
             api_schema: Arc::new(Mutex::new(api_schema)),
+            preferred_order_submission_mode: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -462,6 +471,7 @@ impl OctobotClient {
     ) -> Result<OctobotOrderResult, String> {
         let normalized_side = normalize_order_side(side)
             .ok_or_else(|| format!("Unsupported trade side `{side}`: expected buy or sell"))?;
+
         if !amount_usd.is_finite() || amount_usd <= 0.0 {
             return Err(format!(
                 "Invalid trade amount `{amount_usd}`: expected a positive finite USD value"
@@ -469,54 +479,41 @@ impl OctobotClient {
         }
 
         let rounded_amount = ((amount_usd * 100.0).round() / 100.0).max(0.01);
+
         let baseline = self.capture_order_baseline().await;
         let request_started_at = current_unix_timestamp_f64();
 
         let canonical_order = json!({
-            "exchange": exchange,
-            "symbol": symbol,
-            "side": normalized_side,
-            "type": "market",
-            "order_type": "market",
-            "amount": rounded_amount,
-            "amount_usd": rounded_amount,
-            "quantity": rounded_amount,
-            "cost": rounded_amount,
-            "price": serde_json::Value::Null,
-        });
+        "exchange": exchange,
+        "symbol": symbol,
+        "side": normalized_side,
+        "type": "market",
+        "order_type": "market",
+        "amount": rounded_amount,
+        "amount_usd": rounded_amount,
+        "price": serde_json::Value::Null,
+    });
 
+        let preferred_mode = {
+            *self.preferred_order_submission_mode.lock().await
+        };
+
+        let modes = ordered_submission_modes(preferred_mode);
         let mut attempts = Vec::new();
 
-        let direct_attempts = vec![
-            (
-                "/api/orders?action=create_order",
-                canonical_order.clone(),
-                "create order",
-            ),
-            (
-                "/api/orders?action=create_orders",
-                json!([canonical_order.clone()]),
-                "create orders",
-            ),
-            (
-                "/api/orders",
-                json!({
-                    "action": "create_order",
-                    "exchange": exchange,
-                    "symbol": symbol,
-                    "side": normalized_side,
-                    "type": "market",
-                    "amount": rounded_amount,
-                    "amount_usd": rounded_amount,
-                }),
-                "create order",
-            ),
-            ("/api/orders", canonical_order.clone(), "create order"),
-        ];
+        for mode in modes {
+            let (path, payload, label) = build_order_submission(
+                mode,
+                exchange,
+                symbol,
+                normalized_side,
+                rounded_amount,
+                &canonical_order,
+            );
 
-        for (path, payload, label) in direct_attempts {
-            if let Some(result) = self
+            match self
                 .attempt_order_submission(
+                    mode,
                     path,
                     &payload,
                     label,
@@ -530,57 +527,50 @@ impl OctobotClient {
                 )
                 .await?
             {
-                return Ok(result);
-            }
-        }
+                OrderSubmissionAttempt::Accepted(result) => {
+                    {
+                        let mut preferred = self.preferred_order_submission_mode.lock().await;
+                        *preferred = Some(mode);
+                    }
 
-        let user_command_attempts = vec![
-            json!({
-                "subject": "trading",
-                "action": "create_order",
-                "data": canonical_order,
-            }),
-            json!({
-                "subject": "gail_trading",
-                "action": "create_order",
-                "data": {
-                    "exchange": exchange,
-                    "symbol": symbol,
-                    "side": normalized_side,
-                    "amount_usd": rounded_amount,
-                    "type": "market",
-                },
-            }),
-            json!({
-                "subject": "trading_bridge",
-                "action": "create_order",
-                "data": {
-                    "exchange": exchange,
-                    "symbol": symbol,
-                    "side": normalized_side,
-                    "amount": rounded_amount,
-                    "order_type": "market",
-                },
-            }),
-        ];
+                    debug!(
+                    ?mode,
+                    exchange = %exchange,
+                    symbol = %symbol,
+                    side = %normalized_side,
+                    amount_usd = rounded_amount,
+                    "trading: selected OctoBot order submission mode"
+                );
 
-        for payload in user_command_attempts {
-            if let Some(result) = self
-                .attempt_order_submission(
-                    "/api/user_command",
-                    &payload,
-                    "user command order",
-                    exchange,
-                    symbol,
-                    normalized_side,
-                    rounded_amount,
-                    &baseline,
-                    request_started_at,
-                    &mut attempts,
-                )
-                .await?
-            {
-                return Ok(result);
+                    return Ok(result);
+                }
+
+                OrderSubmissionAttempt::Rejected => {
+                    debug!(
+                    ?mode,
+                    exchange = %exchange,
+                    symbol = %symbol,
+                    side = %normalized_side,
+                    amount_usd = rounded_amount,
+                    "trading: OctoBot order submission mode rejected order; trying next candidate"
+                );
+                }
+
+                OrderSubmissionAttempt::AmbiguousAccepted => {
+                    warn!(
+                    ?mode,
+                    exchange = %exchange,
+                    symbol = %symbol,
+                    side = %normalized_side,
+                    amount_usd = rounded_amount,
+                    "trading: OctoBot order endpoint returned success without acknowledgement; refusing fallback to avoid duplicate order"
+                );
+
+                    return Err(format!(
+                        "OctoBot order submission via {mode:?} returned HTTP success but no order acknowledgement or observable side-effect. Refusing to try additional mutating endpoints to avoid duplicate orders. Tried: {}",
+                        attempts.join(" | ")
+                    ));
+                }
             }
         }
 
@@ -607,6 +597,7 @@ impl OctobotClient {
 
     async fn attempt_order_submission(
         &self,
+        mode: OctobotOrderSubmissionMode,
         path: &str,
         payload: &Value,
         label: &str,
@@ -617,25 +608,35 @@ impl OctobotClient {
         baseline: &OrderPlacementBaseline,
         request_started_at: f64,
         attempts: &mut Vec<String>,
-    ) -> Result<Option<OctobotOrderResult>, String> {
+    ) -> Result<OrderSubmissionAttempt, String> {
         let (status, body) = self.post_json_with_status(path, payload, label).await?;
+
         if !status.is_success() {
             attempts.push(format!(
-                "{path} => HTTP {} {}",
+                "{mode:?} {path} => HTTP {} {}",
                 status.as_u16(),
                 summarize_order_attempt_body(&body)
             ));
-            return Ok(None);
+
+            // If the cached preferred mode starts failing, forget it so future
+            // calls can re-discover a working mode.
+            let mut preferred = self.preferred_order_submission_mode.lock().await;
+            if *preferred == Some(mode) {
+                *preferred = None;
+            }
+
+            return Ok(OrderSubmissionAttempt::Rejected);
         }
 
         if let Some(result) =
             parse_order_result_body(&body, exchange, symbol, side, amount_usd, path)
         {
             attempts.push(format!(
-                "{path} => acknowledged ({})",
+                "{mode:?} {path} => acknowledged ({})",
                 summarize_order_attempt_body(&body)
             ));
-            return Ok(Some(result));
+
+            return Ok(OrderSubmissionAttempt::Accepted(result));
         }
 
         if let Some(result) = self
@@ -649,15 +650,19 @@ impl OctobotClient {
             )
             .await
         {
-            attempts.push(format!("{path} => accepted (observed order side-effects)"));
-            return Ok(Some(result));
+            attempts.push(format!(
+                "{mode:?} {path} => accepted (observed order side-effects)"
+            ));
+
+            return Ok(OrderSubmissionAttempt::Accepted(result));
         }
 
         attempts.push(format!(
-            "{path} => HTTP {} without order acknowledgement",
+            "{mode:?} {path} => HTTP {} without order acknowledgement",
             status.as_u16()
         ));
-        Ok(None)
+
+        Ok(OrderSubmissionAttempt::AmbiguousAccepted)
     }
 
     async fn capture_order_baseline(&self) -> OrderPlacementBaseline {
@@ -925,6 +930,155 @@ struct OrderPlacementBaseline {
     trade_ids: HashSet<String>,
     latest_trade_ts: Option<f64>,
     trades_captured: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OctobotOrderSubmissionMode {
+    DirectCreateOrder,
+    DirectCreateOrders,
+    DirectOrdersActionBody,
+    DirectOrdersCanonicalBody,
+    UserCommandTrading,
+    UserCommandGailTrading,
+    UserCommandTradingBridge,
+}
+
+#[derive(Debug)]
+enum OrderSubmissionAttempt {
+    /// The endpoint positively acknowledged the order, either directly in the
+    /// response body or by producing an observable order/trade side-effect.
+    Accepted(OctobotOrderResult),
+
+    /// The endpoint clearly rejected the order, usually via non-2xx HTTP.
+    Rejected,
+
+    /// The endpoint returned HTTP 2xx but did not provide a parseable order
+    /// acknowledgement and no side-effect was observed within the polling
+    /// window.
+    ///
+    /// This is intentionally treated as unsafe to continue, because retrying
+    /// another mutating endpoint could create a duplicate order.
+    AmbiguousAccepted,
+}
+
+fn default_order_submission_mode_candidates() -> Vec<OctobotOrderSubmissionMode> {
+    vec![
+        // In your current deployment, /api/user_command reaches OctoBot while
+        // /api/orders variants are returning HTTP 500, so user_command is a
+        // better discovery starting point.
+        OctobotOrderSubmissionMode::UserCommandTrading,
+        OctobotOrderSubmissionMode::UserCommandGailTrading,
+        OctobotOrderSubmissionMode::UserCommandTradingBridge,
+
+        // Keep direct modes as fallbacks for native/custom OctoBot deployments.
+        OctobotOrderSubmissionMode::DirectCreateOrder,
+        OctobotOrderSubmissionMode::DirectCreateOrders,
+        OctobotOrderSubmissionMode::DirectOrdersActionBody,
+        OctobotOrderSubmissionMode::DirectOrdersCanonicalBody,
+    ]
+}
+
+fn ordered_submission_modes(
+    preferred: Option<OctobotOrderSubmissionMode>,
+) -> Vec<OctobotOrderSubmissionMode> {
+    let mut modes = Vec::new();
+
+    if let Some(mode) = preferred {
+        modes.push(mode);
+    }
+
+    for mode in default_order_submission_mode_candidates() {
+        if Some(mode) != preferred {
+            modes.push(mode);
+        }
+    }
+
+    modes
+}
+
+fn build_order_submission(
+    mode: OctobotOrderSubmissionMode,
+    exchange: &str,
+    symbol: &str,
+    side: &str,
+    rounded_amount_usd: f64,
+    canonical_order: &Value,
+) -> (&'static str, Value, &'static str) {
+    match mode {
+        OctobotOrderSubmissionMode::DirectCreateOrder => (
+            "/api/orders?action=create_order",
+            canonical_order.clone(),
+            "create order",
+        ),
+
+        OctobotOrderSubmissionMode::DirectCreateOrders => (
+            "/api/orders?action=create_orders",
+            json!([canonical_order.clone()]),
+            "create orders",
+        ),
+
+        OctobotOrderSubmissionMode::DirectOrdersActionBody => (
+            "/api/orders",
+            json!({
+                "action": "create_order",
+                "exchange": exchange,
+                "symbol": symbol,
+                "side": side,
+                "type": "market",
+                "amount": rounded_amount_usd,
+                "amount_usd": rounded_amount_usd,
+            }),
+            "create order",
+        ),
+
+        OctobotOrderSubmissionMode::DirectOrdersCanonicalBody => (
+            "/api/orders",
+            canonical_order.clone(),
+            "create order",
+        ),
+
+        OctobotOrderSubmissionMode::UserCommandTrading => (
+            "/api/user_command",
+            json!({
+                "subject": "trading",
+                "action": "create_order",
+                "data": canonical_order,
+            }),
+            "user command order",
+        ),
+
+        OctobotOrderSubmissionMode::UserCommandGailTrading => (
+            "/api/user_command",
+            json!({
+                "subject": "gail_trading",
+                "action": "create_order",
+                "data": {
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "side": side,
+                    "amount_usd": rounded_amount_usd,
+                    "type": "market",
+                },
+            }),
+            "user command order",
+        ),
+
+        OctobotOrderSubmissionMode::UserCommandTradingBridge => (
+            "/api/user_command",
+            json!({
+                "subject": "trading_bridge",
+                "action": "create_order",
+                "data": {
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "side": side,
+                    "amount": rounded_amount_usd,
+                    "order_type": "market",
+                },
+            }),
+            "user command order",
+        ),
+    }
 }
 
 fn normalize_order_side(raw: &str) -> Option<&'static str> {
