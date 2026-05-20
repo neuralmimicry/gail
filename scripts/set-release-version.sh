@@ -10,13 +10,83 @@ usage() {
 Usage: scripts/set-release-version.sh VERSION
 
 Updates Cargo.toml and Cargo.lock in the current workspace to the supplied
-release version. VERSION must be a Cargo-compatible SemVer value such as
-1.2.3, 1.2.3-alpha.1, or 1.2.3+build.4.
+release version.
+
+VERSION may optionally start with "v". Numeric SemVer components are
+normalised to remove leading zeroes, so values such as:
+
+  v0.1.0072
+  0.1.0072
+
+become:
+
+  0.1.72
+
+The final version must be a Cargo-compatible SemVer value such as:
+  1.2.3
+  1.2.3-alpha.1
+  1.2.3+build.4
 USAGE
 }
 
-version="${1:-}"
-[[ -n "$version" ]] || { usage; exit 2; }
+normalise_cargo_semver() {
+  local raw="${1:-}"
+  local version core build prerelease major minor patch rest
+
+  [[ -n "$raw" ]] || {
+    echo "missing version" >&2
+    return 2
+  }
+
+  # Accept release tags such as v0.1.72.
+  version="${raw#v}"
+
+  build=""
+  prerelease=""
+
+  # Split build metadata first: 1.2.3-alpha.1+build.4
+  core="${version%%+*}"
+  if [[ "$version" == *"+"* ]]; then
+    build="+${version#*+}"
+  fi
+
+  # Split prerelease from the numeric core.
+  if [[ "$core" == *"-"* ]]; then
+    prerelease="-${core#*-}"
+    core="${core%%-*}"
+  fi
+
+  IFS='.' read -r major minor patch rest <<< "$core"
+
+  if [[ -z "${major:-}" || -z "${minor:-}" || -z "${patch:-}" || -n "${rest:-}" ]]; then
+    echo "invalid SemVer core '${core}' from input '${raw}'" >&2
+    return 2
+  fi
+
+  if ! [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ && "$patch" =~ ^[0-9]+$ ]]; then
+    echo "invalid SemVer numeric components in '${raw}'" >&2
+    return 2
+  fi
+
+  # 10# avoids octal interpretation and strips leading zeroes.
+  major="$((10#$major))"
+  minor="$((10#$minor))"
+  patch="$((10#$patch))"
+
+  # Preserve prerelease/build metadata exactly. Cargo validation below will
+  # reject invalid prerelease/build identifiers if present.
+  printf '%s.%s.%s%s%s\n' "$major" "$minor" "$patch" "$prerelease" "$build"
+}
+
+raw_version="${1:-}"
+[[ -n "$raw_version" ]] || {
+  usage
+  exit 2
+}
+
+version="$(normalise_cargo_semver "$raw_version")"
+
+# Validate after normalisation, not before.
 nm_validate_cargo_semver "$version"
 
 REPO_ROOT=$(nm_repo_root)
@@ -40,4 +110,9 @@ perl -0pi -e '
 ' Cargo.lock
 
 nm_run cargo metadata --locked --no-deps --format-version=1 >/dev/null
-printf 'Gail release version set to %s\n' "$version"
+
+if [[ "$raw_version" != "$version" && "${raw_version#v}" != "$version" ]]; then
+  printf 'Gail release version normalised from %s to %s\n' "$raw_version" "$version"
+else
+  printf 'Gail release version set to %s\n' "$version"
+fi

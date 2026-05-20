@@ -1,6 +1,6 @@
 [package]
 name = "gail"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2024"
 description = "Gateway AI and neuromorphic middleware for NeuralMimicry services"
 license = "MIT"
