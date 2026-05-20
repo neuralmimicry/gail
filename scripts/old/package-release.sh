@@ -114,7 +114,7 @@ build_binaries() {
   else
     log "skipping preflight checks"
   fi
-  args=(cargo build --locked --release --bin GAIL --bin GAIL-loader)
+  args=(cargo build --locked --release --bin gail)
   if [[ -n "$TARGET_TRIPLE" ]]; then
     args+=(--target "$TARGET_TRIPLE")
   fi
@@ -243,14 +243,13 @@ create_debian_package() {
   install -d -m 0755 \
     "$deb_root/DEBIAN" \
     "$deb_root/usr/bin" \
-    "$deb_root/usr/share/doc/GAIL"
+    "$deb_root/usr/share/doc/gail"
 
-  install -m 0755 "$GAIL_BIN" "$deb_root/usr/bin/GAIL"
-  install -m 0755 "$LOADER_BIN" "$deb_root/usr/bin/GAIL-loader"
-  install -m 0644 "$REPO_ROOT/README.md" "$deb_root/usr/share/doc/GAIL/README.md"
-  install -m 0644 "$REPO_ROOT/docs/OPERATIONS.md" "$deb_root/usr/share/doc/GAIL/OPERATIONS.md"
+  install -m 0755 "$GAIL_BIN" "$deb_root/usr/bin/gail"
+  install -m 0644 "$REPO_ROOT/README.md" "$deb_root/usr/share/doc/gail/README.md"
+  install -m 0644 "$REPO_ROOT/docs/OPERATIONS.md" "$deb_root/usr/share/doc/gail/OPERATIONS.md"
 
-  depends=$(compute_deb_depends "$deb_root/usr/bin/GAIL" "$deb_root/usr/bin/GAIL-loader")
+  depends=$(compute_deb_depends "$deb_root/usr/bin/GAIL")
 
   {
     printf 'Package: GAIL\n'
