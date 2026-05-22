@@ -262,6 +262,69 @@ jobs:
           rustup toolchain install stable --profile minimal --target "${{ matrix.rust_target }}"
           rustup default stable
 
+      - name: Set up libtorch for host Cargo jobs
+        shell: bash
+        env:
+          HOST_PYTORCH_VERSION: "2.11.0"
+          HOST_LIBTORCH_ACCELERATOR: "cpu"
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates \
+            libgomp1 \
+            python3 \
+            python3-pip \
+            python3-venv
+
+          python3 -m venv "${GITHUB_WORKSPACE}/.venv-libtorch"
+          source "${GITHUB_WORKSPACE}/.venv-libtorch/bin/activate"
+          python -m pip install --upgrade pip setuptools wheel packaging
+
+          runner_arch="${RUNNER_ARCH:-$(uname -m)}"
+          pytorch_version="${HOST_PYTORCH_VERSION}"
+          accelerator="${HOST_LIBTORCH_ACCELERATOR:-cpu}"
+
+          echo "Installing Python PyTorch ${pytorch_version} for torch-sys host build on ${runner_arch} (${accelerator})"
+
+          case "${runner_arch}:${accelerator}" in
+            X64:cpu|x64:cpu|amd64:cpu|x86_64:cpu)
+              python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==${pytorch_version}"
+              ;;
+            X64:cu118|X64:cu121|X64:cu124|X64:cu126|X64:cu128|x86_64:cu118|x86_64:cu121|x86_64:cu124|x86_64:cu126|x86_64:cu128)
+              python -m pip install --index-url "https://download.pytorch.org/whl/${accelerator}" "torch==${pytorch_version}"
+              ;;
+            *)
+              python -m pip install "torch==${pytorch_version}"
+              ;;
+          esac
+
+          torch_lib_dir="$(python - <<'PYTORCH'
+          import pathlib
+          import torch
+          print(pathlib.Path(torch.__file__).resolve().parent / 'lib')
+          PYTORCH
+          )"
+
+          cxx11_abi="$(python -c 'import torch; print(int(getattr(torch._C, "_GLIBCXX_USE_CXX11_ABI", True)))')"
+
+          if [ ! -f "${torch_lib_dir}/libtorch.so" ] && [ ! -f "${torch_lib_dir}/libtorch_cpu.so" ]; then
+            echo "::error::Python PyTorch installed, but libtorch shared libraries were not found under ${torch_lib_dir}"
+            exit 2
+          fi
+
+          {
+            echo "LIBTORCH_USE_PYTORCH=1"
+            echo "LIBTORCH_CXX11_ABI=${cxx11_abi}"
+            echo "CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG=true"
+            echo "CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_DEBUG=true"
+            echo "PATH=${GITHUB_WORKSPACE}/.venv-libtorch/bin:${PATH}"
+            echo "LD_LIBRARY_PATH=${torch_lib_dir}:${LD_LIBRARY_PATH:-}"
+          } >> "${GITHUB_ENV}"
+
+          echo "Configured torch-sys to use Python PyTorch via LIBTORCH_USE_PYTORCH=1"
+
       - name: Configure iOS linker
         if: ${{ matrix.os == 'ios' }}
         run: |
