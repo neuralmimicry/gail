@@ -51,6 +51,7 @@ ARG LIBTORCH_STRICT_ACCELERATOR=false
 ARG LIBTORCH_DOWNLOAD_FALLBACK_TO_SOURCE=true
 ARG LIBTORCH_ARM64_SVE=auto
 ARG LIBTORCH_ARM64_XNNPACK=auto
+ARG LIBTORCH_ARM64_KLEIDIAI=false
 ARG PYTORCH_GIT_REPOSITORY=https://github.com/pytorch/pytorch.git
 ARG PYTORCH_GIT_TAG=auto
 ARG PYTORCH_GIT_TAG_STRICT=false
@@ -265,10 +266,30 @@ RUN set -eu; \
         caffe2_perf_with_sve="OFF"; \
         caffe2_perf_with_sve256="OFF"; \
         pytorch_use_xnnpack="ON"; \
+        caffe2_perf_with_sve="OFF"; \
+        caffe2_perf_with_sve256="OFF"; \
+        pytorch_use_xnnpack="OFF"; \
+        pytorch_use_kleidiai="OFF"; \
         if [ "${norm_arch}" = "arm64" ]; then \
-            if [ "${arm64_sve}" = "true" ]; then \
-                caffe2_perf_with_sve="ON"; \
-            fi; \
+            case "${LIBTORCH_ARM64_SVE:-false}" in \
+                true|1|yes|on) \
+                    if [ "${arm64_sve}" = "true" ]; then \
+                        caffe2_perf_with_sve="ON"; \
+                    else \
+                        echo "LIBTORCH_ARM64_SVE=true requested, but SVE was not detected; keeping SVE OFF" >&2; \
+                    fi; \
+                    ;; \
+                auto|"") \
+                    echo "LIBTORCH_ARM64_SVE=auto detected SVE=${arm64_sve}, but release builds keep SVE OFF unless explicitly enabled"; \
+                    ;; \
+                false|0|no|off) \
+                    caffe2_perf_with_sve="OFF"; \
+                    ;; \
+                *) \
+                    echo "Unsupported LIBTORCH_ARM64_SVE=${LIBTORCH_ARM64_SVE}; use auto, true or false" >&2; \
+                    exit 2; \
+                    ;; \
+            esac; \
             case "${LIBTORCH_ARM64_XNNPACK:-auto}" in \
                 auto|"") \
                     if [ "${arm64_sve}" = "true" ]; then \
@@ -285,11 +306,15 @@ RUN set -eu; \
                     ;; \
             esac; \
         fi; \
-        echo "ARM64 PyTorch CPU features: CAFFE2_PERF_WITH_SVE=${caffe2_perf_with_sve} CAFFE2_PERF_WITH_SVE256=${caffe2_perf_with_sve256} USE_XNNPACK=${pytorch_use_xnnpack}"; \
-        if [ "${pytorch_use_xnnpack}" = "ON" ]; then \
+        echo "ARM64 PyTorch CPU features: CAFFE2_PERF_WITH_SVE=${caffe2_perf_with_sve} CAFFE2_PERF_WITH_SVE256=${caffe2_perf_with_sve256} USE_XNNPACK=${pytorch_use_xnnpack} USE_KLEIDIAI=${pytorch_use_kleidiai}"; \        if [ "${pytorch_use_xnnpack}" = "ON" ]; then \
             export USE_XNNPACK=1; \
         else \
             export USE_XNNPACK=0; \
+        fi; \
+        if [ "${pytorch_use_kleidiai}" = "ON" ]; then \
+            export USE_KLEIDIAI=1; \
+        else \
+            export USE_KLEIDIAI=0; \
         fi; \
         "${cmake_bin}" \
             -G Ninja \
@@ -313,6 +338,7 @@ RUN set -eu; \
             -DUSE_QNNPACK:BOOL=OFF \
             -DUSE_PYTORCH_QNNPACK:BOOL=OFF \
             -DUSE_ROCM:BOOL=OFF \
+            -DUSE_KLEIDIAI:BOOL="${pytorch_use_kleidiai}" \
             -DUSE_XNNPACK:BOOL="${pytorch_use_xnnpack}" \
             -DCAFFE2_PERF_WITH_SVE:BOOL="${caffe2_perf_with_sve}" \
             -DCAFFE2_PERF_WITH_SVE256:BOOL="${caffe2_perf_with_sve256}" \

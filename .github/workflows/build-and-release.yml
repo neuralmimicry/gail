@@ -688,14 +688,14 @@ jobs:
             grep -m1 -E '^Features[[:space:]]*:' /proc/cpuinfo || true
         
             if grep -m1 -E '^Features[[:space:]]*:.*(^|[[:space:]])sve([[:space:]]|$)' /proc/cpuinfo >/dev/null 2>&1; then
-              echo "ARM64 SVE: present"
-              arm64_sve="true"
+              echo "ARM64 SVE: present, but disabled for release container builds unless explicitly enabled"
             else
               echo "ARM64 SVE: absent"
-              arm64_sve="false"
             fi
+            
+            arm64_sve="${LIBTORCH_ARM64_SVE:-false}"
           else
-            arm64_sve="auto"
+            arm64_sve="false"
           fi
 
           podman build \
@@ -716,6 +716,7 @@ jobs:
             --build-arg PYTORCH_BUILD_PARALLEL_LEVEL="${pytorch_jobs}" \
             --build-arg LIBTORCH_ARM64_SVE="${arm64_sve}" \
             --build-arg LIBTORCH_ARM64_XNNPACK="auto" \
+            --build-arg LIBTORCH_ARM64_KLEIDIAI="${LIBTORCH_ARM64_KLEIDIAI:-false}" \
             -f Containerfile \
             -t "${ARCH_TAG}" \
             .
