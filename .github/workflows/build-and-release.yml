@@ -620,9 +620,11 @@ jobs:
           echo "arch_tag=${image_repo}:${BUILD_VERSION}-${{ matrix.arch }}" >> "${GITHUB_OUTPUT}"
           echo "created=${created}" >> "${GITHUB_OUTPUT}"
 
-      - name: Ensure Podman is available
+      - name: Validate container tooling
+        shell: bash
         run: |
           set -euo pipefail
+          
           if ! command -v podman >/dev/null 2>&1; then
             if command -v sudo >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
               sudo apt-get update
@@ -632,8 +634,13 @@ jobs:
               exit 1
             fi
           fi
+          
           podman --version
-          podman info --format '{{.Host.Arch}} {{.Host.Os}}'
+          
+          host_arch="$(podman info --format '{{.Host.Arch}}' 2>/dev/null || uname -m)"
+          host_os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          
+          echo "Podman host: ${host_arch} ${host_os}"
 
       - name: Log in to GHCR
         run: |
