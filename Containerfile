@@ -49,6 +49,8 @@ ARG LIBTORCH_ARM64_BUILD_FROM_SOURCE=auto
 ARG LIBTORCH_ALLOW_CPU_FALLBACK=true
 ARG LIBTORCH_STRICT_ACCELERATOR=false
 ARG LIBTORCH_DOWNLOAD_FALLBACK_TO_SOURCE=true
+ARG LIBTORCH_ARM64_SVE=auto
+ARG LIBTORCH_ARM64_XNNPACK=auto
 ARG PYTORCH_GIT_REPOSITORY=https://github.com/pytorch/pytorch.git
 ARG PYTORCH_GIT_TAG=auto
 ARG PYTORCH_GIT_TAG_STRICT=false
@@ -84,6 +86,25 @@ RUN set -eu; \
         arm64|aarch64) norm_arch="arm64" ;; \
         *) norm_arch="${detected_arch}" ;; \
     esac; \
+    arm64_sve="false"; \
+    if [ "${norm_arch}" = "arm64" ]; then \
+        case "${LIBTORCH_ARM64_SVE:-auto}" in \
+            auto|"") \
+                if grep -m1 -E '^Features[[:space:]]*:.*(^|[[:space:]])sve([[:space:]]|$)' /proc/cpuinfo >/dev/null 2>&1; then \
+                    arm64_sve="true"; \
+                else \
+                    arm64_sve="false"; \
+                fi; \
+                ;; \
+            true|1|yes|on) arm64_sve="true" ;; \
+            false|0|no|off) arm64_sve="false" ;; \
+            *) \
+                echo "Unsupported LIBTORCH_ARM64_SVE=${LIBTORCH_ARM64_SVE}; use auto, true or false" >&2; \
+                exit 2; \
+                ;; \
+        esac; \
+    fi; \
+    echo "ARM64 SVE detection: arch=${norm_arch} sve=${arm64_sve}";
     requested_accelerator="${LIBTORCH_ACCELERATOR:-auto}"; \
     case "${requested_accelerator}" in \
         auto|none|no-gpu|nogpu|cpu) effective_accelerator="cpu" ;; \
@@ -241,7 +262,35 @@ RUN set -eu; \
         export USE_QNNPACK=0; \
         export USE_PYTORCH_QNNPACK=0; \
         export USE_ROCM=0; \
-        export USE_XNNPACK=1; \
+        caffe2_perf_with_sve="OFF"; \
+        caffe2_perf_with_sve256="OFF"; \
+        pytorch_use_xnnpack="ON"; \
+        if [ "${norm_arch}" = "arm64" ]; then \
+            if [ "${arm64_sve}" = "true" ]; then \
+                caffe2_perf_with_sve="ON"; \
+            fi; \
+            case "${LIBTORCH_ARM64_XNNPACK:-auto}" in \
+                auto|"") \
+                    if [ "${arm64_sve}" = "true" ]; then \
+                        pytorch_use_xnnpack="ON"; \
+                    else \
+                        pytorch_use_xnnpack="OFF"; \
+                    fi; \
+                    ;; \
+                true|1|yes|on) pytorch_use_xnnpack="ON" ;; \
+                false|0|no|off) pytorch_use_xnnpack="OFF" ;; \
+                *) \
+                    echo "Unsupported LIBTORCH_ARM64_XNNPACK=${LIBTORCH_ARM64_XNNPACK}; use auto, true or false" >&2; \
+                    exit 2; \
+                    ;; \
+            esac; \
+        fi; \
+        echo "ARM64 PyTorch CPU features: CAFFE2_PERF_WITH_SVE=${caffe2_perf_with_sve} CAFFE2_PERF_WITH_SVE256=${caffe2_perf_with_sve256} USE_XNNPACK=${pytorch_use_xnnpack}"; \
+        if [ "${pytorch_use_xnnpack}" = "ON" ]; then \
+            export USE_XNNPACK=1; \
+        else \
+            export USE_XNNPACK=0; \
+        fi; \
         "${cmake_bin}" \
             -G Ninja \
             -DBUILD_SHARED_LIBS:BOOL=ON \
@@ -264,7 +313,9 @@ RUN set -eu; \
             -DUSE_QNNPACK:BOOL=OFF \
             -DUSE_PYTORCH_QNNPACK:BOOL=OFF \
             -DUSE_ROCM:BOOL=OFF \
-            -DUSE_XNNPACK:BOOL=ON \
+            -DUSE_XNNPACK:BOOL="${pytorch_use_xnnpack}" \
+            -DCAFFE2_PERF_WITH_SVE:BOOL="${caffe2_perf_with_sve}" \
+            -DCAFFE2_PERF_WITH_SVE256:BOOL="${caffe2_perf_with_sve256}" \
             ../pytorch; \
         "${cmake_bin}" --build . --target install --parallel "${PYTORCH_BUILD_PARALLEL_LEVEL}"; \
         rm -rf /tmp/pytorch /tmp/pytorch-build /tmp/pytorch-venv /root/.cache; \

@@ -683,6 +683,21 @@ jobs:
 
           echo "Building ${ARCH_TAG} on ${MATRIX_PLATFORM} with BUILD_JOBS=${build_jobs}, CARGO_BUILD_JOBS=${cargo_jobs}, PYTORCH_BUILD_PARALLEL_LEVEL=${pytorch_jobs}, LIBTORCH_ACCELERATOR=${INPUT_LIBTORCH_ACCELERATOR}"
 
+          if [[ "${MATRIX_ARCH}" == "arm64" ]]; then
+            echo "ARM64 CPU features:"
+            grep -m1 -E '^Features[[:space:]]*:' /proc/cpuinfo || true
+        
+            if grep -m1 -E '^Features[[:space:]]*:.*(^|[[:space:]])sve([[:space:]]|$)' /proc/cpuinfo >/dev/null 2>&1; then
+              echo "ARM64 SVE: present"
+              arm64_sve="true"
+            else
+              echo "ARM64 SVE: absent"
+              arm64_sve="false"
+            fi
+          else
+            arm64_sve="auto"
+          fi
+
           podman build \
             --platform "${MATRIX_PLATFORM}" \
             --network=host \
@@ -699,6 +714,8 @@ jobs:
             --build-arg CARGO_BUILD_JOBS="${cargo_jobs}" \
             --build-arg CMAKE_BUILD_PARALLEL_LEVEL="${build_jobs}" \
             --build-arg PYTORCH_BUILD_PARALLEL_LEVEL="${pytorch_jobs}" \
+            --build-arg LIBTORCH_ARM64_SVE="${arm64_sve}" \
+            --build-arg LIBTORCH_ARM64_XNNPACK="auto" \
             -f Containerfile \
             -t "${ARCH_TAG}" \
             .
