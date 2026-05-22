@@ -104,7 +104,7 @@ RUN set -eu; \
                 ;; \
         esac; \
     fi; \
-    echo "ARM64 SVE detection: arch=${norm_arch} sve=${arm64_sve}";
+    echo "ARM64 SVE detection: arch=${norm_arch} sve=${arm64_sve}"; \
     requested_accelerator="${LIBTORCH_ACCELERATOR:-auto}"; \
     case "${requested_accelerator}" in \
         auto|none|no-gpu|nogpu|cpu) effective_accelerator="cpu" ;; \
