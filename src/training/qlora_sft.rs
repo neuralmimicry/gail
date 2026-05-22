@@ -136,7 +136,7 @@ struct TrainingMetrics {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let code = match async_main().await {
+    let code = match unsafe { async_main() }.await {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("Training failed: {error}");
@@ -146,7 +146,7 @@ async fn main() {
     std::process::exit(code);
 }
 
-async fn async_main() -> anyhow::Result<()> {
+async unsafe fn async_main() -> anyhow::Result<()> {
     let cfg = parse_args(env::args_os().skip(1))?;
     if !SUPPORTED_ALGORITHMS.contains(&cfg.algorithm.as_str()) {
         anyhow::bail!(
@@ -763,7 +763,7 @@ fn tch_device(plan: &HardwarePlan) -> Device {
     plan.device_index.map(Device::Cuda).unwrap_or(Device::Cpu)
 }
 
-fn apply_cpu_thread_limits(cpu_threads: usize) {
+unsafe fn apply_cpu_thread_limits(cpu_threads: usize) {
     let threads = cpu_threads.max(1) as i32;
     tch::set_num_threads(threads);
     tch::set_num_interop_threads((threads / 2).max(1));
