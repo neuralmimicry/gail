@@ -42,13 +42,12 @@ use std::{
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tch::{no_grad, CModule, Cuda, Device, Kind, Tensor};
+use tch::{CModule, Cuda, Device, Kind, Tensor, no_grad};
 use tokenizers::Tokenizer;
 use tokio::fs;
 
 const SUPPORTED_ALGORITHMS: &[&str] = &["qlora_sft", "lora_sft"];
-const DEFAULT_SYSTEM_PROMPT: &str =
-    "You are the Gail in-house continuously trained model. Use prior interaction learning when useful.";
+const DEFAULT_SYSTEM_PROMPT: &str = "You are the Gail in-house continuously trained model. Use prior interaction learning when useful.";
 
 #[derive(Debug, Clone, Serialize)]
 struct TrainingConfig {
@@ -263,7 +262,8 @@ fn train_with_tch(
         .sum::<usize>();
 
     let total_micro_steps = ((cfg.epochs.max(0.0) * batches.len() as f64).ceil() as usize).max(1);
-    let warmup_steps = ((cfg.warmup_ratio.max(0.0) * total_micro_steps as f64).round() as usize).max(1);
+    let warmup_steps =
+        ((cfg.warmup_ratio.max(0.0) * total_micro_steps as f64).round() as usize).max(1);
     let accumulation = cfg.gradient_accumulation_steps.max(1);
     let mut final_loss = None;
     let mut optimiser_step = 0_usize;
@@ -274,7 +274,10 @@ fn train_with_tch(
         let batch = &batches[micro_step % batches.len()];
         let loss = match cfg.forward_mode {
             ForwardMode::Loss => module
-                .forward_ts(&[batch.input_ids.shallow_clone(), batch.labels.shallow_clone()])
+                .forward_ts(&[
+                    batch.input_ids.shallow_clone(),
+                    batch.labels.shallow_clone(),
+                ])
                 .map_err(|error| anyhow::anyhow!("forward(loss) failed: {error}"))?,
             ForwardMode::Logits => {
                 let logits = module
@@ -325,7 +328,10 @@ fn train_with_tch(
     })
 }
 
-fn collect_trainable_parameters(module: &CModule, cfg: &TrainingConfig) -> anyhow::Result<Vec<TrainableParam>> {
+fn collect_trainable_parameters(
+    module: &CModule,
+    cfg: &TrainingConfig,
+) -> anyhow::Result<Vec<TrainableParam>> {
     let train_all = env_bool("GAIL_TCH_TRAIN_ALL", false);
     let marker = cfg.trainable_marker.to_ascii_lowercase();
     let named = module
@@ -424,7 +430,10 @@ fn tokenise_parallel(
             Ok::<_, anyhow::Error>(TokenisedSample { ids })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(encoded.into_iter().filter(|sample| sample.ids.len() > 1).collect())
+    Ok(encoded
+        .into_iter()
+        .filter(|sample| sample.ids.len() > 1)
+        .collect())
 }
 
 fn build_batches(
@@ -476,7 +485,9 @@ async fn load_training_texts(dataset_path: &Path) -> anyhow::Result<Vec<String>>
         }
         let row: DatasetRow = serde_json::from_str(raw)
             .map_err(|error| anyhow::anyhow!("invalid JSONL at line {}: {error}", line_no + 1))?;
-        let Some(messages) = row.messages else { continue };
+        let Some(messages) = row.messages else {
+            continue;
+        };
         let rendered = manual_chat_template(&messages);
         if !rendered.trim().is_empty() {
             texts.push(rendered);
@@ -502,7 +513,11 @@ fn manual_chat_template(messages: &[ChatMessage]) -> String {
             rendered.push('\n');
         }
         rendered.push_str("<|");
-        rendered.push_str(if role.is_empty() { "user" } else { role.as_str() });
+        rendered.push_str(if role.is_empty() {
+            "user"
+        } else {
+            role.as_str()
+        });
         rendered.push_str("|>\n");
         rendered.push_str(content);
     }
@@ -578,7 +593,8 @@ where
     let mut algorithm = env_or("GAIL_TRAIN_ALGORITHM", "qlora_sft");
     let mut epochs = parse_env("GAIL_TRAIN_EPOCHS", 1.0_f64);
     let mut batch_size = parse_env("GAIL_TRAIN_BATCH_SIZE", 1_usize);
-    let mut gradient_accumulation_steps = parse_env("GAIL_TRAIN_GRADIENT_ACCUMULATION_STEPS", 8_usize);
+    let mut gradient_accumulation_steps =
+        parse_env("GAIL_TRAIN_GRADIENT_ACCUMULATION_STEPS", 8_usize);
     let mut learning_rate = parse_env("GAIL_TRAIN_LEARNING_RATE", 2e-4_f64);
     let mut warmup_ratio = parse_env("GAIL_TRAIN_WARMUP_RATIO", 0.03_f64);
     let mut max_seq_len = parse_env("GAIL_TRAIN_MAX_SEQ_LEN", 2048_usize);
@@ -615,7 +631,9 @@ where
             "--algorithm" => algorithm = next(&mut index, &flag)?,
             "--epochs" => epochs = parse_value(&next(&mut index, &flag)?, &flag)?,
             "--batch-size" => batch_size = parse_value(&next(&mut index, &flag)?, &flag)?,
-            "--gradient-accumulation-steps" => gradient_accumulation_steps = parse_value(&next(&mut index, &flag)?, &flag)?,
+            "--gradient-accumulation-steps" => {
+                gradient_accumulation_steps = parse_value(&next(&mut index, &flag)?, &flag)?
+            }
             "--learning-rate" => learning_rate = parse_value(&next(&mut index, &flag)?, &flag)?,
             "--warmup-ratio" => warmup_ratio = parse_value(&next(&mut index, &flag)?, &flag)?,
             "--max-seq-len" => max_seq_len = parse_value(&next(&mut index, &flag)?, &flag)?,
@@ -710,12 +728,19 @@ fn hardware_plan() -> HardwarePlan {
     let use_gpu = env::var("GAIL_TRAIN_DEVICE")
         .map(|value| value.eq_ignore_ascii_case("cuda") || value.eq_ignore_ascii_case("gpu"))
         .unwrap_or(gpu_count > 0);
-    let device_index = if use_gpu && Cuda::is_available() && gpu_count > 0 { Some(0) } else { None };
+    let device_index = if use_gpu && Cuda::is_available() && gpu_count > 0 {
+        Some(0)
+    } else {
+        None
+    };
     let device_label = device_index
         .map(|index| format!("cuda:{index}"))
         .unwrap_or_else(|| "cpu".to_string());
     let compute_dtype = if device_index.is_some() {
-        env_or("GAIL_TCH_COMPUTE_DTYPE", "float16_or_bfloat16_module_defined")
+        env_or(
+            "GAIL_TCH_COMPUTE_DTYPE",
+            "float16_or_bfloat16_module_defined",
+        )
     } else {
         "float32".to_string()
     };
@@ -771,7 +796,12 @@ fn env_or(name: &str, default: &str) -> String {
 fn env_bool(name: &str, default: bool) -> bool {
     env::var(name)
         .ok()
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(default)
 }
 

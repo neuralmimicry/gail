@@ -157,13 +157,8 @@ async fn run_training_pipeline(
         "gpu_memory_mb": hardware.total_gpu_memory_mb(),
         "started_ts": now_ts(),
     });
-    let training_invocation = resolve_training_invocation(
-        trainer,
-        hardware,
-        snapshot_id,
-        dataset_path,
-        snapshot_dir,
-    );
+    let training_invocation =
+        resolve_training_invocation(trainer, hardware, snapshot_id, dataset_path, snapshot_dir);
     if let Some(command_line) = training_invocation {
         let command_output = execute_training_command(
             command_line.as_str(),
@@ -180,7 +175,8 @@ async fn run_training_pipeline(
         pipeline_report["training_exit_code"] = json!(command_output.exit_code);
         pipeline_report["training_runtime_seconds"] = json!(command_output.runtime_seconds);
     } else {
-        pipeline_report["training_command"] = json!("skipped: unsupported algorithm and trainer.command_template is unset");
+        pipeline_report["training_command"] =
+            json!("skipped: unsupported algorithm and trainer.command_template is unset");
     }
     let mut snapshot_tag = format!("{}:{}", trainer.model_prefix, snapshot_id);
     if trainer.register_with_ollama {
@@ -227,7 +223,11 @@ async fn execute_training_command(
 ) -> Result<CommandOutcome> {
     let started = tokio::time::Instant::now();
     let cpu_threads = hardware.preferred_worker_threads().max(1).to_string();
-    let train_device = if hardware.gpu_count() > 0 { "cuda" } else { "cpu" };
+    let train_device = if hardware.gpu_count() > 0 {
+        "cuda"
+    } else {
+        "cpu"
+    };
 
     let mut command = Command::new("bash");
     command
@@ -269,12 +269,14 @@ async fn execute_training_command(
         GailError::invalid_config(format!("failed to spawn trainer command: {error}"))
     })?;
 
-    let stdout = child.stdout.take().ok_or_else(|| {
-        GailError::invalid_config("failed to capture trainer stdout".to_string())
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        GailError::invalid_config("failed to capture trainer stderr".to_string())
-    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GailError::invalid_config("failed to capture trainer stdout".to_string()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| GailError::invalid_config("failed to capture trainer stderr".to_string()))?;
 
     let stdout_task = tokio::spawn(stream_child_output("trainer.stdout", stdout));
     let stderr_task = tokio::spawn(stream_child_output("trainer.stderr", stderr));
@@ -388,10 +390,9 @@ fn resolve_training_invocation(
 }
 
 fn shell_escape(value: &str) -> String {
-    if value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '=' | '+'))
-    {
+    if value.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '=' | '+')
+    }) {
         return value.to_string();
     }
     format!("'{}'", value.replace('\'', "'\\''"))
