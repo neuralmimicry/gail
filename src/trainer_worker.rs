@@ -8,7 +8,7 @@ use reqwest::Client;
 use serde_json::json;
 use tokio::{
     fs::{self, OpenOptions},
-    io::AsyncWriteExt,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
 };
 
@@ -157,15 +157,14 @@ async fn run_training_pipeline(
         "gpu_memory_mb": hardware.total_gpu_memory_mb(),
         "started_ts": now_ts(),
     });
-    if let Some(command_template) = trainer.command_template.as_deref() {
-        let command_line = render_training_command(
-            command_template,
-            trainer,
-            hardware,
-            snapshot_id,
-            dataset_path,
-            snapshot_dir,
-        );
+    let training_invocation = resolve_training_invocation(
+        trainer,
+        hardware,
+        snapshot_id,
+        dataset_path,
+        snapshot_dir,
+    );
+    if let Some(command_line) = training_invocation {
         let command_output = execute_training_command(
             command_line.as_str(),
             trainer,
@@ -176,11 +175,12 @@ async fn run_training_pipeline(
         )
         .await?;
         pipeline_report["training_command"] = json!(command_line);
-        pipeline_report["training_stdout"] = json!(command_output.stdout);
-        pipeline_report["training_stderr"] = json!(command_output.stderr);
+        pipeline_report["training_stdout_tail"] = json!(command_output.stdout);
+        pipeline_report["training_stderr_tail"] = json!(command_output.stderr);
         pipeline_report["training_exit_code"] = json!(command_output.exit_code);
+        pipeline_report["training_runtime_seconds"] = json!(command_output.runtime_seconds);
     } else {
-        pipeline_report["training_command"] = json!("skipped (trainer.command_template is unset)");
+        pipeline_report["training_command"] = json!("skipped: unsupported algorithm and trainer.command_template is unset");
     }
     let mut snapshot_tag = format!("{}:{}", trainer.model_prefix, snapshot_id);
     if trainer.register_with_ollama {
@@ -197,7 +197,12 @@ async fn run_training_pipeline(
     .await?;
     Ok(TrainingOutcome {
         snapshot_tag,
-        status: if trainer.command_template.is_some() {
+        status: if pipeline_report
+            .get("training_exit_code")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(-1)
+            == 0
+        {
             "trained".to_string()
         } else {
             "snapshotted".to_string()
@@ -209,6 +214,7 @@ struct CommandOutcome {
     stdout: String,
     stderr: String,
     exit_code: i32,
+    runtime_seconds: f64,
 }
 
 async fn execute_training_command(
@@ -219,6 +225,10 @@ async fn execute_training_command(
     dataset_path: &Path,
     snapshot_dir: &Path,
 ) -> Result<CommandOutcome> {
+    let started = tokio::time::Instant::now();
+    let cpu_threads = hardware.preferred_worker_threads().max(1).to_string();
+    let train_device = if hardware.gpu_count() > 0 { "cuda" } else { "cpu" };
+
     let mut command = Command::new("bash");
     command
         .arg("-lc")
@@ -236,55 +246,155 @@ async fn execute_training_command(
             "GAIL_TRAIN_OUTPUT_DIR",
             snapshot_dir.to_string_lossy().to_string(),
         )
-        .env(
-            "GAIL_TRAIN_CPU_THREADS",
-            hardware.preferred_worker_threads().to_string(),
-        )
-        .env(
-            "GAIL_TRAIN_DEVICE",
-            if hardware.gpu_count() > 0 {
-                "cuda"
-            } else {
-                "cpu"
-            },
-        )
+        .env("GAIL_TRAIN_CPU_THREADS", cpu_threads.as_str())
+        .env("GAIL_TRAIN_DEVICE", train_device)
         .env("GAIL_TRAIN_GPU_COUNT", hardware.gpu_count().to_string())
         .env(
             "GAIL_TRAIN_GPU_MEMORY_MB",
             hardware.total_gpu_memory_mb().to_string(),
-        );
-    let child = command.spawn().map_err(|error| {
+        )
+        // Make the child process GPU/CPU-aware for common Rust, BLAS and Python backends.
+        .env("RAYON_NUM_THREADS", cpu_threads.as_str())
+        .env("TOKIO_WORKER_THREADS", cpu_threads.as_str())
+        .env("OMP_NUM_THREADS", cpu_threads.as_str())
+        .env("MKL_NUM_THREADS", cpu_threads.as_str())
+        .env("OPENBLAS_NUM_THREADS", cpu_threads.as_str())
+        .env("NUMEXPR_NUM_THREADS", cpu_threads.as_str());
+
+    if hardware.gpu_count() == 0 {
+        command.env("CUDA_VISIBLE_DEVICES", "");
+    }
+
+    let mut child = command.spawn().map_err(|error| {
         GailError::invalid_config(format!("failed to spawn trainer command: {error}"))
     })?;
-    let timeout_duration = Duration::from_secs(trainer.command_timeout_seconds);
-    let output = match tokio::time::timeout(timeout_duration, child.wait_with_output()).await {
-        Ok(Ok(output)) => output,
+
+    let stdout = child.stdout.take().ok_or_else(|| {
+        GailError::invalid_config("failed to capture trainer stdout".to_string())
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        GailError::invalid_config("failed to capture trainer stderr".to_string())
+    })?;
+
+    let stdout_task = tokio::spawn(stream_child_output("trainer.stdout", stdout));
+    let stderr_task = tokio::spawn(stream_child_output("trainer.stderr", stderr));
+
+    let timeout_duration = Duration::from_secs(trainer.command_timeout_seconds.max(1));
+    let status = match tokio::time::timeout(timeout_duration, child.wait()).await {
+        Ok(Ok(status)) => status,
         Ok(Err(error)) => {
             return Err(GailError::invalid_config(format!(
                 "trainer command failed to execute: {error}"
             )));
         }
         Err(_) => {
+            let _ = child.kill().await;
             return Err(GailError::invalid_config(format!(
                 "trainer command timed out after {}s",
                 trainer.command_timeout_seconds
             )));
         }
     };
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let exit_code = output.status.code().unwrap_or(-1);
-    if !output.status.success() {
+
+    let stdout = stdout_task.await.map_err(|error| {
+        GailError::invalid_config(format!("trainer stdout reader failed: {error}"))
+    })?;
+    let stderr = stderr_task.await.map_err(|error| {
+        GailError::invalid_config(format!("trainer stderr reader failed: {error}"))
+    })?;
+    let exit_code = status.code().unwrap_or(-1);
+
+    if !status.success() {
         return Err(GailError::invalid_config(format!(
             "trainer command exited with status {exit_code}: {}",
-            truncate_chars(&stderr, 600)
+            truncate_chars(&stderr, 1200)
         )));
     }
+
     Ok(CommandOutcome {
         stdout: truncate_chars(&stdout, 8_000),
         stderr: truncate_chars(&stderr, 8_000),
         exit_code,
+        runtime_seconds: started.elapsed().as_secs_f64(),
     })
+}
+
+async fn stream_child_output<R>(target: &'static str, reader: R) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(reader).lines();
+    let mut tail = String::new();
+    while let Ok(Some(line)) = lines.next_line().await {
+        match target {
+            "trainer.stderr" => tracing::warn!(target = target, "{}", line),
+            _ => tracing::info!(target = target, "{}", line),
+        }
+        tail.push_str(&line);
+        tail.push('\n');
+        if tail.len() > 16_000 {
+            tail = tail
+                .chars()
+                .rev()
+                .take(12_000)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+        }
+    }
+    tail
+}
+
+fn resolve_training_invocation(
+    trainer: &TrainerConfig,
+    hardware: &HardwareProfile,
+    snapshot_id: &str,
+    dataset_path: &Path,
+    snapshot_dir: &Path,
+) -> Option<String> {
+    if let Some(command_template) = trainer.command_template.as_deref() {
+        return Some(render_training_command(
+            command_template,
+            trainer,
+            hardware,
+            snapshot_id,
+            dataset_path,
+            snapshot_dir,
+        ));
+    }
+
+    if matches!(trainer.algorithm.as_str(), "qlora_sft" | "lora_sft") {
+        let runner = std::env::var("GAIL_RUST_QLORA_SFT_BIN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "gail-qlora-sft".to_string());
+        let base_model = std::env::var("GAIL_TRAIN_BASE_MODEL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| trainer.ollama_base_model.clone());
+        return Some(format!(
+            "{} --dataset {} --output {} --algorithm {} --base-model {} --timeout-seconds {}",
+            shell_escape(runner.as_str()),
+            shell_escape(&dataset_path.to_string_lossy()),
+            shell_escape(&snapshot_dir.to_string_lossy()),
+            shell_escape(trainer.algorithm.as_str()),
+            shell_escape(base_model.as_str()),
+            trainer.command_timeout_seconds.max(1),
+        ));
+    }
+
+    None
+}
+
+fn shell_escape(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '=' | '+'))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 async fn register_snapshot_with_ollama(

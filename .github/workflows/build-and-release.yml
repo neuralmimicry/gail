@@ -22,6 +22,16 @@ name: Build, Version, and Release
         required: true
         type: boolean
         default: true
+      container_libtorch_accelerator:
+        description: "Container libtorch accelerator: cpu, cuda, cu118, cu121, cu124, cu126, cu128, auto, or no-gpu."
+        required: true
+        type: string
+        default: "cpu"
+      container_no_cache:
+        description: "Build container images without Podman layer cache."
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -416,8 +426,8 @@ jobs:
               --notes-file "$notes"
           fi
 
-  publish-container:
-    name: Publish container image
+  build-container-arch:
+    name: Build container (${{ matrix.arch }})
     needs:
       - version
       - create-version-tag
@@ -431,59 +441,210 @@ jobs:
         ) ||
         (github.event_name == 'workflow_dispatch' && inputs.publish_release)
       }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
     permissions:
       contents: read
       packages: write
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runs_on: '["self-hosted","Linux","X64"]'
+            pytorch_jobs_default: auto
+          - arch: arm64
+            platform: linux/arm64
+            runs_on: '["self-hosted","Linux","ARM64"]'
+            pytorch_jobs_default: "2"
     env:
-      IMAGE_REPO: ghcr.io/${{ github.repository }}
-      RELEASE_TAG: ${{ needs.create-version-tag.outputs.tag }}
       BUILD_VERSION: ${{ needs.version.outputs.build_version }}
+      RELEASE_TAG: ${{ needs.create-version-tag.outputs.tag }}
       COMMIT_SHORT: ${{ needs.version.outputs.commit_short }}
-      RELEASE_REPOSITORY: ${{ github.repository }}
-      RELEASE_TOKEN: ${{ github.token }}
       GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
       GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      GITHUB_TOKEN: ${{ github.token }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Assert GHCR credentials are configured
+      - name: Prepare image metadata
+        id: image
         run: |
-          test -n "${GHCR_USERNAME}" || { echo "GHCR_USERNAME secret is required"; exit 1; }
-          test -n "${GHCR_TOKEN}" || { echo "GHCR_TOKEN secret is required"; exit 1; }
+          set -euo pipefail
+          image_repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          created="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "repo=${image_repo}" >> "${GITHUB_OUTPUT}"
+          echo "arch_tag=${image_repo}:${BUILD_VERSION}-${{ matrix.arch }}" >> "${GITHUB_OUTPUT}"
+          echo "created=${created}" >> "${GITHUB_OUTPUT}"
+
+      - name: Ensure Podman is available
+        run: |
+          set -euo pipefail
+          if ! command -v podman >/dev/null 2>&1; then
+            if command -v sudo >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y podman skopeo jq
+            else
+              echo "::error::Podman is required on the self-hosted runner. Install podman, skopeo and jq, or allow this job to use sudo apt-get."
+              exit 1
+            fi
+          fi
+          podman --version
+          podman info --format '{{.Host.Arch}} {{.Host.Os}}'
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ env.GHCR_USERNAME }}
-          password: ${{ env.GHCR_TOKEN }}
+        run: |
+          set -euo pipefail
+          username="${GHCR_USERNAME:-${GITHUB_ACTOR}}"
+          password="${GHCR_TOKEN:-${GITHUB_TOKEN}}"
+          test -n "${username}" || { echo "::error::No GHCR username available"; exit 1; }
+          test -n "${password}" || { echo "::error::No GHCR token available"; exit 1; }
+          printf '%s' "${password}" | podman login ghcr.io --username "${username}" --password-stdin
 
-      - name: Build and push multi-arch image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Containerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          provenance: false
-          tags: |
-            ${{ env.IMAGE_REPO }}:latest
-            ${{ env.IMAGE_REPO }}:local-dev-current
-            ${{ env.IMAGE_REPO }}:${{ env.RELEASE_TAG }}
-            ${{ env.IMAGE_REPO }}:${{ env.BUILD_VERSION }}
-            ${{ env.IMAGE_REPO }}:${{ env.COMMIT_SHORT }}
-          build-args: |
-            GAIL_VERSION=${{ env.BUILD_VERSION }}
-            GAIL_RELEASE_REPOSITORY=${{ env.RELEASE_REPOSITORY }}
-            GAIL_RELEASE_TOKEN=${{ env.RELEASE_TOKEN }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ env.BUILD_VERSION }}
+      - name: Build and push architecture image with Podman
+        env:
+          IMAGE_REPO: ${{ steps.image.outputs.repo }}
+          ARCH_TAG: ${{ steps.image.outputs.arch_tag }}
+          IMAGE_CREATED: ${{ steps.image.outputs.created }}
+          MATRIX_ARCH: ${{ matrix.arch }}
+          MATRIX_PLATFORM: ${{ matrix.platform }}
+          MATRIX_PYTORCH_JOBS_DEFAULT: ${{ matrix.pytorch_jobs_default }}
+          INPUT_LIBTORCH_ACCELERATOR: >-
+            ${{ github.event_name == 'workflow_dispatch' && inputs.container_libtorch_accelerator || 'cpu' }}
+          INPUT_CONTAINER_NO_CACHE: >-
+            ${{ github.event_name == 'workflow_dispatch' && inputs.container_no_cache || false }}
+        run: |
+          set -euo pipefail
+
+          host_jobs="$(nproc)"
+          build_jobs="${BUILD_JOBS:-${host_jobs}}"
+          cargo_jobs="${CARGO_BUILD_JOBS:-${build_jobs}}"
+
+          if [[ "${MATRIX_PYTORCH_JOBS_DEFAULT}" == "auto" ]]; then
+            pytorch_jobs="${PYTORCH_BUILD_PARALLEL_LEVEL:-${build_jobs}}"
+          else
+            pytorch_jobs="${PYTORCH_BUILD_PARALLEL_LEVEL:-${MATRIX_PYTORCH_JOBS_DEFAULT}}"
+          fi
+
+          no_cache_flag=()
+          if [[ "${INPUT_CONTAINER_NO_CACHE}" == "true" ]]; then
+            no_cache_flag+=(--no-cache)
+          fi
+
+          echo "Building ${ARCH_TAG} on ${MATRIX_PLATFORM} with BUILD_JOBS=${build_jobs}, CARGO_BUILD_JOBS=${cargo_jobs}, PYTORCH_BUILD_PARALLEL_LEVEL=${pytorch_jobs}, LIBTORCH_ACCELERATOR=${INPUT_LIBTORCH_ACCELERATOR}"
+
+          podman build \
+            --platform "${MATRIX_PLATFORM}" \
+            --network=host \
+            --pull \
+            --layers \
+            "${no_cache_flag[@]}" \
+            --build-arg GAIL_VERSION=source \
+            --build-arg BUILD_VERSION="${BUILD_VERSION}" \
+            --build-arg VCS_REF="${GITHUB_SHA}" \
+            --build-arg GITHUB_REPOSITORY="${GITHUB_REPOSITORY}" \
+            --build-arg IMAGE_CREATED="${IMAGE_CREATED}" \
+            --build-arg LIBTORCH_ACCELERATOR="${INPUT_LIBTORCH_ACCELERATOR}" \
+            --build-arg BUILD_JOBS="${build_jobs}" \
+            --build-arg CARGO_BUILD_JOBS="${cargo_jobs}" \
+            --build-arg CMAKE_BUILD_PARALLEL_LEVEL="${build_jobs}" \
+            --build-arg PYTORCH_BUILD_PARALLEL_LEVEL="${pytorch_jobs}" \
+            -f Containerfile \
+            -t "${ARCH_TAG}" \
+            .
+
+          podman push "${ARCH_TAG}"
+
+  publish-container:
+    name: Publish multi-arch container manifest
+    needs:
+      - version
+      - create-version-tag
+      - build-container-arch
+    if: >-
+      ${{
+        (
+          github.event_name == 'push' &&
+          startsWith(github.ref, 'refs/heads/') &&
+          github.ref_name == github.event.repository.default_branch
+        ) ||
+        (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+      }}
+    runs-on: [self-hosted, Linux, X64]
+    permissions:
+      contents: read
+      packages: write
+    env:
+      BUILD_VERSION: ${{ needs.version.outputs.build_version }}
+      RELEASE_TAG: ${{ needs.create-version-tag.outputs.tag }}
+      COMMIT_SHORT: ${{ needs.version.outputs.commit_short }}
+      GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Prepare image metadata
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "repo=${image_repo}" >> "${GITHUB_OUTPUT}"
+
+      - name: Ensure Podman is available
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v podman >/dev/null 2>&1; then
+            if command -v sudo >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y podman skopeo jq
+            else
+              echo "::error::Podman is required on the self-hosted runner. Install podman, skopeo and jq, or allow this job to use sudo apt-get."
+              exit 1
+            fi
+          fi
+          podman --version
+
+      - name: Log in to GHCR
+        shell: bash
+        run: |
+          set -euo pipefail
+          username="${GHCR_USERNAME:-${GITHUB_ACTOR}}"
+          password="${GHCR_TOKEN:-${GITHUB_TOKEN}}"
+          test -n "${username}" || { echo "::error::No GHCR username available"; exit 1; }
+          test -n "${password}" || { echo "::error::No GHCR token available"; exit 1; }
+          printf '%s' "${password}" | podman login ghcr.io --username "${username}" --password-stdin
+
+      - name: Create and push multi-arch manifest
+        shell: bash
+        env:
+          IMAGE_REPO: ${{ steps.image.outputs.repo }}
+        run: |
+          set -euo pipefail
+          manifest_local="gail-manifest-${BUILD_VERSION}"
+          amd64_ref="docker://${IMAGE_REPO}:${BUILD_VERSION}-amd64"
+          arm64_ref="docker://${IMAGE_REPO}:${BUILD_VERSION}-arm64"
+
+          podman manifest rm "${manifest_local}" >/dev/null 2>&1 || true
+          podman manifest create "${manifest_local}"
+          podman manifest add "${manifest_local}" "${amd64_ref}"
+          podman manifest add "${manifest_local}" "${arm64_ref}"
+
+          tags=(
+            "latest"
+            "local-dev-current"
+            "${RELEASE_TAG}"
+            "${BUILD_VERSION}"
+            "${COMMIT_SHORT}"
+          )
+
+          for tag in "${tags[@]}"; do
+            echo "Pushing ${IMAGE_REPO}:${tag}"
+            podman manifest push --all "${manifest_local}" "docker://${IMAGE_REPO}:${tag}"
+          done
