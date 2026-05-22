@@ -381,6 +381,10 @@ RUN set -eu; \
         clang \
         cmake \
         dpkg-dev \
+        libblas-dev \
+        liblapack-dev \
+        libopenblas-dev \
+        libgomp1 \
         libssl-dev \
         ocl-icd-opencl-dev \
         opencl-headers \
@@ -474,6 +478,9 @@ RUN set -eu; \
         jq \
         kmod \
         libgomp1 \
+        libblas-dev \
+        liblapack-dev \
+        libopenblas-dev \
         libssl3 \
         ocl-icd-libopencl1 \
         pciutils \
