@@ -266,8 +266,6 @@ RUN set -eu; \
         caffe2_perf_with_sve="OFF"; \
         caffe2_perf_with_sve256="OFF"; \
         pytorch_use_xnnpack="ON"; \
-        caffe2_perf_with_sve="OFF"; \
-        caffe2_perf_with_sve256="OFF"; \
         pytorch_use_xnnpack="OFF"; \
         pytorch_use_kleidiai="OFF"; \
         if [ "${norm_arch}" = "arm64" ]; then \
@@ -293,7 +291,7 @@ RUN set -eu; \
             case "${LIBTORCH_ARM64_XNNPACK:-auto}" in \
                 auto|"") \
                     if [ "${arm64_sve}" = "true" ]; then \
-                        pytorch_use_xnnpack="ON"; \
+                        pytorch_use_xnnpack="OFF"; \
                     else \
                         pytorch_use_xnnpack="OFF"; \
                     fi; \
@@ -306,7 +304,8 @@ RUN set -eu; \
                     ;; \
             esac; \
         fi; \
-        echo "ARM64 PyTorch CPU features: CAFFE2_PERF_WITH_SVE=${caffe2_perf_with_sve} CAFFE2_PERF_WITH_SVE256=${caffe2_perf_with_sve256} USE_XNNPACK=${pytorch_use_xnnpack} USE_KLEIDIAI=${pytorch_use_kleidiai}"; \        if [ "${pytorch_use_xnnpack}" = "ON" ]; then \
+        echo "ARM64 PyTorch CPU features: CAFFE2_PERF_WITH_SVE=${caffe2_perf_with_sve} CAFFE2_PERF_WITH_SVE256=${caffe2_perf_with_sve256} USE_XNNPACK=${pytorch_use_xnnpack} USE_KLEIDIAI=${pytorch_use_kleidiai}"; \
+        if [ "${pytorch_use_xnnpack}" = "ON" ]; then \
             export USE_XNNPACK=1; \
         else \
             export USE_XNNPACK=0; \
