@@ -615,49 +615,47 @@ RUN set -eu; \
     apt-get purge -y --auto-remove jq; \
     rm -rf /var/lib/apt/lists/*
 
-RUN <<'EOF'
-set -eu
-cat > /usr/local/bin/gail-entrypoint.sh <<'SCRIPT'
-#!/bin/sh
-set -eu
-
-export OCL_ICD_VENDORS="${OCL_ICD_VENDORS:-/etc/OpenCL/vendors}"
-export OPENCL_VENDOR_PATH="${OPENCL_VENDOR_PATH:-/etc/OpenCL/vendors}"
-
-opencl_device_count=0
-if command -v clinfo >/dev/null 2>&1; then
-    opencl_device_count="$(clinfo 2>/dev/null | awk -F: '/Number of devices/ {gsub(/^[[:space:]]+/, "", $2); total += $2} END {print total + 0}')"
-fi
-
-backend="none"
-gpu_available="false"
-opencl_available="false"
-
-if [ "${opencl_device_count:-0}" -gt 0 ]; then
-    opencl_available="true"
-    backend="opencl"
-fi
-
-if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-    gpu_available="true"
-    if [ "${backend}" = "opencl" ]; then backend="cuda+opencl"; else backend="cuda"; fi
-elif ls /dev/nvidia* >/dev/null 2>&1; then
-    gpu_available="true"
-    if [ "${backend}" = "opencl" ]; then backend="nvidia+opencl"; else backend="nvidia"; fi
-elif [ -e /dev/kfd ] || ls /dev/dri/renderD* >/dev/null 2>&1; then
-    gpu_available="true"
-    if [ "${backend}" = "opencl" ]; then backend="drm+opencl"; else backend="drm"; fi
-fi
-
-export GAIL_OPENCL_AVAILABLE="${GAIL_OPENCL_AVAILABLE:-${opencl_available}}"
-export GAIL_OPENCL_DEVICE_COUNT="${GAIL_OPENCL_DEVICE_COUNT:-${opencl_device_count:-0}}"
-export GAIL_GPU_AVAILABLE="${GAIL_GPU_AVAILABLE:-${gpu_available}}"
-export GAIL_GPU_BACKEND="${GAIL_GPU_BACKEND:-${backend}}"
-
-exec /usr/bin/tini -- /usr/bin/gail "$@"
-SCRIPT
-chmod 0755 /usr/local/bin/gail-entrypoint.sh
-EOF
+RUN set -eu; \
+    { \
+        printf '%s\n' '#!/bin/sh'; \
+        printf '%s\n' 'set -eu'; \
+        printf '%s\n' ''; \
+        printf '%s\n' 'export OCL_ICD_VENDORS="${OCL_ICD_VENDORS:-/etc/OpenCL/vendors}"'; \
+        printf '%s\n' 'export OPENCL_VENDOR_PATH="${OPENCL_VENDOR_PATH:-/etc/OpenCL/vendors}"'; \
+        printf '%s\n' ''; \
+        printf '%s\n' 'opencl_device_count=0'; \
+        printf '%s\n' 'if command -v clinfo >/dev/null 2>&1; then'; \
+        printf '%s\n' '    opencl_device_count="$(clinfo 2>/dev/null | awk -F: '\''/Number of devices/ {gsub(/^[[:space:]]+/, "", $2); total += $2} END {print total + 0}'\'')"'; \
+        printf '%s\n' 'fi'; \
+        printf '%s\n' ''; \
+        printf '%s\n' 'backend="none"'; \
+        printf '%s\n' 'gpu_available="false"'; \
+        printf '%s\n' 'opencl_available="false"'; \
+        printf '%s\n' ''; \
+        printf '%s\n' 'if [ "${opencl_device_count:-0}" -gt 0 ]; then'; \
+        printf '%s\n' '    opencl_available="true"'; \
+        printf '%s\n' '    backend="opencl"'; \
+        printf '%s\n' 'fi'; \
+        printf '%s\n' ''; \
+        printf '%s\n' 'if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then'; \
+        printf '%s\n' '    gpu_available="true"'; \
+        printf '%s\n' '    if [ "${backend}" = "opencl" ]; then backend="cuda+opencl"; else backend="cuda"; fi'; \
+        printf '%s\n' 'elif ls /dev/nvidia* >/dev/null 2>&1; then'; \
+        printf '%s\n' '    gpu_available="true"'; \
+        printf '%s\n' '    if [ "${backend}" = "opencl" ]; then backend="nvidia+opencl"; else backend="nvidia"; fi'; \
+        printf '%s\n' 'elif [ -e /dev/kfd ] || ls /dev/dri/renderD* >/dev/null 2>&1; then'; \
+        printf '%s\n' '    gpu_available="true"'; \
+        printf '%s\n' '    if [ "${backend}" = "opencl" ]; then backend="drm+opencl"; else backend="drm"; fi'; \
+        printf '%s\n' 'fi'; \
+        printf '%s\n' ''; \
+        printf '%s\n' 'export GAIL_OPENCL_AVAILABLE="${GAIL_OPENCL_AVAILABLE:-${opencl_available}}"'; \
+        printf '%s\n' 'export GAIL_OPENCL_DEVICE_COUNT="${GAIL_OPENCL_DEVICE_COUNT:-${opencl_device_count:-0}}"'; \
+        printf '%s\n' 'export GAIL_GPU_AVAILABLE="${GAIL_GPU_AVAILABLE:-${gpu_available}}"'; \
+        printf '%s\n' 'export GAIL_GPU_BACKEND="${GAIL_GPU_BACKEND:-${backend}}"'; \
+        printf '%s\n' ''; \
+        printf '%s\n' 'exec /usr/bin/tini -- /usr/bin/gail "$@"'; \
+    } > /usr/local/bin/gail-entrypoint.sh; \
+    chmod 0755 /usr/local/bin/gail-entrypoint.sh
 
 WORKDIR /app
 
