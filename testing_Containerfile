@@ -21,7 +21,7 @@ RUN set -eu; \
         release_version="${GAIL_VERSION#v}"; \
         bash scripts/set-release-version.sh "${release_version}"; \
     fi; \
-    cargo build --locked --release -j 1; \
+    cargo build --locked --release --bins -j 1; \
     package_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)"; \
     deb_version="$(printf '%s' "${package_version}" | sed 's/-/~/g')"; \
     deb_arch="$(dpkg --print-architecture)"; \
@@ -30,6 +30,7 @@ RUN set -eu; \
         --deb-version "${deb_version}" \
         --arch "${deb_arch}" \
         --binary target/release/gail \
+        --trainer-binary target/release/gail-qlora-sft \
         --out-dir /out
 
 FROM docker.io/library/debian:bookworm-slim

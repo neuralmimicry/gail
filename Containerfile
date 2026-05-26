@@ -420,7 +420,7 @@ RUN set -eu; \
             bash scripts/set-release-version.sh "${release_version}"; \
         fi; \
     fi; \
-    cargo build --locked --release -j "${CARGO_BUILD_JOBS}"; \
+    cargo build --locked --release --bins -j "${CARGO_BUILD_JOBS}"; \
     package_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)"; \
     if [ -z "${package_version}" ]; then \
         echo "Could not determine Gail package version from Cargo.toml" >&2; \
@@ -433,6 +433,7 @@ RUN set -eu; \
         --deb-version "${deb_version}" \
         --arch "${deb_arch}" \
         --binary target/release/gail \
+        --trainer-binary target/release/gail-qlora-sft \
         --out-dir /out
 
 FROM docker.io/library/debian:bookworm-slim

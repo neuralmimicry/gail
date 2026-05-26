@@ -423,6 +423,10 @@ jobs:
           [[ "$actual_version" == "$expected_version" ]]
           [[ "$actual_arch" == "$DEB_ARCH" ]]
 
+          dpkg-deb --fsys-tarfile "$deb_path" \
+            | tar -tf - \
+            | grep -qx './usr/bin/gail-qlora-sft'
+
       - name: Smoke test packaged binaries
         if: ${{ matrix.can_execute }}
         env:
@@ -432,6 +436,11 @@ jobs:
           set -euo pipefail
           bin_dir="./target/${RUST_TARGET}/release"
           "${bin_dir}/gail${BINARY_SUFFIX}" --version
+          test -x "${bin_dir}/gail-qlora-sft${BINARY_SUFFIX}"
+
+          archive_path="$(find dist -maxdepth 1 -type f -name 'gail-*.tar.gz' | head -n 1)"
+          [[ -n "$archive_path" ]]
+          tar -tzf "$archive_path" | grep -Eq '/gail-qlora-sft$'
 
       - name: Upload packaged artifacts
         uses: actions/upload-artifact@v7

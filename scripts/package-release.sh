@@ -68,6 +68,8 @@ BUILD_AS_USER="$(nm_resolve_build_user || true)"
 BIN_DIR="$(nm_binary_dir "$REPO_ROOT" "$TARGET_TRIPLE")"
 GAIL_BIN="${BIN_DIR}/gail${BINARY_SUFFIX}"
 GAIL_BIN_NAME="gail${BINARY_SUFFIX}"
+GAIL_QLORA_SFT_BIN="${BIN_DIR}/gail-qlora-sft${BINARY_SUFFIX}"
+GAIL_QLORA_SFT_BIN_NAME="gail-qlora-sft${BINARY_SUFFIX}"
 artifacts=()
 STAGE_ROOT=
 SIGN_DIR=
@@ -108,7 +110,7 @@ run_preflight_checks() {
 build_binaries() {
   run_preflight_checks
   local args cmd
-  args=(cargo build --locked --release --bin gail)
+  args=(cargo build --locked --release --bin gail --bin gail-qlora-sft)
   [[ -n "$TARGET_TRIPLE" ]] && args+=(--target "$TARGET_TRIPLE")
   printf -v cmd '%q ' "${args[@]}"
   cmd="cd $(printf '%q' "$REPO_ROOT") && ${cmd% }"
@@ -153,10 +155,11 @@ create_debian_package() {
   rm -rf "$DEB_STAGE_ROOT"
   install -d -m 0755 "$deb_root/DEBIAN" "$deb_root/usr/bin" "$deb_root/usr/share/doc/gail"
   install -m 0755 "$GAIL_BIN" "$deb_root/usr/bin/gail"
+  install -m 0755 "$GAIL_QLORA_SFT_BIN" "$deb_root/usr/bin/gail-qlora-sft"
   install -m 0644 "$REPO_ROOT/README.md" "$deb_root/usr/share/doc/gail/README.md"
   install -m 0644 "$REPO_ROOT/docs/OPERATIONS.md" "$deb_root/usr/share/doc/gail/OPERATIONS.md"
 
-  depends="$(nm_compute_deb_depends "$deb_root/usr/bin/gail" )"
+  depends="$(nm_compute_deb_depends "$deb_root/usr/bin/gail" "$deb_root/usr/bin/gail-qlora-sft")"
   {
     printf 'Package: gail\n'
     printf 'Version: %s\n' "$deb_version"
@@ -179,6 +182,7 @@ if (( ! SKIP_BUILD )) || [[ ! -x "$GAIL_BIN" ]]; then
 fi
 
 [[ -x "$GAIL_BIN" ]] || nm_die "missing GAIL binary: $GAIL_BIN"
+[[ -x "$GAIL_QLORA_SFT_BIN" ]] || nm_die "missing gail-qlora-sft binary: $GAIL_QLORA_SFT_BIN"
 (( SIGN_UPDATE == 0 )) || [[ -n "${GAIL_UPDATE_KEY:-}" ]] || nm_die "GAIL_UPDATE_KEY must be set when --sign-update is used"
 
 ARCHIVE_BASENAME="gail-${VERSION}-${PLATFORM}"
@@ -191,6 +195,7 @@ CHECKSUM_PATH="${OUTPUT_DIR}/${ARCHIVE_BASENAME}.sha256.txt"
 rm -rf "$STAGE_ROOT"
 install -d -m 0755 "$PAYLOAD_DIR/docs"
 install -m 0755 "$GAIL_BIN" "$PAYLOAD_DIR/$GAIL_BIN_NAME"
+install -m 0755 "$GAIL_QLORA_SFT_BIN" "$PAYLOAD_DIR/$GAIL_QLORA_SFT_BIN_NAME"
 install -m 0644 "$REPO_ROOT/README.md" "$PAYLOAD_DIR/README.md"
 install -m 0644 "$REPO_ROOT/docs/OPERATIONS.md" "$PAYLOAD_DIR/docs/OPERATIONS.md"
 
