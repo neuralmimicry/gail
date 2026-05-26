@@ -10,7 +10,7 @@ use reqwest::{
 use serde_json::Value;
 use tokio::{
     sync::{Semaphore, mpsc, oneshot},
-    time::timeout,
+    time::{sleep, timeout},
 };
 use tracing::warn;
 
@@ -73,6 +73,9 @@ pub struct AarnnMirrorClient {
     sensory_size: usize,
     aer_sensory_base: u32,
     aer_output_base: u32,
+    request_max_attempts: usize,
+    request_backoff: Duration,
+    request_backoff_max: Duration,
 }
 
 impl AarnnMirrorClient {
@@ -89,6 +92,14 @@ impl AarnnMirrorClient {
         let transport = resolve_transport_profile(specialists, &config.specialists);
         let queue_capacity = bridge.queue_capacity.clamp(8, 32_768);
         let worker_count = bridge.worker_count.clamp(1, 128);
+        let request_max_attempts = env_usize_clamped("GAIL_AARNN_MIRROR_MAX_ATTEMPTS", 3, 1, 10);
+        let request_backoff_ms = env_u64_clamped("GAIL_AARNN_MIRROR_BACKOFF_MS", 300, 10, 30_000);
+        let request_backoff_max_ms = env_u64_clamped(
+            "GAIL_AARNN_MIRROR_BACKOFF_MAX_MS",
+            request_backoff_ms.saturating_mul(8),
+            request_backoff_ms,
+            120_000,
+        );
         let (queue_tx, queue_rx) = mpsc::channel(queue_capacity);
         let mirror = Self {
             client,
@@ -114,6 +125,9 @@ impl AarnnMirrorClient {
             sensory_size: transport.sensory_size,
             aer_sensory_base: transport.aer_sensory_base,
             aer_output_base: transport.aer_output_base,
+            request_max_attempts,
+            request_backoff: Duration::from_millis(request_backoff_ms),
+            request_backoff_max: Duration::from_millis(request_backoff_max_ms),
         };
         mirror.start_worker_bus(queue_rx);
         Some(mirror)
@@ -389,11 +403,49 @@ impl AarnnMirrorClient {
         &self,
         request: &AarnnMirrorRequest,
     ) -> Result<AarnnMirrorResponse, String> {
+        let max_attempts = self.request_max_attempts.max(1);
+        let mut last_error = String::new();
+        for attempt in 1..=max_attempts {
+            match self.mirror_once_attempt(request).await {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    last_error = error.message.clone();
+                    let retryable = error.retryable && attempt < max_attempts;
+                    if !retryable {
+                        return Err(error.message);
+                    }
+                    let delay = retry_delay(
+                        self.request_backoff,
+                        self.request_backoff_max,
+                        attempt.saturating_sub(1),
+                    );
+                    warn!(
+                        endpoint = %self.endpoint,
+                        attempt,
+                        max_attempts,
+                        backoff_ms = delay.as_millis() as u64,
+                        error = %error.message,
+                        "AARNN mirror request failed; retrying"
+                    );
+                    sleep(delay).await;
+                }
+            }
+        }
+        Err(last_error)
+    }
+
+    async fn mirror_once_attempt(
+        &self,
+        request: &AarnnMirrorRequest,
+    ) -> Result<AarnnMirrorResponse, MirrorHttpError> {
         let url = format!("{}{}", self.endpoint, AARNN_MIRROR_PATH);
         let response = match self
             .client
             .post(url)
-            .headers(self.headers()?)
+            .headers(
+                self.headers()
+                    .map_err(|error| MirrorHttpError::non_retryable(error.as_str()))?,
+            )
             .timeout(self.timeout)
             .json(request)
             .send()
@@ -401,16 +453,17 @@ impl AarnnMirrorClient {
         {
             Ok(response) => response,
             Err(error) => {
+                let message = error.to_string();
                 adaptive_schema::observe_failure(
                     "aarnn_bridge",
                     "POST",
                     AARNN_MIRROR_PATH,
                     "mirror",
                     None,
-                    &error.to_string(),
+                    &message,
                 )
                 .await;
-                return Err(error.to_string());
+                return Err(MirrorHttpError::retryable(message));
             }
         };
         let status = response.status();
@@ -421,6 +474,7 @@ impl AarnnMirrorClient {
             } else {
                 format!("{status}: {body}")
             };
+            let retryable = mirror_status_retryable(status.as_u16());
             adaptive_schema::observe_failure(
                 "aarnn_bridge",
                 "POST",
@@ -430,7 +484,11 @@ impl AarnnMirrorClient {
                 &message,
             )
             .await;
-            return Err(message);
+            return Err(if retryable {
+                MirrorHttpError::retryable(message)
+            } else {
+                MirrorHttpError::non_retryable(message.as_str())
+            });
         }
         match response.json::<AarnnMirrorResponse>().await {
             Ok(parsed) => {
@@ -455,7 +513,7 @@ impl AarnnMirrorClient {
                     &error.to_string(),
                 )
                 .await;
-                Err(error.to_string())
+                Err(MirrorHttpError::retryable(error.to_string()))
             }
         }
     }
@@ -472,12 +530,61 @@ impl AarnnMirrorClient {
     }
 }
 
+#[derive(Debug)]
+struct MirrorHttpError {
+    message: String,
+    retryable: bool,
+}
+
+impl MirrorHttpError {
+    fn retryable(message: String) -> Self {
+        Self {
+            message,
+            retryable: true,
+        }
+    }
+
+    fn non_retryable(message: &str) -> Self {
+        Self {
+            message: message.to_string(),
+            retryable: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct TransportProfile {
     sensory_size: usize,
     output_size: usize,
     aer_sensory_base: u32,
     aer_output_base: u32,
+}
+
+fn mirror_status_retryable(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn retry_delay(base: Duration, max: Duration, attempt_index: usize) -> Duration {
+    let shift = attempt_index.min(8) as u32;
+    let factor = 2_u32.saturating_pow(shift).max(1);
+    let expanded = base.saturating_mul(factor);
+    if expanded > max { max } else { expanded }
+}
+
+fn env_usize_clamped(name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(min, max.max(min))
+}
+
+fn env_u64_clamped(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+        .clamp(min, max.max(min))
 }
 
 fn resolve_endpoint(
@@ -656,6 +763,9 @@ mod tests {
             sensory_size: 32,
             aer_sensory_base: 4096,
             aer_output_base: 16384,
+            request_max_attempts: 1,
+            request_backoff: Duration::from_millis(10),
+            request_backoff_max: Duration::from_millis(50),
         };
         let promoted = AarnnMirrorInvocationTrace {
             direction: AarnnMirrorDirection::Output,

@@ -158,7 +158,9 @@ async fn run_training_pipeline(
         "started_ts": now_ts(),
     });
     let training_invocation =
-        resolve_training_invocation(trainer, hardware, snapshot_id, dataset_path, snapshot_dir);
+        resolve_training_invocation(trainer, hardware, snapshot_id, dataset_path, snapshot_dir)
+            .await?;
+    let mut training_executed = false;
     if let Some(command_line) = training_invocation {
         let command_output = execute_training_command(
             command_line.as_str(),
@@ -174,15 +176,20 @@ async fn run_training_pipeline(
         pipeline_report["training_stderr_tail"] = json!(command_output.stderr);
         pipeline_report["training_exit_code"] = json!(command_output.exit_code);
         pipeline_report["training_runtime_seconds"] = json!(command_output.runtime_seconds);
+        training_executed = true;
     } else {
-        pipeline_report["training_command"] =
-            json!("skipped: unsupported algorithm and trainer.command_template is unset");
+        pipeline_report["training_command"] = json!(
+            "skipped: trainer command unresolved (unsupported algorithm, command_template unset, or Rust qlora model artifacts missing)"
+        );
     }
     let mut snapshot_tag = format!("{}:{}", trainer.model_prefix, snapshot_id);
-    if trainer.register_with_ollama {
+    if trainer.register_with_ollama && training_executed {
         register_snapshot_with_ollama(trainer, snapshot_id, snapshot_dir).await?;
         rotate_ollama_models(trainer).await?;
         snapshot_tag = trainer.model_alias.clone();
+    } else if trainer.register_with_ollama {
+        pipeline_report["ollama_registration"] =
+            json!("skipped: no training command executed for this snapshot");
     }
     pipeline_report["snapshot_tag"] = json!(snapshot_tag);
     pipeline_report["finished_ts"] = json!(now_ts());
@@ -328,9 +335,10 @@ where
     let mut lines = BufReader::new(reader).lines();
     let mut tail = String::new();
     while let Ok(Some(line)) = lines.next_line().await {
-        match target {
-            "trainer.stderr" => tracing::warn!(target = target, "{}", line),
-            _ => tracing::info!(target = target, "{}", line),
+        if target.ends_with(".stderr") {
+            tracing::warn!(target = target, "{}", line);
+        } else {
+            tracing::info!(target = target, "{}", line);
         }
         tail.push_str(&line);
         tail.push('\n');
@@ -348,22 +356,22 @@ where
     tail
 }
 
-fn resolve_training_invocation(
+async fn resolve_training_invocation(
     trainer: &TrainerConfig,
     hardware: &HardwareProfile,
     snapshot_id: &str,
     dataset_path: &Path,
     snapshot_dir: &Path,
-) -> Option<String> {
+) -> Result<Option<String>> {
     if let Some(command_template) = trainer.command_template.as_deref() {
-        return Some(render_training_command(
+        return Ok(Some(render_training_command(
             command_template,
             trainer,
             hardware,
             snapshot_id,
             dataset_path,
             snapshot_dir,
-        ));
+        )));
     }
 
     if matches!(trainer.algorithm.as_str(), "qlora_sft" | "lora_sft") {
@@ -375,19 +383,452 @@ fn resolve_training_invocation(
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| trainer.ollama_base_model.clone());
-        return Some(format!(
-            "{} --dataset {} --output {} --algorithm {} --base-model {} --timeout-seconds {}",
+        let (model_module, tokenizer) =
+            ensure_torchscript_artifacts(trainer, base_model.as_str(), dataset_path).await?;
+
+        return Ok(Some(format!(
+            "{} --dataset {} --output {} --algorithm {} --base-model {} --model-module {} --tokenizer {} --timeout-seconds {}",
             shell_escape(runner.as_str()),
             shell_escape(&dataset_path.to_string_lossy()),
             shell_escape(&snapshot_dir.to_string_lossy()),
             shell_escape(trainer.algorithm.as_str()),
             shell_escape(base_model.as_str()),
+            shell_escape(&model_module.to_string_lossy()),
+            shell_escape(&tokenizer.to_string_lossy()),
             trainer.command_timeout_seconds.max(1),
-        ));
+        )));
     }
 
-    None
+    Ok(None)
 }
+
+async fn ensure_torchscript_artifacts(
+    trainer: &TrainerConfig,
+    base_model: &str,
+    dataset_path: &Path,
+) -> Result<(PathBuf, PathBuf)> {
+    let explicit_model_module = std::env::var("GAIL_TCH_MODEL_MODULE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let explicit_tokenizer = std::env::var("GAIL_TCH_TOKENIZER")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let has_explicit_overrides = explicit_model_module.is_some() || explicit_tokenizer.is_some();
+
+    let model_module =
+        explicit_model_module.unwrap_or_else(|| default_model_module_path(trainer, base_model));
+    let tokenizer =
+        explicit_tokenizer.unwrap_or_else(|| default_tokenizer_path(trainer, base_model));
+    if model_module.exists() && tokenizer.exists() {
+        return Ok((model_module, tokenizer));
+    }
+    if has_explicit_overrides {
+        return Err(GailError::invalid_config(format!(
+            "TorchScript model module/tokenizer not found (model_module={}, tokenizer={}). Verify GAIL_TCH_MODEL_MODULE and GAIL_TCH_TOKENIZER.",
+            model_module.display(),
+            tokenizer.display()
+        )));
+    }
+
+    bootstrap_torchscript_artifacts(trainer, base_model, dataset_path, &model_module, &tokenizer)
+        .await?;
+    if model_module.exists() && tokenizer.exists() {
+        return Ok((model_module, tokenizer));
+    }
+    Err(GailError::invalid_config(format!(
+        "TorchScript bootstrap completed without required artifacts (model_module={}, tokenizer={})",
+        model_module.display(),
+        tokenizer.display()
+    )))
+}
+
+async fn bootstrap_torchscript_artifacts(
+    trainer: &TrainerConfig,
+    base_model: &str,
+    dataset_path: &Path,
+    model_module: &Path,
+    tokenizer: &Path,
+) -> Result<()> {
+    if let Some(parent) = model_module.parent() {
+        fs::create_dir_all(parent).await.map_err(|error| {
+            GailError::invalid_config(format!(
+                "failed to create TorchScript model directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    if let Some(parent) = tokenizer.parent() {
+        fs::create_dir_all(parent).await.map_err(|error| {
+            GailError::invalid_config(format!(
+                "failed to create tokenizer directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let bootstrap_python = bootstrap_python_binary();
+    let bootstrap_script_path = PathBuf::from("/tmp/gail_torchscript_bootstrap.py");
+    let timeout_seconds = bootstrap_timeout_seconds();
+    let hidden_size = bootstrap_env_usize("GAIL_TCH_BOOTSTRAP_HIDDEN_SIZE", 192, 64, 2048);
+    let lora_rank = bootstrap_env_usize("GAIL_TCH_BOOTSTRAP_LORA_RANK", 16, 1, 512);
+    let vocab_size = bootstrap_env_usize("GAIL_TCH_BOOTSTRAP_VOCAB_SIZE", 8_192, 256, 65_536);
+    let hf_model_hint = bootstrap_hf_model_hint(base_model);
+    tracing::info!(
+        algorithm = %trainer.algorithm,
+        base_model = %base_model,
+        model_module = %model_module.display(),
+        tokenizer = %tokenizer.display(),
+        python = %bootstrap_python,
+        timeout_seconds,
+        hidden_size,
+        lora_rank,
+        vocab_size,
+        hf_model_hint = hf_model_hint.as_deref().unwrap_or(""),
+        "TorchScript artifacts missing; bootstrapping local loss-mode module and tokenizer"
+    );
+    fs::write(&bootstrap_script_path, TORCHSCRIPT_BOOTSTRAP_PYTHON)
+        .await
+        .map_err(|error| {
+            GailError::invalid_config(format!(
+                "failed to write TorchScript bootstrap script {}: {error}",
+                bootstrap_script_path.display()
+            ))
+        })?;
+
+    let started = tokio::time::Instant::now();
+    let mut command = Command::new(bootstrap_python.as_str());
+    command
+        .arg(&bootstrap_script_path)
+        .arg("--base-model")
+        .arg(base_model)
+        .arg("--dataset")
+        .arg(dataset_path)
+        .arg("--model-module")
+        .arg(model_module)
+        .arg("--tokenizer")
+        .arg(tokenizer)
+        .arg("--hidden-size")
+        .arg(hidden_size.to_string())
+        .arg("--lora-rank")
+        .arg(lora_rank.to_string())
+        .arg("--vocab-size")
+        .arg(vocab_size.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(hf_model_hint) = hf_model_hint.as_deref() {
+        command.arg("--hf-model").arg(hf_model_hint);
+    }
+    let mut child = command.spawn().map_err(|error| {
+        GailError::invalid_config(format!(
+            "failed to spawn TorchScript bootstrap command: {error}"
+        ))
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        GailError::invalid_config("failed to capture TorchScript bootstrap stdout".to_string())
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        GailError::invalid_config("failed to capture TorchScript bootstrap stderr".to_string())
+    })?;
+    let stdout_task = tokio::spawn(stream_child_output("torchscript.bootstrap.stdout", stdout));
+    let stderr_task = tokio::spawn(stream_child_output("torchscript.bootstrap.stderr", stderr));
+
+    let status =
+        match tokio::time::timeout(Duration::from_secs(timeout_seconds), child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                return Err(GailError::invalid_config(format!(
+                    "TorchScript bootstrap command failed to execute: {error}"
+                )));
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                return Err(GailError::invalid_config(format!(
+                    "TorchScript bootstrap timed out after {timeout_seconds}s"
+                )));
+            }
+        };
+    let stdout = stdout_task.await.map_err(|error| {
+        GailError::invalid_config(format!(
+            "TorchScript bootstrap stdout reader failed: {error}"
+        ))
+    })?;
+    let stderr = stderr_task.await.map_err(|error| {
+        GailError::invalid_config(format!(
+            "TorchScript bootstrap stderr reader failed: {error}"
+        ))
+    })?;
+    if !status.success() {
+        let exit_code = status.code().unwrap_or(-1);
+        return Err(GailError::invalid_config(format!(
+            "TorchScript bootstrap failed with status {exit_code}: {}",
+            truncate_chars(&stderr, 1_200)
+        )));
+    }
+    tracing::info!(
+        runtime_seconds = started.elapsed().as_secs_f64(),
+        model_module = %model_module.display(),
+        tokenizer = %tokenizer.display(),
+        stdout_tail = %truncate_chars(&stdout, 400),
+        "TorchScript bootstrap completed"
+    );
+    Ok(())
+}
+
+fn bootstrap_python_binary() -> String {
+    std::env::var("GAIL_TCH_BOOTSTRAP_PYTHON")
+        .ok()
+        .or_else(|| std::env::var("GAIL_PYTHON").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "python3".to_string())
+}
+
+fn bootstrap_timeout_seconds() -> u64 {
+    std::env::var("GAIL_TCH_BOOTSTRAP_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(900)
+        .max(30)
+}
+
+fn bootstrap_env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(min, max.max(min))
+}
+
+fn bootstrap_hf_model_hint(base_model: &str) -> Option<String> {
+    std::env::var("GAIL_TCH_BOOTSTRAP_HF_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| mapped_hf_model(base_model).map(ToOwned::to_owned))
+}
+
+fn mapped_hf_model(base_model: &str) -> Option<&'static str> {
+    match base_model.trim().to_ascii_lowercase().as_str() {
+        "qwen2.5-coder:0.5b" => Some("Qwen/Qwen2.5-Coder-0.5B"),
+        "qwen2.5-coder:1.5b" => Some("Qwen/Qwen2.5-Coder-1.5B"),
+        "qwen2.5-coder:3b" => Some("Qwen/Qwen2.5-Coder-3B"),
+        "qwen2.5-coder:7b" => Some("Qwen/Qwen2.5-Coder-7B"),
+        "qwen2.5:0.5b" => Some("Qwen/Qwen2.5-0.5B"),
+        "qwen2.5:1.5b" => Some("Qwen/Qwen2.5-1.5B"),
+        "qwen2.5:3b" => Some("Qwen/Qwen2.5-3B"),
+        "qwen2.5:7b" => Some("Qwen/Qwen2.5-7B"),
+        _ => None,
+    }
+}
+
+const TORCHSCRIPT_BOOTSTRAP_PYTHON: &str = r#"
+import argparse
+import json
+import shutil
+import sys
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def clean_text(value):
+    return " ".join(str(value or "").split())
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Bootstrap TorchScript trainer artifacts")
+    parser.add_argument("--base-model", required=True)
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--model-module", required=True)
+    parser.add_argument("--tokenizer", required=True)
+    parser.add_argument("--hidden-size", type=int, default=192)
+    parser.add_argument("--lora-rank", type=int, default=16)
+    parser.add_argument("--vocab-size", type=int, default=8192)
+    parser.add_argument("--hf-model", default="")
+    return parser.parse_args()
+
+
+def read_dataset_texts(dataset_path):
+    texts = []
+    path = Path(dataset_path)
+    if not path.exists():
+        return texts
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                row = json.loads(raw)
+            except Exception:
+                continue
+            messages = row.get("messages") or []
+            if not isinstance(messages, list):
+                continue
+            chunks = []
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                role = clean_text(message.get("role", "user")).lower() or "user"
+                content = clean_text(message.get("content", ""))
+                if content:
+                    chunks.append(f"<|{role}|> {content}")
+            rendered = " ".join(chunks).strip()
+            if rendered:
+                texts.append(rendered)
+    return texts
+
+
+def tokenizer_candidates(base_model, explicit_hf_model):
+    candidates = []
+    if explicit_hf_model:
+        candidates.append(explicit_hf_model.strip())
+    raw = (base_model or "").strip()
+    mapped = {
+        "qwen2.5-coder:0.5b": "Qwen/Qwen2.5-Coder-0.5B",
+        "qwen2.5-coder:1.5b": "Qwen/Qwen2.5-Coder-1.5B",
+        "qwen2.5-coder:3b": "Qwen/Qwen2.5-Coder-3B",
+        "qwen2.5-coder:7b": "Qwen/Qwen2.5-Coder-7B",
+        "qwen2.5:0.5b": "Qwen/Qwen2.5-0.5B",
+        "qwen2.5:1.5b": "Qwen/Qwen2.5-1.5B",
+        "qwen2.5:3b": "Qwen/Qwen2.5-3B",
+        "qwen2.5:7b": "Qwen/Qwen2.5-7B",
+    }.get(raw.lower())
+    if mapped:
+        candidates.append(mapped)
+    if "/" in raw:
+        candidates.append(raw)
+    ordered = []
+    seen = set()
+    for candidate in candidates:
+        value = candidate.strip()
+        if value and value not in seen:
+            seen.add(value)
+            ordered.append(value)
+    return ordered
+
+
+def ensure_tokenizer(tokenizer_path, dataset_path, target_vocab_size, base_model, explicit_hf_model):
+    from tokenizers import Tokenizer, models, normalizers, pre_tokenizers, trainers
+
+    tokenizer_path = Path(tokenizer_path)
+    tokenizer_path.parent.mkdir(parents=True, exist_ok=True)
+    if tokenizer_path.exists():
+        existing = Tokenizer.from_file(str(tokenizer_path))
+        return max(256, int(existing.get_vocab_size()))
+
+    for candidate in tokenizer_candidates(base_model, explicit_hf_model):
+        try:
+            from transformers import AutoTokenizer
+            hf_tokenizer = AutoTokenizer.from_pretrained(candidate, trust_remote_code=True)
+            if hf_tokenizer.pad_token is None and hf_tokenizer.eos_token is not None:
+                hf_tokenizer.pad_token = hf_tokenizer.eos_token
+            hf_tokenizer.save_pretrained(str(tokenizer_path.parent))
+            generated = tokenizer_path.parent / "tokenizer.json"
+            if generated.exists():
+                if generated.resolve() != tokenizer_path.resolve():
+                    shutil.copy2(generated, tokenizer_path)
+                size = int(getattr(hf_tokenizer, "vocab_size", 0) or len(hf_tokenizer))
+                return max(256, size)
+        except Exception as exc:
+            print(
+                f"torchscript.bootstrap tokenizer candidate failed: {candidate}: {exc}",
+                file=sys.stderr,
+            )
+
+    texts = read_dataset_texts(dataset_path)
+    if not texts:
+        texts = ["<|user|> hello <|assistant|> hello"]
+    tokenizer = Tokenizer(models.WordLevel(unk_token="[UNK]"))
+    tokenizer.normalizer = normalizers.NFKC()
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    trainer = trainers.WordLevelTrainer(
+        vocab_size=max(256, int(target_vocab_size)),
+        special_tokens=["[UNK]", "[PAD]", "[BOS]", "[EOS]", "<|system|>", "<|user|>", "<|assistant|>"],
+    )
+    tokenizer.train_from_iterator(texts, trainer=trainer)
+    tokenizer.save(str(tokenizer_path))
+    return max(256, int(tokenizer.get_vocab_size()))
+
+
+class GailTorchscriptLossModule(nn.Module):
+    def __init__(self, vocab_size, hidden_size, lora_rank):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, hidden_size)
+        self.proj = nn.Linear(hidden_size, hidden_size)
+        self.lora_down = nn.Parameter(torch.zeros(hidden_size, lora_rank))
+        self.lora_up = nn.Parameter(torch.zeros(lora_rank, hidden_size))
+        nn.init.normal_(self.lora_down, mean=0.0, std=0.02)
+        nn.init.zeros_(self.lora_up)
+        self.scale = 1.0 / float(max(1, lora_rank))
+        self.embed.weight.requires_grad = False
+        self.proj.weight.requires_grad = False
+        self.proj.bias.requires_grad = False
+
+    def forward(self, input_ids: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        hidden = torch.tanh(self.proj(self.embed(input_ids)))
+        delta = torch.matmul(torch.matmul(hidden, self.lora_down), self.lora_up) * self.scale
+        logits = torch.matmul(hidden + delta, self.embed.weight.t())
+        if logits.size(1) < 2:
+            return logits.sum() * 0.0
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        return F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
+
+
+def main():
+    args = parse_args()
+    model_module = Path(args.model_module)
+    tokenizer = Path(args.tokenizer)
+    model_module.parent.mkdir(parents=True, exist_ok=True)
+    tokenizer.parent.mkdir(parents=True, exist_ok=True)
+
+    vocab_size = ensure_tokenizer(
+        tokenizer,
+        args.dataset,
+        args.vocab_size,
+        args.base_model,
+        args.hf_model.strip(),
+    )
+    module = GailTorchscriptLossModule(
+        vocab_size=max(256, int(vocab_size)),
+        hidden_size=max(64, int(args.hidden_size)),
+        lora_rank=max(1, int(args.lora_rank)),
+    )
+    scripted = torch.jit.script(module)
+    scripted.save(str(model_module))
+
+    print(
+        json.dumps(
+            {
+                "model_module": str(model_module),
+                "tokenizer": str(tokenizer),
+                "vocab_size": int(vocab_size),
+                "hidden_size": int(args.hidden_size),
+                "lora_rank": int(args.lora_rank),
+            }
+        )
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"TorchScript bootstrap failed: {exc}", file=sys.stderr)
+        raise
+"#;
 
 fn shell_escape(value: &str) -> String {
     if value.chars().all(|ch| {
@@ -422,17 +863,44 @@ async fn register_snapshot_with_ollama(
         rendered
     };
     let client = ollama_api_client();
-    ollama_api_post(
+    let create_result = ollama_api_post(
         &client,
         trainer,
         "create",
         &json!({
-            "model": tagged_model,
-            "modelfile": modelfile,
+            "model": tagged_model.as_str(),
+            "modelfile": modelfile.as_str(),
             "stream": false
         }),
     )
-    .await?;
+    .await;
+    if let Err(error) = create_result {
+        let error_text = error.to_string();
+        if error_text.contains("neither 'from' or 'files'") {
+            tracing::warn!(
+                model = %tagged_model,
+                error = %error_text,
+                "Ollama create rejected Modelfile payload; retrying with from-based payload"
+            );
+            ollama_api_post(
+                &client,
+                trainer,
+                "create",
+                &json!({
+                    "model": tagged_model.as_str(),
+                    "from": trainer.ollama_base_model.as_str(),
+                    "system": format!(
+                        "You are the Gail in-house continuously trained model snapshot {}.",
+                        snapshot_id
+                    ),
+                    "stream": false
+                }),
+            )
+            .await?;
+        } else {
+            return Err(error);
+        }
+    }
     ollama_api_post(
         &client,
         trainer,
@@ -575,6 +1043,55 @@ fn render_training_command(
             &hardware.preferred_worker_threads().to_string(),
         )
         .replace("{gpu_count}", &hardware.gpu_count().to_string())
+}
+
+fn default_model_module_path(trainer: &TrainerConfig, base_model: &str) -> PathBuf {
+    let path = PathBuf::from(base_model);
+    if path.is_file() || base_model.trim().ends_with(".pt") {
+        return path;
+    }
+    if path.is_dir() {
+        return path.join("model_train.pt");
+    }
+    torchscript_cache_root(trainer, base_model).join("model_train.pt")
+}
+
+fn default_tokenizer_path(trainer: &TrainerConfig, base_model: &str) -> PathBuf {
+    let path = PathBuf::from(base_model);
+    if path.is_dir() {
+        return path.join("tokenizer.json");
+    }
+    if path.is_file() {
+        return path
+            .parent()
+            .map(|parent| parent.join("tokenizer.json"))
+            .unwrap_or_else(|| PathBuf::from("tokenizer.json"));
+    }
+    torchscript_cache_root(trainer, base_model).join("tokenizer.json")
+}
+
+fn torchscript_cache_root(trainer: &TrainerConfig, base_model: &str) -> PathBuf {
+    let sanitized = sanitize_path_component(base_model);
+    PathBuf::from(trainer.output_root.as_str())
+        .join("torchscript")
+        .join(sanitized)
+}
+
+fn sanitize_path_component(value: &str) -> String {
+    let mut rendered = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            rendered.push(ch);
+        } else {
+            rendered.push('_');
+        }
+    }
+    let trimmed = rendered.trim_matches('_');
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn truncate_chars(value: &str, limit: usize) -> String {

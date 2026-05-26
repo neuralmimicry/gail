@@ -483,99 +483,137 @@ impl OctobotClient {
         let baseline = self.capture_order_baseline().await;
         let request_started_at = current_unix_timestamp_f64();
 
-        let canonical_order = json!({
-            "exchange": exchange,
-            "symbol": symbol,
-            "side": normalized_side,
-            "type": "market",
-            "order_type": "market",
-            "amount": rounded_amount,
-            "amount_usd": rounded_amount,
-            "price": serde_json::Value::Null,
-        });
-
         let preferred_mode = { *self.preferred_order_submission_mode.lock().await };
 
         let modes = ordered_submission_modes(preferred_mode);
         let mut attempts = Vec::new();
+        let mut submission_amount = rounded_amount;
+        let mut allow_sell_retry = normalized_side == "sell";
 
-        for mode in modes {
-            let (path, payload, label) = build_order_submission(
-                mode,
-                exchange,
-                symbol,
-                normalized_side,
-                rounded_amount,
-                &canonical_order,
-            );
+        loop {
+            let canonical_order = json!({
+                "exchange": exchange,
+                "symbol": symbol,
+                "side": normalized_side,
+                "type": "market",
+                "order_type": "market",
+                "amount": submission_amount,
+                "amount_usd": submission_amount,
+                "price": serde_json::Value::Null,
+            });
 
-            match self
-                .attempt_order_submission(
+            let mut saw_portfolio_negative_rejection = false;
+
+            for mode in modes.iter().copied() {
+                let (path, payload, label) = build_order_submission(
                     mode,
-                    path,
-                    &payload,
-                    label,
                     exchange,
                     symbol,
                     normalized_side,
-                    rounded_amount,
-                    &baseline,
-                    request_started_at,
-                    &mut attempts,
-                )
-                .await?
-            {
-                OrderSubmissionAttempt::Accepted(result) => {
-                    {
-                        let mut preferred = self.preferred_order_submission_mode.lock().await;
-                        *preferred = Some(mode);
+                    submission_amount,
+                    &canonical_order,
+                );
+
+                match self
+                    .attempt_order_submission(
+                        mode,
+                        path,
+                        &payload,
+                        label,
+                        exchange,
+                        symbol,
+                        normalized_side,
+                        submission_amount,
+                        &baseline,
+                        request_started_at,
+                        &mut attempts,
+                    )
+                    .await?
+                {
+                    OrderSubmissionAttempt::Accepted(result) => {
+                        {
+                            let mut preferred = self.preferred_order_submission_mode.lock().await;
+                            *preferred = Some(mode);
+                        }
+
+                        debug!(
+                            ?mode,
+                            exchange = %exchange,
+                            symbol = %symbol,
+                            side = %normalized_side,
+                            amount_usd = submission_amount,
+                            "trading: selected OctoBot order submission mode"
+                        );
+
+                        return Ok(result);
                     }
 
-                    debug!(
-                        ?mode,
-                        exchange = %exchange,
-                        symbol = %symbol,
-                        side = %normalized_side,
-                        amount_usd = rounded_amount,
-                        "trading: selected OctoBot order submission mode"
-                    );
+                    OrderSubmissionAttempt::Rejected => {
+                        debug!(
+                            ?mode,
+                            exchange = %exchange,
+                            symbol = %symbol,
+                            side = %normalized_side,
+                            amount_usd = submission_amount,
+                            "trading: OctoBot order submission mode rejected order; trying next candidate"
+                        );
+                    }
 
-                    return Ok(result);
-                }
+                    OrderSubmissionAttempt::RejectedPortfolioNegative => {
+                        saw_portfolio_negative_rejection = true;
+                        warn!(
+                            ?mode,
+                            exchange = %exchange,
+                            symbol = %symbol,
+                            side = %normalized_side,
+                            amount_usd = submission_amount,
+                            "trading: OctoBot rejected sell order due to portfolio precision/availability; trying next candidate"
+                        );
+                    }
 
-                OrderSubmissionAttempt::Rejected => {
-                    debug!(
-                        ?mode,
-                        exchange = %exchange,
-                        symbol = %symbol,
-                        side = %normalized_side,
-                        amount_usd = rounded_amount,
-                        "trading: OctoBot order submission mode rejected order; trying next candidate"
-                    );
-                }
+                    OrderSubmissionAttempt::AmbiguousAccepted => {
+                        warn!(
+                            ?mode,
+                            exchange = %exchange,
+                            symbol = %symbol,
+                            side = %normalized_side,
+                            amount_usd = submission_amount,
+                            "trading: OctoBot order endpoint returned success without acknowledgement; refusing fallback to avoid duplicate order"
+                        );
 
-                OrderSubmissionAttempt::AmbiguousAccepted => {
-                    warn!(
-                        ?mode,
-                        exchange = %exchange,
-                        symbol = %symbol,
-                        side = %normalized_side,
-                        amount_usd = rounded_amount,
-                        "trading: OctoBot order endpoint returned success without acknowledgement; refusing fallback to avoid duplicate order"
-                    );
-
-                    return Err(format!(
-                        "OctoBot order submission via {mode:?} returned HTTP success but no order acknowledgement or observable side-effect. Refusing to try additional mutating endpoints to avoid duplicate orders. Tried: {}",
-                        attempts.join(" | ")
-                    ));
+                        return Err(format!(
+                            "OctoBot order submission via {mode:?} returned HTTP success but no order acknowledgement or observable side-effect. Refusing to try additional mutating endpoints to avoid duplicate orders. Tried: {}",
+                            attempts.join(" | ")
+                        ));
+                    }
                 }
             }
-        }
 
-        Err(format!(
-            "OctoBot order placement failed for {exchange} {symbol} {normalized_side} ${rounded_amount:.2}. Tried: {}",
-            attempts.join(" | ")
-        ))
+            if allow_sell_retry
+                && saw_portfolio_negative_rejection
+                && let Some(retry_amount) = reduced_sell_retry_amount(submission_amount)
+            {
+                attempts.push(format!(
+                    "sell-retry amount_usd={submission_amount:.2}->{retry_amount:.2} after portfolio-negative rejection"
+                ));
+                warn!(
+                    exchange = %exchange,
+                    symbol = %symbol,
+                    side = %normalized_side,
+                    amount_usd = submission_amount,
+                    retry_amount_usd = retry_amount,
+                    "trading: retrying sell order with reduced amount after portfolio-negative rejection"
+                );
+                submission_amount = retry_amount;
+                allow_sell_retry = false;
+                continue;
+            }
+
+            return Err(format!(
+                "OctoBot order placement failed for {exchange} {symbol} {normalized_side} ${submission_amount:.2}. Tried: {}",
+                attempts.join(" | ")
+            ));
+        }
     }
 
     pub async fn cancel_order(&self, order_id: &str) -> Result<(), String> {
@@ -610,10 +648,11 @@ impl OctobotClient {
         let (status, body) = self.post_json_with_status(path, payload, label).await?;
 
         if !status.is_success() {
+            let summarized = summarize_order_attempt_body(&body);
             attempts.push(format!(
                 "{mode:?} {path} => HTTP {} {}",
                 status.as_u16(),
-                summarize_order_attempt_body(&body)
+                summarized
             ));
 
             // If the cached preferred mode starts failing, forget it so future
@@ -621,6 +660,12 @@ impl OctobotClient {
             let mut preferred = self.preferred_order_submission_mode.lock().await;
             if *preferred == Some(mode) {
                 *preferred = None;
+            }
+
+            if normalize_order_side(side) == Some("sell")
+                && body_has_portfolio_negative_rejection(&body)
+            {
+                return Ok(OrderSubmissionAttempt::RejectedPortfolioNegative);
             }
 
             return Ok(OrderSubmissionAttempt::Rejected);
@@ -656,8 +701,9 @@ impl OctobotClient {
         }
 
         attempts.push(format!(
-            "{mode:?} {path} => HTTP {} without order acknowledgement",
-            status.as_u16()
+            "{mode:?} {path} => HTTP {} without order acknowledgement ({})",
+            status.as_u16(),
+            summarize_order_attempt_body(&body)
         ));
 
         Ok(OrderSubmissionAttempt::AmbiguousAccepted)
@@ -950,6 +996,10 @@ enum OrderSubmissionAttempt {
     /// The endpoint clearly rejected the order, usually via non-2xx HTTP.
     Rejected,
 
+    /// The endpoint rejected a sell request with a portfolio precision/
+    /// availability error. This is safe to retry once with a smaller amount.
+    RejectedPortfolioNegative,
+
     /// The endpoint returned HTTP 2xx but did not provide a parseable order
     /// acknowledgement and no side-effect was observed within the polling
     /// window.
@@ -961,17 +1011,17 @@ enum OrderSubmissionAttempt {
 
 fn default_order_submission_mode_candidates() -> Vec<OctobotOrderSubmissionMode> {
     vec![
-        // In your current deployment, /api/user_command reaches OctoBot while
-        // /api/orders variants are returning HTTP 500, so user_command is a
-        // better discovery starting point.
-        OctobotOrderSubmissionMode::UserCommandTrading,
-        OctobotOrderSubmissionMode::UserCommandGailTrading,
-        OctobotOrderSubmissionMode::UserCommandTradingBridge,
-        // Keep direct modes as fallbacks for native/custom OctoBot deployments.
+        // Prefer native trading endpoints first: they synchronously return
+        // explicit success/failure payloads for order creation.
         OctobotOrderSubmissionMode::DirectCreateOrder,
         OctobotOrderSubmissionMode::DirectCreateOrders,
         OctobotOrderSubmissionMode::DirectOrdersActionBody,
         OctobotOrderSubmissionMode::DirectOrdersCanonicalBody,
+        // `/api/user_command` is asynchronous and often returns only an echo
+        // payload with HTTP 200, so treat it as a fallback path.
+        OctobotOrderSubmissionMode::UserCommandTrading,
+        OctobotOrderSubmissionMode::UserCommandGailTrading,
+        OctobotOrderSubmissionMode::UserCommandTradingBridge,
     ]
 }
 
@@ -1141,6 +1191,12 @@ fn summarize_order_attempt_body(body: &Value) -> String {
             }
         }
         Value::Object(object) => {
+            if let Some(message) = extract_attempt_message(body) {
+                let compact = message.replace('\n', " ").trim().to_string();
+                if !compact.is_empty() {
+                    return format!("message={}", compact.chars().take(120).collect::<String>());
+                }
+            }
             if object.is_empty() {
                 "empty-object".to_string()
             } else {
@@ -1150,6 +1206,46 @@ fn summarize_order_attempt_body(body: &Value) -> String {
         }
         Value::Array(array) => format!("array(len={})", array.len()),
         _ => format!("{}-body", body.as_str().unwrap_or("scalar")),
+    }
+}
+
+fn extract_attempt_message(body: &Value) -> Option<String> {
+    match body {
+        Value::String(text) => Some(text.clone()),
+        Value::Object(object) => {
+            for key in ["message", "error", "detail", "details", "reason"] {
+                if let Some(value) = object.get(key)
+                    && let Some(message) = extract_attempt_message(value)
+                    && !message.trim().is_empty()
+                {
+                    return Some(message);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items.iter().find_map(extract_attempt_message),
+        _ => None,
+    }
+}
+
+fn body_has_portfolio_negative_rejection(body: &Value) -> bool {
+    extract_attempt_message(body).is_some_and(|message| {
+        let lowered = message.to_ascii_lowercase();
+        lowered.contains("portfolionegativevalueerror")
+            || (lowered.contains("trying to update") && lowered.contains("quantity was"))
+    })
+}
+
+fn reduced_sell_retry_amount(current_amount_usd: f64) -> Option<f64> {
+    if !current_amount_usd.is_finite() || current_amount_usd <= 0.01 {
+        return None;
+    }
+
+    let reduced = ((current_amount_usd * 0.95) * 100.0).round() / 100.0;
+    if reduced >= 0.01 && reduced + f64::EPSILON < current_amount_usd {
+        Some(reduced)
+    } else {
+        None
     }
 }
 

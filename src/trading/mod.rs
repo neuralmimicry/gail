@@ -737,6 +737,60 @@ async fn execute_if_warranted(
         return;
     }
 
+    if side == "sell" {
+        let base_asset = decision
+            .symbol
+            .split('/')
+            .next()
+            .map(str::trim)
+            .unwrap_or_default();
+
+        if !base_asset.is_empty() {
+            let balance_opt = {
+                let s = state.0.lock().await;
+                s.current_portfolio
+                    .as_ref()
+                    .and_then(|portfolio| portfolio.currencies.get(base_asset).cloned())
+            };
+
+            match balance_opt {
+                Some(balance) if balance.free <= 0.0 && balance.total <= 0.0 => {
+                    warn!(
+                        "trading: sell skipped — non-positive {base_asset} balance for {} (free={}, total={})",
+                        decision.symbol, balance.free, balance.total
+                    );
+                    state
+                        .log_warn(
+                            "execute",
+                            format!(
+                                "Sell skipped for {}: non-positive {} balance (free={}, total={})",
+                                decision.symbol, base_asset, balance.free, balance.total
+                            ),
+                        )
+                        .await;
+                    return;
+                }
+                None => {
+                    warn!(
+                        "trading: sell skipped — {base_asset} balance unavailable in OctoBot portfolio for {}",
+                        decision.symbol
+                    );
+                    state
+                        .log_warn(
+                            "execute",
+                            format!(
+                                "Sell skipped for {}: {base_asset} balance unavailable in OctoBot portfolio",
+                                decision.symbol
+                            ),
+                        )
+                        .await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
     let result = if side == "buy" {
         octobot
             .place_buy_order(&decision.exchange, &decision.symbol, decision.amount_usd)

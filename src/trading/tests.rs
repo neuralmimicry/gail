@@ -1782,6 +1782,15 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        Mock::given(method("POST"))
+            .and(path("/api/user_command"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "subject": "trading",
+                "action": "create_order"
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
 
         let client = OctobotClient::new(&server.uri(), None, 10.0);
         let result = client
@@ -1833,6 +1842,99 @@ mod tests {
         assert!(err.contains("OctoBot order placement failed"));
         assert!(err.contains("/api/orders"));
         assert!(err.contains("/api/user_command"));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_place_sell_order_retries_with_lower_amount_after_portfolio_negative_rejection()
+     {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/trades"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // First sell attempt at 4.0 gets rejected with OctoBot simulator's
+        // precision/portfolio error.
+        Mock::given(method("POST"))
+            .and(path("/api/orders"))
+            .and(query_param("action", "create_order"))
+            .and(body_string_contains("\"amount\":4.0"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "message": "PortfolioNegativeValueError: Trying to update BNB with -0.032 but quantity was -0.032"
+            })))
+            .expect(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        // Second sell attempt retries with a reduced amount and succeeds.
+        Mock::given(method("POST"))
+            .and(path("/api/orders"))
+            .and(query_param("action", "create_order"))
+            .and(body_string_contains("\"amount\":3.8"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "sell-order-accepted",
+                "symbol": "ETH/USDT",
+                "side": "sell",
+                "amount": 3.8,
+                "status": "submitted"
+            })))
+            .expect(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        // Remaining first-pass fallbacks fail, which triggers the reduced sell retry.
+        Mock::given(method("POST"))
+            .and(path("/api/orders"))
+            .and(query_param("action", "create_orders"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unsupported"))
+            .expect(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/orders"))
+            .and(body_string_contains("\"action\":\"create_order\""))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unsupported"))
+            .expect(1)
+            .with_priority(10)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/orders"))
+            .and(body_string_contains("\"order_type\":\"market\""))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unsupported"))
+            .expect(1)
+            .with_priority(10)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/user_command"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unsupported"))
+            .expect(3)
+            .with_priority(10)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let result = client
+            .place_sell_order("binance", "ETH/USDT", 4.0)
+            .await
+            .expect("sell order should succeed after reduced-amount retry");
+        assert_eq!(result.order_id, "sell-order-accepted");
+        assert_eq!(result.side, "sell");
+        assert!((result.amount - 3.8).abs() < f64::EPSILON);
         server.verify().await;
     }
 
