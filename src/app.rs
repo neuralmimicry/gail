@@ -2834,7 +2834,7 @@ mod tests {
         config.providers.push(ProviderProfile {
             name: "OpenAIPrimary".to_string(),
             provider_type: "openai".to_string(),
-            model: Some("gpt-4o-mini".to_string()),
+            model: Some("gpt-5.3-codex".to_string()),
             preferred: true,
             ..ProviderProfile::default()
         });
@@ -2874,8 +2874,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(ids.contains(&"gail-auto"));
-        assert!(ids.contains(&"openai/gpt-4o-mini"));
-        assert!(ids.contains(&"gpt-4o-mini"));
+        assert!(ids.contains(&"openai/gpt-5.3-codex"));
+        assert!(ids.contains(&"gpt-5.3-codex"));
         assert!(ids.contains(&"nvidia/moonshotai/kimi-k2-instruct-0905"));
         assert!(ids.contains(&"moonshotai/kimi-k2-instruct-0905"));
         assert!(ids.contains(&"ollama/llama3.2"));

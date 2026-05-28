@@ -4289,7 +4289,7 @@ mod tests {
                 ranked("nvidia", "moonshotai/kimi-k2-instruct-0905", 5.0, true),
                 ranked("nvidia", "minimaxai/minimax-m2.7", 4.9, true),
                 ranked("ollama", "llama3.2", 4.0, true),
-                ranked("openai", "gpt-4o-mini", 6.0, false),
+                ranked("openai", "gpt-5.3-codex", 6.0, false),
             ],
             3,
         );
@@ -4301,7 +4301,7 @@ mod tests {
         assert_eq!(labels.len(), 3);
         assert_eq!(labels[0], "nvidia/moonshotai/kimi-k2-instruct-0905");
         assert!(labels[1].starts_with("ollama/llama3.2"));
-        assert_eq!(labels[2], "openai/gpt-4o-mini");
+        assert_eq!(labels[2], "openai/gpt-5.3-codex");
     }
 
     #[test]
@@ -4375,7 +4375,7 @@ mod tests {
 
         let selected = select_ranked_candidates(
             vec![
-                ranked("openai", "gpt-4o-mini", 9.0, true),
+                ranked("openai", "gpt-5.3-codex", 9.0, true),
                 ranked("nvidia", "moonshotai/kimi-k2-instruct-0905", 8.0, true),
                 ranked("gemini", "gemini-2.5-flash", 7.0, true),
                 ranked("ollama", "llama3.2", 1.0, false),
@@ -4612,7 +4612,7 @@ mod tests {
             workflow: Some("project_solver".to_string()),
             role: Some("planner".to_string()),
             preferred_provider: Some("openai".to_string()),
-            preferred_model: Some("gpt-4o-mini".to_string()),
+            preferred_model: Some("gpt-5.3-codex".to_string()),
             preferred_api_key: None,
             preferred_access_token: None,
             fallback_provider: None,
@@ -4713,7 +4713,7 @@ mod tests {
         assert!(request_candidate_model_allowed_with_policy(
             &config,
             "openai",
-            Some("gpt-4o-mini"),
+            Some("gpt-5.3-codex"),
             false,
         ));
     }

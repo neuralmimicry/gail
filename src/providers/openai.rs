@@ -43,7 +43,7 @@ impl OpenAIProvider {
             "OPENAI_API_KEY",
             "OPENAI_DEFAULT_MODEL",
             "https://api.openai.com/v1",
-            "gpt-4o-mini",
+            "gpt-5.3-codex",
             true,
             true,
             true,
