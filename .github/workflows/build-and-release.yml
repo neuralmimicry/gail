@@ -423,9 +423,10 @@ jobs:
           [[ "$actual_version" == "$expected_version" ]]
           [[ "$actual_arch" == "$DEB_ARCH" ]]
 
-          dpkg-deb --fsys-tarfile "$deb_path" \
-            | tar -tf - \
-            | grep -qx './usr/bin/gail-qlora-sft'
+          tar_listing="$(mktemp)"
+          trap 'rm -f "$tar_listing"' EXIT
+          dpkg-deb --fsys-tarfile "$deb_path" | tar -tf - > "$tar_listing"
+          grep -qx './usr/bin/gail-qlora-sft' "$tar_listing"
 
       - name: Smoke test packaged binaries
         if: ${{ matrix.can_execute }}
