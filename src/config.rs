@@ -20,6 +20,7 @@ pub struct GailConfig {
     pub mirror_worker: MirrorWorkerConfig,
     pub trainer: TrainerConfig,
     pub aarnn_bridge: AarnnBridgeConfig,
+    pub audit_logging: AuditLoggingConfig,
     pub nmc_telemetry: NmcTelemetryConfig,
     pub providers: Vec<ProviderProfile>,
     pub specialists: Vec<SpecialistProfile>,
@@ -105,6 +106,16 @@ pub struct NmcTelemetryConfig {
     pub cache_ttl_seconds: f64,
     pub stale_after_seconds: u64,
     pub adaptive_policy: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuditLoggingConfig {
+    pub enabled: bool,
+    pub log_llm_prompts: bool,
+    pub log_llm_responses: bool,
+    pub log_aer_payloads: bool,
+    pub max_chars: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -361,6 +372,18 @@ impl Default for NmcTelemetryConfig {
     }
 }
 
+impl Default for AuditLoggingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            log_llm_prompts: true,
+            log_llm_responses: true,
+            log_aer_payloads: true,
+            max_chars: 65_536,
+        }
+    }
+}
+
 impl Default for ProviderProfile {
     fn default() -> Self {
         Self {
@@ -498,6 +521,7 @@ impl GailConfig {
         self.aarnn_bridge.candidate_min_reply_chars =
             self.aarnn_bridge.candidate_min_reply_chars.max(1);
         self.aarnn_bridge.max_text_chars = self.aarnn_bridge.max_text_chars.clamp(128, 65_536);
+        self.audit_logging.max_chars = self.audit_logging.max_chars.clamp(256, 262_144);
         self.nmc_telemetry.base_url =
             normalize_optional_url(self.nmc_telemetry.base_url.as_deref());
         self.nmc_telemetry.access_token =

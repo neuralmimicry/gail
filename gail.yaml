@@ -181,6 +181,13 @@ llm_ledger:
   max_prompt_chars: 65536
   max_response_chars: 65536
 
+audit_logging:
+  enabled: true
+  log_llm_prompts: true
+  log_llm_responses: true
+  log_aer_payloads: true
+  max_chars: 65536
+
 mirror_worker:
   enabled: true
   poll_interval_ms: 2000

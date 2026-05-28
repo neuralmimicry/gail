@@ -7,6 +7,7 @@ use std::{
 
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use reqwest::Client;
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::{
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot},
@@ -19,7 +20,7 @@ use uuid::Uuid;
 use crate::{
     aarnn_bridge::{AarnnMirrorClient, AarnnMirrorExchange},
     adaptive_schema, aer, api_issues,
-    config::{ApiTokenConfig, GailConfig, ProviderProfile},
+    config::{ApiTokenConfig, AuditLoggingConfig, GailConfig, ProviderProfile},
     errors::{GailError, Result, message_indicates_quota},
     hardware::{detect_hardware, log_hardware_profile},
     llm_ledger::{LlmLedger, LlmLedgerRecord},
@@ -274,6 +275,133 @@ impl GailService {
 
     fn nmc_telemetry(&self) -> Option<&NmcTelemetryClient> {
         self.inner.nmc_telemetry.as_ref()
+    }
+
+    fn audit_logging(&self) -> &AuditLoggingConfig {
+        &self.inner.config.audit_logging
+    }
+
+    fn audit_max_chars(&self) -> usize {
+        self.audit_logging().max_chars.max(1)
+    }
+
+    fn truncate_audit_text(&self, value: &str) -> String {
+        value.chars().take(self.audit_max_chars()).collect()
+    }
+
+    fn optional_audit_text(&self, value: Option<&str>) -> Option<String> {
+        value
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(|item| self.truncate_audit_text(item))
+    }
+
+    fn json_for_audit<T: Serialize>(&self, value: &T) -> String {
+        match serde_json::to_string(value) {
+            Ok(serialized) => self.truncate_audit_text(serialized.as_str()),
+            Err(error) => self.truncate_audit_text(format!("<<serialize-error:{error}>>").as_str()),
+        }
+    }
+
+    fn log_llm_audit_record(&self, record: &LlmLedgerRecord) {
+        let audit = self.audit_logging();
+        if !audit.enabled {
+            return;
+        }
+        let prompt_text = if audit.log_llm_prompts {
+            self.optional_audit_text(Some(record.prompt_text.as_str()))
+        } else {
+            None
+        };
+        let response_text = if audit.log_llm_responses {
+            self.optional_audit_text(record.response_text.as_deref())
+        } else {
+            None
+        };
+        let system_prompt = if audit.log_llm_prompts {
+            self.optional_audit_text(record.system_prompt.as_deref())
+        } else {
+            None
+        };
+        info!(
+            audit_stream = "llm",
+            request_id = %record.request_id,
+            conversation_id = %record.conversation_id,
+            workflow = %record.workflow,
+            role = %record.role,
+            status = %record.status,
+            request_category = ?record.request_category,
+            provider_requested = ?record.provider_requested,
+            model_requested = ?record.model_requested,
+            provider_resolved = ?record.provider_resolved,
+            model_resolved = ?record.model_resolved,
+            latency_ms = ?record.latency_ms,
+            error_text = ?record.error_text,
+            system_prompt = ?system_prompt,
+            prompt_text = ?prompt_text,
+            response_text = ?response_text,
+            "GAIL_AUDIT_LLM_INTERACTION"
+        );
+    }
+
+    fn log_aer_encode_audit(
+        &self,
+        ts_us: u64,
+        base_addr: u32,
+        request_events: Option<&[aer::AerEvent]>,
+        request_spikes: Option<&[u8]>,
+        encoded_events: &[aer::AerEvent],
+        payload_hex: &str,
+    ) {
+        let audit = self.audit_logging();
+        if !(audit.enabled && audit.log_aer_payloads) {
+            return;
+        }
+        let request_events_json = request_events.map(|items| self.json_for_audit(&items));
+        let request_spikes_json = request_spikes.map(|items| self.json_for_audit(&items));
+        let encoded_events_json = self.json_for_audit(&encoded_events);
+        info!(
+            audit_stream = "aer",
+            direction = "encode",
+            ts_us,
+            base_addr,
+            request_events = ?request_events_json,
+            request_spikes = ?request_spikes_json,
+            encoded_events = %encoded_events_json,
+            payload_hex = %self.truncate_audit_text(payload_hex),
+            payload_bytes = payload_hex.len() / 2,
+            event_count = encoded_events.len(),
+            "GAIL_AUDIT_AER_ENCODE"
+        );
+    }
+
+    fn log_aer_decode_audit(
+        &self,
+        payload_hex: &str,
+        base_addr: Option<u32>,
+        length: Option<usize>,
+        events: &[aer::AerEvent],
+        spikes: &[u8],
+    ) {
+        let audit = self.audit_logging();
+        if !(audit.enabled && audit.log_aer_payloads) {
+            return;
+        }
+        let events_json = self.json_for_audit(&events);
+        let spikes_json = self.json_for_audit(&spikes);
+        info!(
+            audit_stream = "aer",
+            direction = "decode",
+            payload_hex = %self.truncate_audit_text(payload_hex),
+            payload_bytes = payload_hex.len() / 2,
+            base_addr = ?base_addr,
+            length = ?length,
+            events = %events_json,
+            spikes = %spikes_json,
+            event_count = events.len(),
+            active_spikes = spikes.iter().filter(|value| **value > 0).count(),
+            "GAIL_AUDIT_AER_DECODE"
+        );
     }
 
     pub fn trading_bridge(&self) -> Option<&TradingBridge> {
@@ -1351,6 +1479,8 @@ impl GailService {
 
     pub fn encode_aer(&self, request: AerEncodeRequest) -> Result<AerEncodeResponse> {
         let ts_us = request.ts_us.unwrap_or(0);
+        let request_events_snapshot = request.events.clone();
+        let request_spikes_snapshot = request.spikes.clone();
         let events = if let Some(events) = request.events {
             events
         } else {
@@ -1361,13 +1491,25 @@ impl GailService {
             )
         };
         let payload = aer::encode_events(&events);
+        let payload_hex = aer::payload_hex(&payload);
+        self.log_aer_encode_audit(
+            ts_us,
+            request.base_addr,
+            request_events_snapshot.as_deref(),
+            request_spikes_snapshot.as_deref(),
+            events.as_slice(),
+            payload_hex.as_str(),
+        );
         Ok(AerEncodeResponse {
-            payload_hex: aer::payload_hex(&payload),
+            payload_hex,
             event_count: events.len(),
         })
     }
 
     pub fn decode_aer(&self, request: AerDecodeRequest) -> Result<AerDecodeResponse> {
+        let payload_hex_snapshot = request.payload_hex.clone();
+        let base_addr_snapshot = request.base_addr;
+        let length_snapshot = request.length;
         let payload = hex::decode(request.payload_hex)
             .map_err(|error| GailError::bad_request(error.to_string()))?;
         let events = aer::decode_events(&payload)?;
@@ -1383,6 +1525,13 @@ impl GailService {
                 aer::decode_spikes_auto(&payload, base_addr)?
             }
         };
+        self.log_aer_decode_audit(
+            payload_hex_snapshot.as_str(),
+            base_addr_snapshot,
+            length_snapshot,
+            events.as_slice(),
+            spikes.as_slice(),
+        );
         Ok(AerDecodeResponse { events, spikes })
     }
 
@@ -1618,6 +1767,7 @@ impl GailService {
     }
 
     async fn record_llm_interaction(&self, record: LlmLedgerRecord) {
+        self.log_llm_audit_record(&record);
         if let Some(ledger) = self.llm_ledger() {
             ledger.record(record).await;
         }

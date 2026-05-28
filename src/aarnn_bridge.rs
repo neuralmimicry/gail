@@ -12,7 +12,7 @@ use tokio::{
     sync::{Semaphore, mpsc, oneshot},
     time::{sleep, timeout},
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     adaptive_schema,
@@ -76,6 +76,11 @@ pub struct AarnnMirrorClient {
     request_max_attempts: usize,
     request_backoff: Duration,
     request_backoff_max: Duration,
+    audit_enabled: bool,
+    audit_log_llm_prompts: bool,
+    audit_log_llm_responses: bool,
+    audit_log_aer_payloads: bool,
+    audit_max_chars: usize,
 }
 
 impl AarnnMirrorClient {
@@ -128,6 +133,11 @@ impl AarnnMirrorClient {
             request_max_attempts,
             request_backoff: Duration::from_millis(request_backoff_ms),
             request_backoff_max: Duration::from_millis(request_backoff_max_ms),
+            audit_enabled: config.audit_logging.enabled,
+            audit_log_llm_prompts: config.audit_logging.log_llm_prompts,
+            audit_log_llm_responses: config.audit_logging.log_llm_responses,
+            audit_log_aer_payloads: config.audit_logging.log_aer_payloads,
+            audit_max_chars: config.audit_logging.max_chars.clamp(1, 262_144),
         };
         mirror.start_worker_bus(queue_rx);
         Some(mirror)
@@ -262,6 +272,177 @@ impl AarnnMirrorClient {
             .map(ToOwned::to_owned)
     }
 
+    fn truncate_audit_text(&self, value: &str) -> String {
+        truncate_chars(value, self.audit_max_chars.max(1))
+    }
+
+    fn optional_audit_text(&self, value: Option<&str>) -> Option<String> {
+        value
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(|item| self.truncate_audit_text(item))
+    }
+
+    fn audit_text_for_direction(
+        &self,
+        direction: &AarnnMirrorDirection,
+        value: Option<&str>,
+    ) -> Option<String> {
+        match direction {
+            AarnnMirrorDirection::Input if self.audit_log_llm_prompts => {
+                self.optional_audit_text(value)
+            }
+            AarnnMirrorDirection::Output if self.audit_log_llm_responses => {
+                self.optional_audit_text(value)
+            }
+            _ => None,
+        }
+    }
+
+    fn log_mirror_request_audit(&self, request: &AarnnMirrorRequest, spike_count: usize) {
+        if !self.audit_enabled {
+            return;
+        }
+        let text = self.audit_text_for_direction(&request.direction, Some(request.text.as_str()));
+        let prompt_text =
+            self.audit_text_for_direction(&request.direction, request.prompt_text.as_deref());
+        let system_text = if self.audit_log_llm_prompts {
+            self.optional_audit_text(request.system.as_deref())
+        } else {
+            None
+        };
+        let payload_hex = if self.audit_log_aer_payloads {
+            self.optional_audit_text(Some(request.aer_payload_hex.as_str()))
+        } else {
+            None
+        };
+        let active_spike_indices = if self.audit_log_aer_payloads {
+            Some(
+                request
+                    .sensory_spikes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, spike)| (*spike > 0).then_some(index as u32))
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+        info!(
+            audit_stream = "aarnn",
+            direction = ?request.direction,
+            request_id = %request.request_id,
+            conversation_id = %request.conversation_id,
+            workflow = %request.workflow,
+            role = %request.role,
+            provider = ?request.provider,
+            model = ?request.model,
+            request_category = ?request.request_category,
+            system_prompt = ?system_text,
+            prompt_text = ?prompt_text,
+            text = ?text,
+            aer_base = request.aer_base,
+            output_base = request.output_base,
+            aer_payload_hex = ?payload_hex,
+            sensory_spike_count = spike_count,
+            sensory_spike_indices = ?active_spike_indices,
+            "GAIL_AUDIT_AARNN_MIRROR_REQUEST"
+        );
+    }
+
+    fn log_mirror_response_audit(
+        &self,
+        request: &AarnnMirrorRequest,
+        response: &AarnnMirrorResponse,
+        text_chars: usize,
+        spike_count: usize,
+    ) {
+        if !self.audit_enabled {
+            return;
+        }
+        let candidate_reply_text = if self.audit_log_llm_responses {
+            self.optional_audit_text(
+                response
+                    .candidate
+                    .as_ref()
+                    .and_then(|candidate| candidate.reply_text.as_deref()),
+            )
+        } else {
+            None
+        };
+        let response_payload_hex = if self.audit_log_aer_payloads {
+            self.optional_audit_text(response.aer_payload_hex.as_deref())
+        } else {
+            None
+        };
+        let candidate_payload_hex = if self.audit_log_aer_payloads {
+            self.optional_audit_text(
+                response
+                    .candidate
+                    .as_ref()
+                    .and_then(|candidate| candidate.output_aer_payload_hex.as_deref()),
+            )
+        } else {
+            None
+        };
+        let candidate_spike_indices = if self.audit_log_aer_payloads {
+            response
+                .candidate
+                .as_ref()
+                .map(|candidate| candidate.output_spike_indices.clone())
+        } else {
+            None
+        };
+        info!(
+            audit_stream = "aarnn",
+            direction = ?request.direction,
+            request_id = %request.request_id,
+            accepted = response.accepted,
+            endpoint = %self.endpoint,
+            text_chars = response.text_chars.max(text_chars),
+            spike_count = response.spike_count.max(spike_count),
+            aer_payload_hex = ?response_payload_hex,
+            candidate_usable = ?response.candidate.as_ref().map(|candidate| candidate.usable),
+            candidate_confidence = ?response.candidate.as_ref().and_then(|candidate| candidate.confidence),
+            candidate_source = ?response.candidate.as_ref().and_then(|candidate| candidate.source.as_deref()),
+            candidate_reply_text = ?candidate_reply_text,
+            candidate_output_aer_payload_hex = ?candidate_payload_hex,
+            candidate_output_spike_indices = ?candidate_spike_indices,
+            stimulation = ?response.stimulation,
+            "GAIL_AUDIT_AARNN_MIRROR_RESPONSE"
+        );
+    }
+
+    fn log_mirror_error_audit(
+        &self,
+        request: &AarnnMirrorRequest,
+        error: &str,
+        text_chars: usize,
+        spike_count: usize,
+    ) {
+        if !self.audit_enabled {
+            return;
+        }
+        let text = self.audit_text_for_direction(&request.direction, Some(request.text.as_str()));
+        let payload_hex = if self.audit_log_aer_payloads {
+            self.optional_audit_text(Some(request.aer_payload_hex.as_str()))
+        } else {
+            None
+        };
+        warn!(
+            audit_stream = "aarnn",
+            direction = ?request.direction,
+            request_id = %request.request_id,
+            endpoint = %self.endpoint,
+            text_chars,
+            spike_count,
+            text = ?text,
+            aer_payload_hex = ?payload_hex,
+            error = %self.truncate_audit_text(error),
+            "GAIL_AUDIT_AARNN_MIRROR_ERROR"
+        );
+    }
+
     fn start_worker_bus(&self, mut rx: mpsc::Receiver<AarnnMirrorJob>) {
         let worker = self.clone();
         let concurrency = self.worker_count.max(1);
@@ -333,31 +514,38 @@ impl AarnnMirrorClient {
             .iter()
             .filter(|value| **value > 0)
             .count();
+        self.log_mirror_request_audit(&request, spike_count);
         match self.mirror_once(&request).await {
-            Ok(response) => AarnnMirrorInvocationTrace {
-                direction: request.direction.clone(),
-                accepted: response.accepted,
-                endpoint: self.endpoint.clone(),
-                latency_ms: started.elapsed().as_millis() as u64,
-                text_chars: response.text_chars.max(text_chars),
-                spike_count: response.spike_count.max(spike_count),
-                candidate: response
-                    .candidate
-                    .map(|candidate| sanitize_candidate(candidate, self.max_text_chars)),
-                stimulation: response.stimulation,
-                error: None,
-            },
-            Err(error) => AarnnMirrorInvocationTrace {
-                direction: request.direction,
-                accepted: false,
-                endpoint: self.endpoint.clone(),
-                latency_ms: started.elapsed().as_millis() as u64,
-                text_chars,
-                spike_count,
-                candidate: None,
-                stimulation: None,
-                error: Some(error),
-            },
+            Ok(response) => {
+                self.log_mirror_response_audit(&request, &response, text_chars, spike_count);
+                AarnnMirrorInvocationTrace {
+                    direction: request.direction.clone(),
+                    accepted: response.accepted,
+                    endpoint: self.endpoint.clone(),
+                    latency_ms: started.elapsed().as_millis() as u64,
+                    text_chars: response.text_chars.max(text_chars),
+                    spike_count: response.spike_count.max(spike_count),
+                    candidate: response
+                        .candidate
+                        .map(|candidate| sanitize_candidate(candidate, self.max_text_chars)),
+                    stimulation: response.stimulation,
+                    error: None,
+                }
+            }
+            Err(error) => {
+                self.log_mirror_error_audit(&request, error.as_str(), text_chars, spike_count);
+                AarnnMirrorInvocationTrace {
+                    direction: request.direction,
+                    accepted: false,
+                    endpoint: self.endpoint.clone(),
+                    latency_ms: started.elapsed().as_millis() as u64,
+                    text_chars,
+                    spike_count,
+                    candidate: None,
+                    stimulation: None,
+                    error: Some(error),
+                }
+            }
         }
     }
 
@@ -766,6 +954,11 @@ mod tests {
             request_max_attempts: 1,
             request_backoff: Duration::from_millis(10),
             request_backoff_max: Duration::from_millis(50),
+            audit_enabled: false,
+            audit_log_llm_prompts: true,
+            audit_log_llm_responses: true,
+            audit_log_aer_payloads: true,
+            audit_max_chars: 2048,
         };
         let promoted = AarnnMirrorInvocationTrace {
             direction: AarnnMirrorDirection::Output,
