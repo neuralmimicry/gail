@@ -892,9 +892,12 @@ impl GailService {
                         .cloned()
                         .collect::<Vec<_>>();
                     if !transient_backoff.is_empty() {
+                        let probe_target =
+                            transient_backoff_probe_target(wave_size, transient_backoff.len());
                         info!(
                             workflow = %workflow,
                             role = %role,
+                            probe_candidates = probe_target,
                             backoff_candidates = %preview_labels(
                                 transient_backoff
                                     .iter()
@@ -904,7 +907,8 @@ impl GailService {
                             ),
                             "all providers are in transient adaptive backoff; forcing a probe attempt"
                         );
-                        forced_selected = Some(select_ranked_candidates(transient_backoff, 1));
+                        forced_selected =
+                            Some(select_ranked_candidates(transient_backoff, probe_target));
                     }
                 }
                 if results.is_empty() {
@@ -3345,6 +3349,28 @@ fn should_probe_transient_backoff_candidates(
     expected_json || text_or_tags_indicate_automation(workflow, role, task_tags, prompt_text)
 }
 
+fn transient_backoff_probe_target(wave_size: usize, candidate_count: usize) -> usize {
+    let configured = env_int_any(
+        &[
+            "GAIL_TRANSIENT_BACKOFF_PROBE_CANDIDATES",
+            "REFINER_AI_TRANSIENT_BACKOFF_PROBE_CANDIDATES",
+        ],
+        2,
+    ) as usize;
+    transient_backoff_probe_target_with_config(wave_size, candidate_count, configured)
+}
+
+fn transient_backoff_probe_target_with_config(
+    wave_size: usize,
+    candidate_count: usize,
+    configured: usize,
+) -> usize {
+    configured
+        .max(wave_size.max(1))
+        .max(1)
+        .min(candidate_count.max(1))
+}
+
 fn message_indicates_provider_backoff(message: &str) -> bool {
     message_indicates_quota(message)
         || message_indicates_ollama_saturation(message)
@@ -4712,5 +4738,15 @@ mod tests {
             "qwen2.5-coder:1.5b",
             "qwen2.5-coder:7b"
         ));
+    }
+
+    #[test]
+    fn transient_backoff_probe_target_keeps_minimum_two_candidates_for_small_waves() {
+        assert_eq!(transient_backoff_probe_target_with_config(1, 5, 2), 2,);
+    }
+
+    #[test]
+    fn transient_backoff_probe_target_never_exceeds_remaining_candidates() {
+        assert_eq!(transient_backoff_probe_target_with_config(4, 3, 8), 3,);
     }
 }

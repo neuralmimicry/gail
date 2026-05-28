@@ -1382,9 +1382,6 @@ fn message_indicates_ollama_saturation(message: &str) -> bool {
     lowered.contains("local ollama request queue is saturated")
         || lowered.contains("local model service is saturated")
         || lowered.contains("adaptive endpoint budget exhausted")
-        || lowered.contains("candidate timed out")
-        || lowered.contains("operation timed out")
-        || lowered.contains("request timed out")
 }
 
 fn message_indicates_ollama_endpoint_transport_failure(message: &str) -> bool {
@@ -1395,8 +1392,6 @@ fn message_indicates_ollama_endpoint_transport_failure(message: &str) -> bool {
         || lowered.contains("connection closed")
         || lowered.contains("dns error")
         || lowered.contains("failed to lookup address information")
-        || lowered.contains("operation timed out")
-        || lowered.contains("timed out")
 }
 
 fn normalize_base_url(value: &str) -> Option<String> {
@@ -1664,6 +1659,22 @@ mod tests {
             }
             other => panic!("expected upstream error, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn timeout_messages_are_not_treated_as_ollama_saturation_or_transport_failure() {
+        let timeout = "operation timed out while contacting Ollama";
+        assert!(!message_indicates_ollama_saturation(timeout));
+        assert!(!message_indicates_ollama_endpoint_transport_failure(
+            timeout
+        ));
+    }
+
+    #[test]
+    fn connection_failures_still_trigger_endpoint_transport_cooldown() {
+        let failure =
+            "error sending request for url (http://ollama/api/generate): connection reset by peer";
+        assert!(message_indicates_ollama_endpoint_transport_failure(failure));
     }
 
     #[test]
