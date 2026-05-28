@@ -43,7 +43,6 @@
 
 ARG LIBTORCH_SEED_IMAGE=docker.io/library/debian:bookworm-slim
 FROM ${LIBTORCH_SEED_IMAGE} AS libtorch-seed
-RUN mkdir -p /opt/libtorch
 
 FROM docker.io/library/debian:bookworm-slim AS libtorch
 
@@ -76,7 +75,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTORCH_BUILD_PARALLEL_LEVEL=${PYTORCH_BUILD_PARALLEL_LEVEL} \
     MAKEFLAGS=-j${BUILD_JOBS}
 
-COPY --from=libtorch-seed /opt/libtorch /opt/libtorch
+RUN mkdir -p /opt/libtorch
+COPY --from=libtorch-seed /opt /opt
 
 RUN set -eu; \
     host_jobs="$(nproc)"; \
