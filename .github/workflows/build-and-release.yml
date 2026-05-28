@@ -441,7 +441,10 @@ jobs:
 
           archive_path="$(find dist -maxdepth 1 -type f -name 'gail-*.tar.gz' | head -n 1)"
           [[ -n "$archive_path" ]]
-          tar -tzf "$archive_path" | grep -Eq '/gail-qlora-sft$'
+          tar_listing="$(mktemp)"
+          trap 'rm -f "$tar_listing"' EXIT
+          tar -tzf "$archive_path" > "$tar_listing"
+          grep -Eq '/gail-qlora-sft$' "$tar_listing"
 
       - name: Upload packaged artifacts
         uses: actions/upload-artifact@v7
