@@ -27,6 +27,10 @@
 # Recommended amd64 CUDA build:
 #   podman build --platform linux/amd64 --build-arg GAIL_VERSION=source --build-arg LIBTORCH_ACCELERATOR=cu124 -f Containerfile -t gail:amd64-cu124 .
 #
+# Reusing a self-built local libtorch seed image:
+#   podman build --platform linux/arm64 --target libtorch-export -f Containerfile -t gail-libtorch:arm64 .
+#   podman build --platform linux/arm64 --build-arg LIBTORCH_SEED_IMAGE=gail-libtorch:arm64 --build-arg GAIL_VERSION=source -f Containerfile -t gail:arm64 .
+#
 # GitHub Actions/self-hosted runner notes:
 #   - Build amd64 images on a self-hosted Linux X64 runner.
 #   - Build arm64 images on a self-hosted Linux ARM64 runner.
@@ -37,9 +41,14 @@
 #   --build-arg LIBTORCH_STRICT_ACCELERATOR=true
 #
 
+ARG LIBTORCH_SEED_IMAGE=docker.io/library/debian:bookworm-slim
+FROM ${LIBTORCH_SEED_IMAGE} AS libtorch-seed
+RUN mkdir -p /opt/libtorch
+
 FROM docker.io/library/debian:bookworm-slim AS libtorch
 
 ARG TARGETARCH
+ARG LIBTORCH_SEED_IMAGE=docker.io/library/debian:bookworm-slim
 ARG LIBTORCH_VERSION=2.11.0
 ARG LIBTORCH_ACCELERATOR=cpu
 ARG LIBTORCH_URL=
@@ -66,6 +75,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL} \
     PYTORCH_BUILD_PARALLEL_LEVEL=${PYTORCH_BUILD_PARALLEL_LEVEL} \
     MAKEFLAGS=-j${BUILD_JOBS}
+
+COPY --from=libtorch-seed /opt/libtorch /opt/libtorch
 
 RUN set -eu; \
     host_jobs="$(nproc)"; \
@@ -152,198 +163,221 @@ RUN set -eu; \
         effective_accelerator="cpu"; \
     fi; \
     echo "libtorch configuration: arch=${norm_arch} requested=${requested_accelerator} effective=${effective_accelerator} version=${LIBTORCH_VERSION} source_build=${build_from_source}"; \
-    if [ -n "${LIBTORCH_URL}" ] || [ "${build_from_source}" != "true" ]; then \
-        if [ -n "${LIBTORCH_URL}" ]; then \
-            libtorch_url="${LIBTORCH_URL}"; \
-        elif [ "${norm_arch}" = "amd64" ]; then \
-            case "${effective_accelerator}" in \
-                cpu) archive_suffix="cpu"; archive_dir="cpu" ;; \
-                cu118|cu121|cu124|cu126|cu128) archive_suffix="${effective_accelerator}"; archive_dir="${effective_accelerator}" ;; \
-                *) echo "Unsupported effective accelerator ${effective_accelerator}" >&2; exit 2 ;; \
-            esac; \
-            encoded_version="$(printf '%s' "${LIBTORCH_VERSION}+${archive_suffix}" | sed 's/+/%2B/g')"; \
-            libtorch_url="https://download.pytorch.org/libtorch/${archive_dir}/libtorch-cxx11-abi-shared-with-deps-${encoded_version}.zip"; \
-        else \
-            libtorch_url=""; \
-            build_from_source="true"; \
-        fi; \
-        if [ "${build_from_source}" != "true" ]; then \
-            echo "Downloading libtorch from ${libtorch_url}"; \
-            if curl -fL --retry 5 --retry-delay 2 "${libtorch_url}" -o /tmp/libtorch.zip; then \
-                unzip -q /tmp/libtorch.zip -d /opt; \
+    reuse_cached_libtorch="false"; \
+    if [ -f /opt/libtorch/lib/libtorch.so ] || [ -f /opt/libtorch/lib/libtorch_cpu.so ]; then \
+        if [ -f /opt/libtorch/gail-libtorch-build.env ]; then \
+            cached_version="$(awk -F= '/^LIBTORCH_VERSION=/{print $2; exit}' /opt/libtorch/gail-libtorch-build.env)"; \
+            cached_accelerator="$(awk -F= '/^LIBTORCH_ACCELERATOR=/{print $2; exit}' /opt/libtorch/gail-libtorch-build.env)"; \
+            cached_arch="$(awk -F= '/^LIBTORCH_ARCH=/{print $2; exit}' /opt/libtorch/gail-libtorch-build.env)"; \
+            if [ "${cached_version}" = "${LIBTORCH_VERSION}" ] && [ "${cached_accelerator}" = "${effective_accelerator}" ] && [ "${cached_arch}" = "${norm_arch}" ]; then \
+                reuse_cached_libtorch="true"; \
                 build_from_source="false"; \
-            elif [ "${LIBTORCH_DOWNLOAD_FALLBACK_TO_SOURCE}" = "true" ] && [ "${effective_accelerator}" = "cpu" ]; then \
-                echo "libtorch download failed; falling back to CPU source build" >&2; \
-                rm -f /tmp/libtorch.zip; \
-                build_from_source="true"; \
-            elif [ "${LIBTORCH_ALLOW_CPU_FALLBACK}" = "true" ] && [ "${LIBTORCH_STRICT_ACCELERATOR}" != "true" ]; then \
-                echo "Accelerated libtorch download failed; falling back to CPU source build" >&2; \
-                rm -f /tmp/libtorch.zip; \
-                effective_accelerator="cpu"; \
-                build_from_source="true"; \
+                echo "Reusing seeded /opt/libtorch cache for arch=${norm_arch} accelerator=${effective_accelerator} version=${LIBTORCH_VERSION}"; \
             else \
-                echo "libtorch download failed and no safe fallback is enabled" >&2; \
-                exit 2; \
+                echo "Seeded /opt/libtorch cache mismatch (version=${cached_version} accelerator=${cached_accelerator} arch=${cached_arch}); rebuilding"; \
+                rm -rf /opt/libtorch; \
+                mkdir -p /opt/libtorch; \
             fi; \
+        else \
+            echo "Seeded /opt/libtorch missing gail-libtorch-build.env; rebuilding"; \
+            rm -rf /opt/libtorch; \
+            mkdir -p /opt/libtorch; \
         fi; \
     fi; \
-    if [ "${build_from_source}" = "true" ]; then \
-        pytorch_tag="${PYTORCH_GIT_TAG}"; \
-        expected_pytorch_tag="v${LIBTORCH_VERSION}"; \
-        if [ "${pytorch_tag}" = "auto" ] || [ -z "${pytorch_tag}" ]; then \
-            pytorch_tag="${expected_pytorch_tag}"; \
-        elif [ "${pytorch_tag}" != "${expected_pytorch_tag}" ] && [ "${PYTORCH_GIT_TAG_STRICT}" != "true" ]; then \
-            echo "PYTORCH_GIT_TAG=${pytorch_tag} does not match LIBTORCH_VERSION=${LIBTORCH_VERSION}; using ${expected_pytorch_tag} to satisfy torch-sys" >&2; \
-            pytorch_tag="${expected_pytorch_tag}"; \
-        fi; \
-        echo "Building CPU libtorch directly with CMake from PyTorch source tag ${pytorch_tag} for ${norm_arch}"; \
-        apt-get update; \
-        apt-get install -y --no-install-recommends \
-            build-essential \
-            ccache \
-            cmake \
-            git \
-            libblas-dev \
-            libffi-dev \
-            libjpeg-dev \
-            liblapack-dev \
-            libopenblas-dev \
-            libpng-dev \
-            libssl-dev \
-            ninja-build \
-            ocl-icd-opencl-dev \
-            opencl-headers \
-            pkg-config \
-            python3 \
-            python3-dev \
-            python3-venv \
-            zlib1g-dev; \
-        rm -rf /var/lib/apt/lists/*; \
-        python3 -m venv /tmp/pytorch-venv; \
-        /tmp/pytorch-venv/bin/python -m pip install --no-cache-dir --upgrade pip setuptools wheel packaging; \
-        /tmp/pytorch-venv/bin/python -m pip install --no-cache-dir \
-            "cmake>=${PYTORCH_SOURCE_CMAKE_MIN_VERSION},<4" \
-            astunparse \
-            cffi \
-            filelock \
-            fsspec \
-            future \
-            hypothesis \
-            jinja2 \
-            networkx \
-            ninja \
-            numpy \
-            protobuf \
-            psutil \
-            PyYAML \
-            requests \
-            six \
-            sympy \
-            typing_extensions; \
-        cmake_bin="/tmp/pytorch-venv/bin/cmake"; \
-        "${cmake_bin}" --version; \
-        git clone --branch "${pytorch_tag}" --recurse-submodules "${PYTORCH_GIT_REPOSITORY}" /tmp/pytorch; \
-        export PYTHONPATH="/tmp/pytorch:${PYTHONPATH:-}"; \
-        /tmp/pytorch-venv/bin/python -c 'import sys, yaml, torchgen; print("Using PyTorch build Python: %s" % sys.executable); print("PyYAML module: %s" % yaml.__file__); print("torchgen module: %s" % torchgen.__file__)'; \
-        mkdir -p /tmp/pytorch-build /opt/libtorch; \
-        cd /tmp/pytorch-build; \
-        export BUILD_BINARY=0; \
-        export BUILD_CUSTOM_PROTOBUF=ON; \
-        export BUILD_PYTHON=0; \
-        export BUILD_TEST=0; \
-        export BUILD_TORCH=ON; \
-        export MAX_JOBS="${PYTORCH_BUILD_PARALLEL_LEVEL}"; \
-        export USE_CUDA=0; \
-        export USE_CUDNN=0; \
-        export USE_DISTRIBUTED=0; \
-        export USE_FBGEMM=0; \
-        export USE_MKLDNN=0; \
-        export USE_NCCL=0; \
-        export USE_NUMA=0; \
-        export USE_QNNPACK=0; \
-        export USE_PYTORCH_QNNPACK=0; \
-        export USE_ROCM=0; \
-        caffe2_perf_with_sve="OFF"; \
-        caffe2_perf_with_sve256="OFF"; \
-        pytorch_use_xnnpack="ON"; \
-        pytorch_use_xnnpack="OFF"; \
-        pytorch_use_kleidiai="OFF"; \
-        if [ "${norm_arch}" = "arm64" ]; then \
-            case "${LIBTORCH_ARM64_SVE:-false}" in \
-                true|1|yes|on) \
-                    if [ "${arm64_sve}" = "true" ]; then \
-                        caffe2_perf_with_sve="ON"; \
-                    else \
-                        echo "LIBTORCH_ARM64_SVE=true requested, but SVE was not detected; keeping SVE OFF" >&2; \
-                    fi; \
-                    ;; \
-                auto|"") \
-                    echo "LIBTORCH_ARM64_SVE=auto detected SVE=${arm64_sve}, but release builds keep SVE OFF unless explicitly enabled"; \
-                    ;; \
-                false|0|no|off) \
-                    caffe2_perf_with_sve="OFF"; \
-                    ;; \
-                *) \
-                    echo "Unsupported LIBTORCH_ARM64_SVE=${LIBTORCH_ARM64_SVE}; use auto, true or false" >&2; \
+    if [ "${reuse_cached_libtorch}" != "true" ]; then \
+        if [ -n "${LIBTORCH_URL}" ] || [ "${build_from_source}" != "true" ]; then \
+            if [ -n "${LIBTORCH_URL}" ]; then \
+                libtorch_url="${LIBTORCH_URL}"; \
+            elif [ "${norm_arch}" = "amd64" ]; then \
+                case "${effective_accelerator}" in \
+                    cpu) archive_suffix="cpu"; archive_dir="cpu" ;; \
+                    cu118|cu121|cu124|cu126|cu128) archive_suffix="${effective_accelerator}"; archive_dir="${effective_accelerator}" ;; \
+                    *) echo "Unsupported effective accelerator ${effective_accelerator}" >&2; exit 2 ;; \
+                esac; \
+                encoded_version="$(printf '%s' "${LIBTORCH_VERSION}+${archive_suffix}" | sed 's/+/%2B/g')"; \
+                libtorch_url="https://download.pytorch.org/libtorch/${archive_dir}/libtorch-cxx11-abi-shared-with-deps-${encoded_version}.zip"; \
+            else \
+                libtorch_url=""; \
+                build_from_source="true"; \
+            fi; \
+            if [ "${build_from_source}" != "true" ]; then \
+                echo "Downloading libtorch from ${libtorch_url}"; \
+                if curl -fL --retry 5 --retry-delay 2 "${libtorch_url}" -o /tmp/libtorch.zip; then \
+                    unzip -q /tmp/libtorch.zip -d /opt; \
+                    build_from_source="false"; \
+                elif [ "${LIBTORCH_DOWNLOAD_FALLBACK_TO_SOURCE}" = "true" ] && [ "${effective_accelerator}" = "cpu" ]; then \
+                    echo "libtorch download failed; falling back to CPU source build" >&2; \
+                    rm -f /tmp/libtorch.zip; \
+                    build_from_source="true"; \
+                elif [ "${LIBTORCH_ALLOW_CPU_FALLBACK}" = "true" ] && [ "${LIBTORCH_STRICT_ACCELERATOR}" != "true" ]; then \
+                    echo "Accelerated libtorch download failed; falling back to CPU source build" >&2; \
+                    rm -f /tmp/libtorch.zip; \
+                    effective_accelerator="cpu"; \
+                    build_from_source="true"; \
+                else \
+                    echo "libtorch download failed and no safe fallback is enabled" >&2; \
                     exit 2; \
-                    ;; \
-            esac; \
-            case "${LIBTORCH_ARM64_XNNPACK:-auto}" in \
-                auto|"") \
-                    if [ "${arm64_sve}" = "true" ]; then \
-                        pytorch_use_xnnpack="OFF"; \
-                    else \
-                        pytorch_use_xnnpack="OFF"; \
-                    fi; \
-                    ;; \
-                true|1|yes|on) pytorch_use_xnnpack="ON" ;; \
-                false|0|no|off) pytorch_use_xnnpack="OFF" ;; \
-                *) \
-                    echo "Unsupported LIBTORCH_ARM64_XNNPACK=${LIBTORCH_ARM64_XNNPACK}; use auto, true or false" >&2; \
-                    exit 2; \
-                    ;; \
-            esac; \
+                fi; \
+            fi; \
         fi; \
-        echo "ARM64 PyTorch CPU features: CAFFE2_PERF_WITH_SVE=${caffe2_perf_with_sve} CAFFE2_PERF_WITH_SVE256=${caffe2_perf_with_sve256} USE_XNNPACK=${pytorch_use_xnnpack} USE_KLEIDIAI=${pytorch_use_kleidiai}"; \
-        if [ "${pytorch_use_xnnpack}" = "ON" ]; then \
-            export USE_XNNPACK=1; \
-        else \
-            export USE_XNNPACK=0; \
+        if [ "${build_from_source}" = "true" ]; then \
+            pytorch_tag="${PYTORCH_GIT_TAG}"; \
+            expected_pytorch_tag="v${LIBTORCH_VERSION}"; \
+            if [ "${pytorch_tag}" = "auto" ] || [ -z "${pytorch_tag}" ]; then \
+                pytorch_tag="${expected_pytorch_tag}"; \
+            elif [ "${pytorch_tag}" != "${expected_pytorch_tag}" ] && [ "${PYTORCH_GIT_TAG_STRICT}" != "true" ]; then \
+                echo "PYTORCH_GIT_TAG=${pytorch_tag} does not match LIBTORCH_VERSION=${LIBTORCH_VERSION}; using ${expected_pytorch_tag} to satisfy torch-sys" >&2; \
+                pytorch_tag="${expected_pytorch_tag}"; \
+            fi; \
+            echo "Building CPU libtorch directly with CMake from PyTorch source tag ${pytorch_tag} for ${norm_arch}"; \
+            apt-get update; \
+            apt-get install -y --no-install-recommends \
+                build-essential \
+                ccache \
+                cmake \
+                git \
+                libblas-dev \
+                libffi-dev \
+                libjpeg-dev \
+                liblapack-dev \
+                libopenblas-dev \
+                libpng-dev \
+                libssl-dev \
+                ninja-build \
+                ocl-icd-opencl-dev \
+                opencl-headers \
+                pkg-config \
+                python3 \
+                python3-dev \
+                python3-venv \
+                zlib1g-dev; \
+            rm -rf /var/lib/apt/lists/*; \
+            python3 -m venv /tmp/pytorch-venv; \
+            /tmp/pytorch-venv/bin/python -m pip install --no-cache-dir --upgrade pip setuptools wheel packaging; \
+            /tmp/pytorch-venv/bin/python -m pip install --no-cache-dir \
+                "cmake>=${PYTORCH_SOURCE_CMAKE_MIN_VERSION},<4" \
+                astunparse \
+                cffi \
+                filelock \
+                fsspec \
+                future \
+                hypothesis \
+                jinja2 \
+                networkx \
+                ninja \
+                numpy \
+                protobuf \
+                psutil \
+                PyYAML \
+                requests \
+                six \
+                sympy \
+                typing_extensions; \
+            cmake_bin="/tmp/pytorch-venv/bin/cmake"; \
+            "${cmake_bin}" --version; \
+            git clone --branch "${pytorch_tag}" --recurse-submodules "${PYTORCH_GIT_REPOSITORY}" /tmp/pytorch; \
+            export PYTHONPATH="/tmp/pytorch:${PYTHONPATH:-}"; \
+            /tmp/pytorch-venv/bin/python -c 'import sys, yaml, torchgen; print("Using PyTorch build Python: %s" % sys.executable); print("PyYAML module: %s" % yaml.__file__); print("torchgen module: %s" % torchgen.__file__)'; \
+            mkdir -p /tmp/pytorch-build /opt/libtorch; \
+            cd /tmp/pytorch-build; \
+            export BUILD_BINARY=0; \
+            export BUILD_CUSTOM_PROTOBUF=ON; \
+            export BUILD_PYTHON=0; \
+            export BUILD_TEST=0; \
+            export BUILD_TORCH=ON; \
+            export MAX_JOBS="${PYTORCH_BUILD_PARALLEL_LEVEL}"; \
+            export USE_CUDA=0; \
+            export USE_CUDNN=0; \
+            export USE_DISTRIBUTED=0; \
+            export USE_FBGEMM=0; \
+            export USE_MKLDNN=0; \
+            export USE_NCCL=0; \
+            export USE_NUMA=0; \
+            export USE_QNNPACK=0; \
+            export USE_PYTORCH_QNNPACK=0; \
+            export USE_ROCM=0; \
+            caffe2_perf_with_sve="OFF"; \
+            caffe2_perf_with_sve256="OFF"; \
+            pytorch_use_xnnpack="ON"; \
+            pytorch_use_xnnpack="OFF"; \
+            pytorch_use_kleidiai="OFF"; \
+            if [ "${norm_arch}" = "arm64" ]; then \
+                case "${LIBTORCH_ARM64_SVE:-false}" in \
+                    true|1|yes|on) \
+                        if [ "${arm64_sve}" = "true" ]; then \
+                            caffe2_perf_with_sve="ON"; \
+                        else \
+                            echo "LIBTORCH_ARM64_SVE=true requested, but SVE was not detected; keeping SVE OFF" >&2; \
+                        fi; \
+                        ;; \
+                    auto|"") \
+                        echo "LIBTORCH_ARM64_SVE=auto detected SVE=${arm64_sve}, but release builds keep SVE OFF unless explicitly enabled"; \
+                        ;; \
+                    false|0|no|off) \
+                        caffe2_perf_with_sve="OFF"; \
+                        ;; \
+                    *) \
+                        echo "Unsupported LIBTORCH_ARM64_SVE=${LIBTORCH_ARM64_SVE}; use auto, true or false" >&2; \
+                        exit 2; \
+                        ;; \
+                esac; \
+                case "${LIBTORCH_ARM64_XNNPACK:-auto}" in \
+                    auto|"") \
+                        if [ "${arm64_sve}" = "true" ]; then \
+                            pytorch_use_xnnpack="OFF"; \
+                        else \
+                            pytorch_use_xnnpack="OFF"; \
+                        fi; \
+                        ;; \
+                    true|1|yes|on) pytorch_use_xnnpack="ON" ;; \
+                    false|0|no|off) pytorch_use_xnnpack="OFF" ;; \
+                    *) \
+                        echo "Unsupported LIBTORCH_ARM64_XNNPACK=${LIBTORCH_ARM64_XNNPACK}; use auto, true or false" >&2; \
+                        exit 2; \
+                        ;; \
+                esac; \
+            fi; \
+            echo "ARM64 PyTorch CPU features: CAFFE2_PERF_WITH_SVE=${caffe2_perf_with_sve} CAFFE2_PERF_WITH_SVE256=${caffe2_perf_with_sve256} USE_XNNPACK=${pytorch_use_xnnpack} USE_KLEIDIAI=${pytorch_use_kleidiai}"; \
+            if [ "${pytorch_use_xnnpack}" = "ON" ]; then \
+                export USE_XNNPACK=1; \
+            else \
+                export USE_XNNPACK=0; \
+            fi; \
+            if [ "${pytorch_use_kleidiai}" = "ON" ]; then \
+                export USE_KLEIDIAI=1; \
+            else \
+                export USE_KLEIDIAI=0; \
+            fi; \
+            "${cmake_bin}" \
+                -G Ninja \
+                -DBUILD_SHARED_LIBS:BOOL=ON \
+                -DBUILD_TEST:BOOL=OFF \
+                -DBUILD_PYTHON:BOOL=OFF \
+                -DBUILD_CAFFE2_OPS:BOOL=ON \
+                -DCMAKE_BUILD_TYPE:STRING="${LIBTORCH_BUILD_TYPE}" \
+                -DPYTHON_EXECUTABLE:PATH=/tmp/pytorch-venv/bin/python \
+                -DPython_EXECUTABLE:PATH=/tmp/pytorch-venv/bin/python \
+                -DPython3_EXECUTABLE:PATH=/tmp/pytorch-venv/bin/python \
+                -DCMAKE_INSTALL_PREFIX:PATH=/opt/libtorch \
+                -DCMAKE_PREFIX_PATH:PATH=/tmp/pytorch-venv \
+                -DUSE_CUDA:BOOL=OFF \
+                -DUSE_CUDNN:BOOL=OFF \
+                -DUSE_DISTRIBUTED:BOOL=OFF \
+                -DUSE_FBGEMM:BOOL=OFF \
+                -DUSE_MKLDNN:BOOL=OFF \
+                -DUSE_NCCL:BOOL=OFF \
+                -DUSE_NUMA:BOOL=OFF \
+                -DUSE_QNNPACK:BOOL=OFF \
+                -DUSE_PYTORCH_QNNPACK:BOOL=OFF \
+                -DUSE_ROCM:BOOL=OFF \
+                -DUSE_KLEIDIAI:BOOL="${pytorch_use_kleidiai}" \
+                -DUSE_XNNPACK:BOOL="${pytorch_use_xnnpack}" \
+                -DCAFFE2_PERF_WITH_SVE:BOOL="${caffe2_perf_with_sve}" \
+                -DCAFFE2_PERF_WITH_SVE256:BOOL="${caffe2_perf_with_sve256}" \
+                ../pytorch; \
+            "${cmake_bin}" --build . --target install --parallel "${PYTORCH_BUILD_PARALLEL_LEVEL}"; \
+            rm -rf /tmp/pytorch /tmp/pytorch-build /tmp/pytorch-venv /root/.cache; \
         fi; \
-        if [ "${pytorch_use_kleidiai}" = "ON" ]; then \
-            export USE_KLEIDIAI=1; \
-        else \
-            export USE_KLEIDIAI=0; \
-        fi; \
-        "${cmake_bin}" \
-            -G Ninja \
-            -DBUILD_SHARED_LIBS:BOOL=ON \
-            -DBUILD_TEST:BOOL=OFF \
-            -DBUILD_PYTHON:BOOL=OFF \
-            -DBUILD_CAFFE2_OPS:BOOL=ON \
-            -DCMAKE_BUILD_TYPE:STRING="${LIBTORCH_BUILD_TYPE}" \
-            -DPYTHON_EXECUTABLE:PATH=/tmp/pytorch-venv/bin/python \
-            -DPython_EXECUTABLE:PATH=/tmp/pytorch-venv/bin/python \
-            -DPython3_EXECUTABLE:PATH=/tmp/pytorch-venv/bin/python \
-            -DCMAKE_INSTALL_PREFIX:PATH=/opt/libtorch \
-            -DCMAKE_PREFIX_PATH:PATH=/tmp/pytorch-venv \
-            -DUSE_CUDA:BOOL=OFF \
-            -DUSE_CUDNN:BOOL=OFF \
-            -DUSE_DISTRIBUTED:BOOL=OFF \
-            -DUSE_FBGEMM:BOOL=OFF \
-            -DUSE_MKLDNN:BOOL=OFF \
-            -DUSE_NCCL:BOOL=OFF \
-            -DUSE_NUMA:BOOL=OFF \
-            -DUSE_QNNPACK:BOOL=OFF \
-            -DUSE_PYTORCH_QNNPACK:BOOL=OFF \
-            -DUSE_ROCM:BOOL=OFF \
-            -DUSE_KLEIDIAI:BOOL="${pytorch_use_kleidiai}" \
-            -DUSE_XNNPACK:BOOL="${pytorch_use_xnnpack}" \
-            -DCAFFE2_PERF_WITH_SVE:BOOL="${caffe2_perf_with_sve}" \
-            -DCAFFE2_PERF_WITH_SVE256:BOOL="${caffe2_perf_with_sve256}" \
-            ../pytorch; \
-        "${cmake_bin}" --build . --target install --parallel "${PYTORCH_BUILD_PARALLEL_LEVEL}"; \
-        rm -rf /tmp/pytorch /tmp/pytorch-build /tmp/pytorch-venv /root/.cache; \
     fi; \
     test -f /opt/libtorch/lib/libtorch.so; \
     test -f /opt/libtorch/lib/libtorch_cpu.so; \
@@ -352,6 +386,9 @@ RUN set -eu; \
     find /opt/libtorch -type f -name '*.debug' -delete; \
     find /opt/libtorch -type f -name '*.pyc' -delete; \
     printf 'LIBTORCH_VERSION=%s\nLIBTORCH_ACCELERATOR=%s\nLIBTORCH_ARCH=%s\n' "${LIBTORCH_VERSION}" "${effective_accelerator}" "${norm_arch}" > /opt/libtorch/gail-libtorch-build.env
+
+FROM scratch AS libtorch-export
+COPY --from=libtorch /opt/libtorch /opt/libtorch
 
 FROM docker.io/library/rust:1-bookworm AS source-deb
 

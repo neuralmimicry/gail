@@ -678,6 +678,15 @@ jobs:
           host_jobs="$(nproc)"
           build_jobs="${BUILD_JOBS:-${host_jobs}}"
           cargo_jobs="${CARGO_BUILD_JOBS:-${build_jobs}}"
+          libtorch_version="${LIBTORCH_VERSION:-2.11.0}"
+          libtorch_build_from_source="${LIBTORCH_BUILD_FROM_SOURCE:-auto}"
+          libtorch_amd64_build_from_source="${LIBTORCH_AMD64_BUILD_FROM_SOURCE:-false}"
+          libtorch_arm64_build_from_source="${LIBTORCH_ARM64_BUILD_FROM_SOURCE:-auto}"
+          libtorch_url="${LIBTORCH_URL:-}"
+          libtorch_arm64_xnnpack="${LIBTORCH_ARM64_XNNPACK:-auto}"
+          libtorch_arm64_kleidiai="${LIBTORCH_ARM64_KLEIDIAI:-false}"
+          pytorch_git_tag="${PYTORCH_GIT_TAG:-auto}"
+          provided_libtorch_seed_image="${LIBTORCH_SEED_IMAGE:-}"
 
           if [[ "${MATRIX_PYTORCH_JOBS_DEFAULT}" == "auto" ]]; then
             pytorch_jobs="${PYTORCH_BUILD_PARALLEL_LEVEL:-${build_jobs}}"
@@ -689,8 +698,6 @@ jobs:
           if [[ "${INPUT_CONTAINER_NO_CACHE}" == "true" ]]; then
             no_cache_flag+=(--no-cache)
           fi
-
-          echo "Building ${ARCH_TAG} on ${MATRIX_PLATFORM} with BUILD_JOBS=${build_jobs}, CARGO_BUILD_JOBS=${cargo_jobs}, PYTORCH_BUILD_PARALLEL_LEVEL=${pytorch_jobs}, LIBTORCH_ACCELERATOR=${INPUT_LIBTORCH_ACCELERATOR}"
 
           if [[ "${MATRIX_ARCH}" == "arm64" ]]; then
             echo "ARM64 CPU features:"
@@ -707,6 +714,51 @@ jobs:
             arm64_sve="false"
           fi
 
+          registry_user="${GHCR_USERNAME:-${GITHUB_ACTOR}}"
+          registry_token="${GHCR_TOKEN:-${GITHUB_TOKEN}}"
+          libtorch_seed_image="${provided_libtorch_seed_image}"
+
+          if [[ -z "${libtorch_seed_image}" ]]; then
+            libtorch_key_seed="arch=${MATRIX_ARCH};version=${libtorch_version};accel=${INPUT_LIBTORCH_ACCELERATOR};url=${libtorch_url};build_from_source=${libtorch_build_from_source};amd64_from_source=${libtorch_amd64_build_from_source};arm64_from_source=${libtorch_arm64_build_from_source};arm64_sve=${arm64_sve};arm64_xnnpack=${libtorch_arm64_xnnpack};arm64_kleidiai=${libtorch_arm64_kleidiai};pytorch_tag=${pytorch_git_tag}"
+            libtorch_cache_hash="$(printf '%s' "${libtorch_key_seed}" | sha256sum | cut -c1-24)"
+            libtorch_version_tag="$(printf '%s' "${libtorch_version}" | tr -c '[:alnum:]._-' '-')"
+            libtorch_cache_tag="libtorch-${MATRIX_ARCH}-${libtorch_version_tag}-${libtorch_cache_hash}"
+            libtorch_seed_image="${IMAGE_REPO}:${libtorch_cache_tag}"
+
+            if skopeo inspect --creds "${registry_user}:${registry_token}" "docker://${libtorch_seed_image}" >/dev/null 2>&1; then
+              echo "Reusing existing libtorch seed image ${libtorch_seed_image}"
+            else
+              echo "Building libtorch seed image ${libtorch_seed_image}"
+              podman build \
+                --platform "${MATRIX_PLATFORM}" \
+                --network=host \
+                --pull \
+                --layers \
+                --build-arg LIBTORCH_VERSION="${libtorch_version}" \
+                --build-arg LIBTORCH_ACCELERATOR="${INPUT_LIBTORCH_ACCELERATOR}" \
+                --build-arg LIBTORCH_URL="${libtorch_url}" \
+                --build-arg LIBTORCH_BUILD_FROM_SOURCE="${libtorch_build_from_source}" \
+                --build-arg LIBTORCH_AMD64_BUILD_FROM_SOURCE="${libtorch_amd64_build_from_source}" \
+                --build-arg LIBTORCH_ARM64_BUILD_FROM_SOURCE="${libtorch_arm64_build_from_source}" \
+                --build-arg PYTORCH_GIT_TAG="${pytorch_git_tag}" \
+                --build-arg BUILD_JOBS="${build_jobs}" \
+                --build-arg CMAKE_BUILD_PARALLEL_LEVEL="${build_jobs}" \
+                --build-arg PYTORCH_BUILD_PARALLEL_LEVEL="${pytorch_jobs}" \
+                --build-arg LIBTORCH_ARM64_SVE="${arm64_sve}" \
+                --build-arg LIBTORCH_ARM64_XNNPACK="${libtorch_arm64_xnnpack}" \
+                --build-arg LIBTORCH_ARM64_KLEIDIAI="${libtorch_arm64_kleidiai}" \
+                --target libtorch-export \
+                -f Containerfile \
+                -t "${libtorch_seed_image}" \
+                .
+              podman push "${libtorch_seed_image}"
+            fi
+          else
+            echo "Using caller-provided libtorch seed image ${libtorch_seed_image}"
+          fi
+
+          echo "Building ${ARCH_TAG} on ${MATRIX_PLATFORM} with BUILD_JOBS=${build_jobs}, CARGO_BUILD_JOBS=${cargo_jobs}, PYTORCH_BUILD_PARALLEL_LEVEL=${pytorch_jobs}, LIBTORCH_ACCELERATOR=${INPUT_LIBTORCH_ACCELERATOR}, LIBTORCH_SEED_IMAGE=${libtorch_seed_image}"
+
           podman build \
             --platform "${MATRIX_PLATFORM}" \
             --network=host \
@@ -718,14 +770,21 @@ jobs:
             --build-arg VCS_REF="${GITHUB_SHA}" \
             --build-arg GITHUB_REPOSITORY="${GITHUB_REPOSITORY}" \
             --build-arg IMAGE_CREATED="${IMAGE_CREATED}" \
+            --build-arg LIBTORCH_SEED_IMAGE="${libtorch_seed_image}" \
+            --build-arg LIBTORCH_VERSION="${libtorch_version}" \
             --build-arg LIBTORCH_ACCELERATOR="${INPUT_LIBTORCH_ACCELERATOR}" \
+            --build-arg LIBTORCH_URL="${libtorch_url}" \
+            --build-arg LIBTORCH_BUILD_FROM_SOURCE="${libtorch_build_from_source}" \
+            --build-arg LIBTORCH_AMD64_BUILD_FROM_SOURCE="${libtorch_amd64_build_from_source}" \
+            --build-arg LIBTORCH_ARM64_BUILD_FROM_SOURCE="${libtorch_arm64_build_from_source}" \
+            --build-arg PYTORCH_GIT_TAG="${pytorch_git_tag}" \
             --build-arg BUILD_JOBS="${build_jobs}" \
             --build-arg CARGO_BUILD_JOBS="${cargo_jobs}" \
             --build-arg CMAKE_BUILD_PARALLEL_LEVEL="${build_jobs}" \
             --build-arg PYTORCH_BUILD_PARALLEL_LEVEL="${pytorch_jobs}" \
             --build-arg LIBTORCH_ARM64_SVE="${arm64_sve}" \
-            --build-arg LIBTORCH_ARM64_XNNPACK="auto" \
-            --build-arg LIBTORCH_ARM64_KLEIDIAI="${LIBTORCH_ARM64_KLEIDIAI:-false}" \
+            --build-arg LIBTORCH_ARM64_XNNPACK="${libtorch_arm64_xnnpack}" \
+            --build-arg LIBTORCH_ARM64_KLEIDIAI="${libtorch_arm64_kleidiai}" \
             -f Containerfile \
             -t "${ARCH_TAG}" \
             .
