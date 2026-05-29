@@ -1,3 +1,9 @@
+//! Gail LLM<->SNN mirror bridge.
+//!
+//! This module mirrors LLM prompt/response text into AARNN by projecting text
+//! into sensory spikes, encoding them as AER payloads, and posting the exchange
+//! to `/api/llm/mirror`.
+
 use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -36,6 +42,7 @@ struct AarnnMirrorJob {
 
 #[derive(Clone, Debug)]
 pub struct AarnnMirrorExchange {
+    // LLM-side context captured from orchestration/ledger before translation.
     pub request_id: String,
     pub conversation_id: String,
     pub workflow: String,
@@ -235,6 +242,9 @@ impl AarnnMirrorClient {
         trace: &AarnnMirrorInvocationTrace,
         llm_text: &str,
     ) -> bool {
+        // Candidate promotion is intentionally strict so Gail only replaces the
+        // selected LLM text when AARNN returned a distinct, high-confidence
+        // response that cleared configured quality gates.
         if self.response_preference != AarnnResponsePreference::PreferAarnnWhenConfident {
             return false;
         }
@@ -449,6 +459,8 @@ impl AarnnMirrorClient {
         tokio::spawn(async move {
             let permits = Arc::new(Semaphore::new(concurrency));
             while let Some(job) = rx.recv().await {
+                // Bound in-flight mirror requests so queue consumers do not
+                // overwhelm AARNN or local runtime resources.
                 let permit = match permits.clone().acquire_owned().await {
                     Ok(permit) => permit,
                     Err(_) => break,
@@ -508,6 +520,7 @@ impl AarnnMirrorClient {
     pub async fn mirror(&self, exchange: AarnnMirrorExchange) -> AarnnMirrorInvocationTrace {
         let started = Instant::now();
         let text_chars = exchange.text.chars().count();
+        // LLM text/context -> deterministic sensory spikes -> AER hex payload.
         let request = self.build_request(exchange);
         let spike_count = request
             .sensory_spikes
@@ -550,6 +563,7 @@ impl AarnnMirrorClient {
     }
 
     fn build_request(&self, exchange: AarnnMirrorExchange) -> AarnnMirrorRequest {
+        // Normalize textual context before projecting into the sensory layer.
         let text = truncate_chars(&compact_text(&exchange.text), self.max_text_chars);
         let system = exchange
             .system
@@ -561,6 +575,8 @@ impl AarnnMirrorClient {
             .as_deref()
             .map(compact_text)
             .map(|value| truncate_chars(&value, self.max_text_chars));
+        // Deterministically map normalized text to binary spikes, then encode
+        // active spike indices into AER events rooted at the sensory base.
         let sensory_spikes = text_to_spikes(text.as_str(), self.sensory_size);
         let aer_payload = encode_spikes(now_ts_us(), self.aer_sensory_base, &sensory_spikes);
         AarnnMirrorRequest {
@@ -591,6 +607,7 @@ impl AarnnMirrorClient {
         &self,
         request: &AarnnMirrorRequest,
     ) -> Result<AarnnMirrorResponse, String> {
+        // Retries are only used for transient transport/upstream failures.
         let max_attempts = self.request_max_attempts.max(1);
         let mut last_error = String::new();
         for attempt in 1..=max_attempts {
@@ -823,6 +840,9 @@ fn resolve_transport_profile(
 }
 
 fn text_to_spikes(text: &str, sensory_size: usize) -> Vec<u8> {
+    // Lightweight deterministic text projection for mirrored stimulation.
+    // This is intentionally non-semantic and stable so repeated text produces
+    // comparable sensory activation patterns for AARNN training/replay.
     let sensory_size = sensory_size.max(8);
     let mut spikes = vec![0u8; sensory_size];
     let compact = compact_text(text).to_ascii_lowercase();

@@ -72,6 +72,8 @@ pub async fn run(config: GailConfig) -> Result<()> {
         );
         for entry in entries {
             let mut errors = Vec::new();
+            // Replay prompt-side stimulation for durability/recovery, even when
+            // inline mirroring was skipped or timed out on the request path.
             if bridge.should_mirror_input() && !entry.prompt_text.trim().is_empty() {
                 let trace = bridge
                     .mirror(build_exchange(
@@ -86,6 +88,8 @@ pub async fn run(config: GailConfig) -> Result<()> {
                     errors.push(format!("input mirror: {error}"));
                 }
             }
+            // Replay response-side stimulation and candidate request flow using
+            // the resolved provider/model when available.
             if bridge.should_mirror_output()
                 && let Some(response_text) = entry.response_text.as_deref()
                 && !response_text.trim().is_empty()
@@ -157,6 +161,8 @@ fn build_exchange(
 ) -> AarnnMirrorExchange {
     AarnnMirrorExchange {
         request_id: entry.request_id.clone(),
+        // Keep replay rows usable even when upstream callers omitted a stable
+        // conversation id by falling back to request id.
         conversation_id: if entry.conversation_id.trim().is_empty() {
             entry.request_id.clone()
         } else {

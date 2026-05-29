@@ -1,5 +1,12 @@
 # Gail Operations Runbook
 
+## LLM/SNN Mirror Bridge
+
+Detailed LLM<->SNN mirror flow, including text->spike->AER transformation,
+candidate promotion gates, and mirror-worker replay behaviour:
+
+- [LLM_SNN_MIRROR_WORKFLOW.md](./LLM_SNN_MIRROR_WORKFLOW.md)
+
 ## Trading Bridge
 
 Detailed OctoBot integration behavior, endpoint fallback order, and reliability

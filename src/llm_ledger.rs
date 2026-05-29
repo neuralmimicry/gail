@@ -75,6 +75,9 @@ impl Default for LlmLedgerRecord {
 
 #[derive(Clone, Debug)]
 pub struct LedgerInteraction {
+    // Postgres-backed interaction row consumed by mirror/trainer workers.
+    // Field names intentionally match `gail_llm_interactions` columns so replay
+    // workers can rebuild bridge/training payloads without lossy transforms.
     pub id: i64,
     pub request_id: String,
     pub conversation_id: String,
@@ -240,6 +243,8 @@ pub async fn fetch_pending_mirror(
     batch_size: usize,
 ) -> Result<Vec<LedgerInteraction>, tokio_postgres::Error> {
     let client = connect_client(dsn).await?;
+    // Mirror worker replays any row not marked mirrored yet where either prompt
+    // or response text is available and the retry schedule is due.
     let rows = client
         .query(
             r#"
@@ -310,6 +315,7 @@ pub async fn mark_mirror_success(
     status: &str,
 ) -> Result<(), tokio_postgres::Error> {
     let client = connect_client(dsn).await?;
+    // A successful replay closes mirror scheduling for this interaction.
     client
         .execute(
             r#"
@@ -336,6 +342,8 @@ pub async fn mark_mirror_retry(
     retry_backoff_seconds: u64,
 ) -> Result<(), tokio_postgres::Error> {
     let client = connect_client(dsn).await?;
+    // Retry state is bounded; once attempts are exhausted the row is marked
+    // failed and no further mirror scheduling is attempted.
     client
         .execute(
             r#"

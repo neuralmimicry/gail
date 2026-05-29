@@ -272,26 +272,33 @@ pub struct CompletionResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AarnnMirrorRequest {
+    /// Gail request identifier for this mirrored exchange.
     pub request_id: String,
+    /// Conversation/thread identifier used to group related mirrors.
     pub conversation_id: String,
     pub workflow: String,
     pub role: String,
+    /// Input mirrors prompt-side context; output mirrors LLM response text.
     pub direction: AarnnMirrorDirection,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub request_category: Option<String>,
     pub system: Option<String>,
     pub prompt_text: Option<String>,
+    /// Direction-specific text transformed into spikes/AER payload.
     pub text: String,
     #[serde(default)]
     pub message_roles: Vec<String>,
+    /// Sensory/output base addresses used to encode/decode AER events.
     pub aer_base: u32,
     pub output_base: u32,
+    /// Hex encoded `AER1` payload derived from `sensory_spikes`.
     pub aer_payload_hex: String,
     #[serde(default)]
     pub sensory_spikes: Vec<u8>,
     pub network_id: Option<String>,
     pub node_id: Option<String>,
+    /// Output-only hint requesting candidate reply metadata from AARNN.
     pub request_candidate_reply: bool,
 }
 
@@ -331,12 +338,15 @@ pub struct AarnnMirrorResponse {
     pub spike_count: usize,
     pub aer_payload_hex: Option<String>,
     pub candidate: Option<AarnnMirrorCandidate>,
+    /// Optional stimulation execution details from AARNN.
     pub stimulation: Option<AarnnMirrorStimulus>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AarnnMirrorInvocationTrace {
+    /// Requested mirror direction (`input` or `output`).
     pub direction: AarnnMirrorDirection,
+    /// Whether AARNN accepted and processed this exchange.
     pub accepted: bool,
     pub endpoint: String,
     pub latency_ms: u64,
@@ -349,6 +359,7 @@ pub struct AarnnMirrorInvocationTrace {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AarnnMirrorTrace {
+    /// Combined mirror traces attached to a Gail completion response.
     pub enabled: bool,
     pub endpoint: String,
     pub mirror_input: bool,

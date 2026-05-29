@@ -187,6 +187,7 @@ Provider credentials, Gail bearer tokens, Ollama endpoints, and trading defaults
 - `specialists`: explicit neuromorphic engines. Use this when you have named SNN/AARNN backends to register.
 - `aarnn_bridge`: mirrored Gail-to-AARNN LLM I/O bridge. Gail mirrors prompt-side and response-side text plus translated AER payloads to `POST /api/llm/mirror` and can optionally promote a future AARNN reply.
 - `aarnn_bridge` queue controls (`queue_capacity`, `worker_count`, `enqueue_timeout_ms`, `candidate_wait_timeout_ms`) keep LLM↔SNN mirroring non-blocking while still allowing short bounded waits for candidate reply promotion.
+- `docs/LLM_SNN_MIRROR_WORKFLOW.md`: end-to-end transform reference for how Gail maps LLM text to sensory spikes/AER payloads and processes AARNN candidate responses.
 - `llm_ledger`: bounded non-blocking ledger queue for persisting every LLM interaction to JSONL and (optionally) Postgres.
 - `mirror_worker`: separate polling worker that reads pending interactions from Postgres and mirrors them to AARNN/SNN.
 - `trainer`: separate polling worker that snapshots interaction datasets, runs an external training command, and can rotate/register snapshots in Ollama.
@@ -209,6 +210,10 @@ Provider credentials, Gail bearer tokens, Ollama endpoints, and trading defaults
 ## AARNN Bridge
 
 Use `aarnn_bridge` when Gail should mirror every LLM input and output into an AARNN instance.
+
+Detailed data-flow and transform documentation is in:
+
+- [LLM_SNN_MIRROR_WORKFLOW.md](./docs/LLM_SNN_MIRROR_WORKFLOW.md)
 
 - `endpoint` points at the AARNN web UI base URL; Gail appends `POST /api/llm/mirror`.
 - `access_token` should be the Gail Customers-issued service-account bearer token.

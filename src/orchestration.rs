@@ -585,6 +585,8 @@ impl GailService {
         let mut usage = response.usage.clone();
         let mut raw = response.raw.clone();
         let mut final_source = "llm".to_string();
+        // Optionally promote an AARNN candidate reply over the LLM response when
+        // the bridge confidence gates are explicitly configured to allow it.
         if let (Some(bridge), Some(output_trace)) = (self.aarnn_bridge(), mirror_output.as_ref())
             && bridge.should_promote_candidate(output_trace, response.text.as_str())
             && let Some(reply_text) = bridge.promoted_reply(output_trace)
@@ -1299,6 +1301,8 @@ impl GailService {
         let mut usage = chosen_response.usage.clone();
         let mut raw = chosen_response.raw.clone();
         let mut final_source = "llm".to_string();
+        // Optionally promote an AARNN candidate reply over the selected LLM
+        // candidate when confidence/quality gates pass.
         if let (Some(bridge), Some(output_trace)) = (self.aarnn_bridge(), mirror_output.as_ref())
             && bridge.should_promote_candidate(output_trace, chosen_response.text.as_str())
             && let Some(reply_text) = bridge.promoted_reply(output_trace)
@@ -1670,6 +1674,8 @@ impl GailService {
         exchange: AarnnMirrorExchange,
     ) -> Option<oneshot::Receiver<crate::models::AarnnMirrorInvocationTrace>> {
         let bridge = self.inner.aarnn_bridge.clone()?;
+        // Respect per-direction toggles so input/output mirroring can be tuned
+        // independently without changing orchestration call sites.
         let should_mirror = match exchange.direction {
             AarnnMirrorDirection::Input => bridge.should_mirror_input(),
             AarnnMirrorDirection::Output => bridge.should_mirror_output(),
@@ -1685,6 +1691,8 @@ impl GailService {
         task: Option<oneshot::Receiver<crate::models::AarnnMirrorInvocationTrace>>,
     ) -> Option<crate::models::AarnnMirrorInvocationTrace> {
         let task = task?;
+        // Bounded wait keeps completion latency predictable; if the mirror path
+        // is slow, Gail returns without blocking the main LLM response path.
         let wait_timeout = self
             .aarnn_bridge()
             .map(|bridge| bridge.candidate_wait_timeout())
@@ -1716,6 +1724,8 @@ impl GailService {
         text: &str,
         messages: &[crate::models::ChatMessage],
     ) -> Option<crate::models::AarnnMirrorInvocationTrace> {
+        // Output mirroring reuses the same exchange builder used by input
+        // mirroring so both directions carry identical metadata contracts.
         self.await_aarnn_mirror_task(
             self.spawn_aarnn_mirror(self.build_aarnn_exchange(
                 request_id,
@@ -1751,6 +1761,7 @@ impl GailService {
         text: &str,
         messages: &[crate::models::ChatMessage],
     ) -> AarnnMirrorExchange {
+        // Canonical map from orchestration context into bridge exchange fields.
         AarnnMirrorExchange {
             request_id: request_id.to_string(),
             conversation_id: conversation_id.to_string(),
