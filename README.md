@@ -86,6 +86,14 @@ Run the Rust tests:
 cargo test
 ```
 
+Run trading tests in CI-safe mode (no libtorch / no `tch` build):
+
+```bash
+scripts/test-trading-ci-safe.sh
+# equivalent:
+# cargo test --locked --lib trading::tests:: --no-default-features --features ci-trading-tests
+```
+
 Run the dedicated workers:
 
 ```bash
@@ -312,7 +320,7 @@ Action thresholds on the blended signal:
 - otherwise → `hold`
 
 **Step 6 — Execution** (`mod.rs`)
-Gail evaluates decisions and has live execution enabled by default. Direct `place_buy_order` / `place_sell_order` calls return an explicit unsupported error when OctoBot's current web API only exposes order cancellation and trading-mode/user-command surfaces, not direct market-order placement. Live execution should be routed through a supported OctoBot trading mode or command bridge for autonomous orders.
+Gail evaluates decisions and has live execution enabled by default. Execution uses resilient OctoBot endpoint orchestration in `octobot.rs`: direct `/api/orders` creation routes are preferred, with guarded `/api/user_command` fallbacks for builds that expose command bridges instead of direct order creation. For sell actions, Gail now performs a one-shot `refresh_portfolio` + portfolio refetch before skipping due to missing/non-positive base-asset balance, reducing false skips caused by stale portfolio cache.
 
 **Override mechanism**: if `TradingState.pending_override` is set via `POST /v1/trading/override`, the decision pipeline is bypassed and the override decision is prepared with `confidence = 1.0`. The override still requires `trading.live_execution_enabled: true` before Gail submits anything to OctoBot. The override is cleared after the attempt.
 
@@ -353,6 +361,9 @@ State is persisted to `data_path` (default `./data/trading_state.json`) every 5 
 | `src/trading/fuzzy.rs` | `FuzzyEngine` — Type-2 interval fuzzy logic, 25 rules, Karnik-Mendel |
 | `src/trading/advisor.rs` | `TradingAdvisor` — parallel multi-AI advisory, consensus aggregation |
 | `src/trading/decision.rs` | `DecisionEngine` — signal blending, risk gates, trade sizing |
+
+OctoBot endpoint and fallback details are documented in:
+- `docs/OCTOBOT_CONNECTIVITY.md`
 
 ### Configuration Reference
 

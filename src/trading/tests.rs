@@ -1945,7 +1945,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/exchanges"))
             .respond_with(ResponseTemplate::new(404))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -1985,6 +1985,249 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn octobot_client_get_exchange_info_uses_exchange_symbols_when_config_is_empty() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/first_exchange_details"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exchange_name": "binance",
+                "exchange_id": "binance-id"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/get_config_currency"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/get_all_symbols/binance"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!(["ETH/USDT", "BTC/USDT", "ETH|USDT", "ETH/USDT"])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/currency_list"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let exchanges = client.get_exchange_info().await.unwrap();
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(
+            exchanges[0].symbols,
+            vec!["BTC/USDT".to_string(), "ETH/USDT".to_string()]
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_get_exchange_info_falls_back_to_currency_list_symbols() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/first_exchange_details"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exchange_name": "binance",
+                "exchange_id": "binance-id"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/get_config_currency"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/get_all_symbols/binance"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/currency_list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"symbol": "BTC/USDT"},
+                {"symbol": "ETH|USDT"},
+                {"symbol": "eth"}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let exchanges = client.get_exchange_info().await.unwrap();
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(
+            exchanges[0].symbols,
+            vec!["BTC/USDT".to_string(), "ETH/USDT".to_string()]
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_get_portfolio_falls_back_to_portfolio_page_when_api_missing() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/portfolio"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/portfolio"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"
+                <html><body>
+                  <h2>Portfolio: <span>9702.66</span> USDT</h2>
+                  <table>
+                    <tr>
+                      <th>Asset</th><th>Total</th><th>Value in USDT</th><th>Available</th><th>Locked in orders</th>
+                    </tr>
+                    <tr>
+                      <td>ETH</td><td>1.25</td><td>2514.50</td><td>1.0</td><td>0.25</td>
+                    </tr>
+                    <tr>
+                      <td>USDT</td><td>100.0</td><td>100.0</td><td>100.0</td><td>0.0</td>
+                    </tr>
+                  </table>
+                </body></html>
+                "#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/historical_portfolio_value"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let portfolio = client.get_portfolio().await.unwrap();
+        assert_eq!(portfolio.total_value_usd, Some(9702.66));
+        assert_eq!(portfolio.currencies.len(), 2);
+        assert!(portfolio.currencies.contains_key("ETH"));
+        assert!(portfolio.currencies.contains_key("USDT"));
+        let eth = portfolio.currencies.get("ETH").unwrap();
+        assert_eq!(eth.total, 1.25);
+        assert_eq!(eth.free, 1.0);
+        assert_eq!(eth.locked, 0.25);
+        assert_eq!(eth.value_usd, Some(2514.50));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_refresh_portfolio_calls_refresh_endpoint() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/refresh_portfolio"))
+            .respond_with(ResponseTemplate::new(200).set_body_json("Portfolio(s) refreshed"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let result = client.refresh_portfolio().await;
+        assert!(
+            result.is_ok(),
+            "refresh_portfolio should succeed: {result:?}"
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_refresh_portfolio_surfaces_http_error() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/refresh_portfolio"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "message": "No portfolio to refresh"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let err = client
+            .refresh_portfolio()
+            .await
+            .expect_err("refresh_portfolio should fail");
+        assert!(err.contains("refresh portfolio failed"));
+        assert!(err.contains("No portfolio to refresh"));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn sell_balance_precheck_refreshes_portfolio_when_balance_is_missing() {
+        let server = MockServer::start().await;
+        let state = SharedTradingState::new(100, 100);
+        {
+            let mut s = state.0.lock().await;
+            s.current_portfolio = Some(OctobotPortfolio::default());
+        }
+
+        Mock::given(method("POST"))
+            .and(path("/api/refresh_portfolio"))
+            .respond_with(ResponseTemplate::new(200).set_body_json("Portfolio(s) refreshed"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/portfolio"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ETH": {
+                    "free": 0.75,
+                    "locked": 0.0,
+                    "total": 0.75,
+                    "value_usd": 1880.0
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/historical_portfolio_value"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let availability =
+            crate::trading::ensure_sell_balance_available(&client, &state, "ETH", "ETH/USDT").await;
+
+        assert!(
+            matches!(
+                availability,
+                crate::trading::SellBalanceAvailability::Available
+            ),
+            "expected sell balance to become available after refresh"
+        );
+        {
+            let s = state.0.lock().await;
+            let portfolio = s.current_portfolio.as_ref().expect("updated portfolio");
+            let eth = portfolio.currencies.get("ETH").expect("ETH balance");
+            assert!(eth.total > 0.0);
+        }
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn octobot_client_get_market_snapshot_uses_dashboard_graph_fallback() {
         let server = MockServer::start().await;
 
@@ -1993,7 +2236,7 @@ mod tests {
             .and(query_param("exchange", "binance"))
             .and(query_param("symbol", "BTC/USDT"))
             .respond_with(ResponseTemplate::new(404))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -2038,38 +2281,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn octobot_client_schema_skips_known_missing_optional_ticker_route() {
+    async fn octobot_client_schema_skips_known_missing_optional_watched_symbol_route() {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/api/market/ticker"))
-            .and(query_param("exchange", "binance"))
-            .and(query_param("symbol", "BTC/USDT"))
+            .and(path_regex(r"^/dashboard/watched_symbol/BTC(%7C|\|)USDT$"))
             .respond_with(ResponseTemplate::new(404))
             .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path_regex(r"^/dashboard/watched_symbol/BTC(%7C|\|)USDT$"))
+            .and(path("/api/market/ticker"))
+            .and(query_param("exchange", "binance"))
+            .and(query_param("symbol", "BTC/USDT"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "exchange_id": "binance-id",
-                "time_frame": "1h"
-            })))
-            .expect(2)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path_regex(
-                r"^/dashboard/currency_price_graph_update/binance-id/BTC(%7C|\|)USDT/1h/live$",
-            ))
-            .and(query_param("display_orders", "false"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "candles": {
-                    "close": [100.0, 110.0],
-                    "high": [101.0, 112.0],
-                    "low": [99.0, 105.0],
-                    "volume": [10.0, 15.0]
-                }
+                "last": 110.0,
+                "high": 112.0,
+                "low": 99.0,
+                "baseVolume": 25.0,
+                "percentage": 10.0
             })))
             .expect(2)
             .mount(&server)
@@ -2088,8 +2318,12 @@ mod tests {
         assert!(
             schema
                 .endpoints
-                .get("GET /api/market/ticker")
-                .is_some_and(|endpoint| endpoint.degraded)
+                .iter()
+                .find_map(|(key, endpoint)| {
+                    key.contains("/dashboard/watched_symbol")
+                        .then_some(endpoint.degraded)
+                })
+                .is_some_and(|degraded| degraded)
         );
         server.verify().await;
     }
@@ -2101,7 +2335,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/logs"))
             .respond_with(ResponseTemplate::new(404))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
         Mock::given(method("GET"))

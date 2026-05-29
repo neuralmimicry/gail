@@ -746,47 +746,41 @@ async fn execute_if_warranted(
             .unwrap_or_default();
 
         if !base_asset.is_empty() {
-            let balance_opt = {
-                let s = state.0.lock().await;
-                s.current_portfolio
-                    .as_ref()
-                    .and_then(|portfolio| portfolio.currencies.get(base_asset).cloned())
-            };
-
-            match balance_opt {
-                Some(balance) if balance.free <= 0.0 && balance.total <= 0.0 => {
+            match ensure_sell_balance_available(octobot, state, base_asset, &decision.symbol).await
+            {
+                SellBalanceAvailability::Available => {}
+                SellBalanceAvailability::NonPositive { free, total } => {
                     warn!(
                         "trading: sell skipped — non-positive {base_asset} balance for {} (free={}, total={})",
-                        decision.symbol, balance.free, balance.total
+                        decision.symbol, free, total
                     );
                     state
                         .log_warn(
                             "execute",
                             format!(
                                 "Sell skipped for {}: non-positive {} balance (free={}, total={})",
-                                decision.symbol, base_asset, balance.free, balance.total
+                                decision.symbol, base_asset, free, total
                             ),
                         )
                         .await;
                     return;
                 }
-                None => {
+                SellBalanceAvailability::Missing => {
                     warn!(
-                        "trading: sell skipped — {base_asset} balance unavailable in OctoBot portfolio for {}",
+                        "trading: sell skipped — {base_asset} balance unavailable in OctoBot portfolio for {} after refresh",
                         decision.symbol
                     );
                     state
                         .log_warn(
                             "execute",
                             format!(
-                                "Sell skipped for {}: {base_asset} balance unavailable in OctoBot portfolio",
+                                "Sell skipped for {}: {base_asset} balance unavailable in OctoBot portfolio after refresh",
                                 decision.symbol
                             ),
                         )
                         .await;
                     return;
                 }
-                _ => {}
             }
         }
     }
@@ -844,6 +838,82 @@ async fn execute_if_warranted(
                 .log_error("execute", format!("{side} order failed: {err}"))
                 .await;
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SellBalanceAvailability {
+    Available,
+    Missing,
+    NonPositive { free: f64, total: f64 },
+}
+
+async fn ensure_sell_balance_available(
+    octobot: &OctobotClient,
+    state: &SharedTradingState,
+    base_asset: &str,
+    symbol: &str,
+) -> SellBalanceAvailability {
+    let initial = cached_sell_balance(state, base_asset).await;
+    if matches!(initial, SellBalanceAvailability::Available) {
+        return initial;
+    }
+
+    // Try one explicit OctoBot refresh cycle before skipping a sell. This
+    // closes the gap between exchange state and cached portfolio snapshots.
+    debug!(
+        "trading: refreshing OctoBot portfolio before sell precheck for {} ({})",
+        symbol, base_asset
+    );
+    if let Err(err) = octobot.refresh_portfolio().await {
+        warn!(
+            "trading: portfolio refresh request failed before sell precheck for {}: {}",
+            symbol, err
+        );
+    }
+
+    match octobot.get_portfolio().await {
+        Ok(portfolio) => {
+            let availability = portfolio_balance_state(&portfolio, base_asset);
+            let mut s = state.0.lock().await;
+            s.current_portfolio = Some(portfolio);
+            availability
+        }
+        Err(err) => {
+            warn!(
+                "trading: portfolio refetch failed after refresh for {}: {}",
+                symbol, err
+            );
+            initial
+        }
+    }
+}
+
+async fn cached_sell_balance(
+    state: &SharedTradingState,
+    base_asset: &str,
+) -> SellBalanceAvailability {
+    let s = state.0.lock().await;
+    if let Some(portfolio) = s.current_portfolio.as_ref() {
+        portfolio_balance_state(portfolio, base_asset)
+    } else {
+        SellBalanceAvailability::Missing
+    }
+}
+
+fn portfolio_balance_state(
+    portfolio: &OctobotPortfolio,
+    base_asset: &str,
+) -> SellBalanceAvailability {
+    match portfolio.currencies.get(base_asset) {
+        Some(balance) if balance.free > 0.0 || balance.total > 0.0 => {
+            SellBalanceAvailability::Available
+        }
+        Some(balance) => SellBalanceAvailability::NonPositive {
+            free: balance.free,
+            total: balance.total,
+        },
+        None => SellBalanceAvailability::Missing,
     }
 }
 

@@ -209,6 +209,7 @@ jobs:
           scripts/package-release.sh
           scripts/build-deb.sh
           scripts/set-release-version.sh
+          scripts/test-trading-ci-safe.sh
 
   package:
     name: Package (${{ matrix.platform }})

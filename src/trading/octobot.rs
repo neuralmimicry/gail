@@ -390,42 +390,78 @@ impl OctobotClient {
     // -----------------------------------------------------------------------
 
     pub async fn get_portfolio(&self) -> Result<OctobotPortfolio, String> {
-        let body = match self
+        // OctoBot builds differ: some expose `/api/portfolio`, others only the
+        // HTML `/portfolio` page.
+        if let Some(body) = self
             .get_optional_json("/api/portfolio", "portfolio")
             .await?
         {
-            Some(body) => body,
-            None => {
-                let mut portfolio = OctobotPortfolio::default();
-                if let Some(body) = self
-                    .get_optional_json(
-                        "/api/historical_portfolio_value?currency=USDT",
-                        "historical portfolio",
-                    )
-                    .await?
-                {
-                    portfolio.total_value_usd = parse_latest_portfolio_value(&body);
-                }
+            let mut portfolio = parse_portfolio_json(&body);
+            if portfolio.total_value_usd.is_none() {
+                self.enrich_portfolio_total_from_history(&mut portfolio)
+                    .await?;
+            }
+            if !portfolio.currencies.is_empty() || portfolio.total_value_usd.is_some() {
                 return Ok(portfolio);
             }
-        };
-        let mut portfolio = OctobotPortfolio::default();
-        if let Some(currencies) = body.as_object() {
-            for (symbol, data) in currencies {
-                if symbol == "total_value_usd" {
-                    portfolio.total_value_usd = data.as_f64();
-                    continue;
-                }
-                let balance = CurrencyBalance {
-                    free: data.get("free").and_then(Value::as_f64).unwrap_or(0.0),
-                    locked: data.get("locked").and_then(Value::as_f64).unwrap_or(0.0),
-                    total: data.get("total").and_then(Value::as_f64).unwrap_or(0.0),
-                    value_usd: data.get("value_usd").and_then(Value::as_f64),
-                };
-                portfolio.currencies.insert(symbol.clone(), balance);
-            }
         }
+
+        if let Some(page) = self
+            .get_optional_text("/portfolio", "portfolio page")
+            .await?
+            && let Some(mut portfolio) = parse_portfolio_html(&page)
+        {
+            if portfolio.total_value_usd.is_none() {
+                self.enrich_portfolio_total_from_history(&mut portfolio)
+                    .await?;
+            }
+            return Ok(portfolio);
+        }
+
+        let mut portfolio = OctobotPortfolio::default();
+        self.enrich_portfolio_total_from_history(&mut portfolio)
+            .await?;
         Ok(portfolio)
+    }
+
+    async fn enrich_portfolio_total_from_history(
+        &self,
+        portfolio: &mut OctobotPortfolio,
+    ) -> Result<(), String> {
+        if portfolio.total_value_usd.is_some() {
+            return Ok(());
+        }
+        if let Some(body) = self
+            .get_optional_json(
+                "/api/historical_portfolio_value?currency=USDT",
+                "historical portfolio",
+            )
+            .await?
+        {
+            portfolio.total_value_usd = parse_latest_portfolio_value(&body);
+        }
+        Ok(())
+    }
+
+    /// Ask OctoBot to refresh exchange balances before reading portfolio data.
+    ///
+    /// This is useful right before sell decisions: OctoBot can lag briefly
+    /// after fills/transfers, and stale balances can lead to avoidable
+    /// "balance unavailable" skips in Gail.
+    pub async fn refresh_portfolio(&self) -> Result<(), String> {
+        let (status, body) = self
+            .post_json_with_status("/api/refresh_portfolio", &json!({}), "refresh portfolio")
+            .await?;
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let detail =
+            extract_attempt_message(&body).unwrap_or_else(|| summarize_order_attempt_body(&body));
+        Err(format!(
+            "OctoBot refresh portfolio failed: HTTP {}: {detail}",
+            status.as_u16()
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -827,38 +863,56 @@ impl OctobotClient {
     // -----------------------------------------------------------------------
 
     pub async fn get_exchange_info(&self) -> Result<Vec<OctobotExchange>, String> {
+        // Primary path for modern OctoBot builds: explicit first-exchange
+        // endpoint plus symbol discovery from config/runtime routes.
+        let exchange_body = self
+            .get_optional_json("/api/first_exchange_details", "first exchange details")
+            .await?;
+        if let Some(exchange_body) = exchange_body {
+            let exchange_data = unwrap_octobot_data(&exchange_body);
+            let exchange_name = exchange_data
+                .get("exchange_name")
+                .or_else(|| exchange_data.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let symbols = self
+                .configured_symbols(Some(exchange_name.as_str()))
+                .await
+                .unwrap_or_default();
+            return Ok(vec![OctobotExchange {
+                name: exchange_name,
+                enabled: true,
+                symbols,
+            }]);
+        }
+
         if let Some(body) = self
             .get_optional_json("/api/exchanges", "exchanges")
             .await?
         {
-            let exchanges = parse_exchange_info_array(&body);
+            // Older/custom builds may still expose `/api/exchanges`; enrich
+            // symbol lists if the endpoint omits them.
+            let mut exchanges = parse_exchange_info_array(&body);
+            for exchange in &mut exchanges {
+                if exchange.symbols.is_empty() {
+                    exchange.symbols = self
+                        .configured_symbols(Some(exchange.name.as_str()))
+                        .await
+                        .unwrap_or_default();
+                }
+                exchange.symbols.sort();
+                exchange.symbols.dedup();
+            }
             if !exchanges.is_empty() {
                 return Ok(exchanges);
             }
         }
 
-        let exchange_body = self
-            .get_optional_json("/api/first_exchange_details", "first exchange details")
-            .await?;
-        let Some(exchange_body) = exchange_body else {
-            return Ok(Vec::new());
-        };
-        let exchange_data = unwrap_octobot_data(&exchange_body);
-        let exchange_name = exchange_data
-            .get("exchange_name")
-            .or_else(|| exchange_data.get("name"))
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-        let symbols = self.configured_symbols().await.unwrap_or_default();
-        Ok(vec![OctobotExchange {
-            name: exchange_name,
-            enabled: true,
-            symbols,
-        }])
+        Ok(Vec::new())
     }
 
-    async fn configured_symbols(&self) -> Result<Vec<String>, String> {
+    async fn configured_symbols(&self, exchange_name: Option<&str>) -> Result<Vec<String>, String> {
         let body = self
             .get_optional_json("/api/get_config_currency", "configured currencies")
             .await?
@@ -875,18 +929,69 @@ impl OctobotClient {
                     .or_else(|| data.get("crypto-pairs"))
                     .and_then(Value::as_array)
                 {
-                    symbols.extend(pairs.iter().filter_map(Value::as_str).map(str::to_string));
+                    symbols.extend(
+                        pairs
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .filter_map(normalize_trading_symbol),
+                    );
                 }
             }
+        }
+        // Fallback order is intentionally progressive:
+        // 1) configured pairs
+        // 2) exchange market universe
+        // 3) generic currency list
+        // 4) dashboard first symbol
+        //
+        // This keeps symbols useful across OctoBot editions where any one
+        // endpoint can be disabled, empty, or unavailable.
+        if symbols.is_empty()
+            && let Some(exchange_name) = exchange_name
+        {
+            symbols.extend(self.exchange_symbols(exchange_name).await?);
+        }
+        if symbols.is_empty() {
+            symbols.extend(self.currency_list_symbols().await?);
         }
         if symbols.is_empty()
             && let Some(first) = self
                 .get_optional_json("/dashboard/first_symbol", "first symbol")
                 .await?
-            && let Some(symbol) = first.get("symbol").and_then(Value::as_str)
+            && let Some(symbol) = first
+                .get("symbol")
+                .and_then(Value::as_str)
+                .and_then(normalize_trading_symbol)
         {
-            symbols.push(symbol.replace('|', "/"));
+            symbols.push(symbol);
         }
+        symbols.sort();
+        symbols.dedup();
+        Ok(symbols)
+    }
+
+    async fn exchange_symbols(&self, exchange_name: &str) -> Result<Vec<String>, String> {
+        let exchange_name = exchange_name.trim();
+        if exchange_name.is_empty() {
+            return Ok(Vec::new());
+        }
+        let path = format!("/api/get_all_symbols/{exchange_name}");
+        let mut symbols = self
+            .get_optional_json(&path, "exchange symbols")
+            .await?
+            .map(|body| parse_trading_symbol_candidates(&body))
+            .unwrap_or_default();
+        symbols.sort();
+        symbols.dedup();
+        Ok(symbols)
+    }
+
+    async fn currency_list_symbols(&self) -> Result<Vec<String>, String> {
+        let mut symbols = self
+            .get_optional_json("/api/currency_list", "currency list")
+            .await?
+            .map(|body| parse_trading_symbol_candidates(&body))
+            .unwrap_or_default();
         symbols.sort();
         symbols.dedup();
         Ok(symbols)
@@ -898,35 +1003,49 @@ impl OctobotClient {
         exchange: &str,
         symbol: &str,
     ) -> Result<MarketSnapshot, String> {
-        let legacy_path = format!("/api/market/ticker?exchange={}&symbol={}", exchange, symbol);
+        // Prefer dashboard routes in current OctoBot builds.
+        let web_symbol = symbol.replace('/', "|");
+        let watched_path = format!("/dashboard/watched_symbol/{web_symbol}");
+        if let Some(watched) = self
+            .get_optional_json(&watched_path, "watched symbol")
+            .await?
+        {
+            let exchange_id = watched
+                .get("exchange_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if let Some(exchange_id) = exchange_id {
+                let time_frame = watched
+                    .get("time_frame")
+                    .and_then(Value::as_str)
+                    .unwrap_or("1h");
+                let graph_path = format!(
+                    "/dashboard/currency_price_graph_update/{exchange_id}/{web_symbol}/{time_frame}/live?display_orders=false"
+                );
+                if let Some(graph) = self.get_optional_json(&graph_path, "price graph").await? {
+                    return Ok(parse_graph_snapshot(exchange, symbol, &graph));
+                }
+            }
+        }
+
+        // Legacy fallback.
+        let legacy_path = format!("/api/market/ticker?exchange={exchange}&symbol={symbol}");
         if let Some(body) = self.get_optional_json(&legacy_path, "ticker").await? {
             return Ok(parse_ticker_snapshot(exchange, symbol, &body));
         }
 
-        let web_symbol = symbol.replace('/', "|");
-        let watched_path = format!("/dashboard/watched_symbol/{web_symbol}");
-        let watched = self.get_json(&watched_path, "watched symbol").await?;
-        let exchange_id = watched
-            .get("exchange_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "OctoBot watched symbol response missing exchange_id".to_string())?;
-        let time_frame = watched
-            .get("time_frame")
-            .and_then(Value::as_str)
-            .unwrap_or("1h");
-        let graph_path = format!(
-            "/dashboard/currency_price_graph_update/{exchange_id}/{web_symbol}/{time_frame}/live?display_orders=false"
-        );
-        let graph = self.get_json(&graph_path, "price graph").await?;
-        Ok(parse_graph_snapshot(exchange, symbol, &graph))
+        Err(format!(
+            "OctoBot market snapshot unavailable for {exchange}/{symbol}: no dashboard or ticker endpoint returned data"
+        ))
     }
 
     pub async fn get_recent_logs(&self, limit: usize) -> Result<Vec<OctobotLogEntry>, String> {
         let limit = limit.clamp(1, 1000);
         let candidate_paths = [
-            format!("/api/logs?limit={limit}"),
             format!("/logs?format=json&limit={limit}"),
             "/logs".to_string(),
+            format!("/api/logs?limit={limit}"),
         ];
         let mut last_error = None;
         for path in candidate_paths {
@@ -1407,7 +1526,7 @@ fn parse_exchange_info_array(body: &Value) -> Vec<OctobotExchange> {
                     .map(|a| {
                         a.iter()
                             .filter_map(Value::as_str)
-                            .map(str::to_string)
+                            .filter_map(normalize_trading_symbol)
                             .collect()
                     })
                     .unwrap_or_default(),
@@ -1416,6 +1535,45 @@ fn parse_exchange_info_array(body: &Value) -> Vec<OctobotExchange> {
         }
     }
     exchanges
+}
+
+fn normalize_trading_symbol(raw: &str) -> Option<String> {
+    let candidate = raw.trim().replace('|', "/");
+    if candidate.is_empty() || !candidate.contains('/') {
+        return None;
+    }
+    Some(candidate)
+}
+
+fn parse_trading_symbol_candidates(body: &Value) -> Vec<String> {
+    let mut symbols = Vec::new();
+    collect_trading_symbol_candidates(body, &mut symbols);
+    symbols.sort();
+    symbols.dedup();
+    symbols
+}
+
+fn collect_trading_symbol_candidates(value: &Value, symbols: &mut Vec<String>) {
+    match value {
+        Value::String(text) => {
+            if let Some(symbol) = normalize_trading_symbol(text) {
+                symbols.push(symbol);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_trading_symbol_candidates(item, symbols);
+            }
+        }
+        Value::Object(object) => {
+            for key in ["symbol", "symbols", "pair", "pairs", "market", "markets"] {
+                if let Some(candidate) = object.get(key) {
+                    collect_trading_symbol_candidates(candidate, symbols);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn unwrap_octobot_data(body: &Value) -> &Value {
@@ -1644,6 +1802,101 @@ fn parse_latest_portfolio_value(body: &Value) -> Option<f64> {
                 .as_f64()
                 .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
         })
+}
+
+fn parse_portfolio_json(body: &Value) -> OctobotPortfolio {
+    let mut portfolio = OctobotPortfolio::default();
+    if let Some(currencies) = body.as_object() {
+        for (symbol, data) in currencies {
+            if symbol == "total_value_usd" {
+                portfolio.total_value_usd = data.as_f64();
+                continue;
+            }
+            let balance = CurrencyBalance {
+                free: data.get("free").and_then(Value::as_f64).unwrap_or(0.0),
+                locked: data.get("locked").and_then(Value::as_f64).unwrap_or(0.0),
+                total: data.get("total").and_then(Value::as_f64).unwrap_or(0.0),
+                value_usd: data.get("value_usd").and_then(Value::as_f64),
+            };
+            portfolio.currencies.insert(symbol.clone(), balance);
+        }
+    }
+    portfolio
+}
+
+fn parse_portfolio_html(raw: &str) -> Option<OctobotPortfolio> {
+    let text = html_table_to_text(raw);
+    let mut portfolio = OctobotPortfolio::default();
+    portfolio.total_value_usd = parse_portfolio_total_from_text(&text);
+
+    for line in text.lines() {
+        let cols: Vec<&str> = line
+            .split('\t')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .collect();
+        if cols.len() < 5 {
+            continue;
+        }
+        if cols[0].eq_ignore_ascii_case("asset") {
+            continue;
+        }
+        let Some(total) = parse_first_number(cols[1]) else {
+            continue;
+        };
+        let Some(symbol) = extract_portfolio_symbol(cols[0]) else {
+            continue;
+        };
+        let free = parse_first_number(cols[3]).unwrap_or(total);
+        let locked = parse_first_number(cols[4]).unwrap_or((total - free).max(0.0));
+        let value_usd = parse_first_number(cols[2]);
+        portfolio.currencies.insert(
+            symbol,
+            CurrencyBalance {
+                free,
+                locked,
+                total,
+                value_usd,
+            },
+        );
+    }
+
+    if portfolio.currencies.is_empty() && portfolio.total_value_usd.is_none() {
+        None
+    } else {
+        Some(portfolio)
+    }
+}
+
+fn parse_portfolio_total_from_text(text: &str) -> Option<f64> {
+    let marker = "portfolio:";
+    let lowered = text.to_ascii_lowercase();
+    let idx = lowered.find(marker)?;
+    let tail = &text[idx + marker.len()..];
+    for token in tail.split_whitespace().take(8) {
+        if let Some(value) = parse_first_number(token) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn parse_first_number(value: &str) -> Option<f64> {
+    static NUMBER_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"[-+]?\d[\d,]*(?:\.\d+)?(?:[eE][-+]?\d+)?").expect("valid numeric regex")
+    });
+    let matched = NUMBER_RE.find(value)?.as_str().replace(',', "");
+    matched.parse::<f64>().ok()
+}
+
+fn extract_portfolio_symbol(value: &str) -> Option<String> {
+    static SYMBOL_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"\b([A-Z0-9][A-Z0-9._-]{1,15})\b").expect("valid symbol regex"));
+    SYMBOL_RE
+        .captures_iter(value)
+        .filter_map(|capture| capture.get(1).map(|m| m.as_str()))
+        .last()
+        .map(str::to_string)
 }
 
 impl OctobotClient {
