@@ -5,7 +5,7 @@ use std::{
 };
 
 use reqwest::Client;
-use serde_json::json;
+use serde_json::{Map, Value, json};
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -862,43 +862,36 @@ async fn register_snapshot_with_ollama(
             })?;
         rendered
     };
-    let client = ollama_api_client();
-    let create_result = ollama_api_post(
-        &client,
+    let create_payload = build_ollama_create_payload_from_modelfile(
         trainer,
-        "create",
-        &json!({
-            "model": tagged_model.as_str(),
-            "modelfile": modelfile.as_str(),
-            "stream": false
-        }),
-    )
-    .await;
-    if let Err(error) = create_result {
-        let error_text = error.to_string();
-        if error_text.contains("neither 'from' or 'files'") {
-            tracing::warn!(
-                model = %tagged_model,
-                error = %error_text,
-                "Ollama create rejected Modelfile payload; retrying with from-based payload"
-            );
-            ollama_api_post(
-                &client,
-                trainer,
-                "create",
-                &json!({
-                    "model": tagged_model.as_str(),
-                    "from": trainer.ollama_base_model.as_str(),
-                    "system": format!(
-                        "You are the Gail in-house continuously trained model snapshot {}.",
-                        snapshot_id
-                    ),
-                    "stream": false
-                }),
-            )
-            .await?;
-        } else {
-            return Err(error);
+        tagged_model.as_str(),
+        snapshot_id,
+        &modelfile,
+    );
+    let client = ollama_api_client();
+    let create_result = ollama_api_post(&client, trainer, "create", &create_payload).await;
+    if let Err(primary_error) = create_result {
+        let primary_error_text = primary_error.to_string();
+        tracing::warn!(
+            model = %tagged_model,
+            error = %primary_error_text,
+            "Ollama create via from-based payload failed; retrying with Modelfile payload"
+        );
+        if let Err(fallback_error) = ollama_api_post(
+            &client,
+            trainer,
+            "create",
+            &json!({
+                "model": tagged_model.as_str(),
+                "modelfile": modelfile.as_str(),
+                "stream": false
+            }),
+        )
+        .await
+        {
+            return Err(GailError::invalid_config(format!(
+                "Ollama API /api/create failed with both payload styles: from-based={primary_error_text}; modelfile-based={fallback_error}"
+            )));
         }
     }
     ollama_api_post(
@@ -939,15 +932,9 @@ async fn rotate_ollama_models(trainer: &TrainerConfig) -> Result<()> {
         .skip(trainer.rotate_keep)
         .collect::<Vec<_>>();
     for model in remove {
-        let _ = ollama_api_post(
-            &client,
-            trainer,
-            "delete",
-            &json!({
-                "model": model
-            }),
-        )
-        .await;
+        if let Err(error) = ollama_api_delete(&client, trainer, model.as_str()).await {
+            tracing::warn!(model = %model, error = %error, "failed to delete stale Ollama snapshot model");
+        }
     }
     Ok(())
 }
@@ -1098,6 +1085,109 @@ fn truncate_chars(value: &str, limit: usize) -> String {
     value.chars().take(limit.max(1)).collect()
 }
 
+#[derive(Default)]
+struct ParsedModelfile {
+    from: Option<String>,
+    system: Option<String>,
+    parameters: Map<String, Value>,
+}
+
+fn build_ollama_create_payload_from_modelfile(
+    trainer: &TrainerConfig,
+    tagged_model: &str,
+    snapshot_id: &str,
+    modelfile: &str,
+) -> Value {
+    let parsed = parse_modelfile(modelfile);
+    let from = parsed
+        .from
+        .unwrap_or_else(|| trainer.ollama_base_model.clone());
+    let system = parsed.system.unwrap_or_else(|| {
+        format!("You are the Gail in-house continuously trained model snapshot {snapshot_id}.")
+    });
+    let mut payload = json!({
+        "model": tagged_model,
+        "from": from,
+        "stream": false,
+    });
+    if !system.trim().is_empty() {
+        payload["system"] = json!(system);
+    }
+    if !parsed.parameters.is_empty() {
+        payload["parameters"] = Value::Object(parsed.parameters);
+    }
+    payload
+}
+
+fn parse_modelfile(modelfile: &str) -> ParsedModelfile {
+    let mut parsed = ParsedModelfile::default();
+    for line in modelfile.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let Some(directive) = parts.next() else {
+            continue;
+        };
+        let rest = parts.next().unwrap_or_default().trim();
+        if rest.is_empty() {
+            continue;
+        }
+        if directive.eq_ignore_ascii_case("FROM") {
+            parsed.from = Some(rest.to_string());
+            continue;
+        }
+        if directive.eq_ignore_ascii_case("SYSTEM") {
+            parsed.system = Some(unquote_modelfile_value(rest));
+            continue;
+        }
+        if directive.eq_ignore_ascii_case("PARAMETER") {
+            let mut parameter_parts = rest.splitn(2, char::is_whitespace);
+            let key = parameter_parts.next().unwrap_or_default().trim();
+            let value = parameter_parts.next().unwrap_or_default().trim();
+            if key.is_empty() || value.is_empty() {
+                continue;
+            }
+            parsed
+                .parameters
+                .insert(key.to_string(), parse_modelfile_parameter_value(value));
+        }
+    }
+    parsed
+}
+
+fn parse_modelfile_parameter_value(value: &str) -> Value {
+    let normalized = unquote_modelfile_value(value);
+    let lowered = normalized.to_ascii_lowercase();
+    if lowered == "true" {
+        return json!(true);
+    }
+    if lowered == "false" {
+        return json!(false);
+    }
+    if let Ok(parsed) = normalized.parse::<i64>() {
+        return json!(parsed);
+    }
+    if let Ok(parsed) = normalized.parse::<f64>() {
+        return json!(parsed);
+    }
+    json!(normalized)
+}
+
+fn unquote_modelfile_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        let first = bytes[0] as char;
+        let last = bytes[trimmed.len() - 1] as char;
+        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+            return trimmed[1..trimmed.len() - 1].to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 fn ollama_api_client() -> Client {
     Client::builder()
         .pool_idle_timeout(Duration::from_secs(90))
@@ -1184,6 +1274,45 @@ async fn ollama_api_get(
     )))
 }
 
+async fn ollama_api_delete(client: &Client, trainer: &TrainerConfig, model: &str) -> Result<()> {
+    let payload = json!({ "model": model });
+    let base_url = ollama_base_url(trainer);
+    let url = format!("{base_url}/api/delete");
+    let response = client
+        .delete(url.as_str())
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| {
+            GailError::invalid_config(format!(
+                "Ollama API request failed for /api/delete: {error}"
+            ))
+        })?;
+    let status = response.status();
+    let text = response.text().await.map_err(|error| {
+        GailError::invalid_config(format!("failed to read Ollama API response: {error}"))
+    })?;
+    let parsed = serde_json::from_str::<serde_json::Value>(text.as_str())
+        .unwrap_or_else(|_| json!({ "message": text }));
+    if status.is_success() {
+        return Ok(());
+    }
+    let error_message = parsed.to_string();
+    if status.as_u16() == 405
+        || error_message
+            .to_ascii_lowercase()
+            .contains("method not allowed")
+    {
+        ollama_api_post(client, trainer, "delete", &payload).await?;
+        return Ok(());
+    }
+    Err(GailError::invalid_config(format!(
+        "Ollama API /api/delete failed with HTTP {}: {}",
+        status.as_u16(),
+        truncate_chars(&error_message, 600)
+    )))
+}
+
 fn snapshot_id() -> String {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1197,4 +1326,62 @@ fn now_ts() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_modelfile_extracts_from_system_and_parameters() {
+        let parsed = parse_modelfile(
+            r#"
+            # comment
+            FROM qwen2.5-coder:1.5b
+            PARAMETER temperature 0.2
+            PARAMETER num_ctx 4096
+            PARAMETER mirostat true
+            SYSTEM "hello world"
+            "#,
+        );
+        assert_eq!(parsed.from.as_deref(), Some("qwen2.5-coder:1.5b"));
+        assert_eq!(parsed.system.as_deref(), Some("hello world"));
+        assert_eq!(parsed.parameters.get("temperature"), Some(&json!(0.2)));
+        assert_eq!(parsed.parameters.get("num_ctx"), Some(&json!(4096)));
+        assert_eq!(parsed.parameters.get("mirostat"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn build_ollama_create_payload_prefers_modelfile_directives() {
+        let trainer = TrainerConfig {
+            ollama_base_model: "fallback-model:latest".to_string(),
+            ..TrainerConfig::default()
+        };
+        let payload = build_ollama_create_payload_from_modelfile(
+            &trainer,
+            "gail-inhouse:test",
+            "123",
+            "FROM qwen2.5-coder:1.5b\nSYSTEM tuned system\nPARAMETER temperature 0.2\n",
+        );
+        assert_eq!(payload["model"], json!("gail-inhouse:test"));
+        assert_eq!(payload["from"], json!("qwen2.5-coder:1.5b"));
+        assert_eq!(payload["system"], json!("tuned system"));
+        assert_eq!(payload["parameters"]["temperature"], json!(0.2));
+    }
+
+    #[test]
+    fn build_ollama_create_payload_uses_defaults_when_modelfile_is_sparse() {
+        let trainer = TrainerConfig {
+            ollama_base_model: "fallback-model:latest".to_string(),
+            ..TrainerConfig::default()
+        };
+        let payload =
+            build_ollama_create_payload_from_modelfile(&trainer, "gail-inhouse:test", "456", "");
+        assert_eq!(payload["from"], json!("fallback-model:latest"));
+        assert_eq!(
+            payload["system"],
+            json!("You are the Gail in-house continuously trained model snapshot 456.")
+        );
+        assert!(payload.get("parameters").is_none());
+    }
 }
