@@ -244,6 +244,28 @@ mod tests {
         }
     }
 
+    fn make_executed_trade(
+        ts: f64,
+        symbol: &str,
+        action: TradeAction,
+        price: f64,
+    ) -> ExecutedTrade {
+        ExecutedTrade {
+            ts,
+            exchange: "binance".to_string(),
+            symbol: symbol.to_string(),
+            action,
+            amount_usd: 10.0,
+            price: Some(price),
+            order_id: Some(format!("test-{ts}")),
+            confidence: 0.75,
+            rationale: "historical test trade".to_string(),
+            ai_votes: json!({}),
+            fuzzy_confidence: 0.7,
+            ai_confidence: 0.8,
+        }
+    }
+
     fn default_config() -> TradingConfig {
         TradingConfig {
             enabled: true,
@@ -264,13 +286,20 @@ mod tests {
         assert_eq!(cfg.micro_trade_min_usd, 1.0);
         assert_eq!(cfg.fuzzy_confidence_threshold, 0.65);
         assert_eq!(cfg.fuzzy_weight, 0.4);
+        assert!(cfg.decision_roi_feedback_enabled);
+        assert_eq!(cfg.decision_roi_feedback_lookback_trades, 120);
+        assert_eq!(cfg.decision_roi_feedback_min_samples, 8);
+        assert_eq!(cfg.decision_roi_feedback_target_roi_pct, 1.0);
+        assert_eq!(cfg.decision_roi_feedback_max_signal_adjustment, 0.2);
+        assert_eq!(cfg.decision_roi_feedback_max_confidence_penalty, 0.35);
+        assert_eq!(cfg.decision_roi_feedback_max_confidence_boost, 0.1);
         assert_eq!(cfg.max_open_positions, 5);
         assert_eq!(cfg.evaluation_interval_seconds, 60);
         assert_eq!(cfg.research_index_name, "crypto");
         assert_eq!(cfg.research_site_hints, vec!["bloomberg.com".to_string()]);
         assert_eq!(cfg.research_max_parallel_queries, 3);
         assert!(cfg.live_execution_enabled);
-        assert!(!cfg.backtesting_enabled);
+        assert!(cfg.backtesting_enabled);
         assert!(cfg.backtest_data_collection_enabled);
         assert_eq!(cfg.backtest_data_collection_exchange, "binance");
         assert_eq!(cfg.backtest_data_collection_time_frames, vec!["1h", "1d"]);
@@ -309,6 +338,12 @@ mod tests {
             micro_trade_min_usd: 100.0, // min > max before normalise
             fuzzy_confidence_threshold: 1.5,
             fuzzy_weight: -0.1,
+            decision_roi_feedback_lookback_trades: 1,
+            decision_roi_feedback_min_samples: 999,
+            decision_roi_feedback_target_roi_pct: 0.0,
+            decision_roi_feedback_max_signal_adjustment: 2.0,
+            decision_roi_feedback_max_confidence_penalty: -0.4,
+            decision_roi_feedback_max_confidence_boost: 2.0,
             evaluation_interval_seconds: 3, // below minimum of 10
             max_parallel_advisors: 0,       // below minimum of 1
             max_open_positions: 0,
@@ -339,6 +374,13 @@ mod tests {
         );
         assert!(cfg.fuzzy_confidence_threshold <= 1.0);
         assert!(cfg.fuzzy_weight >= 0.0);
+        assert!(cfg.decision_roi_feedback_lookback_trades >= 10);
+        assert!(cfg.decision_roi_feedback_min_samples >= 2);
+        assert!(cfg.decision_roi_feedback_min_samples <= cfg.decision_roi_feedback_lookback_trades);
+        assert!(cfg.decision_roi_feedback_target_roi_pct >= 0.1);
+        assert!(cfg.decision_roi_feedback_max_signal_adjustment <= 0.5);
+        assert!(cfg.decision_roi_feedback_max_confidence_penalty >= 0.0);
+        assert!(cfg.decision_roi_feedback_max_confidence_boost <= 0.5);
         assert!(cfg.evaluation_interval_seconds >= 10);
         assert!(cfg.max_parallel_advisors >= 1);
         assert!(cfg.max_open_positions >= 1);
@@ -1331,6 +1373,210 @@ mod tests {
             "blended_signal should be {expected:.3} got {:.3}",
             decision.blended_signal
         );
+    }
+
+    #[test]
+    fn decision_roi_feedback_penalizes_underperforming_buy_direction() {
+        use crate::trading::fuzzy::{FuzzyDecision, FuzzyTermActivations};
+
+        let engine = DecisionEngine::new(0.4);
+        let fuzzy = FuzzyDecision {
+            signal: 0.25,
+            confidence: 0.8,
+            label: "buy".to_string(),
+            term_activations: FuzzyTermActivations::default(),
+        };
+        let consensus = AiConsensus {
+            action: "buy".to_string(),
+            confidence: 0.8,
+            signal: 0.25,
+            vote_distribution: json!({}),
+            advices: Vec::new(),
+            responders: 1,
+            failures: 0,
+        };
+        let snap = make_snapshot("binance", "BTC/USDT", 50_000.0, 2.0, 1_000_000.0);
+        let mut state = make_default_state();
+        for trade in [
+            make_executed_trade(1.0, "BTC/USDT", TradeAction::Buy, 100.0),
+            make_executed_trade(2.0, "BTC/USDT", TradeAction::Sell, 95.0),
+            make_executed_trade(3.0, "BTC/USDT", TradeAction::Buy, 110.0),
+            make_executed_trade(4.0, "BTC/USDT", TradeAction::Sell, 104.0),
+            make_executed_trade(5.0, "BTC/USDT", TradeAction::Buy, 120.0),
+            make_executed_trade(6.0, "BTC/USDT", TradeAction::Sell, 114.0),
+        ] {
+            state.record_trade(trade);
+        }
+
+        let disabled_config = TradingConfig {
+            enabled: true,
+            octobot_base_url: "http://x".to_string(),
+            fuzzy_confidence_threshold: 0.0,
+            decision_roi_feedback_enabled: false,
+            decision_roi_feedback_min_samples: 2,
+            decision_roi_feedback_lookback_trades: 20,
+            decision_roi_feedback_max_signal_adjustment: 0.25,
+            ..TradingConfig::default()
+        };
+        let enabled_config = TradingConfig {
+            decision_roi_feedback_enabled: true,
+            ..disabled_config.clone()
+        };
+
+        let without_feedback =
+            engine.decide(&fuzzy, &consensus, Some(&snap), &state, &disabled_config);
+        let with_feedback = engine.decide(&fuzzy, &consensus, Some(&snap), &state, &enabled_config);
+
+        assert!(
+            matches!(
+                without_feedback.action,
+                TradeAction::Buy | TradeAction::StrongBuy
+            ),
+            "baseline signal should still produce buy without ROI feedback"
+        );
+        assert_eq!(
+            with_feedback.action,
+            TradeAction::Hold,
+            "negative historical buy ROI should dampen a marginal buy into hold"
+        );
+        assert!(with_feedback.roi_feedback_applied);
+        assert!(with_feedback.roi_feedback_signal_adjustment < 0.0);
+    }
+
+    #[test]
+    fn decision_roi_feedback_boosts_profitable_buy_direction() {
+        use crate::trading::fuzzy::{FuzzyDecision, FuzzyTermActivations};
+
+        let engine = DecisionEngine::new(0.4);
+        let fuzzy = FuzzyDecision {
+            signal: 0.15,
+            confidence: 0.75,
+            label: "hold".to_string(),
+            term_activations: FuzzyTermActivations::default(),
+        };
+        let consensus = AiConsensus {
+            action: "hold".to_string(),
+            confidence: 0.75,
+            signal: 0.15,
+            vote_distribution: json!({}),
+            advices: Vec::new(),
+            responders: 1,
+            failures: 0,
+        };
+        let snap = make_snapshot("binance", "BTC/USDT", 50_000.0, 1.0, 1_000_000.0);
+        let mut state = make_default_state();
+        for trade in [
+            make_executed_trade(1.0, "BTC/USDT", TradeAction::Buy, 100.0),
+            make_executed_trade(2.0, "BTC/USDT", TradeAction::Sell, 110.0),
+            make_executed_trade(3.0, "BTC/USDT", TradeAction::Buy, 105.0),
+            make_executed_trade(4.0, "BTC/USDT", TradeAction::Sell, 118.0),
+            make_executed_trade(5.0, "BTC/USDT", TradeAction::Buy, 115.0),
+            make_executed_trade(6.0, "BTC/USDT", TradeAction::Sell, 126.0),
+        ] {
+            state.record_trade(trade);
+        }
+
+        let disabled_config = TradingConfig {
+            enabled: true,
+            octobot_base_url: "http://x".to_string(),
+            fuzzy_confidence_threshold: 0.0,
+            decision_roi_feedback_enabled: false,
+            decision_roi_feedback_min_samples: 2,
+            decision_roi_feedback_lookback_trades: 20,
+            decision_roi_feedback_max_signal_adjustment: 0.25,
+            ..TradingConfig::default()
+        };
+        let enabled_config = TradingConfig {
+            decision_roi_feedback_enabled: true,
+            ..disabled_config.clone()
+        };
+
+        let without_feedback =
+            engine.decide(&fuzzy, &consensus, Some(&snap), &state, &disabled_config);
+        let with_feedback = engine.decide(&fuzzy, &consensus, Some(&snap), &state, &enabled_config);
+
+        assert_eq!(
+            without_feedback.action,
+            TradeAction::Hold,
+            "baseline marginal signal should hold without ROI feedback"
+        );
+        assert!(
+            matches!(
+                with_feedback.action,
+                TradeAction::Buy | TradeAction::StrongBuy
+            ),
+            "positive historical buy ROI should boost marginal signal into buy"
+        );
+        assert!(with_feedback.roi_feedback_applied);
+        assert!(with_feedback.roi_feedback_signal_adjustment > 0.0);
+    }
+
+    #[test]
+    fn decision_roi_feedback_penalizes_underperforming_sell_direction() {
+        use crate::trading::fuzzy::{FuzzyDecision, FuzzyTermActivations};
+
+        let engine = DecisionEngine::new(0.4);
+        let fuzzy = FuzzyDecision {
+            signal: -0.25,
+            confidence: 0.8,
+            label: "sell".to_string(),
+            term_activations: FuzzyTermActivations::default(),
+        };
+        let consensus = AiConsensus {
+            action: "sell".to_string(),
+            confidence: 0.8,
+            signal: -0.25,
+            vote_distribution: json!({}),
+            advices: Vec::new(),
+            responders: 1,
+            failures: 0,
+        };
+        let snap = make_snapshot("binance", "BTC/USDT", 50_000.0, -2.0, 1_000_000.0);
+        let mut state = make_default_state();
+        for trade in [
+            make_executed_trade(1.0, "BTC/USDT", TradeAction::Sell, 100.0),
+            make_executed_trade(2.0, "BTC/USDT", TradeAction::Buy, 106.0),
+            make_executed_trade(3.0, "BTC/USDT", TradeAction::Sell, 110.0),
+            make_executed_trade(4.0, "BTC/USDT", TradeAction::Buy, 118.0),
+            make_executed_trade(5.0, "BTC/USDT", TradeAction::Sell, 120.0),
+            make_executed_trade(6.0, "BTC/USDT", TradeAction::Buy, 129.0),
+        ] {
+            state.record_trade(trade);
+        }
+
+        let disabled_config = TradingConfig {
+            enabled: true,
+            octobot_base_url: "http://x".to_string(),
+            fuzzy_confidence_threshold: 0.0,
+            decision_roi_feedback_enabled: false,
+            decision_roi_feedback_min_samples: 2,
+            decision_roi_feedback_lookback_trades: 20,
+            decision_roi_feedback_max_signal_adjustment: 0.25,
+            ..TradingConfig::default()
+        };
+        let enabled_config = TradingConfig {
+            decision_roi_feedback_enabled: true,
+            ..disabled_config.clone()
+        };
+
+        let without_feedback =
+            engine.decide(&fuzzy, &consensus, Some(&snap), &state, &disabled_config);
+        let with_feedback = engine.decide(&fuzzy, &consensus, Some(&snap), &state, &enabled_config);
+
+        assert!(
+            matches!(
+                without_feedback.action,
+                TradeAction::Sell | TradeAction::StrongSell
+            ),
+            "baseline signal should still produce sell without ROI feedback"
+        );
+        assert_eq!(
+            with_feedback.action,
+            TradeAction::Hold,
+            "negative historical sell ROI should dampen a marginal sell into hold"
+        );
+        assert!(with_feedback.roi_feedback_applied);
+        assert!(with_feedback.roi_feedback_signal_adjustment > 0.0);
     }
 
     #[test]

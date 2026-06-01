@@ -337,7 +337,7 @@ impl Default for TrainerConfig {
 impl Default for AarnnBridgeConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             endpoint: None,
             access_token: None,
             timeout_seconds: 4.0,
@@ -361,7 +361,7 @@ impl Default for AarnnBridgeConfig {
 impl Default for NmcTelemetryConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             base_url: None,
             access_token: None,
             timeout_seconds: 2.0,
@@ -724,4 +724,38 @@ fn interpolate_env(raw: &str) -> String {
             std::env::var(&captures[1]).unwrap_or_default()
         })
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use reqwest::Client;
+
+    use super::GailConfig;
+    use crate::{aarnn_bridge::AarnnMirrorClient, nmc_telemetry::NmcTelemetryClient};
+
+    #[test]
+    fn optional_workflow_components_default_to_enabled() {
+        let config = GailConfig::default();
+        assert!(config.llm_ledger.enabled);
+        assert!(config.aarnn_bridge.enabled);
+        assert!(config.nmc_telemetry.enabled);
+        assert!(config.trainer.register_with_ollama);
+        assert!(config.trading.backtesting_enabled);
+    }
+
+    #[test]
+    fn default_enabled_optional_clients_remain_safe_without_endpoints() {
+        let config = GailConfig::default();
+        let client = Client::builder().build().expect("http client");
+        let aarnn_bridge = AarnnMirrorClient::from_config(&config, client.clone(), &[]);
+        let nmc_client = NmcTelemetryClient::from_config(&config, client);
+        assert!(
+            aarnn_bridge.is_none(),
+            "bridge should stay disabled at runtime when no endpoint is configured"
+        );
+        assert!(
+            nmc_client.is_none(),
+            "NMC telemetry should stay disabled at runtime when base_url is unset"
+        );
+    }
 }

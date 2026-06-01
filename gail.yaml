@@ -157,7 +157,7 @@ aarnn_bridge:
   max_text_chars: 8192
 
 nmc_telemetry:
-  enabled: false
+  enabled: true
   base_url: "${GAIL_NMC_BASE_URL}"
   access_token: "${GAIL_NMC_API_TOKEN}"
   timeout_seconds: 2.0
@@ -240,11 +240,18 @@ trading:
   trade_ring_size: 200
   data_path: "./data/trading_state.json"
   fuzzy_weight: 0.4
+  decision_roi_feedback_enabled: true
+  decision_roi_feedback_lookback_trades: 120
+  decision_roi_feedback_min_samples: 8
+  decision_roi_feedback_target_roi_pct: 1.0
+  decision_roi_feedback_max_signal_adjustment: 0.2
+  decision_roi_feedback_max_confidence_penalty: 0.35
+  decision_roi_feedback_max_confidence_boost: 0.1
   live_execution_enabled: true
   octobot_timeout_seconds: 10.0
   refiner_timeout_seconds: 15.0
   advisor_timeout_seconds: 30.0
-  backtesting_enabled: false
+  backtesting_enabled: true
   backtest_data_catalog_path: "./data/backtest_data_catalog.json"
   backtest_data_collection_enabled: true
   backtest_data_collection_exchange: "binance"

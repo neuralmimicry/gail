@@ -5,7 +5,7 @@
 ///  2. Gathers research context from Refiner
 ///  3. Consults all configured AI providers in parallel (TradingAdvisor)
 ///  4. Applies Type-2 fuzzy logic (FuzzyEngine)
-///  5. Blends fuzzy + AI signals into a decision (DecisionEngine)
+///  5. Blends fuzzy + AI signals and applies historical ROI feedback (DecisionEngine)
 ///  6. Executes only through supported OctoBot trading/command bridges
 ///  7. Logs all activity in a ring-buffer (SharedTradingState)
 ///  8. Persists state to disk periodically
@@ -463,6 +463,12 @@ async fn run_single_evaluation(
                 "ai_failures": consensus.failures,
                 "ai_vote_distribution": consensus.vote_distribution,
                 "blended_signal": decision.blended_signal,
+                "roi_feedback_applied": decision.roi_feedback_applied,
+                "roi_feedback_signal_adjustment": decision.roi_feedback_signal_adjustment,
+                "roi_feedback_confidence_multiplier": decision.roi_feedback_confidence_multiplier,
+                "roi_feedback_samples": decision.roi_feedback_samples,
+                "roi_feedback_avg_directional_roi": decision.roi_feedback_avg_directional_roi,
+                "roi_feedback_win_rate": decision.roi_feedback_win_rate,
                 "rationale": decision.rationale
             }),
         )

@@ -85,6 +85,30 @@ pub struct TradingConfig {
     /// AI consensus weight = 1.0 - fuzzy_weight.
     pub fuzzy_weight: f64,
 
+    // -----------------------------------------------------------------------
+    // Historical ROI feedback
+    // -----------------------------------------------------------------------
+    /// Whether Gail should adapt live decisions based on historical buy/sell ROI outcomes.
+    pub decision_roi_feedback_enabled: bool,
+
+    /// Number of most recent executed trades to inspect for directional ROI feedback.
+    pub decision_roi_feedback_lookback_trades: usize,
+
+    /// Minimum directional samples required before ROI feedback is applied.
+    pub decision_roi_feedback_min_samples: usize,
+
+    /// Per-decision ROI target used for normalization, expressed as a percentage.
+    pub decision_roi_feedback_target_roi_pct: f64,
+
+    /// Maximum absolute signal adjustment applied by ROI feedback.
+    pub decision_roi_feedback_max_signal_adjustment: f64,
+
+    /// Maximum confidence penalty applied when historical ROI performance is poor.
+    pub decision_roi_feedback_max_confidence_penalty: f64,
+
+    /// Maximum confidence boost applied when historical ROI performance is strong.
+    pub decision_roi_feedback_max_confidence_boost: f64,
+
     /// Timeout for OctoBot API calls (seconds).
     pub octobot_timeout_seconds: f64,
 
@@ -175,10 +199,17 @@ impl Default for TradingConfig {
             trade_ring_size: 200,
             data_path: "./data/trading_state.json".to_string(),
             fuzzy_weight: 0.4,
+            decision_roi_feedback_enabled: true,
+            decision_roi_feedback_lookback_trades: 120,
+            decision_roi_feedback_min_samples: 8,
+            decision_roi_feedback_target_roi_pct: 1.0,
+            decision_roi_feedback_max_signal_adjustment: 0.2,
+            decision_roi_feedback_max_confidence_penalty: 0.35,
+            decision_roi_feedback_max_confidence_boost: 0.1,
             octobot_timeout_seconds: 10.0,
             refiner_timeout_seconds: 15.0,
             advisor_timeout_seconds: 30.0,
-            backtesting_enabled: false,
+            backtesting_enabled: true,
             backtest_interval_seconds: 86_400,
             backtest_profitability_threshold: 0.0,
             backtest_data_files: Vec::new(),
@@ -210,6 +241,22 @@ impl TradingConfig {
             .min(self.micro_trade_max_usd);
         self.fuzzy_confidence_threshold = self.fuzzy_confidence_threshold.clamp(0.0, 1.0);
         self.fuzzy_weight = self.fuzzy_weight.clamp(0.0, 1.0);
+        self.decision_roi_feedback_lookback_trades =
+            self.decision_roi_feedback_lookback_trades.clamp(10, 5_000);
+        self.decision_roi_feedback_min_samples = self
+            .decision_roi_feedback_min_samples
+            .clamp(2, self.decision_roi_feedback_lookback_trades.max(2));
+        self.decision_roi_feedback_target_roi_pct =
+            self.decision_roi_feedback_target_roi_pct.clamp(0.1, 50.0);
+        self.decision_roi_feedback_max_signal_adjustment = self
+            .decision_roi_feedback_max_signal_adjustment
+            .clamp(0.0, 0.5);
+        self.decision_roi_feedback_max_confidence_penalty = self
+            .decision_roi_feedback_max_confidence_penalty
+            .clamp(0.0, 0.95);
+        self.decision_roi_feedback_max_confidence_boost = self
+            .decision_roi_feedback_max_confidence_boost
+            .clamp(0.0, 0.5);
         self.evaluation_interval_seconds = self.evaluation_interval_seconds.max(10);
         self.max_parallel_advisors = self.max_parallel_advisors.clamp(1, 20);
         self.max_open_positions = self.max_open_positions.clamp(1, 50);

@@ -4,6 +4,8 @@ Gail is the shared AI middleware for NeuralMimicry services. It consolidates LLM
 
 The service is designed so Refiner can delegate immediately, while Tracey and Continuum/NMC can consume the same HTTP contract without re-implementing provider selection or neuromorphic transport glue.
 
+End-to-end implementation workflows are documented in [docs/PROJECT_WORKFLOWS.md](./docs/PROJECT_WORKFLOWS.md).
+
 ## Goals
 
 - Remove duplicated LLM and neuromorphic service-interface code from product repositories.
@@ -310,6 +312,8 @@ The fuzzy signal and AI consensus signal are blended with configurable weights (
 blended_signal     = fuzzy.signal × fuzzy_weight + ai.signal × ai_weight
 blended_confidence = fuzzy.confidence × fuzzy_weight + ai.confidence × ai_weight
 ```
+Before risk gates run, Gail optionally applies **directional ROI feedback** from recent executed trades. For the current direction (buy or sell), Gail measures whether prior decisions were directionally profitable by comparing each trade price with the next priced trade for the same symbol. Strong recent ROI performance can provide a bounded signal/confidence boost; weak performance can dampen signal/confidence to reduce repeated losing entries.
+
 Three sequential risk gates are applied before a trade is placed:
 1. **Confidence gate**: `blended_confidence < fuzzy_confidence_threshold` → hold
 2. **Position gate**: open positions ≥ `max_open_positions` and signal is buy → hold
@@ -433,6 +437,13 @@ trading:
   target_currencies: []                  # empty = all available
   fuzzy_confidence_threshold: 0.65       # minimum blended confidence to trade
   fuzzy_weight: 0.4                      # fuzzy vs AI blend weight
+  decision_roi_feedback_enabled: true
+  decision_roi_feedback_lookback_trades: 120
+  decision_roi_feedback_min_samples: 8
+  decision_roi_feedback_target_roi_pct: 1.0
+  decision_roi_feedback_max_signal_adjustment: 0.2
+  decision_roi_feedback_max_confidence_penalty: 0.35
+  decision_roi_feedback_max_confidence_boost: 0.1
   live_execution_enabled: true
   research_query_template: "cryptocurrency market sentiment {currency} {exchange} {date}"
   research_index_name: "crypto"
@@ -445,7 +456,7 @@ trading:
   octobot_timeout_seconds: 10.0
   refiner_timeout_seconds: 15.0
   advisor_timeout_seconds: 30.0
-  backtesting_enabled: false             # requires OctoBot .data files
+  backtesting_enabled: true              # requires OctoBot .data files
   backtest_data_files: []                # explicit .data files, or auto-discovered when enabled
   backtest_data_catalog_path: "./data/backtest_data_catalog.json"   # persistent discovered-file cache
   backtest_data_collection_enabled: true  # auto-trigger OctoBot collector when files are missing
