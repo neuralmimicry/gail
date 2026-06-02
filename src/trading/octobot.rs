@@ -1829,27 +1829,22 @@ fn parse_portfolio_html(raw: &str) -> Option<OctobotPortfolio> {
     let mut portfolio = OctobotPortfolio::default();
     portfolio.total_value_usd = parse_portfolio_total_from_text(&text);
 
-    for line in text.lines() {
-        let cols: Vec<&str> = line
-            .split('\t')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .collect();
+    for cols in html_table_rows(raw) {
         if cols.len() < 5 {
             continue;
         }
         if cols[0].eq_ignore_ascii_case("asset") {
             continue;
         }
-        let Some(total) = parse_first_number(cols[1]) else {
+        let Some(total) = parse_first_number(&cols[1]) else {
             continue;
         };
-        let Some(symbol) = extract_portfolio_symbol(cols[0]) else {
+        let Some(symbol) = extract_portfolio_symbol(&cols[0]) else {
             continue;
         };
-        let free = parse_first_number(cols[3]).unwrap_or(total);
-        let locked = parse_first_number(cols[4]).unwrap_or((total - free).max(0.0));
-        let value_usd = parse_first_number(cols[2]);
+        let free = parse_first_number(&cols[3]).unwrap_or(total);
+        let locked = parse_first_number(&cols[4]).unwrap_or((total - free).max(0.0));
+        let value_usd = parse_first_number(&cols[2]);
         portfolio.currencies.insert(
             symbol,
             CurrencyBalance {
@@ -1866,6 +1861,97 @@ fn parse_portfolio_html(raw: &str) -> Option<OctobotPortfolio> {
     } else {
         Some(portfolio)
     }
+}
+
+fn html_table_rows(raw: &str) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let mut current_row: Vec<String> = Vec::new();
+    let mut current_cell = String::new();
+    let mut in_row = false;
+    let mut in_cell = false;
+    let mut chars = raw.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '<' {
+            if in_cell {
+                current_cell.push(ch);
+            }
+            continue;
+        }
+
+        let mut tag = String::new();
+        for tag_ch in chars.by_ref() {
+            if tag_ch == '>' {
+                break;
+            }
+            tag.push(tag_ch);
+        }
+        let trimmed = tag.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let is_closing = trimmed.starts_with('/');
+        let tag_name = trimmed
+            .trim_start_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        match (is_closing, tag_name.as_str()) {
+            (false, "tr") => {
+                if in_row && !current_row.is_empty() {
+                    rows.push(std::mem::take(&mut current_row));
+                }
+                in_row = true;
+                in_cell = false;
+                current_cell.clear();
+            }
+            (true, "tr") => {
+                if in_cell {
+                    finalize_html_cell(&mut current_row, &mut current_cell);
+                    in_cell = false;
+                }
+                if !current_row.is_empty() {
+                    rows.push(std::mem::take(&mut current_row));
+                }
+                in_row = false;
+            }
+            (false, "td") | (false, "th") => {
+                if in_row {
+                    in_cell = true;
+                    current_cell.clear();
+                }
+            }
+            (true, "td") | (true, "th") => {
+                if in_row && in_cell {
+                    finalize_html_cell(&mut current_row, &mut current_cell);
+                    in_cell = false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if in_row && in_cell {
+        finalize_html_cell(&mut current_row, &mut current_cell);
+    }
+    if !current_row.is_empty() {
+        rows.push(current_row);
+    }
+
+    rows
+}
+
+fn finalize_html_cell(row: &mut Vec<String>, cell: &mut String) {
+    let normalized = decode_basic_html_entities(cell)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !normalized.is_empty() {
+        row.push(normalized);
+    }
+    cell.clear();
 }
 
 fn parse_portfolio_total_from_text(text: &str) -> Option<f64> {

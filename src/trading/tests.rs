@@ -2376,6 +2376,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn octobot_client_get_portfolio_parses_multiline_portfolio_table_rows() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/portfolio"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/portfolio"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"
+                <html><body>
+                  <div class="card-header"><h2>Portfolio: <span class="rounded-number">9711.56780793</span> USDT</h2></div>
+                  <table class="table table-striped table-responsive-sm" id="holdings-table">
+                    <thead>
+                      <tr class="text-center">
+                        <th scope="col">Asset</th>
+                        <th scope="col">Total</th>
+                        <th scope="col">Value in USDT</th>
+                        <th scope="col">Available</th>
+                        <th scope="col">Locked in orders</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr class="symbol-holding text-center">
+                        <td class="row mx-0">
+                          <div class="col col-md-5 animated px-2 fadeIn img-fluid very-small-size">
+                            <img class="card-img-top currency-image" alt="ETH" data-symbol="eth">
+                          </div>
+                          <div class="d-none d-md-inline col-7 my-auto">
+                            <span class="symbol">ETH</span>
+                          </div>
+                        </td>
+                        <td class="align-middle rounded-number">1.5959918</td>
+                        <td class="total-value align-middle rounded-number">3164.09124930730</td>
+                        <td class="align-middle rounded-number">1.5959918</td>
+                        <td class="align-middle rounded-number">0E-7</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </body></html>
+                "#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/historical_portfolio_value"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let portfolio = client.get_portfolio().await.unwrap();
+        assert_eq!(portfolio.total_value_usd, Some(9711.56780793));
+        let eth = portfolio.currencies.get("ETH").expect("ETH balance");
+        assert_eq!(eth.total, 1.5959918);
+        assert_eq!(eth.free, 1.5959918);
+        assert_eq!(eth.locked, 0.0);
+        assert_eq!(eth.value_usd, Some(3164.09124930730));
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn octobot_client_refresh_portfolio_calls_refresh_endpoint() {
         let server = MockServer::start().await;
 
