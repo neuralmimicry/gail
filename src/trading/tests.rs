@@ -298,6 +298,16 @@ mod tests {
         assert_eq!(cfg.research_index_name, "crypto");
         assert_eq!(cfg.research_site_hints, vec!["bloomberg.com".to_string()]);
         assert_eq!(cfg.research_max_parallel_queries, 3);
+        assert!(cfg.token_discovery_enabled);
+        assert_eq!(cfg.token_discovery_interval_seconds, 1_800);
+        assert_eq!(cfg.token_discovery_snapshot_limit, 250);
+        assert_eq!(cfg.token_discovery_candidate_pool_size, 12);
+        assert_eq!(cfg.token_discovery_min_composite_score, 0.55);
+        assert!(cfg.portfolio_pruning_enabled);
+        assert_eq!(cfg.portfolio_pruning_interval_seconds, 1_800);
+        assert_eq!(cfg.portfolio_pruning_min_holding_usd, 20.0);
+        assert_eq!(cfg.portfolio_pruning_candidate_pool_size, 12);
+        assert_eq!(cfg.portfolio_pruning_min_composite_score, 0.55);
         assert!(cfg.live_execution_enabled);
         assert!(cfg.backtesting_enabled);
         assert!(cfg.backtest_data_collection_enabled);
@@ -345,7 +355,15 @@ mod tests {
             decision_roi_feedback_max_confidence_penalty: -0.4,
             decision_roi_feedback_max_confidence_boost: 2.0,
             evaluation_interval_seconds: 3, // below minimum of 10
-            max_parallel_advisors: 0,       // below minimum of 1
+            token_discovery_interval_seconds: 0,
+            token_discovery_snapshot_limit: 1,
+            token_discovery_candidate_pool_size: 0,
+            token_discovery_min_composite_score: -1.0,
+            portfolio_pruning_interval_seconds: 0,
+            portfolio_pruning_min_holding_usd: -10.0,
+            portfolio_pruning_candidate_pool_size: 0,
+            portfolio_pruning_min_composite_score: 4.0,
+            max_parallel_advisors: 0, // below minimum of 1
             max_open_positions: 0,
             research_index_name: "   ".to_string(),
             research_site_hints: vec![
@@ -382,6 +400,14 @@ mod tests {
         assert!(cfg.decision_roi_feedback_max_confidence_penalty >= 0.0);
         assert!(cfg.decision_roi_feedback_max_confidence_boost <= 0.5);
         assert!(cfg.evaluation_interval_seconds >= 10);
+        assert!(cfg.token_discovery_interval_seconds >= 60);
+        assert!(cfg.token_discovery_snapshot_limit >= 10);
+        assert!(cfg.token_discovery_candidate_pool_size >= 1);
+        assert!(cfg.token_discovery_min_composite_score >= 0.0);
+        assert!(cfg.portfolio_pruning_interval_seconds >= 60);
+        assert!(cfg.portfolio_pruning_min_holding_usd >= 0.0);
+        assert!(cfg.portfolio_pruning_candidate_pool_size >= 1);
+        assert!(cfg.portfolio_pruning_min_composite_score <= 2.0);
         assert!(cfg.max_parallel_advisors >= 1);
         assert!(cfg.max_open_positions >= 1);
         assert_eq!(cfg.research_index_name, "crypto");
@@ -1804,6 +1830,127 @@ mod tests {
         assert!(
             score >= 0.0,
             "score with missing data should be non-negative: {score}"
+        );
+    }
+
+    #[test]
+    fn discovery_candidates_exclude_held_assets_and_dedupe_symbol_bases() {
+        let portfolio = make_portfolio(1_000.0); // includes BTC + USDT
+        let snapshots = vec![
+            make_snapshot("binance", "BTC/USDT", 70_000.0, 8.0, 5_000_000.0),
+            make_snapshot("binance", "SOL/USDT", 150.0, 9.0, 8_000_000.0),
+            make_snapshot("binance", "SOL/BUSD", 150.1, 8.5, 7_900_000.0),
+            make_snapshot("binance", "ETH/USDT", 3_500.0, 4.0, 6_000_000.0),
+            make_snapshot("binance", "XRP/BTC", 0.00001, 6.0, 2_500_000.0),
+        ];
+        let selected = crate::trading::select_non_portfolio_candidates(&snapshots, &portfolio, 10);
+
+        assert!(
+            !selected.iter().any(|snap| snap.symbol == "BTC/USDT"),
+            "already-held assets should be excluded from discovery candidates"
+        );
+        assert!(
+            selected
+                .iter()
+                .filter(|snap| snap.symbol.starts_with("SOL/"))
+                .count()
+                == 1,
+            "only one candidate per base asset should be kept"
+        );
+        assert!(
+            !selected.iter().any(|snap| snap.symbol == "XRP/BTC"),
+            "non-stable quote candidates should be excluded from discovery"
+        );
+    }
+
+    #[test]
+    fn pruning_candidates_focus_on_held_non_stable_assets() {
+        let mut currencies = std::collections::HashMap::new();
+        currencies.insert(
+            "ETH".to_string(),
+            CurrencyBalance {
+                free: 1.0,
+                locked: 0.0,
+                total: 1.0,
+                value_usd: Some(3500.0),
+            },
+        );
+        currencies.insert(
+            "BNB".to_string(),
+            CurrencyBalance {
+                free: 3.0,
+                locked: 0.0,
+                total: 3.0,
+                value_usd: Some(1800.0),
+            },
+        );
+        currencies.insert(
+            "USDT".to_string(),
+            CurrencyBalance {
+                free: 500.0,
+                locked: 0.0,
+                total: 500.0,
+                value_usd: Some(500.0),
+            },
+        );
+        let portfolio = OctobotPortfolio {
+            currencies,
+            total_value_usd: Some(5800.0),
+        };
+        let snapshots = vec![
+            make_snapshot("binance", "ETH/USDT", 3500.0, -7.0, 9_000_000.0),
+            make_snapshot("binance", "ETH/BTC", 0.05, -7.5, 8_000_000.0),
+            make_snapshot("binance", "BNB/USDT", 600.0, -4.5, 3_000_000.0),
+            make_snapshot("binance", "DOGE/USDT", 0.2, -10.0, 12_000_000.0),
+        ];
+        let selected =
+            crate::trading::select_portfolio_pruning_candidates(&snapshots, &portfolio, 20.0, 10);
+        let selected_symbols = selected
+            .iter()
+            .map(|snap| snap.symbol.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            selected_symbols.contains(&"ETH/USDT"),
+            "held ETH should be represented by a stable-quote symbol"
+        );
+        assert!(
+            selected_symbols.contains(&"BNB/USDT"),
+            "held BNB should be represented in pruning candidates"
+        );
+        assert!(
+            !selected_symbols.contains(&"DOGE/USDT"),
+            "non-held assets should not be included in pruning candidates"
+        );
+        assert!(
+            !selected_symbols.contains(&"ETH/BTC"),
+            "non-stable quote pairs should not be selected for pruning"
+        );
+    }
+
+    #[test]
+    fn composite_symbol_score_tracks_buy_vs_sell_direction() {
+        let snapshot = make_snapshot("binance", "SOL/USDT", 150.0, 10.0, 5_500_000.0);
+        let mut buy_decision = crate::trading::decision::TradeDecision::hold("");
+        buy_decision.action = TradeAction::Buy;
+        buy_decision.confidence = 0.8;
+        buy_decision.blended_signal = 0.6;
+
+        let mut sell_decision = crate::trading::decision::TradeDecision::hold("");
+        sell_decision.action = TradeAction::Sell;
+        sell_decision.confidence = 0.8;
+        sell_decision.blended_signal = -0.6;
+
+        let buy_score = crate::trading::composite_symbol_score(&snapshot, &buy_decision);
+        let sell_score = crate::trading::composite_symbol_score(&snapshot, &sell_decision);
+
+        assert!(
+            buy_score > 0.0,
+            "buy score should be positive, got {buy_score}"
+        );
+        assert!(
+            sell_score < 0.0,
+            "sell score should be negative, got {sell_score}"
         );
     }
 

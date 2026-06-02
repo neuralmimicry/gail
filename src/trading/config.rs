@@ -51,6 +51,36 @@ pub struct TradingConfig {
     /// Restrict trading to these currency symbols (empty = all available).
     pub target_currencies: Vec<String>,
 
+    /// Enable periodic discovery of non-portfolio symbols from the wider market universe.
+    pub token_discovery_enabled: bool,
+
+    /// How often Gail runs non-portfolio discovery/scoring (seconds).
+    pub token_discovery_interval_seconds: u64,
+
+    /// Max symbols requested from OctoBot per discovery/pruning scan.
+    pub token_discovery_snapshot_limit: usize,
+
+    /// Number of top market-ranked non-portfolio symbols to score with AI+Fuzzy.
+    pub token_discovery_candidate_pool_size: usize,
+
+    /// Minimum composite score required before auto-buying a discovered symbol.
+    pub token_discovery_min_composite_score: f64,
+
+    /// Enable periodic pruning review of currently held non-stable assets.
+    pub portfolio_pruning_enabled: bool,
+
+    /// How often Gail reviews held symbols for potential selloff (seconds).
+    pub portfolio_pruning_interval_seconds: u64,
+
+    /// Minimum holding USD value required for a symbol to be considered in pruning.
+    pub portfolio_pruning_min_holding_usd: f64,
+
+    /// Number of held symbols to score with AI+Fuzzy in each pruning cycle.
+    pub portfolio_pruning_candidate_pool_size: usize,
+
+    /// Minimum bearish composite score required before auto-selling a held symbol.
+    pub portfolio_pruning_min_composite_score: f64,
+
     /// Combined fuzzy+AI confidence required before placing a trade (0.0–1.0).
     pub fuzzy_confidence_threshold: f64,
 
@@ -188,6 +218,16 @@ impl Default for TradingConfig {
             min_trade_interval_seconds: 120,
             target_exchanges: Vec::new(),
             target_currencies: Vec::new(),
+            token_discovery_enabled: true,
+            token_discovery_interval_seconds: 1_800,
+            token_discovery_snapshot_limit: 250,
+            token_discovery_candidate_pool_size: 12,
+            token_discovery_min_composite_score: 0.55,
+            portfolio_pruning_enabled: true,
+            portfolio_pruning_interval_seconds: 1_800,
+            portfolio_pruning_min_holding_usd: 20.0,
+            portfolio_pruning_candidate_pool_size: 12,
+            portfolio_pruning_min_composite_score: 0.55,
             fuzzy_confidence_threshold: 0.65,
             research_query_template: "cryptocurrency market sentiment {currency} {exchange} {date}"
                 .to_string(),
@@ -258,6 +298,18 @@ impl TradingConfig {
             .decision_roi_feedback_max_confidence_boost
             .clamp(0.0, 0.5);
         self.evaluation_interval_seconds = self.evaluation_interval_seconds.max(10);
+        self.token_discovery_interval_seconds = self.token_discovery_interval_seconds.max(60);
+        self.token_discovery_snapshot_limit = self.token_discovery_snapshot_limit.clamp(10, 2_000);
+        self.token_discovery_candidate_pool_size =
+            self.token_discovery_candidate_pool_size.clamp(1, 64);
+        self.token_discovery_min_composite_score =
+            self.token_discovery_min_composite_score.clamp(0.0, 2.0);
+        self.portfolio_pruning_interval_seconds = self.portfolio_pruning_interval_seconds.max(60);
+        self.portfolio_pruning_min_holding_usd = self.portfolio_pruning_min_holding_usd.max(0.0);
+        self.portfolio_pruning_candidate_pool_size =
+            self.portfolio_pruning_candidate_pool_size.clamp(1, 64);
+        self.portfolio_pruning_min_composite_score =
+            self.portfolio_pruning_min_composite_score.clamp(0.0, 2.0);
         self.max_parallel_advisors = self.max_parallel_advisors.clamp(1, 20);
         self.max_open_positions = self.max_open_positions.clamp(1, 50);
         self.log_ring_size = self.log_ring_size.clamp(10, 10_000);

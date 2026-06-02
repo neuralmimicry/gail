@@ -27,7 +27,9 @@ mod tests;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{cmp::Ordering, collections::HashSet};
 
+use serde::Serialize;
 use serde_json::json;
 use tokio::sync::oneshot;
 use tokio::time::interval;
@@ -185,6 +187,8 @@ async fn run_evaluation_loop(
         None
     };
     let mut last_backtest_ts: f64 = 0.0;
+    let mut last_discovery_ts: f64 = 0.0;
+    let mut last_pruning_ts: f64 = 0.0;
     info!(
         interval_seconds = config.evaluation_interval_seconds,
         backtesting_enabled = config.backtesting_enabled,
@@ -215,6 +219,38 @@ async fn run_evaluation_loop(
                 if persist_counter >= 5 {
                     state.persist(&data_path).await;
                     persist_counter = 0;
+                }
+
+                if config.token_discovery_enabled {
+                    let due = now_ts() - last_discovery_ts >= config.token_discovery_interval_seconds as f64;
+                    if due {
+                        run_non_portfolio_discovery_cycle(
+                            &config,
+                            &state,
+                            &octobot,
+                            &refiner,
+                            &fuzzy_engine,
+                            &advisor,
+                            &decision_engine,
+                        ).await;
+                        last_discovery_ts = now_ts();
+                    }
+                }
+
+                if config.portfolio_pruning_enabled {
+                    let due = now_ts() - last_pruning_ts >= config.portfolio_pruning_interval_seconds as f64;
+                    if due {
+                        run_portfolio_pruning_cycle(
+                            &config,
+                            &state,
+                            &octobot,
+                            &refiner,
+                            &fuzzy_engine,
+                            &advisor,
+                            &decision_engine,
+                        ).await;
+                        last_pruning_ts = now_ts();
+                    }
                 }
 
                 // --- Periodic backtest ---
@@ -280,17 +316,7 @@ async fn run_single_evaluation(
     state.log_info("eval", "Starting evaluation cycle").await;
 
     // --- 1. Fetch market data from OctoBot ---
-    let (target_exchanges, target_currencies) = {
-        let s = state.0.lock().await;
-        let ov = s.config_overrides.as_ref();
-        let exch = ov
-            .and_then(|o| o.target_exchanges.clone())
-            .unwrap_or_else(|| config.target_exchanges.clone());
-        let curr = ov
-            .and_then(|o| o.target_currencies.clone())
-            .unwrap_or_else(|| config.target_currencies.clone());
-        (exch, curr)
-    };
+    let (target_exchanges, target_currencies) = resolve_target_market_filters(config, state).await;
 
     let market_snapshots = octobot
         .get_all_market_snapshots(&target_exchanges, &target_currencies, 20)
@@ -489,6 +515,628 @@ async fn run_single_evaluation(
         "trading: evaluation cycle complete in {:.1}ms",
         (now_ts() - eval_start) * 1000.0
     );
+}
+
+async fn resolve_target_market_filters(
+    config: &TradingConfig,
+    state: &SharedTradingState,
+) -> (Vec<String>, Vec<String>) {
+    let s = state.0.lock().await;
+    let ov = s.config_overrides.as_ref();
+    let exchanges = ov
+        .and_then(|o| o.target_exchanges.clone())
+        .unwrap_or_else(|| config.target_exchanges.clone());
+    let currencies = ov
+        .and_then(|o| o.target_currencies.clone())
+        .unwrap_or_else(|| config.target_currencies.clone());
+    (exchanges, currencies)
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SymbolScorecard {
+    at: f64,
+    exchange: String,
+    symbol: String,
+    in_portfolio: bool,
+    market_score: f64,
+    price_change_pct_24h: Option<f64>,
+    volume_24h: Option<f64>,
+    ai_signal: f64,
+    ai_confidence: f64,
+    fuzzy_signal: f64,
+    fuzzy_confidence: f64,
+    blended_signal: f64,
+    blended_confidence: f64,
+    action: String,
+    composite_score: f64,
+    amount_usd: f64,
+    rationale: String,
+}
+
+#[derive(Clone, Debug)]
+struct EvaluatedSymbol {
+    decision: TradeDecision,
+    scorecard: SymbolScorecard,
+}
+
+async fn run_non_portfolio_discovery_cycle(
+    config: &TradingConfig,
+    state: &SharedTradingState,
+    octobot: &OctobotClient,
+    refiner: &RefinerClient,
+    fuzzy_engine: &FuzzyEngine,
+    advisor: &TradingAdvisor,
+    decision_engine: &DecisionEngine,
+) {
+    if {
+        let s = state.0.lock().await;
+        s.pending_override.is_some()
+    } {
+        debug!("trading: discovery review skipped due to pending operator override");
+        return;
+    }
+
+    let Some(portfolio) = load_current_portfolio_snapshot(state, octobot).await else {
+        warn!("trading: discovery review skipped because portfolio is unavailable");
+        state
+            .log_warn(
+                "discovery",
+                "Portfolio unavailable; discovery review skipped",
+            )
+            .await;
+        return;
+    };
+
+    let (target_exchanges, target_currencies) = resolve_target_market_filters(config, state).await;
+    let snapshots = octobot
+        .get_all_market_snapshots(
+            &target_exchanges,
+            &target_currencies,
+            config.token_discovery_snapshot_limit,
+        )
+        .await;
+    if snapshots.is_empty() {
+        state
+            .log_warn(
+                "discovery",
+                "No market snapshots available for discovery review",
+            )
+            .await;
+        return;
+    }
+
+    let candidates = select_non_portfolio_candidates(
+        &snapshots,
+        &portfolio,
+        config.token_discovery_candidate_pool_size,
+    );
+    if candidates.is_empty() {
+        state
+            .log_info(
+                "discovery",
+                "No non-portfolio candidates available for discovery review",
+            )
+            .await;
+        return;
+    }
+
+    let mut evaluated = Vec::new();
+    for snapshot in &candidates {
+        let review = evaluate_symbol_candidate(
+            config,
+            state,
+            refiner,
+            fuzzy_engine,
+            advisor,
+            decision_engine,
+            &portfolio,
+            snapshot,
+            false,
+        )
+        .await;
+        evaluated.push(review);
+    }
+    evaluated.sort_by(|left, right| {
+        left.scorecard
+            .composite_score
+            .partial_cmp(&right.scorecard.composite_score)
+            .unwrap_or(Ordering::Equal)
+            .reverse()
+    });
+
+    let scorecards = evaluated
+        .iter()
+        .map(|entry| entry.scorecard.clone())
+        .collect::<Vec<_>>();
+    state
+        .log(
+            "info",
+            "discovery",
+            format!(
+                "Scored {} non-portfolio symbols; top composite={:.3}",
+                scorecards.len(),
+                scorecards
+                    .first()
+                    .map(|entry| entry.composite_score)
+                    .unwrap_or(0.0)
+            ),
+            json!({ "scorecards": scorecards }),
+        )
+        .await;
+
+    let selected = evaluated
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.decision.action,
+                TradeAction::Buy | TradeAction::StrongBuy
+            )
+        })
+        .max_by(|left, right| {
+            left.scorecard
+                .composite_score
+                .partial_cmp(&right.scorecard.composite_score)
+                .unwrap_or(Ordering::Equal)
+        })
+        .map(|entry| (entry.decision.clone(), entry.scorecard.clone()));
+
+    let Some((decision, scorecard)) = selected else {
+        state
+            .log_info(
+                "discovery",
+                "No buy-qualified non-portfolio candidate from discovery review",
+            )
+            .await;
+        return;
+    };
+
+    if scorecard.composite_score < config.token_discovery_min_composite_score {
+        state
+            .log_info(
+                "discovery",
+                format!(
+                    "Discovery top candidate {} below threshold ({:.3} < {:.3})",
+                    scorecard.symbol,
+                    scorecard.composite_score,
+                    config.token_discovery_min_composite_score
+                ),
+            )
+            .await;
+        return;
+    }
+
+    info!(
+        "trading: discovery selected {} (score {:.3}) for automatic entry",
+        scorecard.symbol, scorecard.composite_score
+    );
+    state
+        .log(
+            "info",
+            "discovery",
+            format!(
+                "Selected discovered symbol {} for auto-buy (score {:.3})",
+                scorecard.symbol, scorecard.composite_score
+            ),
+            json!({ "scorecard": scorecard }),
+        )
+        .await;
+    execute_if_warranted(octobot, &decision, state, config).await;
+}
+
+async fn run_portfolio_pruning_cycle(
+    config: &TradingConfig,
+    state: &SharedTradingState,
+    octobot: &OctobotClient,
+    refiner: &RefinerClient,
+    fuzzy_engine: &FuzzyEngine,
+    advisor: &TradingAdvisor,
+    decision_engine: &DecisionEngine,
+) {
+    if {
+        let s = state.0.lock().await;
+        s.pending_override.is_some()
+    } {
+        debug!("trading: pruning review skipped due to pending operator override");
+        return;
+    }
+
+    let Some(portfolio) = load_current_portfolio_snapshot(state, octobot).await else {
+        warn!("trading: pruning review skipped because portfolio is unavailable");
+        state
+            .log_warn("pruning", "Portfolio unavailable; pruning review skipped")
+            .await;
+        return;
+    };
+
+    let (target_exchanges, target_currencies) = resolve_target_market_filters(config, state).await;
+    let snapshots = octobot
+        .get_all_market_snapshots(
+            &target_exchanges,
+            &target_currencies,
+            config.token_discovery_snapshot_limit,
+        )
+        .await;
+    if snapshots.is_empty() {
+        state
+            .log_warn(
+                "pruning",
+                "No market snapshots available for pruning review",
+            )
+            .await;
+        return;
+    }
+
+    let candidates = select_portfolio_pruning_candidates(
+        &snapshots,
+        &portfolio,
+        config.portfolio_pruning_min_holding_usd,
+        config.portfolio_pruning_candidate_pool_size,
+    );
+    if candidates.is_empty() {
+        state
+            .log_info("pruning", "No held symbols eligible for pruning review")
+            .await;
+        return;
+    }
+
+    let mut evaluated = Vec::new();
+    for snapshot in &candidates {
+        let review = evaluate_symbol_candidate(
+            config,
+            state,
+            refiner,
+            fuzzy_engine,
+            advisor,
+            decision_engine,
+            &portfolio,
+            snapshot,
+            true,
+        )
+        .await;
+        evaluated.push(review);
+    }
+    evaluated.sort_by(|left, right| {
+        left.scorecard
+            .composite_score
+            .partial_cmp(&right.scorecard.composite_score)
+            .unwrap_or(Ordering::Equal)
+    });
+
+    let scorecards = evaluated
+        .iter()
+        .map(|entry| entry.scorecard.clone())
+        .collect::<Vec<_>>();
+    state
+        .log(
+            "info",
+            "pruning",
+            format!(
+                "Scored {} held symbols for pruning; strongest bearish composite={:.3}",
+                scorecards.len(),
+                scorecards
+                    .first()
+                    .map(|entry| (-entry.composite_score).max(0.0))
+                    .unwrap_or(0.0)
+            ),
+            json!({ "scorecards": scorecards }),
+        )
+        .await;
+
+    let selected = evaluated
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.decision.action,
+                TradeAction::Sell | TradeAction::StrongSell
+            )
+        })
+        .max_by(|left, right| {
+            let left_score = (-left.scorecard.composite_score).max(0.0);
+            let right_score = (-right.scorecard.composite_score).max(0.0);
+            left_score
+                .partial_cmp(&right_score)
+                .unwrap_or(Ordering::Equal)
+        })
+        .map(|entry| (entry.decision.clone(), entry.scorecard.clone()));
+
+    let Some((mut decision, scorecard)) = selected else {
+        state
+            .log_info(
+                "pruning",
+                "No sell-qualified held symbol from pruning review",
+            )
+            .await;
+        return;
+    };
+
+    let bearish_score = (-scorecard.composite_score).max(0.0);
+    if bearish_score < config.portfolio_pruning_min_composite_score {
+        state
+            .log_info(
+                "pruning",
+                format!(
+                    "Pruning top candidate {} below threshold ({:.3} < {:.3})",
+                    scorecard.symbol, bearish_score, config.portfolio_pruning_min_composite_score
+                ),
+            )
+            .await;
+        return;
+    }
+
+    if let Some(holding_usd) = holding_value_usd_for_symbol(&portfolio, &decision.symbol)
+        .filter(|value| value.is_finite() && *value > 0.0)
+    {
+        decision.amount_usd = holding_usd.max(0.01);
+    }
+
+    info!(
+        "trading: pruning selected {} (bearish score {:.3}) for automatic selloff",
+        scorecard.symbol, bearish_score
+    );
+    state
+        .log(
+            "info",
+            "pruning",
+            format!(
+                "Selected held symbol {} for auto-selloff (bearish score {:.3})",
+                scorecard.symbol, bearish_score
+            ),
+            json!({ "scorecard": scorecard, "amount_usd": decision.amount_usd }),
+        )
+        .await;
+    execute_if_warranted(octobot, &decision, state, config).await;
+}
+
+async fn load_current_portfolio_snapshot(
+    state: &SharedTradingState,
+    octobot: &OctobotClient,
+) -> Option<OctobotPortfolio> {
+    if let Some(cached) = {
+        let s = state.0.lock().await;
+        s.current_portfolio.clone()
+    } {
+        return Some(cached);
+    }
+    match octobot.get_portfolio().await {
+        Ok(portfolio) => {
+            let mut s = state.0.lock().await;
+            s.current_portfolio = Some(portfolio.clone());
+            Some(portfolio)
+        }
+        Err(err) => {
+            warn!(
+                "trading: failed to refresh portfolio for discovery/pruning review: {}",
+                err
+            );
+            None
+        }
+    }
+}
+
+async fn evaluate_symbol_candidate(
+    config: &TradingConfig,
+    state: &SharedTradingState,
+    refiner: &RefinerClient,
+    fuzzy_engine: &FuzzyEngine,
+    advisor: &TradingAdvisor,
+    decision_engine: &DecisionEngine,
+    portfolio: &OctobotPortfolio,
+    snapshot: &MarketSnapshot,
+    in_portfolio: bool,
+) -> EvaluatedSymbol {
+    let research_query = build_research_query(config, Some(snapshot));
+    let research = refiner
+        .research_with_site_hints_best_effort(
+            &config.research_index_name,
+            &research_query,
+            &config.research_site_hints,
+            config.research_top_k,
+            config.research_max_parallel_queries,
+        )
+        .await;
+    let consensus = advisor
+        .consult_all(
+            std::slice::from_ref(snapshot),
+            &research,
+            portfolio,
+            config.max_parallel_advisors,
+        )
+        .await;
+    let fuzzy_inputs = compute_fuzzy_inputs(Some(snapshot), &consensus, &research, portfolio);
+    let fuzzy = fuzzy_engine.evaluate(&fuzzy_inputs);
+    let decision = {
+        let s = state.0.lock().await;
+        decision_engine.decide(&fuzzy, &consensus, Some(snapshot), &s, config)
+    };
+    let composite_score = composite_symbol_score(snapshot, &decision);
+    let scorecard = SymbolScorecard {
+        at: now_ts(),
+        exchange: snapshot.exchange.clone(),
+        symbol: snapshot.symbol.clone(),
+        in_portfolio,
+        market_score: market_score(snapshot),
+        price_change_pct_24h: snapshot.price_change_pct_24h,
+        volume_24h: snapshot.volume_24h,
+        ai_signal: consensus.signal,
+        ai_confidence: consensus.confidence,
+        fuzzy_signal: fuzzy.signal,
+        fuzzy_confidence: fuzzy.confidence,
+        blended_signal: decision.blended_signal,
+        blended_confidence: decision.confidence,
+        action: decision.action.to_string(),
+        composite_score,
+        amount_usd: decision.amount_usd,
+        rationale: truncate_message(&decision.rationale, 220),
+    };
+    EvaluatedSymbol {
+        decision,
+        scorecard,
+    }
+}
+
+fn select_non_portfolio_candidates(
+    snapshots: &[MarketSnapshot],
+    portfolio: &OctobotPortfolio,
+    pool_size: usize,
+) -> Vec<MarketSnapshot> {
+    let mut ranked = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.price.is_finite() && snapshot.price > 0.0)
+        .filter(|snapshot| snapshot_has_stable_quote(snapshot))
+        .filter(|snapshot| !snapshot_in_portfolio(snapshot, portfolio))
+        .cloned()
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        market_score(right)
+            .partial_cmp(&market_score(left))
+            .unwrap_or(Ordering::Equal)
+    });
+
+    let mut seen_assets = HashSet::new();
+    ranked
+        .into_iter()
+        .filter(|snapshot| {
+            symbol_base_asset(&snapshot.symbol)
+                .is_some_and(|asset| seen_assets.insert(asset.trim().to_ascii_uppercase()))
+        })
+        .take(pool_size.max(1))
+        .collect()
+}
+
+fn select_portfolio_pruning_candidates(
+    snapshots: &[MarketSnapshot],
+    portfolio: &OctobotPortfolio,
+    min_holding_usd: f64,
+    pool_size: usize,
+) -> Vec<MarketSnapshot> {
+    let held_assets = portfolio
+        .currencies
+        .iter()
+        .filter(|(asset, balance)| {
+            !is_stablecoin(asset)
+                && (balance.free > 0.0 || balance.total > 0.0)
+                && balance.value_usd.unwrap_or(min_holding_usd) >= min_holding_usd
+        })
+        .map(|(asset, _)| asset.to_ascii_uppercase())
+        .collect::<HashSet<_>>();
+
+    let mut selected = held_assets
+        .into_iter()
+        .filter_map(|asset| preferred_snapshot_for_asset(snapshots, &asset))
+        .collect::<Vec<_>>();
+    selected.sort_by(|left, right| {
+        market_score(right)
+            .partial_cmp(&market_score(left))
+            .unwrap_or(Ordering::Equal)
+    });
+    selected.truncate(pool_size.max(1));
+    selected
+}
+
+fn preferred_snapshot_for_asset(
+    snapshots: &[MarketSnapshot],
+    asset: &str,
+) -> Option<MarketSnapshot> {
+    snapshots
+        .iter()
+        .filter(|snapshot| snapshot.price.is_finite() && snapshot.price > 0.0)
+        .filter(|snapshot| snapshot_has_stable_quote(snapshot))
+        .filter(|snapshot| {
+            symbol_base_asset(&snapshot.symbol).is_some_and(|base| base.eq_ignore_ascii_case(asset))
+        })
+        .max_by(|left, right| {
+            let left_quote = quote_priority(symbol_quote_asset(&left.symbol).unwrap_or_default());
+            let right_quote = quote_priority(symbol_quote_asset(&right.symbol).unwrap_or_default());
+            left_quote.cmp(&right_quote).then_with(|| {
+                market_score(left)
+                    .partial_cmp(&market_score(right))
+                    .unwrap_or(Ordering::Equal)
+            })
+        })
+        .cloned()
+}
+
+fn snapshot_has_stable_quote(snapshot: &MarketSnapshot) -> bool {
+    symbol_quote_asset(&snapshot.symbol).is_some_and(is_stablecoin)
+}
+
+fn snapshot_in_portfolio(snapshot: &MarketSnapshot, portfolio: &OctobotPortfolio) -> bool {
+    let Some(base_asset) = symbol_base_asset(&snapshot.symbol) else {
+        return false;
+    };
+    portfolio
+        .currencies
+        .get(base_asset)
+        .is_some_and(|balance| balance.free > 0.0 || balance.total > 0.0)
+}
+
+fn holding_value_usd_for_symbol(portfolio: &OctobotPortfolio, symbol: &str) -> Option<f64> {
+    let base_asset = symbol_base_asset(symbol)?;
+    portfolio
+        .currencies
+        .get(base_asset)
+        .and_then(|balance| balance.value_usd)
+}
+
+fn symbol_base_asset(symbol: &str) -> Option<&str> {
+    symbol
+        .split('/')
+        .next()
+        .map(str::trim)
+        .filter(|asset| !asset.is_empty())
+}
+
+fn symbol_quote_asset(symbol: &str) -> Option<&str> {
+    symbol
+        .split('/')
+        .nth(1)
+        .map(str::trim)
+        .filter(|asset| !asset.is_empty())
+}
+
+fn quote_priority(quote: &str) -> usize {
+    if quote.eq_ignore_ascii_case("USDT") {
+        5
+    } else if quote.eq_ignore_ascii_case("USDC") {
+        4
+    } else if quote.eq_ignore_ascii_case("BUSD") {
+        3
+    } else if quote.eq_ignore_ascii_case("DAI") {
+        2
+    } else if quote.eq_ignore_ascii_case("USD") || quote.eq_ignore_ascii_case("EUR") {
+        1
+    } else {
+        0
+    }
+}
+
+fn action_direction_multiplier(action: &TradeAction) -> f64 {
+    match action {
+        TradeAction::StrongBuy => 1.15,
+        TradeAction::Buy => 1.0,
+        TradeAction::Hold | TradeAction::Cancel => 0.0,
+        TradeAction::Sell => -1.0,
+        TradeAction::StrongSell => -1.15,
+    }
+}
+
+fn composite_symbol_score(snapshot: &MarketSnapshot, decision: &TradeDecision) -> f64 {
+    let direction = action_direction_multiplier(&decision.action);
+    if direction.abs() < f64::EPSILON {
+        return 0.0;
+    }
+    let trend_strength = snapshot.price_change_pct_24h.unwrap_or(0.0).abs().min(25.0) / 25.0;
+    let liquidity_strength =
+        ((snapshot.volume_24h.unwrap_or(0.0) + 1.0).ln() / 18.0).clamp(0.0, 1.0);
+    let market_quality = (trend_strength * 0.6 + liquidity_strength * 0.4).clamp(0.0, 1.0);
+    direction
+        * decision.confidence.clamp(0.0, 1.0)
+        * decision.blended_signal.abs().clamp(0.0, 1.0)
+        * (0.7 + 0.3 * market_quality)
+}
+
+fn truncate_message(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 async fn process_octobot_feedback(
