@@ -59,6 +59,13 @@ static OLLAMA_ENDPOINT_SATURATED_UNTIL: Lazy<Mutex<HashMap<String, Instant>>> =
 static OLLAMA_ENDPOINT_SKIP_LOGGED_AT: Lazy<Mutex<HashMap<String, Instant>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+#[cfg(test)]
+pub(crate) async fn reset_test_runtime_state() {
+    *OLLAMA_SATURATED_UNTIL.lock().await = None;
+    OLLAMA_ENDPOINT_SATURATED_UNTIL.lock().await.clear();
+    OLLAMA_ENDPOINT_SKIP_LOGGED_AT.lock().await.clear();
+}
+
 fn resolved_ollama_max_concurrent_requests() -> u64 {
     let configured = env_int("GAIL_OLLAMA_MAX_CONCURRENT_REQUESTS", 1).max(1);
     if cfg!(test) {

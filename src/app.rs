@@ -3365,6 +3365,7 @@ mod tests {
     use crate::config::{ApiTokenConfig, GailConfig, ProviderProfile, SpecialistProfile};
 
     async fn test_service_with_config(mut config: GailConfig) -> GailService {
+        crate::providers::ollama::reset_test_runtime_state().await;
         config.security.allow_unauthenticated_health = false;
         config.storage.metrics_path = std::env::temp_dir()
             .join(format!(
