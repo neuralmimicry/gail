@@ -3121,8 +3121,7 @@ fn has_usable_value(value: Option<&str>) -> bool {
     value
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| value.to_ascii_lowercase())
-        .map(|value| !matches!(value.as_str(), "none" | "null" | "nil" | "undefined"))
+        .map(|value| !looks_like_placeholder_secret(value))
         .unwrap_or(false)
 }
 
@@ -3130,6 +3129,28 @@ fn env_has_usable_value(names: &[&str]) -> bool {
     names
         .iter()
         .any(|name| has_usable_value(env::var(name).ok().as_deref()))
+}
+
+fn looks_like_placeholder_secret(value: &str) -> bool {
+    let trimmed = value.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    if matches!(
+        lowered.as_str(),
+        "none"
+            | "null"
+            | "nil"
+            | "undefined"
+            | "changeme"
+            | "replace_me"
+            | "redacted"
+            | "<redacted>"
+            | "***"
+    ) {
+        return true;
+    }
+    trimmed.starts_with("${")
+        || (trimmed.starts_with('$') && trimmed.len() > 1)
+        || (trimmed.starts_with("{{") && trimmed.ends_with("}}"))
 }
 
 fn select_ranked_candidates(
@@ -4269,6 +4290,9 @@ mod tests {
         };
         assert!(!has_usable_value(Some("None")));
         assert!(!has_usable_value(Some("null")));
+        assert!(!has_usable_value(Some("${GEMINI_API_KEY}")));
+        assert!(!has_usable_value(Some("{{ vault_gemini_api_key }}")));
+        assert!(!has_usable_value(Some("changeme")));
         assert!(provider_profile_is_usable(&nvidia));
     }
 

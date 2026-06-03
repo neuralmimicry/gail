@@ -400,13 +400,9 @@ async fn run_single_evaluation(
     };
 
     // --- 2. Build research query ---
-    let best_snapshot = select_best_market_candidate(&market_snapshots);
-    let best_snapshot_history = best_snapshot.as_ref().and_then(|snapshot| {
-        historical_features
-            .get(&market_feature_key(&snapshot.exchange, &snapshot.symbol))
-            .cloned()
-    });
-    let research_query = build_research_query(config, best_snapshot.as_ref());
+    // Keep pre-consensus market ranking for research context only.
+    let research_snapshot = select_best_market_candidate(&market_snapshots);
+    let research_query = build_research_query(config, research_snapshot.as_ref());
 
     // Run remaining service calls in parallel so one slow dependency
     // does not serialize the whole evaluation cycle.
@@ -487,10 +483,31 @@ async fn run_single_evaluation(
         consensus.action, consensus.signal, consensus.confidence, consensus.responders
     );
 
+    // Select final decision market after consensus so high-confidence
+    // target symbols are not silently replaced by generic market ranking.
+    let decision_market_selection =
+        choose_decision_market_candidate(&market_snapshots, &consensus, research_snapshot.as_ref());
+    if let Some(reason) = decision_market_selection.override_reason.as_deref() {
+        warn!(
+            "trading: consensus target override applied with explicit risk justification: {}",
+            reason
+        );
+    }
+    debug!(
+        "trading: decision market selection => {}",
+        decision_market_selection.note
+    );
+    let decision_snapshot = decision_market_selection.snapshot.clone();
+    let decision_snapshot_history = decision_snapshot.as_ref().and_then(|snapshot| {
+        historical_features
+            .get(&market_feature_key(&snapshot.exchange, &snapshot.symbol))
+            .cloned()
+    });
+
     // --- 4. Compute fuzzy inputs ---
     let fuzzy_inputs = compute_fuzzy_inputs(
-        best_snapshot.as_ref(),
-        best_snapshot_history.as_ref(),
+        decision_snapshot.as_ref(),
+        decision_snapshot_history.as_ref(),
         &consensus,
         &research,
         &portfolio,
@@ -506,7 +523,13 @@ async fn run_single_evaluation(
     // --- 5. Make decision ---
     let mut decision = {
         let s = state.0.lock().await;
-        decision_engine.decide(&fuzzy_out, &consensus, best_snapshot.as_ref(), &s, config)
+        decision_engine.decide(
+            &fuzzy_out,
+            &consensus,
+            decision_snapshot.as_ref(),
+            &s,
+            config,
+        )
     };
 
     if !decision.override_applied
@@ -547,6 +570,9 @@ async fn run_single_evaluation(
         };
     }
 
+    decision.rationale =
+        merge_rationale_note(&decision.rationale, decision_market_selection.note.as_str());
+
     info!(
         "trading: decision = {:?} exchange={} symbol={} amount=${:.2} confidence={:.2}",
         decision.action,
@@ -577,7 +603,25 @@ async fn run_single_evaluation(
                 "ai_responders": consensus.responders,
                 "ai_failures": consensus.failures,
                 "ai_vote_distribution": consensus.vote_distribution,
-                "market_history": best_snapshot_history,
+                "market_history": decision_snapshot_history,
+                "research_market": research_snapshot.as_ref().map(|snapshot| {
+                    json!({
+                        "exchange": snapshot.exchange,
+                        "symbol": snapshot.symbol,
+                    })
+                }),
+                "decision_market": decision_snapshot.as_ref().map(|snapshot| {
+                    json!({
+                        "exchange": snapshot.exchange,
+                        "symbol": snapshot.symbol,
+                    })
+                }),
+                "market_selection_note": decision_market_selection.note,
+                "market_selection_override_reason": decision_market_selection.override_reason,
+                "market_selection_used_target": decision_market_selection.used_target_signal,
+                "market_selection_target_support": decision_market_selection.target_support,
+                "market_selection_target_support_advisors": decision_market_selection.target_support_advisors,
+                "market_selection_high_confidence_target": decision_market_selection.high_confidence_target,
                 "blended_signal": decision.blended_signal,
                 "roi_feedback_applied": decision.roi_feedback_applied,
                 "roi_feedback_signal_adjustment": decision.roi_feedback_signal_adjustment,
@@ -1325,6 +1369,13 @@ fn preferred_snapshot_for_asset(
     snapshots: &[MarketSnapshot],
     asset: &str,
 ) -> Option<MarketSnapshot> {
+    preferred_snapshot_for_asset_ref(snapshots, asset).cloned()
+}
+
+fn preferred_snapshot_for_asset_ref<'a>(
+    snapshots: &'a [MarketSnapshot],
+    asset: &str,
+) -> Option<&'a MarketSnapshot> {
     snapshots
         .iter()
         .filter(|snapshot| snapshot.price.is_finite() && snapshot.price > 0.0)
@@ -1341,7 +1392,6 @@ fn preferred_snapshot_for_asset(
                     .unwrap_or(Ordering::Equal)
             })
         })
-        .cloned()
 }
 
 fn snapshot_has_stable_quote(snapshot: &MarketSnapshot) -> bool {
@@ -1862,6 +1912,330 @@ fn portfolio_balance_state(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+const TARGET_LOCK_CONSENSUS_CONFIDENCE_MIN: f64 = 0.70;
+const TARGET_LOCK_CONSENSUS_SIGNAL_MIN: f64 = 0.30;
+const TARGET_LOCK_SUPPORT_MIN: f64 = 0.35;
+
+#[derive(Clone, Debug)]
+struct DecisionMarketSelection {
+    snapshot: Option<MarketSnapshot>,
+    note: String,
+    override_reason: Option<String>,
+    used_target_signal: bool,
+    target_support: f64,
+    target_support_advisors: usize,
+    high_confidence_target: bool,
+}
+
+#[derive(Clone, Debug)]
+struct TargetSnapshotSupport {
+    snapshot: MarketSnapshot,
+    signed_support: f64,
+    total_support: f64,
+    advisors: usize,
+}
+
+fn choose_decision_market_candidate(
+    snapshots: &[MarketSnapshot],
+    consensus: &advisor::AiConsensus,
+    fallback_snapshot: Option<&MarketSnapshot>,
+) -> DecisionMarketSelection {
+    if snapshots.is_empty() {
+        return DecisionMarketSelection {
+            snapshot: None,
+            note: "No market snapshots available for decision targeting".to_string(),
+            override_reason: None,
+            used_target_signal: false,
+            target_support: 0.0,
+            target_support_advisors: 0,
+            high_confidence_target: false,
+        };
+    }
+
+    let fallback = fallback_snapshot
+        .cloned()
+        .or_else(|| select_best_market_candidate(snapshots));
+    let fallback_label = fallback
+        .as_ref()
+        .map(snapshot_label)
+        .unwrap_or_else(|| "none".to_string());
+
+    let mut supports: HashMap<String, TargetSnapshotSupport> = HashMap::new();
+    let mut strongest_unresolved_target: Option<(String, f64)> = None;
+    for advice in consensus.advices.iter().filter(|advice| advice.parsed_ok) {
+        let direction = advisory_action_signal(advice.action.as_str());
+        if direction.abs() < f64::EPSILON {
+            continue;
+        }
+        let Some(target_hint) = advice
+            .target_symbol
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+
+        let weight = advisory_target_support_weight(advice);
+        if weight <= 0.0 {
+            continue;
+        }
+        let signed_support = direction * weight;
+        let support_abs = signed_support.abs();
+
+        if let Some(snapshot) = resolve_target_snapshot_hint(snapshots, target_hint) {
+            let key = market_feature_key(&snapshot.exchange, &snapshot.symbol);
+            let entry = supports
+                .entry(key)
+                .or_insert_with(|| TargetSnapshotSupport {
+                    snapshot: snapshot.clone(),
+                    signed_support: 0.0,
+                    total_support: 0.0,
+                    advisors: 0,
+                });
+            entry.signed_support += signed_support;
+            entry.total_support += support_abs;
+            entry.advisors += 1;
+        } else {
+            let should_replace = strongest_unresolved_target
+                .as_ref()
+                .map(|(_, current_support)| support_abs > *current_support + f64::EPSILON)
+                .unwrap_or(true);
+            if should_replace {
+                strongest_unresolved_target = Some((target_hint.to_string(), support_abs));
+            }
+        }
+    }
+
+    let mut strongest_target: Option<TargetSnapshotSupport> = None;
+    let consensus_direction = consensus_direction_sign(consensus.signal);
+    for support in supports.values() {
+        if consensus_direction > 0.0 && support.signed_support <= 0.0 {
+            continue;
+        }
+        if consensus_direction < 0.0 && support.signed_support >= 0.0 {
+            continue;
+        }
+        let should_replace = strongest_target
+            .as_ref()
+            .map(|current| {
+                support.signed_support.abs() > current.signed_support.abs() + f64::EPSILON
+                    || ((support.signed_support.abs() - current.signed_support.abs()).abs()
+                        <= f64::EPSILON
+                        && snapshot_label(&support.snapshot) < snapshot_label(&current.snapshot))
+            })
+            .unwrap_or(true);
+        if should_replace {
+            strongest_target = Some(support.clone());
+        }
+    }
+
+    if let Some(target) = strongest_target {
+        let support_abs = target.signed_support.abs();
+        let high_confidence_target =
+            should_lock_target_by_consensus(consensus, support_abs, target.advisors);
+        if high_confidence_target || fallback.is_none() {
+            let selected_label = snapshot_label(&target.snapshot);
+            let note = if fallback
+                .as_ref()
+                .is_some_and(|candidate| same_market(candidate, &target.snapshot))
+            {
+                format!(
+                    "Decision market {} aligns with high-confidence AI target support {:.2}",
+                    selected_label, support_abs
+                )
+            } else {
+                format!(
+                    "Decision market locked to AI target {} (support {:.2}, responders {})",
+                    selected_label, support_abs, target.advisors
+                )
+            };
+            return DecisionMarketSelection {
+                snapshot: Some(target.snapshot),
+                note,
+                override_reason: None,
+                used_target_signal: true,
+                target_support: support_abs,
+                target_support_advisors: target.advisors,
+                high_confidence_target,
+            };
+        }
+
+        let selected = fallback.clone();
+        let note = format!(
+            "Decision market kept at {}: strongest AI target {} support {:.2} below lock threshold",
+            fallback_label,
+            snapshot_label(&target.snapshot),
+            support_abs
+        );
+        return DecisionMarketSelection {
+            snapshot: selected,
+            note,
+            override_reason: None,
+            used_target_signal: false,
+            target_support: support_abs,
+            target_support_advisors: target.advisors,
+            high_confidence_target: false,
+        };
+    }
+
+    if let Some((target_hint, support)) = strongest_unresolved_target
+        && should_lock_target_by_consensus(consensus, support, 1)
+    {
+        let reason = format!(
+            "High-confidence AI target `{}` could not be mapped to a live tradable market snapshot",
+            target_hint
+        );
+        let note = format!("{reason}; using fallback market {}", fallback_label);
+        return DecisionMarketSelection {
+            snapshot: fallback,
+            note,
+            override_reason: Some(reason),
+            used_target_signal: false,
+            target_support: support,
+            target_support_advisors: 0,
+            high_confidence_target: true,
+        };
+    }
+
+    DecisionMarketSelection {
+        snapshot: fallback,
+        note: format!(
+            "Decision market defaulted to {} (no aligned AI target support)",
+            fallback_label
+        ),
+        override_reason: None,
+        used_target_signal: false,
+        target_support: 0.0,
+        target_support_advisors: 0,
+        high_confidence_target: false,
+    }
+}
+
+fn resolve_target_snapshot_hint<'a>(
+    snapshots: &'a [MarketSnapshot],
+    target_hint: &str,
+) -> Option<&'a MarketSnapshot> {
+    let normalized = normalize_target_hint(target_hint)?;
+    let normalized_key = normalize_symbol_key(&normalized);
+    if !normalized_key.is_empty()
+        && let Some(snapshot) = snapshots
+            .iter()
+            .filter(|snapshot| snapshot_is_usable(snapshot))
+            .find(|snapshot| normalize_symbol_key(&snapshot.symbol) == normalized_key)
+    {
+        return Some(snapshot);
+    }
+
+    let base_asset =
+        if normalized.contains('/') || normalized.contains('-') || normalized.contains('_') {
+            normalized
+                .split(['/', '-', '_'])
+                .next()
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            normalized.clone()
+        };
+
+    if base_asset.is_empty() {
+        return None;
+    }
+
+    preferred_snapshot_for_asset_ref(snapshots, &base_asset).or_else(|| {
+        snapshots
+            .iter()
+            .filter(|snapshot| snapshot_is_usable(snapshot))
+            .find(|snapshot| {
+                symbol_base_asset(&snapshot.symbol)
+                    .is_some_and(|asset| asset.eq_ignore_ascii_case(base_asset.as_str()))
+            })
+    })
+}
+
+fn normalize_target_hint(value: &str) -> Option<String> {
+    let trimmed = value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches('`');
+    if trimmed.is_empty() || matches!(trimmed.to_ascii_lowercase().as_str(), "null" | "none") {
+        return None;
+    }
+    Some(trimmed.to_ascii_uppercase())
+}
+
+fn normalize_symbol_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+fn advisory_target_support_weight(advice: &advisor::AiAdvice) -> f64 {
+    advice.weight.max(0.05) * advice.confidence.clamp(0.0, 1.0)
+}
+
+fn advisory_action_signal(action: &str) -> f64 {
+    match action.to_ascii_lowercase().as_str() {
+        "strong_buy" => 1.0,
+        "buy" => 0.5,
+        "sell" => -0.5,
+        "strong_sell" => -1.0,
+        _ => 0.0,
+    }
+}
+
+fn consensus_direction_sign(signal: f64) -> f64 {
+    if signal > 0.05 {
+        1.0
+    } else if signal < -0.05 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
+fn should_lock_target_by_consensus(
+    consensus: &advisor::AiConsensus,
+    target_support: f64,
+    advisors: usize,
+) -> bool {
+    consensus.confidence >= TARGET_LOCK_CONSENSUS_CONFIDENCE_MIN
+        && consensus.signal.abs() >= TARGET_LOCK_CONSENSUS_SIGNAL_MIN
+        && target_support >= TARGET_LOCK_SUPPORT_MIN
+        && advisors >= 1
+}
+
+fn merge_rationale_note(rationale: &str, note: &str) -> String {
+    let rationale = rationale.trim();
+    let note = note.trim();
+    if note.is_empty() {
+        rationale.to_string()
+    } else if rationale.is_empty() {
+        note.to_string()
+    } else if rationale.contains(note) {
+        rationale.to_string()
+    } else {
+        format!("{rationale} | {note}")
+    }
+}
+
+fn snapshot_is_usable(snapshot: &MarketSnapshot) -> bool {
+    snapshot.price.is_finite() && snapshot.price > 0.0
+}
+
+fn same_market(left: &MarketSnapshot, right: &MarketSnapshot) -> bool {
+    left.exchange.eq_ignore_ascii_case(&right.exchange)
+        && left.symbol.eq_ignore_ascii_case(&right.symbol)
+}
+
+fn snapshot_label(snapshot: &MarketSnapshot) -> String {
+    format!("{}/{}", snapshot.exchange, snapshot.symbol)
+}
 
 /// Select the best candidate market for trading based on signal quality.
 /// Prefers high-volume, high-momentum markets.

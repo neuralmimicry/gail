@@ -248,6 +248,7 @@ fn provider_identity(profile: &ProviderProfile) -> String {
 
 fn provider_advisor_score(profile: &ProviderProfile) -> f64 {
     let mut score = profile.weight;
+    let provider_type = normalize_provider_type(profile.provider_type.as_str());
     if profile.preferred {
         score += 0.25;
     }
@@ -280,8 +281,18 @@ fn provider_advisor_score(profile: &ProviderProfile) -> f64 {
         }
     }
     score += ollama_trading_profile_adjustment(profile);
+    if provider_type == "gemini" && !provider_has_direct_credentials(profile) {
+        // Keep Gemini available as a late fallback, but avoid noisy first-pass
+        // failures when credentials are absent or placeholder-like.
+        score -= 0.35;
+    }
     score += model_trading_adjustment(profile);
     score
+}
+
+fn provider_has_direct_credentials(profile: &ProviderProfile) -> bool {
+    has_usable_value(profile.api_key.as_deref())
+        || has_usable_value(profile.access_token.as_deref())
 }
 
 fn ollama_trading_profile_adjustment(profile: &ProviderProfile) -> f64 {
@@ -356,13 +367,7 @@ fn has_usable_value(value: Option<&str>) -> bool {
     value
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| {
-            let lowered = value.to_ascii_lowercase();
-            !matches!(
-                lowered.as_str(),
-                "none" | "null" | "nil" | "undefined" | "changeme"
-            )
-        })
+        .map(|value| !looks_like_placeholder_secret(value))
         .unwrap_or(false)
 }
 
@@ -372,6 +377,28 @@ fn env_has(name: &str) -> bool {
         .as_deref()
         .map(|value| has_usable_value(Some(value)))
         .unwrap_or(false)
+}
+
+fn looks_like_placeholder_secret(value: &str) -> bool {
+    let trimmed = value.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    if matches!(
+        lowered.as_str(),
+        "none"
+            | "null"
+            | "nil"
+            | "undefined"
+            | "changeme"
+            | "replace_me"
+            | "redacted"
+            | "<redacted>"
+            | "***"
+    ) {
+        return true;
+    }
+    trimmed.starts_with("${")
+        || (trimmed.starts_with('$') && trimmed.len() > 1)
+        || (trimmed.starts_with("{{") && trimmed.ends_with("}}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1063,6 +1090,28 @@ mod tests {
             select_trading_profiles(&[claude_bridge, codex_bridge, openai_compat, native], 1);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].name, "ollama-native");
+    }
+
+    #[test]
+    fn has_usable_value_rejects_placeholder_secrets() {
+        assert!(!has_usable_value(Some("${GEMINI_API_KEY}")));
+        assert!(!has_usable_value(Some("{{ vault_gemini_api_key }}")));
+        assert!(!has_usable_value(Some("$GEMINI_API_KEY")));
+        assert!(!has_usable_value(Some("changeme")));
+        assert!(has_usable_value(Some("AIzaValidLookingToken")));
+    }
+
+    #[test]
+    fn gemini_without_direct_credentials_is_deprioritized() {
+        let mut gemini = profile("gemini-a", "gemini", 0.35);
+        gemini.api_key = None;
+        gemini.access_token = None;
+        gemini.specialties = vec!["research".to_string()];
+
+        let nvidia = profile("nvidia-a", "nvidia", 0.22);
+        let selected = select_trading_profiles(&[gemini, nvidia], 1);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].provider_type, "nvidia");
     }
 
     #[test]

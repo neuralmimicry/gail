@@ -1884,6 +1884,70 @@ mod tests {
     }
 
     #[test]
+    fn decision_market_selection_locks_high_confidence_target_symbol() {
+        let snapshots = vec![
+            make_snapshot("binance", "ETH/USDT", 3000.0, 12.0, 9_000_000.0),
+            make_snapshot("binance", "BNB/USDT", 650.0, 3.0, 3_000_000.0),
+        ];
+        let fallback = crate::trading::select_best_market_candidate(&snapshots)
+            .expect("fallback market candidate");
+        assert_eq!(
+            fallback.symbol, "ETH/USDT",
+            "pre-consensus fallback should prefer ETH for this setup"
+        );
+
+        let mut primary = make_advice("strong_sell", 0.90, 1.0);
+        primary.target_symbol = Some("BNB".to_string());
+        let mut secondary = make_advice("sell", 0.86, 0.9);
+        secondary.target_symbol = Some("BNB/USDT".to_string());
+        let consensus = consensus_from_advices(vec![primary, secondary], 0);
+
+        let selection = crate::trading::choose_decision_market_candidate(
+            &snapshots,
+            &consensus,
+            Some(&fallback),
+        );
+        let selected = selection.snapshot.expect("selected decision market");
+        assert_eq!(selected.symbol, "BNB/USDT");
+        assert!(selection.used_target_signal);
+        assert!(selection.high_confidence_target);
+        assert!(selection.override_reason.is_none());
+    }
+
+    #[test]
+    fn decision_market_selection_requires_reason_when_high_confidence_target_missing() {
+        let snapshots = vec![
+            make_snapshot("binance", "ETH/USDT", 3000.0, 12.0, 9_000_000.0),
+            make_snapshot("binance", "BTC/USDT", 68000.0, 4.0, 7_000_000.0),
+        ];
+        let fallback = crate::trading::select_best_market_candidate(&snapshots)
+            .expect("fallback market candidate");
+
+        let mut advice = make_advice("strong_sell", 0.92, 1.0);
+        advice.target_symbol = Some("BNB/USDT".to_string());
+        let consensus = consensus_from_advices(vec![advice], 0);
+
+        let selection = crate::trading::choose_decision_market_candidate(
+            &snapshots,
+            &consensus,
+            Some(&fallback),
+        );
+        assert!(
+            selection.override_reason.is_some(),
+            "missing high-confidence target should produce explicit override reason"
+        );
+        assert!(selection.high_confidence_target);
+        assert!(!selection.used_target_signal);
+        assert!(
+            selection
+                .override_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("BNB/USDT")
+        );
+    }
+
+    #[test]
     fn discovery_candidates_exclude_held_assets_and_dedupe_symbol_bases() {
         let portfolio = make_portfolio(1_000.0); // includes BTC + USDT
         let snapshots = vec![
