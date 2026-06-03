@@ -1811,7 +1811,10 @@ mod tests {
             strict_no_downgrade: Some(true),
         };
 
-        let error = provider.complete(&request).await.expect_err("should fail");
+        let error = provider
+            .complete_once(&request, 0)
+            .await
+            .expect_err("should fail");
         assert!(
             error
                 .to_string()

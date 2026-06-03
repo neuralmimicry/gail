@@ -3736,8 +3736,9 @@ mod tests {
     #[tokio::test]
     async fn openai_chat_completions_saturation_reuses_cached_execution_plan() {
         let success_server = MockServer::start().await;
+        let success_base_url = format!("{}/chat-cache-success", success_server.uri());
         Mock::given(method("GET"))
-            .and(path("/api/tags"))
+            .and(path("/chat-cache-success/api/tags"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "models": [{"name": "llama3.2"}]
             })))
@@ -3759,7 +3760,7 @@ mod tests {
             "max_iterations": null
         });
         Mock::given(method("POST"))
-            .and(path("/api/generate"))
+            .and(path("/chat-cache-success/api/generate"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "response": cached_execution_plan.to_string(),
                 "prompt_eval_count": 8,
@@ -3769,15 +3770,16 @@ mod tests {
             .await;
 
         let saturated_server = MockServer::start().await;
+        let saturated_base_url = format!("{}/chat-cache-saturated", saturated_server.uri());
         Mock::given(method("GET"))
-            .and(path("/api/tags"))
+            .and(path("/chat-cache-saturated/api/tags"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "models": [{"name": "llama3.2"}]
             })))
             .mount(&saturated_server)
             .await;
         Mock::given(method("POST"))
-            .and(path("/api/generate"))
+            .and(path("/chat-cache-saturated/api/generate"))
             .respond_with(ResponseTemplate::new(503).set_body_json(json!({
                 "error": "local Ollama request queue is saturated; backing off before retrying in 14s"
             })))
@@ -3833,7 +3835,7 @@ mod tests {
                     .header("authorization", "Bearer secret")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
-                        request_payload(success_server.uri()).to_string(),
+                        request_payload(success_base_url.clone()).to_string(),
                     ))
                     .unwrap(),
             )
@@ -3860,7 +3862,7 @@ mod tests {
                     .header("authorization", "Bearer secret")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
-                        request_payload(saturated_server.uri()).to_string(),
+                        request_payload(saturated_base_url.clone()).to_string(),
                     ))
                     .unwrap(),
             )
@@ -5127,8 +5129,9 @@ mod tests {
     #[tokio::test]
     async fn openai_responses_saturation_reuses_cached_execution_plan() {
         let success_server = MockServer::start().await;
+        let success_base_url = format!("{}/responses-cache-success", success_server.uri());
         Mock::given(method("GET"))
-            .and(path("/api/tags"))
+            .and(path("/responses-cache-success/api/tags"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "models": [{"name": "llama3.2"}]
             })))
@@ -5150,7 +5153,7 @@ mod tests {
             "max_iterations": null
         });
         Mock::given(method("POST"))
-            .and(path("/api/generate"))
+            .and(path("/responses-cache-success/api/generate"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "response": cached_execution_plan.to_string(),
                 "prompt_eval_count": 4,
@@ -5160,15 +5163,16 @@ mod tests {
             .await;
 
         let saturated_server = MockServer::start().await;
+        let saturated_base_url = format!("{}/responses-cache-saturated", saturated_server.uri());
         Mock::given(method("GET"))
-            .and(path("/api/tags"))
+            .and(path("/responses-cache-saturated/api/tags"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "models": [{"name": "llama3.2"}]
             })))
             .mount(&saturated_server)
             .await;
         Mock::given(method("POST"))
-            .and(path("/api/generate"))
+            .and(path("/responses-cache-saturated/api/generate"))
             .respond_with(ResponseTemplate::new(503).set_body_json(json!({
                 "error": "local Ollama request queue is saturated; backing off before retrying in 14s"
             })))
@@ -5226,7 +5230,7 @@ mod tests {
                     .header("authorization", "Bearer secret")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
-                        request_payload(success_server.uri()).to_string(),
+                        request_payload(success_base_url.clone()).to_string(),
                     ))
                     .unwrap(),
             )
@@ -5253,7 +5257,7 @@ mod tests {
                     .header("authorization", "Bearer secret")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
-                        request_payload(saturated_server.uri()).to_string(),
+                        request_payload(saturated_base_url.clone()).to_string(),
                     ))
                     .unwrap(),
             )
