@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -15,6 +16,7 @@ use axum::{
     routing::{get, post},
 };
 use futures::stream;
+use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::signal;
@@ -129,6 +131,10 @@ impl OpenAIResponseSchemaContext {
     }
 }
 
+const EXECUTION_PLAN_CACHE_MAX_ENTRIES: usize = 64;
+static EXECUTION_PLAN_CACHE: Lazy<Mutex<HashMap<String, Value>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 pub fn build_router(service: GailService) -> Router {
     Router::new()
         .route("/healthz", get(health))
@@ -215,6 +221,7 @@ async fn openai_chat_completions(
             {
                 response.text = normalized;
             }
+            maybe_cache_execution_plan_from_chat_success(&request_for_fallback, &response);
             if stream_response {
                 openai_chat_completion_stream(public_model, response).into_response()
             } else {
@@ -261,6 +268,7 @@ async fn openai_responses(
     let request_for_fallback = request.clone();
     match dispatch_openai_responses(&service, request).await {
         Ok((public_model, response)) => {
+            maybe_cache_execution_plan_from_responses_success(&request_for_fallback, &response);
             if stream_response {
                 openai_responses_stream(public_model, response).into_response()
             } else {
@@ -2644,7 +2652,19 @@ fn degraded_chat_completion_for_upstream_error(
     error: &GailError,
 ) -> Option<(String, CompletionResponse)> {
     let reason = transient_openai_fallback_reason(error)?;
-    let text = if response_schema_context.manager_tool_call {
+    let text = if let Some(schema) =
+        schema_value_from_response_format(request.response_format.as_ref())
+        && let Some(mut value) = minimal_json_from_schema(schema)
+    {
+        if response_format_targets_execution_plan(request.response_format.as_ref())
+            && execution_plan_is_blank(&value)
+            && let Some(cache_key) = execution_plan_cache_key_from_chat_request(request)
+            && let Some(cached) = load_cached_execution_plan(cache_key.as_str(), schema)
+        {
+            value = cached;
+        }
+        serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+    } else if response_schema_context.manager_tool_call {
         json!({
             "tool_name": "finish",
             "arguments": {
@@ -2685,7 +2705,20 @@ fn degraded_responses_completion_for_upstream_error(
     error: &GailError,
 ) -> Option<(String, CompletionResponse)> {
     let reason = transient_openai_fallback_reason(error)?;
-    let text = if responses_request_expects_json(request) {
+    let text = if let Some(schema) = schema_value_from_response_format(
+        request.text.as_ref().and_then(|text| text.format.as_ref()),
+    ) && let Some(mut value) = minimal_json_from_schema(schema)
+    {
+        if response_format_targets_execution_plan(
+            request.text.as_ref().and_then(|text| text.format.as_ref()),
+        ) && execution_plan_is_blank(&value)
+            && let Some(cache_key) = execution_plan_cache_key_from_responses_request(request)
+            && let Some(cached) = load_cached_execution_plan(cache_key.as_str(), schema)
+        {
+            value = cached;
+        }
+        serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+    } else if responses_request_expects_json(request) {
         json!({
             "status": "degraded",
             "decision": "hold",
@@ -2790,6 +2823,423 @@ fn responses_request_expects_json(request: &OpenAIResponseRequest) -> bool {
     }
     let lowered = request.input.to_string().to_ascii_lowercase();
     lowered.contains("json")
+}
+
+fn maybe_cache_execution_plan_from_chat_success(
+    request: &OpenAIChatCompletionRequest,
+    response: &CompletionResponse,
+) {
+    if response.model.eq_ignore_ascii_case("degraded_safety") {
+        return;
+    }
+    let Some(format) = request.response_format.as_ref() else {
+        return;
+    };
+    maybe_cache_execution_plan_response(
+        response.text.as_str(),
+        Some(format),
+        execution_plan_cache_key_from_chat_request(request),
+    );
+}
+
+fn maybe_cache_execution_plan_from_responses_success(
+    request: &OpenAIResponseRequest,
+    response: &CompletionResponse,
+) {
+    if response.model.eq_ignore_ascii_case("degraded_safety") {
+        return;
+    }
+    let Some(format) = request.text.as_ref().and_then(|text| text.format.as_ref()) else {
+        return;
+    };
+    maybe_cache_execution_plan_response(
+        response.text.as_str(),
+        Some(format),
+        execution_plan_cache_key_from_responses_request(request),
+    );
+}
+
+fn maybe_cache_execution_plan_response(
+    response_text: &str,
+    format: Option<&OpenAIResponseFormat>,
+    cache_key: Option<String>,
+) {
+    if !response_format_targets_execution_plan(format) {
+        return;
+    }
+    let Some(cache_key) = cache_key else {
+        return;
+    };
+    let Some(schema) = schema_value_from_response_format(format) else {
+        return;
+    };
+    let Some(value) = extract_json_value(response_text) else {
+        return;
+    };
+    if execution_plan_is_blank(&value) {
+        return;
+    }
+    if !execution_plan_has_steps(&value) {
+        return;
+    }
+    if !json_matches_object_schema_requirements(schema, &value) {
+        return;
+    }
+    store_cached_execution_plan(cache_key, value);
+}
+
+fn schema_value_from_response_format(format: Option<&OpenAIResponseFormat>) -> Option<&Value> {
+    let format = format?;
+    let schema = format.json_schema.as_ref()?;
+    if let Some(schema_value) = schema.get("schema") {
+        Some(schema_value)
+    } else {
+        Some(schema)
+    }
+}
+
+fn minimal_json_from_schema(schema: &Value) -> Option<Value> {
+    minimal_json_from_schema_inner(schema, schema, 0)
+}
+
+fn minimal_json_from_schema_inner(root: &Value, schema: &Value, depth: usize) -> Option<Value> {
+    if depth > 24 {
+        return Some(Value::Null);
+    }
+
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str)
+        && reference.starts_with("#/")
+        && let Some(target) = root.pointer(&reference[1..])
+    {
+        return minimal_json_from_schema_inner(root, target, depth + 1);
+    }
+
+    if let Some(value) = schema.get("const") {
+        return Some(value.clone());
+    }
+    if let Some(value) = schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+    {
+        return Some(value.clone());
+    }
+    if let Some(default) = schema.get("default") {
+        return Some(default.clone());
+    }
+    if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array)
+        && let Some(first) = any_of.first()
+    {
+        return minimal_json_from_schema_inner(root, first, depth + 1);
+    }
+    if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array)
+        && let Some(first) = one_of.first()
+    {
+        return minimal_json_from_schema_inner(root, first, depth + 1);
+    }
+    if let Some(all_of) = schema.get("allOf").and_then(Value::as_array)
+        && let Some(first) = all_of.first()
+    {
+        return minimal_json_from_schema_inner(root, first, depth + 1);
+    }
+
+    let mut selected_type = schema
+        .get("type")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    if selected_type.is_none()
+        && let Some(types) = schema.get("type").and_then(Value::as_array)
+    {
+        selected_type = types
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|kind| *kind != "null")
+            .map(ToOwned::to_owned);
+    }
+    if selected_type.is_none()
+        && (schema.get("properties").is_some() || schema.get("required").is_some())
+    {
+        selected_type = Some("object".to_string());
+    }
+
+    match selected_type.as_deref().unwrap_or("object") {
+        "object" => {
+            let properties = schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let required = schema
+                .get("required")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+
+            let mut object = serde_json::Map::new();
+            for key in required.iter().filter_map(Value::as_str) {
+                if let Some(prop_schema) = properties.get(key) {
+                    if let Some(value) =
+                        minimal_json_from_schema_inner(root, prop_schema, depth + 1)
+                    {
+                        object.insert(key.to_string(), value);
+                    }
+                } else if key.eq_ignore_ascii_case("steps") {
+                    object.insert(key.to_string(), Value::Array(Vec::new()));
+                }
+            }
+            Some(Value::Object(object))
+        }
+        "array" => Some(Value::Array(Vec::new())),
+        "boolean" => Some(Value::Bool(false)),
+        "integer" => Some(Value::from(0)),
+        "number" => Some(Value::from(0.0)),
+        "string" => Some(Value::String(String::new())),
+        "null" => Some(Value::Null),
+        _ => Some(Value::Null),
+    }
+}
+
+fn response_format_targets_execution_plan(format: Option<&OpenAIResponseFormat>) -> bool {
+    let Some(format) = format else {
+        return false;
+    };
+    let Some(json_schema) = format.json_schema.as_ref() else {
+        return false;
+    };
+    if json_schema
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("executionplan"))
+    {
+        return true;
+    }
+    let schema = json_schema.get("schema").unwrap_or(json_schema);
+    schema_value_looks_like_execution_plan(schema)
+}
+
+fn schema_value_looks_like_execution_plan(schema: &Value) -> bool {
+    if schema
+        .get("title")
+        .and_then(Value::as_str)
+        .is_some_and(|title| title.eq_ignore_ascii_case("executionplan"))
+    {
+        return true;
+    }
+    let has_steps_property = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| properties.contains_key("steps"));
+    let required_steps = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|required| {
+            required
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|key| key == "steps")
+        });
+    has_steps_property && required_steps
+}
+
+fn execution_plan_steps_len(value: &Value) -> Option<usize> {
+    value
+        .as_object()
+        .and_then(|object| object.get("steps"))
+        .and_then(Value::as_array)
+        .map(Vec::len)
+}
+
+fn execution_plan_is_blank(value: &Value) -> bool {
+    execution_plan_steps_len(value).is_some_and(|len| len == 0)
+}
+
+fn execution_plan_has_steps(value: &Value) -> bool {
+    execution_plan_steps_len(value).is_some_and(|len| len > 0)
+}
+
+fn json_matches_object_schema_requirements(schema: &Value, value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        for key in required.iter().filter_map(Value::as_str) {
+            if !object.contains_key(key) {
+                return false;
+            }
+        }
+    }
+
+    if schema
+        .get("additionalProperties")
+        .and_then(Value::as_bool)
+        .is_some_and(|enabled| !enabled)
+        && let Some(properties) = schema.get("properties").and_then(Value::as_object)
+    {
+        for key in object.keys() {
+            if !properties.contains_key(key) {
+                return false;
+            }
+        }
+    }
+
+    object.get("steps").is_none_or(Value::is_array)
+}
+
+fn execution_plan_cache_key_from_chat_request(
+    request: &OpenAIChatCompletionRequest,
+) -> Option<String> {
+    if !response_format_targets_execution_plan(request.response_format.as_ref()) {
+        return None;
+    }
+    execution_plan_cache_key_from_context(openai_chat_request_context_text(request).as_str())
+}
+
+fn execution_plan_cache_key_from_responses_request(
+    request: &OpenAIResponseRequest,
+) -> Option<String> {
+    if !response_format_targets_execution_plan(
+        request.text.as_ref().and_then(|text| text.format.as_ref()),
+    ) {
+        return None;
+    }
+    execution_plan_cache_key_from_context(openai_responses_request_context_text(request).as_str())
+}
+
+fn openai_chat_request_context_text(request: &OpenAIChatCompletionRequest) -> String {
+    let mut context = String::new();
+    if let Some(instructions) = request.instructions.as_deref() {
+        context.push_str(instructions);
+        context.push('\n');
+    }
+    for message in &request.messages {
+        context.push_str(&message.flattened_text());
+        context.push('\n');
+    }
+    context
+}
+
+fn openai_responses_request_context_text(request: &OpenAIResponseRequest) -> String {
+    let mut context = String::new();
+    if let Some(instructions) = request.instructions.as_deref() {
+        context.push_str(instructions);
+        context.push('\n');
+    }
+    append_json_string_values(&request.input, &mut context);
+    context
+}
+
+fn append_json_string_values(value: &Value, context: &mut String) {
+    match value {
+        Value::String(text) => {
+            context.push_str(text);
+            context.push('\n');
+        }
+        Value::Array(items) => {
+            for item in items {
+                append_json_string_values(item, context);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values() {
+                append_json_string_values(item, context);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn execution_plan_cache_key_from_context(context: &str) -> Option<String> {
+    let team = extract_labeled_line_value(context, "Team:")?;
+    let agents_section = extract_labeled_section(
+        context,
+        "Agents:",
+        &["Relations:", "Initial Data:", "Instructions:"],
+    )?;
+    let mut agent_names = extract_named_values_from_section(agents_section, "name")
+        .into_iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    agent_names.sort();
+    agent_names.dedup();
+    if agent_names.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "team={}|agents={}",
+        team.trim().to_ascii_lowercase(),
+        agent_names.join(",")
+    ))
+}
+
+fn extract_labeled_line_value(text: &str, label: &str) -> Option<String> {
+    let start = text.find(label)?;
+    let remainder = &text[start + label.len()..];
+    let value = remainder
+        .split(['\n', '\r', '\\', '"'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn extract_labeled_section<'a>(
+    text: &'a str,
+    label: &str,
+    end_markers: &[&str],
+) -> Option<&'a str> {
+    let start = text.find(label)?;
+    let after_label = &text[start + label.len()..];
+    let mut end = after_label.len();
+    for marker in end_markers {
+        if let Some(position) = after_label.find(marker) {
+            end = end.min(position);
+        }
+    }
+    Some(after_label[..end].trim())
+}
+
+fn extract_named_values_from_section(section: &str, field_name: &str) -> Vec<String> {
+    let needle = format!("\"{field_name}\"");
+    section
+        .split(needle.as_str())
+        .skip(1)
+        .filter_map(|tail| {
+            let (_, after_colon) = tail.split_once(':')?;
+            let (_, after_start_quote) = after_colon.split_once('"')?;
+            let (value, _) = after_start_quote.split_once('"')?;
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        })
+        .collect()
+}
+
+fn load_cached_execution_plan(cache_key: &str, schema: &Value) -> Option<Value> {
+    let cached = {
+        let cache = EXECUTION_PLAN_CACHE.lock().ok()?;
+        cache.get(cache_key).cloned()?
+    };
+    if !execution_plan_has_steps(&cached) {
+        return None;
+    }
+    if !json_matches_object_schema_requirements(schema, &cached) {
+        return None;
+    }
+    Some(cached)
+}
+
+fn store_cached_execution_plan(cache_key: String, execution_plan: Value) {
+    let Ok(mut cache) = EXECUTION_PLAN_CACHE.lock() else {
+        return;
+    };
+    if cache.len() >= EXECUTION_PLAN_CACHE_MAX_ENTRIES
+        && !cache.contains_key(cache_key.as_str())
+        && let Some(evicted_key) = cache.keys().next().cloned()
+    {
+        cache.remove(evicted_key.as_str());
+    }
+    cache.insert(cache_key, execution_plan);
 }
 
 fn degraded_openai_completion_response(text: String, reason: String) -> CompletionResponse {
@@ -3195,6 +3645,241 @@ mod tests {
         assert_eq!(degraded["should_trade"], false);
         assert_eq!(payload["gail"]["provider"], "gail");
         assert_eq!(payload["gail"]["resolved_model"], "degraded_safety");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_explicit_ollama_saturation_respects_json_schema_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "error": "local Ollama request queue is saturated; backing off before retrying in 14s"
+            })))
+            .mount(&server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/llama3.2",
+                            "base_url": server.uri(),
+                            "response_format": {
+                                "type": "json_schema",
+                                "json_schema": {
+                                    "name": "ExecutionPlan",
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "loop": {"type": "boolean", "default": false},
+                                            "loop_condition": {
+                                                "anyOf": [{"type": "string"}, {"type": "null"}]
+                                            },
+                                            "max_iterations": {
+                                                "anyOf": [{"type": "integer"}, {"type": "null"}]
+                                            },
+                                            "steps": {
+                                                "type": "array",
+                                                "items": {"type": "object"}
+                                            }
+                                        },
+                                        "required": ["steps", "loop", "loop_condition", "max_iterations"],
+                                        "additionalProperties": false
+                                    }
+                                }
+                            },
+                            "messages": [
+                                {"role": "user", "content": "Return only valid execution plan JSON."}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+        let content = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("completion content");
+        let degraded: Value = serde_json::from_str(content).expect("degraded json payload");
+        let degraded_object = degraded.as_object().expect("degraded object");
+
+        assert_eq!(payload["model"], "ollama/llama3.2");
+        assert_eq!(degraded_object.len(), 4);
+        assert_eq!(degraded["loop"], false);
+        assert_eq!(degraded["loop_condition"], "");
+        assert_eq!(degraded["max_iterations"], 0);
+        assert!(degraded_object.contains_key("steps"));
+        assert_eq!(
+            degraded["steps"].as_array().expect("steps array").len(),
+            0,
+            "schema fallback should avoid non-schema keys like status/decision"
+        );
+        assert_eq!(payload["gail"]["provider"], "gail");
+        assert_eq!(payload["gail"]["resolved_model"], "degraded_safety");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_saturation_reuses_cached_execution_plan() {
+        let success_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&success_server)
+            .await;
+        let cached_execution_plan = json!({
+            "steps": [
+                {
+                    "agent_name": "TechnicalAnalysisAIAgentProducer",
+                    "instructions": null,
+                    "wait_for": null,
+                    "skip": false,
+                    "step_type": "agent",
+                    "debate_config": null
+                }
+            ],
+            "loop": false,
+            "loop_condition": null,
+            "max_iterations": null
+        });
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": cached_execution_plan.to_string(),
+                "prompt_eval_count": 8,
+                "eval_count": 5
+            })))
+            .mount(&success_server)
+            .await;
+
+        let saturated_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&saturated_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "error": "local Ollama request queue is saturated; backing off before retrying in 14s"
+            })))
+            .mount(&saturated_server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let team_name = format!("ExecutionPlanCacheTeam{}", uuid::Uuid::new_v4().simple());
+        let manager_prompt = format!(
+            "Analyze the following team structure and create an execution plan:\n\
+             Team: {team_name}\n\
+             Agents: [{{\"name\":\"TechnicalAnalysisAIAgentProducer\",\"channel\":\"TechnicalAnalysisAIAgentChannel\"}},{{\"name\":\"SummarizationAIAgentProducer\",\"channel\":\"SummarizationAIAgentChannel\"}}]\n\
+             Relations: [{{\"source\":\"TechnicalAnalysisAIAgentChannel\",\"target\":\"SummarizationAIAgentChannel\"}}]\n\
+             Initial Data: {{}}\n\
+             Instructions: None"
+        );
+        let request_payload = |base_url: String| {
+            json!({
+                "model": "ollama/llama3.2",
+                "base_url": base_url,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "ExecutionPlan",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "steps": {
+                                    "type": "array",
+                                    "items": {"type": "object"}
+                                },
+                                "loop": {"type": "boolean"},
+                                "loop_condition": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                                "max_iterations": {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+                            },
+                            "required": ["steps", "loop", "loop_condition", "max_iterations"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "messages": [
+                    {"role": "user", "content": manager_prompt}
+                ]
+            })
+        };
+
+        let first_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        request_payload(success_server.uri()).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("first response");
+        let first_payload = read_json(first_response).await;
+        let first_plan: Value = serde_json::from_str(
+            first_payload["choices"][0]["message"]["content"]
+                .as_str()
+                .expect("first content"),
+        )
+        .expect("first plan json");
+        assert_eq!(
+            first_plan["steps"].as_array().expect("steps").len(),
+            1,
+            "first response should cache a working execution plan"
+        );
+
+        let second_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        request_payload(saturated_server.uri()).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("second response");
+        let second_payload = read_json(second_response).await;
+        let second_plan: Value = serde_json::from_str(
+            second_payload["choices"][0]["message"]["content"]
+                .as_str()
+                .expect("second content"),
+        )
+        .expect("second plan json");
+
+        assert_eq!(
+            second_plan, first_plan,
+            "degraded schema fallback should reuse the last non-empty execution plan"
+        );
+        assert_eq!(second_payload["gail"]["provider"], "gail");
+        assert_eq!(second_payload["gail"]["resolved_model"], "degraded_safety");
     }
 
     #[tokio::test]
@@ -4347,6 +5032,247 @@ mod tests {
         assert_eq!(payload["output_text"], "mocked answer");
         assert_eq!(payload["output"][0]["type"], "text");
         assert_eq!(payload["output"][0]["text"], "mocked answer");
+    }
+
+    #[tokio::test]
+    async fn openai_responses_explicit_ollama_saturation_respects_json_schema_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "error": "local Ollama request queue is saturated; backing off before retrying in 14s"
+            })))
+            .mount(&server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/llama3.2",
+                            "base_url": server.uri(),
+                            "text": {
+                                "format": {
+                                    "type": "json_schema",
+                                    "json_schema": {
+                                        "name": "ExecutionPlan",
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "loop": {"type": "boolean", "default": false},
+                                                "loop_condition": {
+                                                    "anyOf": [{"type": "string"}, {"type": "null"}]
+                                                },
+                                                "max_iterations": {
+                                                    "anyOf": [{"type": "integer"}, {"type": "null"}]
+                                                },
+                                                "steps": {
+                                                    "type": "array",
+                                                    "items": {"type": "object"}
+                                                }
+                                            },
+                                            "required": ["steps", "loop", "loop_condition", "max_iterations"],
+                                            "additionalProperties": false
+                                        }
+                                    }
+                                }
+                            },
+                            "input": [
+                                {"type": "input_text", "text": "Generate the next execution plan."}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+        let degraded_text = payload["output_text"]
+            .as_str()
+            .expect("response output text");
+        let degraded: Value =
+            serde_json::from_str(degraded_text).expect("degraded json output_text payload");
+        let degraded_object = degraded.as_object().expect("degraded object");
+
+        assert_eq!(payload["model"], "ollama/llama3.2");
+        assert_eq!(degraded_object.len(), 4);
+        assert_eq!(degraded["loop"], false);
+        assert_eq!(degraded["loop_condition"], "");
+        assert_eq!(degraded["max_iterations"], 0);
+        assert!(degraded_object.contains_key("steps"));
+        assert_eq!(
+            degraded["steps"].as_array().expect("steps array").len(),
+            0,
+            "schema fallback should avoid non-schema keys like status/decision"
+        );
+        assert_eq!(payload["output"][0]["type"], "text");
+        assert_eq!(payload["gail"]["provider"], "gail");
+        assert_eq!(payload["gail"]["resolved_model"], "degraded_safety");
+    }
+
+    #[tokio::test]
+    async fn openai_responses_saturation_reuses_cached_execution_plan() {
+        let success_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&success_server)
+            .await;
+        let cached_execution_plan = json!({
+            "steps": [
+                {
+                    "agent_name": "TechnicalAnalysisAIAgentProducer",
+                    "instructions": null,
+                    "wait_for": null,
+                    "skip": false,
+                    "step_type": "agent",
+                    "debate_config": null
+                }
+            ],
+            "loop": false,
+            "loop_condition": null,
+            "max_iterations": null
+        });
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": cached_execution_plan.to_string(),
+                "prompt_eval_count": 4,
+                "eval_count": 3
+            })))
+            .mount(&success_server)
+            .await;
+
+        let saturated_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&saturated_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "error": "local Ollama request queue is saturated; backing off before retrying in 14s"
+            })))
+            .mount(&saturated_server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let team_name = format!("ExecutionPlanCacheTeam{}", uuid::Uuid::new_v4().simple());
+        let manager_prompt = format!(
+            "Analyze the following team structure and create an execution plan:\n\
+             Team: {team_name}\n\
+             Agents: [{{\"name\":\"TechnicalAnalysisAIAgentProducer\",\"channel\":\"TechnicalAnalysisAIAgentChannel\"}},{{\"name\":\"SummarizationAIAgentProducer\",\"channel\":\"SummarizationAIAgentChannel\"}}]\n\
+             Relations: [{{\"source\":\"TechnicalAnalysisAIAgentChannel\",\"target\":\"SummarizationAIAgentChannel\"}}]\n\
+             Initial Data: {{}}\n\
+             Instructions: None"
+        );
+        let request_payload = |base_url: String| {
+            json!({
+                "model": "ollama/llama3.2",
+                "base_url": base_url,
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "ExecutionPlan",
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "steps": {
+                                        "type": "array",
+                                        "items": {"type": "object"}
+                                    },
+                                    "loop": {"type": "boolean"},
+                                    "loop_condition": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                                    "max_iterations": {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+                                },
+                                "required": ["steps", "loop", "loop_condition", "max_iterations"],
+                                "additionalProperties": false
+                            }
+                        }
+                    }
+                },
+                "input": [
+                    {"type": "input_text", "text": manager_prompt}
+                ]
+            })
+        };
+
+        let first_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        request_payload(success_server.uri()).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("first response");
+        let first_payload = read_json(first_response).await;
+        let first_plan: Value = serde_json::from_str(
+            first_payload["output_text"]
+                .as_str()
+                .expect("first output text"),
+        )
+        .expect("first plan json");
+        assert_eq!(
+            first_plan["steps"].as_array().expect("steps").len(),
+            1,
+            "first response should cache a working execution plan"
+        );
+
+        let second_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        request_payload(saturated_server.uri()).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("second response");
+        let second_payload = read_json(second_response).await;
+        let second_plan: Value = serde_json::from_str(
+            second_payload["output_text"]
+                .as_str()
+                .expect("second output text"),
+        )
+        .expect("second plan json");
+
+        assert_eq!(
+            second_plan, first_plan,
+            "degraded schema fallback should reuse the last non-empty execution plan"
+        );
+        assert_eq!(second_payload["gail"]["provider"], "gail");
+        assert_eq!(second_payload["gail"]["resolved_model"], "degraded_safety");
     }
 
     #[tokio::test]
