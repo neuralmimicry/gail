@@ -619,6 +619,21 @@ impl OctobotClient {
                         break;
                     }
 
+                    OrderSubmissionAttempt::RejectedNonPositiveQuantity => {
+                        warn!(
+                            ?mode,
+                            exchange = %exchange,
+                            symbol = %symbol,
+                            side = %normalized_side,
+                            amount_usd = submission_amount,
+                            "trading: OctoBot rejected order due to non-positive adapted quantity; skipping fallback endpoints"
+                        );
+                        return Err(format!(
+                            "OctoBot rejected {normalized_side} order for {exchange} {symbol} ${submission_amount:.2}: quantity became non-positive after market adaptation. Tried: {}",
+                            attempts.join(" | ")
+                        ));
+                    }
+
                     OrderSubmissionAttempt::AmbiguousAccepted => {
                         warn!(
                             ?mode,
@@ -719,6 +734,10 @@ impl OctobotClient {
                         &body, amount_usd,
                     ),
                 });
+            }
+
+            if body_has_non_positive_quantity_rejection(&body) {
+                return Ok(OrderSubmissionAttempt::RejectedNonPositiveQuantity);
             }
 
             return Ok(OrderSubmissionAttempt::Rejected);
@@ -1189,6 +1208,10 @@ enum OrderSubmissionAttempt {
     /// availability error. This is safe to retry once with a smaller amount.
     RejectedPortfolioNegative { retry_amount_usd: Option<f64> },
 
+    /// The endpoint rejected the order because quantity adaptation collapsed
+    /// to a non-positive value. Retrying equivalent endpoints is unnecessary.
+    RejectedNonPositiveQuantity,
+
     /// The endpoint returned HTTP 2xx but did not provide a parseable order
     /// acknowledgement and no side-effect was observed within the polling
     /// window.
@@ -1422,6 +1445,15 @@ fn body_has_portfolio_negative_rejection(body: &Value) -> bool {
         let lowered = message.to_ascii_lowercase();
         lowered.contains("portfolionegativevalueerror")
             || (lowered.contains("trying to update") && lowered.contains("quantity was"))
+    })
+}
+
+fn body_has_non_positive_quantity_rejection(body: &Value) -> bool {
+    extract_attempt_message(body).is_some_and(|message| {
+        let lowered = message.to_ascii_lowercase();
+        lowered.contains("order quantity became non-positive after market adaptation")
+            || (lowered.contains("quantity became non-positive")
+                && lowered.contains("market adaptation"))
     })
 }
 

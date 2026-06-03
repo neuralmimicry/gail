@@ -1683,9 +1683,10 @@ async fn execute_if_warranted(
     octobot: &OctobotClient,
     decision: &TradeDecision,
     state: &SharedTradingState,
-    _config: &TradingConfig,
+    config: &TradingConfig,
 ) {
     let mut execution_amount_usd = decision.amount_usd;
+    let min_execution_usd = effective_micro_trade_floor_usd(state, config).await;
 
     match &decision.action {
         TradeAction::Hold => {
@@ -1716,7 +1717,7 @@ async fn execute_if_warranted(
         return;
     }
 
-    if !_config.live_execution_enabled {
+    if !config.live_execution_enabled {
         info!(
             "trading: live execution disabled — decision not sent to OctoBot exchange={} symbol={} action={:?} amount=${:.2}",
             decision.exchange, decision.symbol, decision.action, decision.amount_usd
@@ -1832,6 +1833,26 @@ async fn execute_if_warranted(
         }
     }
 
+    if execution_amount_usd + f64::EPSILON < min_execution_usd {
+        warn!(
+            "trading: {} skipped — execution amount for {} below effective micro-trade floor (${:.2} < ${:.2})",
+            side, decision.symbol, execution_amount_usd, min_execution_usd
+        );
+        state
+            .log_warn(
+                "execute",
+                format!(
+                    "{} skipped for {}: amount ${:.2} below effective micro-trade floor ${:.2}",
+                    side.to_ascii_uppercase(),
+                    decision.symbol,
+                    execution_amount_usd,
+                    min_execution_usd
+                ),
+            )
+            .await;
+        return;
+    }
+
     let result = if side == "buy" {
         octobot
             .place_buy_order(&decision.exchange, &decision.symbol, execution_amount_usd)
@@ -1886,6 +1907,18 @@ async fn execute_if_warranted(
                 .await;
         }
     }
+}
+
+async fn effective_micro_trade_floor_usd(
+    state: &SharedTradingState,
+    config: &TradingConfig,
+) -> f64 {
+    let s = state.0.lock().await;
+    s.config_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.micro_trade_min_usd)
+        .unwrap_or(config.micro_trade_min_usd)
+        .max(0.01)
 }
 
 #[derive(Clone, Copy, Debug)]

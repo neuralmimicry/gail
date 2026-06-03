@@ -2519,6 +2519,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn octobot_client_place_sell_order_stops_fallback_on_non_positive_quantity_rejection() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/trades"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/orders"))
+            .and(query_param("action", "create_order"))
+            .and(body_string_contains("\"amount\":0.16"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "message": "Unable to create order for ETH/USDT after trying 1 exchange(s): binance: ValueError: Order quantity became non-positive after market adaptation for ETH/USDT: 0.0000"
+            })))
+            .expect(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        // Non-positive quantity after exchange adaptation should fail fast and
+        // avoid trying additional mutating endpoints with equivalent payloads.
+        Mock::given(method("POST"))
+            .and(path("/api/orders"))
+            .and(query_param("action", "create_orders"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unsupported"))
+            .expect(0)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/orders"))
+            .and(body_string_contains("\"action\":\"create_order\""))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unsupported"))
+            .expect(0)
+            .with_priority(10)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/orders"))
+            .and(body_string_contains("\"order_type\":\"market\""))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unsupported"))
+            .expect(0)
+            .with_priority(10)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/user_command"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unsupported"))
+            .expect(0)
+            .with_priority(10)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let err = client
+            .place_sell_order("binance", "ETH/USDT", 0.16)
+            .await
+            .expect_err("non-positive quantity rejection should fail immediately");
+        assert!(err.contains("quantity became non-positive after market adaptation"));
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn octobot_client_get_exchange_info_uses_first_exchange_and_configured_symbols() {
         let server = MockServer::start().await;
 
