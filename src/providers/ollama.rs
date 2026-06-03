@@ -211,7 +211,13 @@ impl OllamaProvider {
         &self,
         request: &ProviderCompletionRequest,
     ) -> Result<ProviderInvocationResponse> {
-        if ollama_family_saturation_enabled()
+        let has_explicit_request_base = request
+            .base_url
+            .as_deref()
+            .and_then(normalize_base_url)
+            .is_some();
+        if !has_explicit_request_base
+            && ollama_family_saturation_enabled()
             && let Some(remaining) = ollama_saturation_remaining().await
         {
             return Err(ollama_saturated_error(remaining));
