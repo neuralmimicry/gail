@@ -18,6 +18,7 @@ use futures::stream;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::signal;
+use uuid::Uuid;
 
 use crate::{
     adaptive_schema, api_issues,
@@ -205,6 +206,7 @@ async fn openai_chat_completions(
     let stream_response = request.stream.unwrap_or(false);
     let tool_context = OpenAIToolContext::from_tools(request.tools.as_ref());
     let response_schema_context = OpenAIResponseSchemaContext::from_chat_request(&request);
+    let request_for_fallback = request.clone();
     match dispatch_openai_chat_completion(&service, request).await {
         Ok((public_model, mut response)) => {
             if tool_context.is_none()
@@ -224,7 +226,26 @@ async fn openai_chat_completions(
                 .into_response()
             }
         }
-        Err(error) => openai_error_response(error),
+        Err(error) => {
+            if let Some((public_model, fallback)) = degraded_chat_completion_for_upstream_error(
+                &request_for_fallback,
+                &response_schema_context,
+                &error,
+            ) {
+                if stream_response {
+                    openai_chat_completion_stream(public_model, fallback).into_response()
+                } else {
+                    Json(openai_chat_completion_body(
+                        &public_model,
+                        &fallback,
+                        tool_context.as_ref(),
+                    ))
+                    .into_response()
+                }
+            } else {
+                openai_error_response(error)
+            }
+        }
     }
 }
 
@@ -237,6 +258,7 @@ async fn openai_responses(
         return openai_error_response(error);
     }
     let stream_response = request.stream.unwrap_or(false);
+    let request_for_fallback = request.clone();
     match dispatch_openai_responses(&service, request).await {
         Ok((public_model, response)) => {
             if stream_response {
@@ -245,7 +267,19 @@ async fn openai_responses(
                 Json(openai_responses_body(&public_model, &response)).into_response()
             }
         }
-        Err(error) => openai_error_response(error),
+        Err(error) => {
+            if let Some((public_model, fallback)) =
+                degraded_responses_completion_for_upstream_error(&request_for_fallback, &error)
+            {
+                if stream_response {
+                    openai_responses_stream(public_model, fallback).into_response()
+                } else {
+                    Json(openai_responses_body(&public_model, &fallback)).into_response()
+                }
+            } else {
+                openai_error_response(error)
+            }
+        }
     }
 }
 
@@ -2604,6 +2638,182 @@ fn gail_response_body(response: &CompletionResponse) -> Value {
     payload
 }
 
+fn degraded_chat_completion_for_upstream_error(
+    request: &OpenAIChatCompletionRequest,
+    response_schema_context: &OpenAIResponseSchemaContext,
+    error: &GailError,
+) -> Option<(String, CompletionResponse)> {
+    let reason = transient_openai_fallback_reason(error)?;
+    let text = if response_schema_context.manager_tool_call {
+        json!({
+            "tool_name": "finish",
+            "arguments": {
+                "status": "degraded",
+                "decision": "hold",
+                "action": "hold",
+                "should_trade": false,
+                "reason": reason,
+            }
+        })
+        .to_string()
+    } else if chat_request_expects_json(request) {
+        json!({
+            "status": "degraded",
+            "decision": "hold",
+            "action": "hold",
+            "signal": "neutral",
+            "confidence": 0.0,
+            "should_trade": false,
+            "orders": [],
+            "trades": [],
+            "risk": "provider_unavailable",
+            "reason": reason,
+        })
+        .to_string()
+    } else {
+        format!(
+            "HOLD / NO_TRADE: Gail returned a degraded response because upstream providers were unavailable. Reason: {reason}."
+        )
+    };
+
+    let response = degraded_openai_completion_response(text, reason);
+    Some((request.model.trim().to_string(), response))
+}
+
+fn degraded_responses_completion_for_upstream_error(
+    request: &OpenAIResponseRequest,
+    error: &GailError,
+) -> Option<(String, CompletionResponse)> {
+    let reason = transient_openai_fallback_reason(error)?;
+    let text = if responses_request_expects_json(request) {
+        json!({
+            "status": "degraded",
+            "decision": "hold",
+            "action": "hold",
+            "signal": "neutral",
+            "confidence": 0.0,
+            "should_trade": false,
+            "orders": [],
+            "trades": [],
+            "risk": "provider_unavailable",
+            "reason": reason,
+        })
+        .to_string()
+    } else {
+        format!(
+            "HOLD / NO_TRADE: Gail returned a degraded response because upstream providers were unavailable. Reason: {reason}."
+        )
+    };
+
+    let response = degraded_openai_completion_response(text, reason);
+    Some((request.model.trim().to_string(), response))
+}
+
+fn transient_openai_fallback_reason(error: &GailError) -> Option<String> {
+    match error {
+        GailError::Upstream {
+            message,
+            status,
+            quota,
+            timeout,
+            ..
+        } => {
+            if *quota {
+                return None;
+            }
+            let status_is_transient = status
+                .map(|code| code.as_u16())
+                .is_some_and(|code| matches!(code, 502 | 503 | 504));
+            if *timeout || status_is_transient || message_indicates_transient_upstream(message) {
+                return Some(truncate_openai_reason(message));
+            }
+            None
+        }
+        GailError::Reqwest(err) => {
+            let text = err.to_string();
+            if err.is_timeout() || message_indicates_transient_upstream(&text) {
+                Some(truncate_openai_reason(text))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn message_indicates_transient_upstream(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("local ollama request queue is saturated")
+        || lowered.contains("local model service is saturated")
+        || lowered.contains("adaptive backoff")
+        || lowered.contains("upstream error")
+        || lowered.contains("gateway timeout")
+        || lowered.contains("bad gateway")
+        || lowered.contains("connection error")
+        || lowered.contains("error sending request")
+        || lowered.contains("timed out")
+        || lowered.contains("timeout")
+        || lowered.contains("status 502")
+        || lowered.contains("status 503")
+        || lowered.contains("status 504")
+        || lowered.contains("http 502")
+        || lowered.contains("http 503")
+        || lowered.contains("http 504")
+}
+
+fn chat_request_expects_json(request: &OpenAIChatCompletionRequest) -> bool {
+    if response_format_system_hint(request.response_format.as_ref()).is_some()
+        || tool_call_system_hint(request.tools.as_ref()).is_some()
+    {
+        return true;
+    }
+    let mut context = String::new();
+    if let Some(instructions) = request.instructions.as_deref() {
+        context.push_str(instructions);
+        context.push('\n');
+    }
+    for message in &request.messages {
+        context.push_str(&message.flattened_text());
+        context.push('\n');
+    }
+    let lowered = context.to_ascii_lowercase();
+    lowered.contains("json")
+        || lowered.contains("managertoolcall")
+        || (lowered.contains("tool_name") && lowered.contains("arguments"))
+}
+
+fn responses_request_expects_json(request: &OpenAIResponseRequest) -> bool {
+    if response_format_system_hint(request.text.as_ref().and_then(|text| text.format.as_ref()))
+        .is_some()
+    {
+        return true;
+    }
+    let lowered = request.input.to_string().to_ascii_lowercase();
+    lowered.contains("json")
+}
+
+fn degraded_openai_completion_response(text: String, reason: String) -> CompletionResponse {
+    let request_id = format!("degraded_{}", Uuid::new_v4().simple());
+    CompletionResponse {
+        request_id,
+        text,
+        provider: "gail".to_string(),
+        model: "degraded_safety".to_string(),
+        latency_ms: 0,
+        usage: None,
+        trace: None,
+        raw: Some(json!({
+            "selected_source": "degraded_openai_gateway_fallback",
+            "reason": reason,
+            "safety_action": "hold_no_trade",
+        })),
+    }
+}
+
+fn truncate_openai_reason(reason: impl AsRef<str>) -> String {
+    reason.as_ref().trim().chars().take(220).collect::<String>()
+}
+
 fn openai_error_response(error: GailError) -> Response {
     let status = openai_error_status(&error);
     let body = json!({
@@ -2930,6 +3140,61 @@ mod tests {
         assert_eq!(payload["choices"][0]["message"]["content"], "mocked answer");
         assert_eq!(payload["gail"]["provider"], "ollama");
         assert_eq!(payload["gail"]["resolved_model"], "llama3.2");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_explicit_ollama_saturation_returns_degraded_success_payload() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "error": "local Ollama request queue is saturated; backing off before retrying in 14s"
+            })))
+            .mount(&server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/llama3.2",
+                            "base_url": server.uri(),
+                            "response_format": { "type": "json_object" },
+                            "messages": [
+                                {"role": "user", "content": "Return only valid JSON for this evaluation."}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+        let content = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("completion content");
+        let degraded: Value = serde_json::from_str(content).expect("degraded json payload");
+
+        assert_eq!(payload["model"], "ollama/llama3.2");
+        assert_eq!(degraded["status"], "degraded");
+        assert_eq!(degraded["action"], "hold");
+        assert_eq!(degraded["should_trade"], false);
+        assert_eq!(payload["gail"]["provider"], "gail");
+        assert_eq!(payload["gail"]["resolved_model"], "degraded_safety");
     }
 
     #[tokio::test]
