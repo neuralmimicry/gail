@@ -15,6 +15,7 @@
 pub mod advisor;
 pub mod backtest;
 pub mod config;
+pub mod datalake;
 pub mod decision;
 pub mod fuzzy;
 pub mod octobot;
@@ -27,7 +28,10 @@ mod tests;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::{cmp::Ordering, collections::HashSet};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+};
 
 use serde::Serialize;
 use serde_json::json;
@@ -42,6 +46,9 @@ use crate::{
 use advisor::TradingAdvisor;
 use backtest::BacktestEngine;
 use config::{TradingConfig, TradingConfigOverride};
+use datalake::{
+    MarketDataLake, MarketDataLakeBootstrapReport, MarketHistoricalFeatures, market_feature_key,
+};
 use decision::{DecisionEngine, TradeDecision};
 use fuzzy::{FuzzyEngine, FuzzyInputs};
 use octobot::{MarketSnapshot, OctobotClient, OctobotLogEntry, OctobotPortfolio};
@@ -154,9 +161,25 @@ async fn run_evaluation_loop(
         config.refiner_timeout_seconds,
     );
     let fuzzy_engine = FuzzyEngine::new();
+    let postgres_dsn = service.config().storage.postgres_dsn.clone();
     let advisor = TradingAdvisor::new(service, config.advisor_timeout_seconds);
     let decision_engine = DecisionEngine::new(config.fuzzy_weight);
     let data_path = PathBuf::from(&config.data_path);
+    let market_data_lake = if config.market_datalake_enabled {
+        Some(MarketDataLake::new(&config, postgres_dsn).await)
+    } else {
+        None
+    };
+    let mut pending_datalake_bootstrap_reason = if config.market_datalake_bootstrap_enabled {
+        if let Some(lake) = market_data_lake.as_ref() {
+            lake.bootstrap_required_reason().await
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let mut last_datalake_bootstrap_attempt_ts: f64 = 0.0;
 
     // Initial OctoBot login.
     if let Err(err) = octobot.login().await {
@@ -166,6 +189,17 @@ async fn run_evaluation_loop(
             .await;
     } else {
         state.log_info("startup", "Trading bridge started").await;
+    }
+
+    if let Some(reason) = pending_datalake_bootstrap_reason.clone()
+        && let Some(lake) = market_data_lake.as_ref()
+    {
+        let bootstrap_ok =
+            run_market_datalake_bootstrap(&config, &state, &octobot, lake, &reason).await;
+        last_datalake_bootstrap_attempt_ts = now_ts();
+        if bootstrap_ok {
+            pending_datalake_bootstrap_reason = None;
+        }
     }
 
     let eval_interval = Duration::from_secs(config.evaluation_interval_seconds);
@@ -206,6 +240,23 @@ async fn run_evaluation_loop(
                     debug!("trading: evaluation skipped — bridge is paused");
                     continue;
                 }
+                if let Some(reason) = pending_datalake_bootstrap_reason.clone() {
+                    let due = now_ts() - last_datalake_bootstrap_attempt_ts
+                        >= config.market_datalake_bootstrap_retry_seconds as f64;
+                    if due {
+                        if let Some(lake) = market_data_lake.as_ref() {
+                            let bootstrap_ok = run_market_datalake_bootstrap(
+                                &config, &state, &octobot, lake, &reason,
+                            ).await;
+                            last_datalake_bootstrap_attempt_ts = now_ts();
+                            if bootstrap_ok {
+                                pending_datalake_bootstrap_reason = None;
+                            }
+                        } else {
+                            pending_datalake_bootstrap_reason = None;
+                        }
+                    }
+                }
                 run_single_evaluation(
                     &config,
                     &state,
@@ -214,6 +265,7 @@ async fn run_evaluation_loop(
                     &fuzzy_engine,
                     &advisor,
                     &decision_engine,
+                    market_data_lake.as_ref(),
                 ).await;
                 persist_counter += 1;
                 if persist_counter >= 5 {
@@ -232,6 +284,7 @@ async fn run_evaluation_loop(
                             &fuzzy_engine,
                             &advisor,
                             &decision_engine,
+                            market_data_lake.as_ref(),
                         ).await;
                         last_discovery_ts = now_ts();
                     }
@@ -248,6 +301,7 @@ async fn run_evaluation_loop(
                             &fuzzy_engine,
                             &advisor,
                             &decision_engine,
+                            market_data_lake.as_ref(),
                         ).await;
                         last_pruning_ts = now_ts();
                     }
@@ -310,6 +364,7 @@ async fn run_single_evaluation(
     fuzzy_engine: &FuzzyEngine,
     advisor: &TradingAdvisor,
     decision_engine: &DecisionEngine,
+    market_data_lake: Option<&MarketDataLake>,
 ) {
     let eval_start = now_ts();
     debug!("trading: starting evaluation cycle");
@@ -321,9 +376,36 @@ async fn run_single_evaluation(
     let market_snapshots = octobot
         .get_all_market_snapshots(&target_exchanges, &target_currencies, 20)
         .await;
+    let historical_features = if let Some(lake) = market_data_lake {
+        let ingest_summary = lake.ingest_snapshots(&market_snapshots).await;
+        if ingest_summary.file_error.is_some() || ingest_summary.postgres_error.is_some() {
+            state
+                .log(
+                    "warn",
+                    "market_datalake",
+                    "Incremental market snapshot persistence encountered an error",
+                    json!({
+                        "received": ingest_summary.received,
+                        "persisted": ingest_summary.persisted,
+                        "deduplicated": ingest_summary.deduplicated,
+                        "file_error": ingest_summary.file_error,
+                        "postgres_error": ingest_summary.postgres_error,
+                    }),
+                )
+                .await;
+        }
+        lake.features_for_snapshots(&market_snapshots).await
+    } else {
+        HashMap::new()
+    };
 
     // --- 2. Build research query ---
     let best_snapshot = select_best_market_candidate(&market_snapshots);
+    let best_snapshot_history = best_snapshot.as_ref().and_then(|snapshot| {
+        historical_features
+            .get(&market_feature_key(&snapshot.exchange, &snapshot.symbol))
+            .cloned()
+    });
     let research_query = build_research_query(config, best_snapshot.as_ref());
 
     // Run remaining service calls in parallel so one slow dependency
@@ -393,6 +475,7 @@ async fn run_single_evaluation(
     let consensus = advisor
         .consult_all(
             &market_snapshots,
+            &historical_features,
             &research,
             &portfolio,
             config.max_parallel_advisors,
@@ -405,8 +488,14 @@ async fn run_single_evaluation(
     );
 
     // --- 4. Compute fuzzy inputs ---
-    let fuzzy_inputs =
-        compute_fuzzy_inputs(best_snapshot.as_ref(), &consensus, &research, &portfolio);
+    let fuzzy_inputs = compute_fuzzy_inputs(
+        best_snapshot.as_ref(),
+        best_snapshot_history.as_ref(),
+        &consensus,
+        &research,
+        &portfolio,
+        config,
+    );
     let fuzzy_out = fuzzy_engine.evaluate(&fuzzy_inputs);
 
     debug!(
@@ -488,6 +577,7 @@ async fn run_single_evaluation(
                 "ai_responders": consensus.responders,
                 "ai_failures": consensus.failures,
                 "ai_vote_distribution": consensus.vote_distribution,
+                "market_history": best_snapshot_history,
                 "blended_signal": decision.blended_signal,
                 "roi_feedback_applied": decision.roi_feedback_applied,
                 "roi_feedback_signal_adjustment": decision.roi_feedback_signal_adjustment,
@@ -517,6 +607,118 @@ async fn run_single_evaluation(
     );
 }
 
+async fn run_market_datalake_bootstrap(
+    config: &TradingConfig,
+    state: &SharedTradingState,
+    octobot: &OctobotClient,
+    market_data_lake: &MarketDataLake,
+    reason: &str,
+) -> bool {
+    market_data_lake.mark_bootstrap_started(reason).await;
+    state
+        .log_info(
+            "market_datalake",
+            format!("Starting one-time market datalake bootstrap: {reason}"),
+        )
+        .await;
+
+    let (target_exchanges, target_currencies) = resolve_target_market_filters(config, state).await;
+    let seed_snapshots = octobot
+        .get_all_market_snapshots(
+            &target_exchanges,
+            &target_currencies,
+            config.market_datalake_bootstrap_symbol_limit,
+        )
+        .await;
+    if seed_snapshots.is_empty() {
+        let error = "No bootstrap symbols available from OctoBot";
+        market_data_lake.mark_bootstrap_failed(reason, error).await;
+        state.log_warn("market_datalake", error).await;
+        return false;
+    }
+
+    let mut historical_snapshots = Vec::new();
+    let mut symbols_with_history = 0usize;
+    for snapshot in &seed_snapshots {
+        let mut symbol_has_history = false;
+        for time_frame in &config.market_datalake_bootstrap_time_frames {
+            match octobot
+                .get_market_snapshot_history(&snapshot.exchange, &snapshot.symbol, time_frame)
+                .await
+            {
+                Ok(history) => {
+                    if !history.is_empty() {
+                        symbol_has_history = true;
+                        historical_snapshots.extend(history);
+                    }
+                }
+                Err(error) => {
+                    debug!(
+                        exchange = %snapshot.exchange,
+                        symbol = %snapshot.symbol,
+                        time_frame = %time_frame,
+                        error = %error,
+                        "trading: bootstrap history request failed for symbol"
+                    );
+                }
+            }
+        }
+        if symbol_has_history {
+            symbols_with_history += 1;
+        }
+    }
+
+    if historical_snapshots.is_empty() {
+        let error = "Bootstrap fetched no historical candle snapshots";
+        market_data_lake.mark_bootstrap_failed(reason, error).await;
+        state
+            .log_warn("market_datalake", format!("{error}; will retry later"))
+            .await;
+        return false;
+    }
+
+    let ingest = market_data_lake
+        .ingest_snapshots(&historical_snapshots)
+        .await;
+    if let Some(error) = ingest.file_error.as_deref() {
+        market_data_lake.mark_bootstrap_failed(reason, error).await;
+        state
+            .log_warn(
+                "market_datalake",
+                format!("Bootstrap file persistence failed: {error}"),
+            )
+            .await;
+        return false;
+    }
+
+    let report = MarketDataLakeBootstrapReport {
+        reason: reason.to_string(),
+        symbols_attempted: seed_snapshots.len(),
+        symbols_with_history,
+        time_frames: config.market_datalake_bootstrap_time_frames.clone(),
+        snapshots_received: historical_snapshots.len(),
+        snapshots_persisted: ingest.persisted,
+        snapshots_deduplicated: ingest.deduplicated,
+    };
+    market_data_lake.mark_bootstrap_completed(&report).await;
+    state
+        .log(
+            "info",
+            "market_datalake",
+            format!(
+                "Market datalake bootstrap complete: symbols={} with_history={} snapshots={} persisted={} deduped={}",
+                report.symbols_attempted,
+                report.symbols_with_history,
+                report.snapshots_received,
+                report.snapshots_persisted,
+                report.snapshots_deduplicated,
+            ),
+            json!(report),
+        )
+        .await;
+    true
+}
+
 async fn resolve_target_market_filters(
     config: &TradingConfig,
     state: &SharedTradingState,
@@ -541,6 +743,12 @@ struct SymbolScorecard {
     market_score: f64,
     price_change_pct_24h: Option<f64>,
     volume_24h: Option<f64>,
+    history_momentum_short_pct: Option<f64>,
+    history_momentum_mid_pct: Option<f64>,
+    history_momentum_long_pct: Option<f64>,
+    history_volatility_pct: Option<f64>,
+    history_drawdown_pct: Option<f64>,
+    history_volume_ratio_short_long: Option<f64>,
     ai_signal: f64,
     ai_confidence: f64,
     fuzzy_signal: f64,
@@ -567,6 +775,7 @@ async fn run_non_portfolio_discovery_cycle(
     fuzzy_engine: &FuzzyEngine,
     advisor: &TradingAdvisor,
     decision_engine: &DecisionEngine,
+    market_data_lake: Option<&MarketDataLake>,
 ) {
     if {
         let s = state.0.lock().await;
@@ -595,6 +804,28 @@ async fn run_non_portfolio_discovery_cycle(
             config.token_discovery_snapshot_limit,
         )
         .await;
+    let historical_features = if let Some(lake) = market_data_lake {
+        let ingest_summary = lake.ingest_snapshots(&snapshots).await;
+        if ingest_summary.file_error.is_some() || ingest_summary.postgres_error.is_some() {
+            state
+                .log(
+                    "warn",
+                    "market_datalake",
+                    "Discovery cycle market snapshot persistence encountered an error",
+                    json!({
+                        "received": ingest_summary.received,
+                        "persisted": ingest_summary.persisted,
+                        "deduplicated": ingest_summary.deduplicated,
+                        "file_error": ingest_summary.file_error,
+                        "postgres_error": ingest_summary.postgres_error,
+                    }),
+                )
+                .await;
+        }
+        lake.features_for_snapshots(&snapshots).await
+    } else {
+        HashMap::new()
+    };
     if snapshots.is_empty() {
         state
             .log_warn(
@@ -632,6 +863,7 @@ async fn run_non_portfolio_discovery_cycle(
             &portfolio,
             snapshot,
             false,
+            historical_features.get(&market_feature_key(&snapshot.exchange, &snapshot.symbol)),
         )
         .await;
         evaluated.push(review);
@@ -731,6 +963,7 @@ async fn run_portfolio_pruning_cycle(
     fuzzy_engine: &FuzzyEngine,
     advisor: &TradingAdvisor,
     decision_engine: &DecisionEngine,
+    market_data_lake: Option<&MarketDataLake>,
 ) {
     if {
         let s = state.0.lock().await;
@@ -756,6 +989,28 @@ async fn run_portfolio_pruning_cycle(
             config.token_discovery_snapshot_limit,
         )
         .await;
+    let historical_features = if let Some(lake) = market_data_lake {
+        let ingest_summary = lake.ingest_snapshots(&snapshots).await;
+        if ingest_summary.file_error.is_some() || ingest_summary.postgres_error.is_some() {
+            state
+                .log(
+                    "warn",
+                    "market_datalake",
+                    "Pruning cycle market snapshot persistence encountered an error",
+                    json!({
+                        "received": ingest_summary.received,
+                        "persisted": ingest_summary.persisted,
+                        "deduplicated": ingest_summary.deduplicated,
+                        "file_error": ingest_summary.file_error,
+                        "postgres_error": ingest_summary.postgres_error,
+                    }),
+                )
+                .await;
+        }
+        lake.features_for_snapshots(&snapshots).await
+    } else {
+        HashMap::new()
+    };
     if snapshots.is_empty() {
         state
             .log_warn(
@@ -791,6 +1046,7 @@ async fn run_portfolio_pruning_cycle(
             &portfolio,
             snapshot,
             true,
+            historical_features.get(&market_feature_key(&snapshot.exchange, &snapshot.symbol)),
         )
         .await;
         evaluated.push(review);
@@ -923,6 +1179,7 @@ async fn evaluate_symbol_candidate(
     portfolio: &OctobotPortfolio,
     snapshot: &MarketSnapshot,
     in_portfolio: bool,
+    historical_features: Option<&MarketHistoricalFeatures>,
 ) -> EvaluatedSymbol {
     let research_query = build_research_query(config, Some(snapshot));
     let research = refiner
@@ -937,12 +1194,20 @@ async fn evaluate_symbol_candidate(
     let consensus = advisor
         .consult_all(
             std::slice::from_ref(snapshot),
+            &historical_features_map(snapshot, historical_features),
             &research,
             portfolio,
             config.max_parallel_advisors,
         )
         .await;
-    let fuzzy_inputs = compute_fuzzy_inputs(Some(snapshot), &consensus, &research, portfolio);
+    let fuzzy_inputs = compute_fuzzy_inputs(
+        Some(snapshot),
+        historical_features,
+        &consensus,
+        &research,
+        portfolio,
+        config,
+    );
     let fuzzy = fuzzy_engine.evaluate(&fuzzy_inputs);
     let decision = {
         let s = state.0.lock().await;
@@ -957,6 +1222,15 @@ async fn evaluate_symbol_candidate(
         market_score: market_score(snapshot),
         price_change_pct_24h: snapshot.price_change_pct_24h,
         volume_24h: snapshot.volume_24h,
+        history_momentum_short_pct: historical_features
+            .and_then(|feature| feature.momentum_short_pct),
+        history_momentum_mid_pct: historical_features.and_then(|feature| feature.momentum_mid_pct),
+        history_momentum_long_pct: historical_features
+            .and_then(|feature| feature.momentum_long_pct),
+        history_volatility_pct: historical_features.and_then(|feature| feature.volatility_pct),
+        history_drawdown_pct: historical_features.and_then(|feature| feature.drawdown_pct),
+        history_volume_ratio_short_long: historical_features
+            .and_then(|feature| feature.volume_ratio_short_long),
         ai_signal: consensus.signal,
         ai_confidence: consensus.confidence,
         fuzzy_signal: fuzzy.signal,
@@ -972,6 +1246,20 @@ async fn evaluate_symbol_candidate(
         decision,
         scorecard,
     }
+}
+
+fn historical_features_map(
+    snapshot: &MarketSnapshot,
+    features: Option<&MarketHistoricalFeatures>,
+) -> HashMap<String, MarketHistoricalFeatures> {
+    let mut map = HashMap::new();
+    if let Some(features) = features {
+        map.insert(
+            market_feature_key(&snapshot.exchange, &snapshot.symbol),
+            features.clone(),
+        );
+    }
+    map
 }
 
 fn select_non_portfolio_candidates(
@@ -1634,16 +1922,18 @@ fn utc_date_from_unix_days(days_since_epoch: i64) -> String {
 
 fn compute_fuzzy_inputs(
     best_market: Option<&MarketSnapshot>,
+    historical_market: Option<&MarketHistoricalFeatures>,
     consensus: &advisor::AiConsensus,
     research: &refiner::ResearchContext,
     portfolio: &OctobotPortfolio,
+    config: &TradingConfig,
 ) -> FuzzyInputs {
-    let price_trend = best_market
+    let live_price_trend = best_market
         .and_then(|m| m.price_change_pct_24h)
         .map(|p| (p / 5.0).clamp(-1.0, 1.0))
         .unwrap_or(0.0);
 
-    let volume_ratio = best_market
+    let live_volume_ratio = best_market
         .and_then(|m| m.volume_24h)
         .map(|v| (v / 1_000_000.0).clamp(0.0, 2.0)) // rough normalisation
         .unwrap_or(1.0);
@@ -1651,7 +1941,7 @@ fn compute_fuzzy_inputs(
     let ai_consensus = consensus.signal.clamp(-1.0, 1.0);
 
     // Rough research sentiment from match scores.
-    let research_sentiment = if research.is_empty() {
+    let mut research_sentiment = if research.is_empty() {
         0.0
     } else {
         let avg_score: f64 = research.matches.iter().map(|m| m.score).sum::<f64>()
@@ -1676,6 +1966,20 @@ fn compute_fuzzy_inputs(
             ((total - stable) / total).clamp(0.0, 1.0)
         }
     };
+
+    let mut price_trend = live_price_trend;
+    let mut volume_ratio = live_volume_ratio;
+    if let Some(history) = historical_market {
+        let weight = config.market_datalake_feature_weight.clamp(0.0, 1.0);
+        let historical_momentum = history.momentum_signal();
+        let historical_volume = history.volume_regime_ratio().clamp(0.0, 2.0);
+        price_trend =
+            (live_price_trend * (1.0 - weight) + historical_momentum * weight).clamp(-1.0, 1.0);
+        volume_ratio =
+            (live_volume_ratio * (1.0 - weight) + historical_volume * weight).clamp(0.0, 2.0);
+        let risk_pressure = history.risk_pressure();
+        research_sentiment = (research_sentiment - risk_pressure * 0.25).clamp(-1.0, 1.0);
+    }
 
     FuzzyInputs {
         price_trend,

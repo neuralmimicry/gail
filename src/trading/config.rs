@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, path::Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -149,6 +149,53 @@ pub struct TradingConfig {
     pub advisor_timeout_seconds: f64,
 
     // -----------------------------------------------------------------------
+    // Incremental market datalake
+    // -----------------------------------------------------------------------
+    /// Whether Gail should persist incremental market snapshots and derive
+    /// historical features from cumulative data.
+    pub market_datalake_enabled: bool,
+
+    /// JSONL path for incremental market snapshots.
+    /// Empty means "derive from `data_path` parent directory".
+    pub market_datalake_file_path: String,
+
+    /// Retention horizon for persisted market snapshots (days).
+    pub market_datalake_retention_days: u32,
+
+    /// Bucket size (seconds) used for deduplicating snapshots per symbol.
+    pub market_datalake_bucket_seconds: u64,
+
+    /// Short momentum window used for historical feature extraction (minutes).
+    pub market_datalake_short_window_minutes: u64,
+
+    /// Mid momentum window used for historical feature extraction (hours).
+    pub market_datalake_mid_window_hours: u64,
+
+    /// Long momentum window used for historical feature extraction (days).
+    pub market_datalake_long_window_days: u64,
+
+    /// Minimum historical samples required before historical features are
+    /// considered active for decisioning.
+    pub market_datalake_min_samples: usize,
+
+    /// Blend weight applied when mixing historical datalake features into
+    /// fuzzy input normalization.
+    pub market_datalake_feature_weight: f64,
+
+    /// Whether a build-change bootstrap/backfill should run before normal
+    /// incremental datalake collection.
+    pub market_datalake_bootstrap_enabled: bool,
+
+    /// Max symbols to include in one bootstrap/backfill run.
+    pub market_datalake_bootstrap_symbol_limit: usize,
+
+    /// Time frames requested during bootstrap backfill.
+    pub market_datalake_bootstrap_time_frames: Vec<String>,
+
+    /// Retry delay for failed bootstrap attempts (seconds).
+    pub market_datalake_bootstrap_retry_seconds: u64,
+
+    // -----------------------------------------------------------------------
     // Backtesting
     // -----------------------------------------------------------------------
     /// Whether to run periodic backtests as a safety check on the approach.
@@ -175,6 +222,10 @@ pub struct TradingConfig {
     /// Optional path to persist discovered OctoBot backtest `.data` files (JSON).
     /// Empty means "derive from `data_path` parent directory".
     pub backtest_data_catalog_path: String,
+
+    /// Maximum age of the discovered backtest-data catalog (seconds) before
+    /// Gail refreshes it from OctoBot.
+    pub backtest_data_catalog_refresh_seconds: u64,
 
     /// Whether Gail may trigger OctoBot's historical data collector when
     /// no matching backtest `.data` files are available.
@@ -249,6 +300,23 @@ impl Default for TradingConfig {
             octobot_timeout_seconds: 10.0,
             refiner_timeout_seconds: 15.0,
             advisor_timeout_seconds: 30.0,
+            market_datalake_enabled: true,
+            market_datalake_file_path: String::new(),
+            market_datalake_retention_days: 365,
+            market_datalake_bucket_seconds: 60,
+            market_datalake_short_window_minutes: 60,
+            market_datalake_mid_window_hours: 24,
+            market_datalake_long_window_days: 60,
+            market_datalake_min_samples: 8,
+            market_datalake_feature_weight: 0.45,
+            market_datalake_bootstrap_enabled: true,
+            market_datalake_bootstrap_symbol_limit: 120,
+            market_datalake_bootstrap_time_frames: vec![
+                "1h".to_string(),
+                "4h".to_string(),
+                "1d".to_string(),
+            ],
+            market_datalake_bootstrap_retry_seconds: 1_800,
             backtesting_enabled: true,
             backtest_interval_seconds: 86_400,
             backtest_profitability_threshold: 0.0,
@@ -256,6 +324,7 @@ impl Default for TradingConfig {
             backtest_symbols: vec!["BTC/USDT".to_string()],
             backtest_lookback_days: 30,
             backtest_data_catalog_path: String::new(),
+            backtest_data_catalog_refresh_seconds: 1_800,
             backtest_data_collection_enabled: true,
             backtest_data_collection_exchange: "binance".to_string(),
             backtest_data_collection_time_frames: vec!["1h".to_string(), "1d".to_string()],
@@ -317,6 +386,33 @@ impl TradingConfig {
         self.octobot_timeout_seconds = self.octobot_timeout_seconds.max(1.0);
         self.refiner_timeout_seconds = self.refiner_timeout_seconds.max(1.0);
         self.advisor_timeout_seconds = self.advisor_timeout_seconds.max(5.0);
+        self.market_datalake_retention_days = self.market_datalake_retention_days.clamp(7, 3650);
+        self.market_datalake_bucket_seconds = self.market_datalake_bucket_seconds.clamp(10, 3_600);
+        self.market_datalake_short_window_minutes =
+            self.market_datalake_short_window_minutes.clamp(5, 24 * 30);
+        self.market_datalake_mid_window_hours =
+            self.market_datalake_mid_window_hours.clamp(1, 24 * 120);
+        self.market_datalake_long_window_days =
+            self.market_datalake_long_window_days.clamp(1, 3650);
+        self.market_datalake_min_samples = self.market_datalake_min_samples.clamp(3, 10_000);
+        self.market_datalake_feature_weight = self.market_datalake_feature_weight.clamp(0.0, 1.0);
+        self.market_datalake_bootstrap_symbol_limit =
+            self.market_datalake_bootstrap_symbol_limit.clamp(5, 2_000);
+        self.market_datalake_bootstrap_retry_seconds = self
+            .market_datalake_bootstrap_retry_seconds
+            .clamp(60, 86_400);
+        let mut seen_bootstrap_time_frames: HashSet<String> = HashSet::new();
+        self.market_datalake_bootstrap_time_frames = self
+            .market_datalake_bootstrap_time_frames
+            .iter()
+            .map(|time_frame| time_frame.trim().to_string())
+            .filter(|time_frame| !time_frame.is_empty())
+            .filter(|time_frame| seen_bootstrap_time_frames.insert(time_frame.to_ascii_lowercase()))
+            .collect();
+        if self.market_datalake_bootstrap_time_frames.is_empty() {
+            self.market_datalake_bootstrap_time_frames =
+                vec!["1h".to_string(), "4h".to_string(), "1d".to_string()];
+        }
         if self.research_query_template.trim().is_empty() {
             self.research_query_template =
                 "cryptocurrency market sentiment {currency} {exchange} {date}".to_string();
@@ -337,11 +433,29 @@ impl TradingConfig {
         if self.data_path.trim().is_empty() {
             self.data_path = "./data/trading_state.json".to_string();
         }
+        self.market_datalake_file_path = self.market_datalake_file_path.trim().to_string();
+        if self.market_datalake_file_path.is_empty() {
+            let fallback = Path::new(&self.data_path)
+                .parent()
+                .map(|parent| parent.join("market_datalake.jsonl"))
+                .unwrap_or_else(|| "./data/market_datalake.jsonl".into());
+            self.market_datalake_file_path = fallback.to_string_lossy().to_string();
+        }
+        if self.market_datalake_mid_window_hours * 60 <= self.market_datalake_short_window_minutes {
+            self.market_datalake_mid_window_hours =
+                (self.market_datalake_short_window_minutes / 60).saturating_add(1);
+        }
+        if self.market_datalake_long_window_days * 24 <= self.market_datalake_mid_window_hours {
+            self.market_datalake_long_window_days =
+                (self.market_datalake_mid_window_hours / 24).saturating_add(1);
+        }
         self.backtest_profitability_threshold =
             self.backtest_profitability_threshold.clamp(-100.0, 100.0);
         self.backtest_interval_seconds = self.backtest_interval_seconds.max(300); // at least 5 min
         self.backtest_lookback_days = self.backtest_lookback_days.clamp(1, 365);
         self.backtest_data_catalog_path = self.backtest_data_catalog_path.trim().to_string();
+        self.backtest_data_catalog_refresh_seconds =
+            self.backtest_data_catalog_refresh_seconds.clamp(60, 86_400);
         self.backtest_data_collection_exchange =
             self.backtest_data_collection_exchange.trim().to_string();
         if self.backtest_data_collection_exchange.is_empty() {

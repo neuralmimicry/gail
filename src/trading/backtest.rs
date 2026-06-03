@@ -304,43 +304,80 @@ impl BacktestEngine {
 
         let catalog_path = resolve_backtest_catalog_path(config);
         let mut catalog = load_backtest_data_catalog(&catalog_path).await;
+        let now = now_ts();
+        let catalog_refresh_seconds = config.backtest_data_catalog_refresh_seconds as f64;
+        let catalog_is_stale = catalog.files.is_empty()
+            || catalog.updated_at <= 0.0
+            || now - catalog.updated_at >= catalog_refresh_seconds;
 
-        match self.octobot.list_backtest_data_files().await {
-            Ok(available) => {
-                let available = dedupe_backtest_data_files(available);
-                let selected =
-                    select_backtest_data_files(available.clone(), &config.backtest_symbols);
-                if !available.is_empty() {
-                    catalog.files = available;
-                    catalog.updated_at = now_ts();
-                    catalog.last_collection_requested_at = None;
-                    persist_backtest_data_catalog(&catalog_path, &catalog).await;
-                }
-                if !selected.is_empty() {
-                    return Ok(selected);
+        if catalog_is_stale {
+            match self
+                .discover_and_cache_backtest_files(
+                    &catalog_path,
+                    &mut catalog,
+                    &config.backtest_symbols,
+                )
+                .await
+            {
+                Ok(selected) if !selected.is_empty() => return Ok(selected),
+                Ok(_) => {}
+                Err(err) => {
+                    warn!(
+                        "trading: OctoBot backtest data-file discovery failed: {}",
+                        err
+                    );
                 }
             }
-            Err(err) => {
-                warn!(
-                    "trading: OctoBot backtest data-file discovery failed: {}",
-                    err
-                );
-            }
+        } else {
+            debug!(
+                "trading: using fresh backtest data-file catalog path={} age={:.0}s (refresh={}s)",
+                catalog_path.display(),
+                now - catalog.updated_at,
+                config.backtest_data_catalog_refresh_seconds
+            );
         }
 
         let cached_selected =
             select_backtest_data_files(catalog.files.clone(), &config.backtest_symbols);
         if !cached_selected.is_empty() {
-            info!(
-                "trading: using cached backtest data-file catalog path={} files={}",
-                catalog_path.display(),
-                cached_selected.len()
-            );
+            if catalog_is_stale {
+                warn!(
+                    "trading: using stale cached backtest data-file catalog path={} files={} age={:.0}s",
+                    catalog_path.display(),
+                    cached_selected.len(),
+                    now - catalog.updated_at
+                );
+            } else {
+                info!(
+                    "trading: using cached backtest data-file catalog path={} files={}",
+                    catalog_path.display(),
+                    cached_selected.len()
+                );
+            }
             return Ok(cached_selected);
         }
 
+        if !catalog_is_stale {
+            match self
+                .discover_and_cache_backtest_files(
+                    &catalog_path,
+                    &mut catalog,
+                    &config.backtest_symbols,
+                )
+                .await
+            {
+                Ok(selected) if !selected.is_empty() => return Ok(selected),
+                Ok(_) => {}
+                Err(err) => {
+                    warn!(
+                        "trading: OctoBot backtest data-file discovery failed: {}",
+                        err
+                    );
+                }
+            }
+        }
+
         if config.backtest_data_collection_enabled {
-            let now = now_ts();
             let cooldown_seconds = config.backtest_data_collection_cooldown_seconds as f64;
             if let Some(last_request_at) = catalog.last_collection_requested_at
                 && cooldown_seconds > 0.0
@@ -401,51 +438,231 @@ impl BacktestEngine {
 
         Err("no OctoBot backtesting .data files matched Gail's configured backtest symbols; collect or configure backtest data files before enabling Gail backtesting".to_string())
     }
+
+    async fn discover_and_cache_backtest_files(
+        &self,
+        catalog_path: &PathBuf,
+        catalog: &mut BacktestDataCatalog,
+        symbols: &[String],
+    ) -> Result<Vec<String>, String> {
+        let available = self.octobot.list_backtest_data_files().await?;
+        let available = dedupe_backtest_data_files(available);
+        let selected = select_backtest_data_files(available.clone(), symbols);
+        if !available.is_empty() {
+            catalog.files = available;
+            catalog.updated_at = now_ts();
+            catalog.last_collection_requested_at = None;
+            persist_backtest_data_catalog(catalog_path, catalog).await;
+        }
+        Ok(selected)
+    }
 }
 
 fn select_backtest_data_files(available: Vec<String>, symbols: &[String]) -> Vec<String> {
     let available = dedupe_backtest_data_files(available);
+    let mut candidates = available
+        .into_iter()
+        .map(BacktestDataFileCandidate::from_path)
+        .collect::<Vec<_>>();
+
     let wanted = symbols
         .iter()
         .map(|symbol| normalize_symbol_for_data_file(symbol))
         .filter(|symbol| !symbol.is_empty())
         .collect::<Vec<_>>();
     if wanted.is_empty() {
-        return available;
+        sort_backtest_data_file_candidates(&mut candidates);
+        return candidates
+            .into_iter()
+            .map(|candidate| candidate.path)
+            .collect();
     }
 
-    let symbol_matches = available
-        .iter()
-        .filter(|file| {
-            let normalized_file = normalize_symbol_for_data_file(file);
-            wanted
-                .iter()
-                .any(|symbol| normalized_file.contains(symbol.as_str()))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut selected = Vec::new();
+    for symbol in wanted {
+        let mut symbol_candidates = candidates
+            .iter()
+            .filter(|candidate| candidate.normalized_path.contains(symbol.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if symbol_candidates.is_empty() {
+            continue;
+        }
 
-    if !symbol_matches.is_empty() {
-        return symbol_matches;
+        // Keep one best file per timeframe for each requested symbol.
+        sort_backtest_data_file_candidates(&mut symbol_candidates);
+        let mut seen_timeframes = HashSet::new();
+        let mut included_unknown_timeframe = false;
+        for candidate in symbol_candidates {
+            if let Some(timeframe_seconds) = candidate.timeframe_seconds {
+                if seen_timeframes.insert(timeframe_seconds) {
+                    selected.push(candidate.path);
+                }
+            } else if !included_unknown_timeframe {
+                selected.push(candidate.path);
+                included_unknown_timeframe = true;
+            }
+        }
     }
 
-    if available
+    let selected = dedupe_backtest_data_files(selected);
+    if !selected.is_empty() {
+        return selected;
+    }
+
+    if candidates
         .iter()
-        .all(|file| is_generic_octobot_collector_file(file))
+        .all(|candidate| is_generic_octobot_collector_file(&candidate.path))
     {
-        let mut generic_files = available;
-        generic_files.sort_by(|left, right| {
-            let left_timestamp = generic_collector_file_timestamp(left).unwrap_or(0.0);
-            let right_timestamp = generic_collector_file_timestamp(right).unwrap_or(0.0);
-            right_timestamp
-                .partial_cmp(&left_timestamp)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| right.cmp(left))
-        });
-        return generic_files.into_iter().take(1).collect();
+        sort_backtest_data_file_candidates(&mut candidates);
+        return candidates
+            .into_iter()
+            .take(1)
+            .map(|candidate| candidate.path)
+            .collect();
     }
 
     Vec::new()
+}
+
+#[derive(Clone, Debug)]
+struct BacktestDataFileCandidate {
+    path: String,
+    normalized_path: String,
+    timeframe_seconds: Option<u64>,
+    freshness_ts: Option<f64>,
+    coverage_seconds: Option<u64>,
+}
+
+impl BacktestDataFileCandidate {
+    fn from_path(path: String) -> Self {
+        let timestamps = parse_file_epoch_timestamps_seconds(path.as_str());
+        let freshness_ts = generic_collector_file_timestamp(path.as_str()).or_else(|| {
+            timestamps
+                .iter()
+                .copied()
+                .max_by(|left, right| left.total_cmp(right))
+        });
+
+        let coverage_seconds = if timestamps.len() >= 2 {
+            let min_ts = timestamps
+                .iter()
+                .copied()
+                .min_by(|left, right| left.total_cmp(right));
+            let max_ts = timestamps
+                .iter()
+                .copied()
+                .max_by(|left, right| left.total_cmp(right));
+            match (min_ts, max_ts) {
+                (Some(min_ts), Some(max_ts)) if max_ts > min_ts => {
+                    Some((max_ts - min_ts).round() as u64)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        Self {
+            normalized_path: normalize_symbol_for_data_file(path.as_str()),
+            timeframe_seconds: parse_file_timeframe_seconds(path.as_str()),
+            freshness_ts,
+            coverage_seconds,
+            path,
+        }
+    }
+}
+
+fn sort_backtest_data_file_candidates(candidates: &mut [BacktestDataFileCandidate]) {
+    candidates.sort_by(compare_backtest_data_file_candidates);
+}
+
+fn compare_backtest_data_file_candidates(
+    left: &BacktestDataFileCandidate,
+    right: &BacktestDataFileCandidate,
+) -> std::cmp::Ordering {
+    compare_optional_u64_desc(left.timeframe_seconds, right.timeframe_seconds)
+        .then_with(|| compare_optional_u64_desc(left.coverage_seconds, right.coverage_seconds))
+        .then_with(|| compare_optional_f64_desc(left.freshness_ts, right.freshness_ts))
+        .then_with(|| right.path.cmp(&left.path))
+}
+
+fn compare_optional_u64_desc(left: Option<u64>, right: Option<u64>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => right.cmp(&left),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn compare_optional_f64_desc(left: Option<f64>, right: Option<f64>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => right
+            .partial_cmp(&left)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn parse_file_timeframe_seconds(path: &str) -> Option<u64> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let filename = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    filename
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter_map(parse_timeframe_token_seconds)
+        .max()
+}
+
+fn parse_timeframe_token_seconds(token: &str) -> Option<u64> {
+    let digit_end = token
+        .chars()
+        .position(|ch| !ch.is_ascii_digit())
+        .unwrap_or(token.len());
+    if digit_end == 0 || digit_end == token.len() {
+        return None;
+    }
+
+    let value = token[..digit_end].parse::<u64>().ok()?;
+    let unit = &token[digit_end..];
+    let multiplier = match unit {
+        "m" | "min" | "MIN" => 60,
+        "h" | "H" => 3_600,
+        "d" | "D" => 86_400,
+        "w" | "W" => 604_800,
+        "M" | "mo" | "Mo" | "mO" | "MO" => 2_592_000,
+        _ => return None,
+    };
+    value.checked_mul(multiplier)
+}
+
+fn parse_file_epoch_timestamps_seconds(path: &str) -> Vec<f64> {
+    path.split(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .filter_map(parse_epoch_seconds_token)
+        .collect()
+}
+
+fn parse_epoch_seconds_token(token: &str) -> Option<f64> {
+    if token.is_empty() {
+        return None;
+    }
+    let value = token.parse::<f64>().ok()?;
+    if !value.is_finite() {
+        return None;
+    }
+    if (1_000_000_000_000.0..=9_999_999_999_999.0).contains(&value) {
+        return Some(value / 1000.0);
+    }
+    if (1_000_000_000.0..=9_999_999_999.0).contains(&value) {
+        return Some(value);
+    }
+    None
 }
 
 fn normalize_symbol_for_data_file(value: &str) -> String {
@@ -488,11 +705,17 @@ fn generic_collector_file_timestamp(value: &str) -> Option<f64> {
     }
     let trimmed = value.trim();
     let filename = trimmed.rsplit('/').next().unwrap_or(trimmed);
-    let prefix = "ExchangeHistoryDataCollector_";
+    let prefix = "exchangehistorydatacollector_";
     let suffix = ".data";
+    let lowercase_filename = filename.to_ascii_lowercase();
     let timestamp = filename
-        .strip_prefix(prefix)
-        .and_then(|rest| rest.strip_suffix(suffix))?;
+        .strip_prefix("ExchangeHistoryDataCollector_")
+        .and_then(|rest| rest.strip_suffix(".data"))
+        .or_else(|| {
+            lowercase_filename
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_suffix(suffix))
+        })?;
     timestamp.parse::<f64>().ok()
 }
 
@@ -690,7 +913,32 @@ mod tests {
             "user/backtesting/collector/binance_ETH_USDT_1h.data".to_string(),
         ];
         let selected = select_backtest_data_files(available.clone(), &[]);
-        assert_eq!(selected, available);
+        assert_eq!(selected.len(), 2);
+        for file in available {
+            assert!(selected.contains(&file));
+        }
+    }
+
+    #[test]
+    fn backtest_file_selection_prefers_longer_timeframes_and_newer_ranges() {
+        let available = vec![
+            "user/backtesting/collector/binance_BTC_USDT_1h_1710000000_1710100000.data".to_string(),
+            "user/backtesting/collector/binance_BTC_USDT_4h_1710000000_1710100000.data".to_string(),
+            "user/backtesting/collector/binance_BTC_USDT_4h_1710200000_1710600000.data".to_string(),
+            "user/backtesting/collector/binance_BTC_USDT_1d_1690000000_1690100000.data".to_string(),
+        ];
+        let selected = select_backtest_data_files(available, &["BTC/USDT".to_string()]);
+        assert_eq!(
+            selected,
+            vec![
+                "user/backtesting/collector/binance_BTC_USDT_1d_1690000000_1690100000.data"
+                    .to_string(),
+                "user/backtesting/collector/binance_BTC_USDT_4h_1710200000_1710600000.data"
+                    .to_string(),
+                "user/backtesting/collector/binance_BTC_USDT_1h_1710000000_1710100000.data"
+                    .to_string(),
+            ]
+        );
     }
 
     #[test]

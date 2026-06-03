@@ -273,7 +273,7 @@ Gail HTTP Server
 Each evaluation runs the following pipeline steps in sequence:
 
 **Step 1 — Market data** (`octobot.rs`)
-OctoBot is queried for market snapshots (price, 24 h change %, 24 h volume), portfolio totals where available, and open orders. The client probes `/api/ping` at startup; Continuum deployments normally keep OctoBot native web auth disabled behind shared ingress auth, so Gail does not attempt the old non-existent JSON password-login endpoint. Up to 20 snapshots are fetched across all configured exchanges and currency filters. Gail records each OctoBot endpoint's observed shape, status, failures, and log-derived semantic hints in an adaptive API schema; optional routes that prove missing or temporarily bad are skipped for a short TTL while fallback routes are used.
+OctoBot is queried for market snapshots (price, 24 h change %, 24 h volume), portfolio totals where available, and open orders. The client probes `/api/ping` at startup; Continuum deployments normally keep OctoBot native web auth disabled behind shared ingress auth, so Gail does not attempt the old non-existent JSON password-login endpoint. Up to 20 snapshots are fetched across all configured exchanges and currency filters. Gail records each OctoBot endpoint's observed shape, status, failures, and log-derived semantic hints in an adaptive API schema; optional routes that prove missing or temporarily bad are skipped for a short TTL while fallback routes are used. Each fetched snapshot is then ingested into Gail's incremental market datalake (JSONL + optional Postgres upsert) so historical context accumulates over time without re-pulling full datasets every cycle. On startup, Gail can run a one-time historical bootstrap/backfill when it detects a new build/schema state in datalake metadata, then return to normal incremental ingestion.
 
 **Step 2 — Research** (`refiner.rs`)
 The highest-signal market snapshot (scored by `|Δ%| × ln(volume+1)`) is used to build a Refiner RAG query from the `research_query_template`. Gail queries the configured RAG index (`research_index_name`) and can fan out additional source-biased queries in parallel using `site:<domain>` hints (for example `bloomberg.com`) from `research_site_hints`. Refiner's `/api/rag/query` endpoint returns ranked context passages (default top 5). Gail merges the contexts, de-duplicates matches, extracts publication dates from metadata/citations/URLs where available, and prioritises the newest timestamped evidence ahead of older or undated matches before passing context to AI advisors.
@@ -291,17 +291,17 @@ The highest-signal market snapshot (scored by `|Δ%| × ln(volume+1)`) is used t
   "target_symbol": "BTC/USDT"
 }
 ```
-Providers are selected by quality weight and provider-family diversity, so a single rate-limited cloud family does not crowd out OpenAI/Gemini/Ollama alternatives. Responses are parsed defensively, schema-echo responses are rejected, and `AiConsensus` uses weighted voting with agreement, response coverage, and risk penalties before producing a signal in `[−1, +1]`.
+Providers are selected by quality weight and provider-family diversity, so a single rate-limited cloud family does not crowd out OpenAI/Gemini/Ollama alternatives. Prompts include datalake-derived symbol history (short/mid/long momentum, volatility, drawdown, and volume regime) alongside current snapshots. Responses are parsed defensively, schema-echo responses are rejected, and `AiConsensus` uses weighted voting with agreement, response coverage, and risk penalties before producing a signal in `[−1, +1]`.
 
 **Step 4 — Type-2 fuzzy inference** (`fuzzy.rs`)
 Five linguistic input variables are encoded from the gathered data:
 
 | Variable | Range | Derivation |
 | --- | --- | --- |
-| `price_trend` | −1 to +1 | `clamp(Δ% / 5, -1, 1)` |
-| `volume_ratio` | 0 to 2 | `clamp(vol24h / 1M, 0, 2)` |
+| `price_trend` | −1 to +1 | Blend of live `clamp(Δ% / 5, -1, 1)` and datalake momentum signal |
+| `volume_ratio` | 0 to 2 | Blend of live `clamp(vol24h / 1M, 0, 2)` and datalake volume regime |
 | `ai_consensus` | −1 to +1 | Aggregated AI signal |
-| `research_sentiment` | −1 to +1 | `(avg_rag_score − 0.5) × 0.4` |
+| `research_sentiment` | −1 to +1 | `(avg_rag_score − 0.5) × 0.4` with datalake risk-pressure damping |
 | `portfolio_exposure` | 0 to 1 | Non-stablecoin fraction of portfolio |
 
 Each variable has three linguistic terms with **interval Type-2 Gaussian membership functions** (lower/upper bounds encoding epistemic uncertainty). A rule base of 25 Mamdani rules fires against the five inputs and activates output terms (`strong_sell, sell, hold, buy, strong_buy`). Type reduction uses a simplified **Karnik-Mendel centroid** over the interval-weighted output terms to produce a crisp signal in `[−1, +1]` plus a confidence score.
@@ -352,6 +352,8 @@ Gail evaluates decisions and has live execution enabled by default. Execution us
 
 State is persisted to `data_path` (default `./data/trading_state.json`) every 5 evaluation cycles and on shutdown, and restored at startup.
 
+Incremental market history is persisted separately in `market_datalake_file_path` (default `./data/market_datalake.jsonl`) and, when `storage.postgres_dsn` is configured, mirrored into `gail_market_snapshots` with retention pruning. Bootstrap metadata is persisted in a sidecar metadata file and optional Postgres metadata row so new-build/schema bootstrap runs only when needed. Set `GAIL_BUILD_ID` in deployment if you need deterministic build-change detection across identical package versions.
+
 ### Module Layout
 
 | File | Responsibility |
@@ -364,6 +366,7 @@ State is persisted to `data_path` (default `./data/trading_state.json`) every 5 
 | `src/hardware.rs` | Runtime CPU/GPU detection and scheduling hints |
 | `src/trading/mod.rs` | `TradingBridge`, background loop, evaluation pipeline, execution |
 | `src/trading/config.rs` | `TradingConfig`, `TradingConfigOverride` |
+| `src/trading/datalake.rs` | Incremental market snapshot persistence and historical feature extraction |
 | `src/trading/state.rs` | `TradingState`, `SharedTradingState`, ring buffers, persistence |
 | `src/trading/octobot.rs` | `OctobotClient` — OctoBot web API probe, market data, portfolio totals, orders |
 | `src/trading/refiner.rs` | `RefinerClient` — RAG research queries |
@@ -456,9 +459,23 @@ trading:
   octobot_timeout_seconds: 10.0
   refiner_timeout_seconds: 15.0
   advisor_timeout_seconds: 30.0
+  market_datalake_enabled: true
+  market_datalake_file_path: "./data/market_datalake.jsonl"
+  market_datalake_retention_days: 365
+  market_datalake_bucket_seconds: 60
+  market_datalake_short_window_minutes: 60
+  market_datalake_mid_window_hours: 24
+  market_datalake_long_window_days: 60
+  market_datalake_min_samples: 8
+  market_datalake_feature_weight: 0.45
+  market_datalake_bootstrap_enabled: true
+  market_datalake_bootstrap_symbol_limit: 120
+  market_datalake_bootstrap_time_frames: ["1h", "4h", "1d"]
+  market_datalake_bootstrap_retry_seconds: 1800
   backtesting_enabled: true              # requires OctoBot .data files
   backtest_data_files: []                # explicit .data files, or auto-discovered when enabled
   backtest_data_catalog_path: "./data/backtest_data_catalog.json"   # persistent discovered-file cache
+  backtest_data_catalog_refresh_seconds: 1800  # refresh discovery cache from OctoBot at this cadence
   backtest_data_collection_enabled: true  # auto-trigger OctoBot collector when files are missing
   backtest_data_collection_exchange: "binance"
   backtest_data_collection_time_frames: ["1h", "1d"]

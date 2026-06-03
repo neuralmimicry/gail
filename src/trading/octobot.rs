@@ -1005,27 +1005,12 @@ impl OctobotClient {
     ) -> Result<MarketSnapshot, String> {
         // Prefer dashboard routes in current OctoBot builds.
         let web_symbol = symbol.replace('/', "|");
-        let watched_path = format!("/dashboard/watched_symbol/{web_symbol}");
-        if let Some(watched) = self
-            .get_optional_json(&watched_path, "watched symbol")
-            .await?
-        {
-            let exchange_id = watched
-                .get("exchange_id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            if let Some(exchange_id) = exchange_id {
-                let time_frame = watched
-                    .get("time_frame")
-                    .and_then(Value::as_str)
-                    .unwrap_or("1h");
-                let graph_path = format!(
-                    "/dashboard/currency_price_graph_update/{exchange_id}/{web_symbol}/{time_frame}/live?display_orders=false"
-                );
-                if let Some(graph) = self.get_optional_json(&graph_path, "price graph").await? {
-                    return Ok(parse_graph_snapshot(exchange, symbol, &graph));
-                }
+        if let Some((exchange_id, time_frame)) = self.watched_symbol_context(symbol).await? {
+            let graph_path = format!(
+                "/dashboard/currency_price_graph_update/{exchange_id}/{web_symbol}/{time_frame}/live?display_orders=false"
+            );
+            if let Some(graph) = self.get_optional_json(&graph_path, "price graph").await? {
+                return Ok(parse_graph_snapshot(exchange, symbol, &graph));
             }
         }
 
@@ -1038,6 +1023,74 @@ impl OctobotClient {
         Err(format!(
             "OctoBot market snapshot unavailable for {exchange}/{symbol}: no dashboard or ticker endpoint returned data"
         ))
+    }
+
+    /// Fetch historical dashboard candle snapshots for a symbol/time frame.
+    ///
+    /// This is used for one-time datalake bootstrap/backfill after a new
+    /// container build or schema change.
+    pub async fn get_market_snapshot_history(
+        &self,
+        exchange: &str,
+        symbol: &str,
+        time_frame: &str,
+    ) -> Result<Vec<MarketSnapshot>, String> {
+        let web_symbol = symbol.replace('/', "|");
+        let Some((exchange_id, default_time_frame)) = self.watched_symbol_context(symbol).await?
+        else {
+            return Ok(Vec::new());
+        };
+        let resolved_time_frame = if time_frame.trim().is_empty() {
+            default_time_frame
+        } else {
+            time_frame.trim().to_string()
+        };
+        let graph_path = format!(
+            "/dashboard/currency_price_graph_update/{exchange_id}/{web_symbol}/{resolved_time_frame}/history?display_orders=false"
+        );
+        let Some(graph) = self
+            .get_optional_json(&graph_path, "price graph history")
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(parse_graph_history_snapshots(
+            exchange,
+            symbol,
+            &resolved_time_frame,
+            &graph,
+        ))
+    }
+
+    async fn watched_symbol_context(
+        &self,
+        symbol: &str,
+    ) -> Result<Option<(String, String)>, String> {
+        let web_symbol = symbol.replace('/', "|");
+        let watched_path = format!("/dashboard/watched_symbol/{web_symbol}");
+        let Some(watched) = self
+            .get_optional_json(&watched_path, "watched symbol")
+            .await?
+        else {
+            return Ok(None);
+        };
+        let exchange_id = watched
+            .get("exchange_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let Some(exchange_id) = exchange_id else {
+            return Ok(None);
+        };
+        let time_frame = watched
+            .get("time_frame")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("1h")
+            .to_string();
+        Ok(Some((exchange_id, time_frame)))
     }
 
     pub async fn get_recent_logs(&self, limit: usize) -> Result<Vec<OctobotLogEntry>, String> {
@@ -1638,6 +1691,53 @@ fn parse_graph_snapshot(exchange: &str, symbol: &str, body: &Value) -> MarketSna
     }
 }
 
+fn parse_graph_history_snapshots(
+    exchange: &str,
+    symbol: &str,
+    time_frame: &str,
+    body: &Value,
+) -> Vec<MarketSnapshot> {
+    let candles = body.get("candles").unwrap_or(&Value::Null);
+    let closes = value_array(candles, "close").unwrap_or_default();
+    if closes.is_empty() {
+        return Vec::new();
+    }
+    let highs = value_array(candles, "high").unwrap_or_default();
+    let lows = value_array(candles, "low").unwrap_or_default();
+    let volumes = value_array(candles, "volume")
+        .or_else(|| value_array(candles, "vol"))
+        .unwrap_or_default();
+    let times = value_string_array(candles, "time").unwrap_or_default();
+    let fallback_now = current_unix_timestamp_f64();
+    let fallback_step = time_frame_to_seconds(time_frame).max(1) as f64;
+    let fallback_start = fallback_now - fallback_step * closes.len().saturating_sub(1) as f64;
+    let first_close = closes.first().copied();
+
+    let mut snapshots = Vec::with_capacity(closes.len());
+    for (idx, close) in closes.iter().copied().enumerate() {
+        let fetched_at = times
+            .get(idx)
+            .and_then(|value| parse_dashboard_time_to_ts(value))
+            .unwrap_or(fallback_start + fallback_step * idx as f64);
+        let price_change_pct_24h = first_close
+            .filter(|first| first.abs() > f64::EPSILON)
+            .map(|first| ((close - first) / first) * 100.0);
+        snapshots.push(MarketSnapshot {
+            exchange: exchange.to_string(),
+            symbol: symbol.to_string(),
+            price: close,
+            price_change_pct_1h: None,
+            price_change_pct_24h,
+            volume_24h: volumes.get(idx).copied(),
+            volume_change_pct: None,
+            high_24h: highs.get(idx).copied(),
+            low_24h: lows.get(idx).copied(),
+            fetched_at,
+        });
+    }
+    snapshots
+}
+
 fn value_array(body: &Value, key: &str) -> Option<Vec<f64>> {
     body.get(key).and_then(Value::as_array).map(|values| {
         values
@@ -1649,6 +1749,91 @@ fn value_array(body: &Value, key: &str) -> Option<Vec<f64>> {
             })
             .collect::<Vec<_>>()
     })
+}
+
+fn value_string_array(body: &Value, key: &str) -> Option<Vec<String>> {
+    body.get(key).and_then(Value::as_array).map(|values| {
+        values
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+    })
+}
+
+fn parse_dashboard_time_to_ts(value: &str) -> Option<f64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(timestamp) = trimmed.parse::<f64>() {
+        return Some(timestamp);
+    }
+    let mut parts = trimmed.split(' ');
+    let date = parts.next()?;
+    let time = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let mut d = date.split('-');
+    let year_short = d.next()?.parse::<i64>().ok()?;
+    let month = d.next()?.parse::<u32>().ok()?;
+    let day = d.next()?.parse::<u32>().ok()?;
+    if d.next().is_some() {
+        return None;
+    }
+    let mut t = time.split(':');
+    let hour = t.next()?.parse::<u32>().ok()?;
+    let minute = t.next()?.parse::<u32>().ok()?;
+    let second = t.next()?.parse::<u32>().ok()?;
+    if t.next().is_some() {
+        return None;
+    }
+    let year = 2000 + year_short;
+    unix_timestamp_from_ymd_hms(year, month, day, hour, minute, second)
+}
+
+fn unix_timestamp_from_ymd_hms(
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<f64> {
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let y = year - if month <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let month_i = month as i64;
+    let day_i = day as i64;
+    let doy = (153 * (month_i + if month_i > 2 { -3 } else { 9 }) + 2) / 5 + day_i - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days_since_epoch = era * 146_097 + doe - 719_468;
+    let seconds_of_day = hour as i64 * 3600 + minute as i64 * 60 + second as i64;
+    Some((days_since_epoch * 86_400 + seconds_of_day) as f64)
+}
+
+fn time_frame_to_seconds(time_frame: &str) -> u64 {
+    let trimmed = time_frame.trim();
+    if trimmed.len() < 2 {
+        return 3_600;
+    }
+    let (value, unit) = trimmed.split_at(trimmed.len() - 1);
+    let amount = value.parse::<u64>().unwrap_or(1).max(1);
+    match unit.to_ascii_lowercase().as_str() {
+        "m" => amount.saturating_mul(60),
+        "h" => amount.saturating_mul(3_600),
+        "d" => amount.saturating_mul(86_400),
+        "w" => amount.saturating_mul(7 * 86_400),
+        _ => 3_600,
+    }
 }
 
 fn current_unix_timestamp_f64() -> f64 {

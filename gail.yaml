@@ -251,8 +251,22 @@ trading:
   octobot_timeout_seconds: 10.0
   refiner_timeout_seconds: 15.0
   advisor_timeout_seconds: 30.0
+  market_datalake_enabled: true
+  market_datalake_file_path: "./data/market_datalake.jsonl"
+  market_datalake_retention_days: 365
+  market_datalake_bucket_seconds: 60
+  market_datalake_short_window_minutes: 60
+  market_datalake_mid_window_hours: 24
+  market_datalake_long_window_days: 60
+  market_datalake_min_samples: 8
+  market_datalake_feature_weight: 0.45
+  market_datalake_bootstrap_enabled: true
+  market_datalake_bootstrap_symbol_limit: 120
+  market_datalake_bootstrap_time_frames: ["1h", "4h", "1d"]
+  market_datalake_bootstrap_retry_seconds: 1800
   backtesting_enabled: true
   backtest_data_catalog_path: "./data/backtest_data_catalog.json"
+  backtest_data_catalog_refresh_seconds: 1800
   backtest_data_collection_enabled: true
   backtest_data_collection_exchange: "binance"
   backtest_data_collection_time_frames: ["1h", "1d"]

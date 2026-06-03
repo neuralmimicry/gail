@@ -309,10 +309,26 @@ mod tests {
         assert_eq!(cfg.portfolio_pruning_candidate_pool_size, 12);
         assert_eq!(cfg.portfolio_pruning_min_composite_score, 0.55);
         assert!(cfg.live_execution_enabled);
+        assert!(cfg.market_datalake_enabled);
+        assert_eq!(cfg.market_datalake_retention_days, 365);
+        assert_eq!(cfg.market_datalake_bucket_seconds, 60);
+        assert_eq!(cfg.market_datalake_short_window_minutes, 60);
+        assert_eq!(cfg.market_datalake_mid_window_hours, 24);
+        assert_eq!(cfg.market_datalake_long_window_days, 60);
+        assert_eq!(cfg.market_datalake_min_samples, 8);
+        assert_eq!(cfg.market_datalake_feature_weight, 0.45);
+        assert!(cfg.market_datalake_bootstrap_enabled);
+        assert_eq!(cfg.market_datalake_bootstrap_symbol_limit, 120);
+        assert_eq!(
+            cfg.market_datalake_bootstrap_time_frames,
+            vec!["1h".to_string(), "4h".to_string(), "1d".to_string()]
+        );
+        assert_eq!(cfg.market_datalake_bootstrap_retry_seconds, 1_800);
         assert!(cfg.backtesting_enabled);
         assert!(cfg.backtest_data_collection_enabled);
         assert_eq!(cfg.backtest_data_collection_exchange, "binance");
         assert_eq!(cfg.backtest_data_collection_time_frames, vec!["1h", "1d"]);
+        assert_eq!(cfg.backtest_data_catalog_refresh_seconds, 1_800);
     }
 
     #[test]
@@ -375,12 +391,29 @@ mod tests {
             research_top_k: 0,
             log_ring_size: 0,
             trade_ring_size: 0,
+            market_datalake_file_path: "  ".to_string(),
+            market_datalake_retention_days: 1,
+            market_datalake_bucket_seconds: 0,
+            market_datalake_short_window_minutes: 0,
+            market_datalake_mid_window_hours: 0,
+            market_datalake_long_window_days: 0,
+            market_datalake_min_samples: 1,
+            market_datalake_feature_weight: 3.0,
+            market_datalake_bootstrap_symbol_limit: 0,
+            market_datalake_bootstrap_time_frames: vec![
+                " 1h ".to_string(),
+                "4h".to_string(),
+                "".to_string(),
+                "1H".to_string(),
+            ],
+            market_datalake_bootstrap_retry_seconds: 0,
             backtest_data_collection_exchange: "  ".to_string(),
             backtest_data_collection_time_frames: vec![
                 " 1h ".to_string(),
                 "".to_string(),
                 "1H".to_string(),
             ],
+            backtest_data_catalog_refresh_seconds: 0,
             backtest_data_collection_cooldown_seconds: 0,
             ..TradingConfig::default()
         };
@@ -416,8 +449,25 @@ mod tests {
         assert_eq!(cfg.research_top_k, 1);
         assert!(cfg.log_ring_size >= 10);
         assert!(cfg.trade_ring_size >= 10);
+        assert!(!cfg.market_datalake_file_path.is_empty());
+        assert!(cfg.market_datalake_retention_days >= 7);
+        assert!(cfg.market_datalake_bucket_seconds >= 10);
+        assert!(cfg.market_datalake_short_window_minutes >= 5);
+        assert!(
+            cfg.market_datalake_mid_window_hours * 60 > cfg.market_datalake_short_window_minutes
+        );
+        assert!(cfg.market_datalake_long_window_days * 24 > cfg.market_datalake_mid_window_hours);
+        assert!(cfg.market_datalake_min_samples >= 3);
+        assert!((0.0..=1.0).contains(&cfg.market_datalake_feature_weight));
+        assert!(cfg.market_datalake_bootstrap_symbol_limit >= 5);
+        assert_eq!(
+            cfg.market_datalake_bootstrap_time_frames,
+            vec!["1h".to_string(), "4h".to_string()]
+        );
+        assert!(cfg.market_datalake_bootstrap_retry_seconds >= 60);
         assert_eq!(cfg.backtest_data_collection_exchange, "binance");
         assert_eq!(cfg.backtest_data_collection_time_frames, vec!["1h"]);
+        assert!(cfg.backtest_data_catalog_refresh_seconds >= 60);
         assert!(cfg.backtest_data_collection_cooldown_seconds >= 60);
     }
 
@@ -2741,6 +2791,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn octobot_client_get_market_snapshot_history_reads_dashboard_history_mode() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/dashboard/watched_symbol/BTC(%7C|\|)USDT$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exchange_id": "binance-id",
+                "time_frame": "1h"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/dashboard/currency_price_graph_update/binance-id/BTC(%7C|\|)USDT/1h/history$",
+            ))
+            .and(query_param("display_orders", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "candles": {
+                    "time": ["26-04-19 10:00:00", "26-04-19 11:00:00", "26-04-19 12:00:00"],
+                    "close": [100.0, 105.0, 110.0],
+                    "high": [101.0, 106.0, 112.0],
+                    "low": [99.0, 103.0, 107.0],
+                    "volume": [10.0, 11.0, 12.0]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let history = client
+            .get_market_snapshot_history("binance", "BTC/USDT", "1h")
+            .await
+            .unwrap();
+
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].price, 100.0);
+        assert_eq!(history[2].price, 110.0);
+        assert_eq!(history[2].volume_24h, Some(12.0));
+        assert!(history[0].fetched_at > 1_700_000_000.0);
+        assert!(history[2].fetched_at > history[0].fetched_at);
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn octobot_client_schema_skips_known_missing_optional_watched_symbol_route() {
         let server = MockServer::start().await;
 
@@ -3298,6 +3394,84 @@ mod tests {
 
         assert_eq!(summary.assessment, ApproachAssessment::Viable);
         assert_eq!(summary.run_id, Some(77));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn backtest_engine_run_with_config_skips_discovery_when_catalog_is_fresh() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_data_files"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("should not be called"))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/backtesting"))
+            .and(query_param("action_type", "start_backtesting"))
+            .and(body_string_contains("binance_BTC_USDT_1h.data"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("\"Backtesting started\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting_run_id"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "backtesting_id": 123 })),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_report"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(octobot_report_body(3.0, 1.0, 5)),
+            )
+            .mount(&server)
+            .await;
+
+        let temp = tempdir().expect("tempdir");
+        let catalog_path = temp.path().join("backtest_data_catalog.json");
+        let updated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("unix epoch")
+            .as_secs_f64();
+        std::fs::write(
+            &catalog_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "files": ["user/backtesting/collector/binance_BTC_USDT_1h.data"],
+                "updated_at": updated_at
+            }))
+            .expect("catalog json"),
+        )
+        .expect("write catalog");
+
+        let mut config = TradingConfig {
+            data_path: temp
+                .path()
+                .join("trading_state.json")
+                .to_string_lossy()
+                .to_string(),
+            backtest_data_catalog_path: catalog_path.to_string_lossy().to_string(),
+            backtest_data_catalog_refresh_seconds: 3_600,
+            backtest_symbols: vec!["BTC/USDT".to_string()],
+            backtest_data_collection_enabled: false,
+            ..TradingConfig::default()
+        };
+        config.normalize();
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let engine = BacktestEngine::with_poll_params(client, 0.0, Duration::from_millis(1), 5);
+        let summary = engine.run_with_config(&config).await;
+
+        assert_eq!(summary.assessment, ApproachAssessment::Viable);
+        assert_eq!(summary.run_id, Some(123));
         server.verify().await;
     }
 

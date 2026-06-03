@@ -22,6 +22,7 @@ use crate::{
     providers::normalize_provider_type,
 };
 
+use super::datalake::{MarketHistoricalFeatures, market_feature_key};
 use super::octobot::{MarketSnapshot, OctobotPortfolio};
 use super::refiner::ResearchContext;
 
@@ -110,6 +111,7 @@ impl TradingAdvisor {
     pub async fn consult_all(
         &self,
         market_snapshots: &[MarketSnapshot],
+        historical_features: &HashMap<String, MarketHistoricalFeatures>,
         research: &ResearchContext,
         portfolio: &OctobotPortfolio,
         max_advisors: usize,
@@ -124,7 +126,8 @@ impl TradingAdvisor {
             .map(provider_identity)
             .collect::<HashSet<_>>();
 
-        let prompt = build_advisory_prompt(market_snapshots, research, portfolio);
+        let prompt =
+            build_advisory_prompt(market_snapshots, historical_features, research, portfolio);
         let system = advisory_system_prompt();
         let timeout_secs = self.timeout.as_secs();
 
@@ -488,6 +491,7 @@ Rules:
 
 fn build_advisory_prompt(
     snapshots: &[MarketSnapshot],
+    historical_features: &HashMap<String, MarketHistoricalFeatures>,
     research: &ResearchContext,
     portfolio: &OctobotPortfolio,
 ) -> String {
@@ -505,14 +509,29 @@ fn build_advisory_prompt(
                     Some(p) if p < -0.5 => "↓",
                     _ => "→",
                 };
+                let historical = historical_features
+                    .get(&market_feature_key(&s.exchange, &s.symbol))
+                    .map(|features| {
+                        format!(
+                            ", hist[m_short={:.2}% m_mid={:.2}% m_long={:.2}% vol={:.2}% dd={:.2}% v_reg={:.2}x]",
+                            features.momentum_short_pct.unwrap_or(0.0),
+                            features.momentum_mid_pct.unwrap_or(0.0),
+                            features.momentum_long_pct.unwrap_or(0.0),
+                            features.volatility_pct.unwrap_or(0.0),
+                            features.drawdown_pct.unwrap_or(0.0),
+                            features.volume_ratio_short_long.unwrap_or(1.0),
+                        )
+                    })
+                    .unwrap_or_default();
                 format!(
-                    "  {}/{}: price={:.4}, 24h_chg={:.2}% {}, vol24h={:.2}",
+                    "  {}/{}: price={:.4}, 24h_chg={:.2}% {}, vol24h={:.2}{}",
                     s.exchange,
                     s.symbol,
                     s.price,
                     s.price_change_pct_24h.unwrap_or(0.0),
                     trend,
                     s.volume_24h.unwrap_or(0.0),
+                    historical,
                 )
             })
             .collect();
