@@ -1410,10 +1410,9 @@ fn snapshot_in_portfolio(snapshot: &MarketSnapshot, portfolio: &OctobotPortfolio
 
 fn holding_value_usd_for_symbol(portfolio: &OctobotPortfolio, symbol: &str) -> Option<f64> {
     let base_asset = symbol_base_asset(symbol)?;
-    portfolio
-        .currencies
-        .get(base_asset)
-        .and_then(|balance| balance.value_usd)
+    let balance = portfolio.currencies.get(base_asset)?;
+    sellable_value_usd(balance.free, balance.total, balance.value_usd, None)
+        .filter(|value| value.is_finite() && *value > 0.0)
 }
 
 fn symbol_base_asset(symbol: &str) -> Option<&str> {
@@ -1686,6 +1685,8 @@ async fn execute_if_warranted(
     state: &SharedTradingState,
     _config: &TradingConfig,
 ) {
+    let mut execution_amount_usd = decision.amount_usd;
+
     match &decision.action {
         TradeAction::Hold => {
             debug!("trading: hold — no trade placed");
@@ -1740,7 +1741,61 @@ async fn execute_if_warranted(
         if !base_asset.is_empty() {
             match ensure_sell_balance_available(octobot, state, base_asset, &decision.symbol).await
             {
-                SellBalanceAvailability::Available => {}
+                SellBalanceAvailability::Available {
+                    free,
+                    total,
+                    value_usd,
+                } => {
+                    if let Some(max_sell_amount_usd) = max_sell_amount_usd_from_balance(
+                        octobot,
+                        &decision.exchange,
+                        &decision.symbol,
+                        free,
+                        total,
+                        value_usd,
+                    )
+                    .await
+                    {
+                        if max_sell_amount_usd < 0.01 {
+                            warn!(
+                                "trading: sell skipped — estimated sellable {} value too small for {} (${:.4})",
+                                base_asset, decision.symbol, max_sell_amount_usd
+                            );
+                            state
+                                .log_warn(
+                                    "execute",
+                                    format!(
+                                        "Sell skipped for {}: estimated sellable {base_asset} value too small (${max_sell_amount_usd:.4})",
+                                        decision.symbol
+                                    ),
+                                )
+                                .await;
+                            return;
+                        }
+
+                        if execution_amount_usd > max_sell_amount_usd + f64::EPSILON {
+                            warn!(
+                                "trading: capping sell amount for {} from ${:.2} to ${:.2} based on available {} balance (free={}, total={})",
+                                decision.symbol,
+                                execution_amount_usd,
+                                max_sell_amount_usd,
+                                base_asset,
+                                free,
+                                total
+                            );
+                            state
+                                .log_warn(
+                                    "execute",
+                                    format!(
+                                        "Capped sell amount for {} from ${:.2} to ${:.2} based on available {base_asset} balance",
+                                        decision.symbol, execution_amount_usd, max_sell_amount_usd
+                                    ),
+                                )
+                                .await;
+                            execution_amount_usd = max_sell_amount_usd;
+                        }
+                    }
+                }
                 SellBalanceAvailability::NonPositive { free, total } => {
                     warn!(
                         "trading: sell skipped — non-positive {base_asset} balance for {} (free={}, total={})",
@@ -1779,11 +1834,11 @@ async fn execute_if_warranted(
 
     let result = if side == "buy" {
         octobot
-            .place_buy_order(&decision.exchange, &decision.symbol, decision.amount_usd)
+            .place_buy_order(&decision.exchange, &decision.symbol, execution_amount_usd)
             .await
     } else {
         octobot
-            .place_sell_order(&decision.exchange, &decision.symbol, decision.amount_usd)
+            .place_sell_order(&decision.exchange, &decision.symbol, execution_amount_usd)
             .await
     };
 
@@ -1791,14 +1846,14 @@ async fn execute_if_warranted(
         Ok(order) => {
             info!(
                 "trading: {} order placed — id={} {}/{} ${:.2}",
-                side, order.order_id, decision.exchange, decision.symbol, decision.amount_usd
+                side, order.order_id, decision.exchange, decision.symbol, execution_amount_usd
             );
             let trade = ExecutedTrade {
                 ts: now_ts(),
                 exchange: decision.exchange.clone(),
                 symbol: decision.symbol.clone(),
                 action: decision.action.clone(),
-                amount_usd: decision.amount_usd,
+                amount_usd: execution_amount_usd,
                 price: order.price,
                 order_id: Some(order.order_id.clone()),
                 confidence: decision.confidence,
@@ -1818,7 +1873,7 @@ async fn execute_if_warranted(
                     "execute",
                     format!(
                         "{side} order placed: {}/{} ${:.2} id={}",
-                        decision.exchange, decision.symbol, decision.amount_usd, order.order_id
+                        decision.exchange, decision.symbol, execution_amount_usd, order.order_id
                     ),
                     json!({ "order_id": order.order_id, "status": order.status }),
                 )
@@ -1835,9 +1890,16 @@ async fn execute_if_warranted(
 
 #[derive(Clone, Copy, Debug)]
 enum SellBalanceAvailability {
-    Available,
+    Available {
+        free: f64,
+        total: f64,
+        value_usd: Option<f64>,
+    },
     Missing,
-    NonPositive { free: f64, total: f64 },
+    NonPositive {
+        free: f64,
+        total: f64,
+    },
 }
 
 async fn ensure_sell_balance_available(
@@ -1847,12 +1909,9 @@ async fn ensure_sell_balance_available(
     symbol: &str,
 ) -> SellBalanceAvailability {
     let initial = cached_sell_balance(state, base_asset).await;
-    if matches!(initial, SellBalanceAvailability::Available) {
-        return initial;
-    }
 
-    // Try one explicit OctoBot refresh cycle before skipping a sell. This
-    // closes the gap between exchange state and cached portfolio snapshots.
+    // Always request one explicit OctoBot refresh cycle before executing a sell.
+    // This keeps free balances and lock state aligned with the exchange.
     debug!(
         "trading: refreshing OctoBot portfolio before sell precheck for {} ({})",
         symbol, base_asset
@@ -1898,15 +1957,63 @@ fn portfolio_balance_state(
     base_asset: &str,
 ) -> SellBalanceAvailability {
     match portfolio.currencies.get(base_asset) {
-        Some(balance) if balance.free > 0.0 || balance.total > 0.0 => {
-            SellBalanceAvailability::Available
-        }
+        Some(balance) if balance.free > 0.0 => SellBalanceAvailability::Available {
+            free: balance.free,
+            total: balance.total,
+            value_usd: balance.value_usd,
+        },
         Some(balance) => SellBalanceAvailability::NonPositive {
             free: balance.free,
             total: balance.total,
         },
         None => SellBalanceAvailability::Missing,
     }
+}
+
+async fn max_sell_amount_usd_from_balance(
+    octobot: &OctobotClient,
+    exchange: &str,
+    symbol: &str,
+    free: f64,
+    total: f64,
+    value_usd: Option<f64>,
+) -> Option<f64> {
+    let mut sellable_usd = sellable_value_usd(free, total, value_usd, None);
+    if sellable_usd.is_none()
+        && let Ok(snapshot) = octobot.get_market_snapshot(exchange, symbol).await
+    {
+        sellable_usd = sellable_value_usd(free, total, value_usd, Some(snapshot.price));
+    }
+    let sellable_usd = sellable_usd?;
+    if !sellable_usd.is_finite() || sellable_usd <= 0.0 {
+        return None;
+    }
+    let capped = ((sellable_usd * SELL_BALANCE_USD_SAFETY_FACTOR) * 100.0).floor() / 100.0;
+    if capped > 0.0 { Some(capped) } else { None }
+}
+
+fn sellable_value_usd(
+    free: f64,
+    total: f64,
+    value_usd: Option<f64>,
+    fallback_price: Option<f64>,
+) -> Option<f64> {
+    if !free.is_finite() || free <= 0.0 {
+        return Some(0.0);
+    }
+
+    if let Some(value) = value_usd.filter(|value| value.is_finite() && *value > 0.0) {
+        let ratio = if total.is_finite() && total > 0.0 {
+            (free / total).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        return Some(value * ratio);
+    }
+
+    fallback_price
+        .filter(|price| price.is_finite() && *price > 0.0)
+        .map(|price| free * price)
 }
 
 // ---------------------------------------------------------------------------
@@ -1916,6 +2023,7 @@ fn portfolio_balance_state(
 const TARGET_LOCK_CONSENSUS_CONFIDENCE_MIN: f64 = 0.70;
 const TARGET_LOCK_CONSENSUS_SIGNAL_MIN: f64 = 0.30;
 const TARGET_LOCK_SUPPORT_MIN: f64 = 0.35;
+const SELL_BALANCE_USD_SAFETY_FACTOR: f64 = 0.99;
 
 #[derive(Clone, Debug)]
 struct DecisionMarketSelection {

@@ -2401,12 +2401,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Remaining first-pass fallbacks fail, which triggers the reduced sell retry.
+        // A portfolio-negative rejection should trigger an immediate amount retry
+        // on the same native endpoint before any fallback mutating endpoints.
         Mock::given(method("POST"))
             .and(path("/api/orders"))
             .and(query_param("action", "create_orders"))
             .respond_with(ResponseTemplate::new(404).set_body_string("unsupported"))
-            .expect(1)
+            .expect(0)
             .with_priority(1)
             .mount(&server)
             .await;
@@ -2414,7 +2415,7 @@ mod tests {
             .and(path("/api/orders"))
             .and(body_string_contains("\"action\":\"create_order\""))
             .respond_with(ResponseTemplate::new(404).set_body_string("unsupported"))
-            .expect(1)
+            .expect(0)
             .with_priority(10)
             .mount(&server)
             .await;
@@ -2422,14 +2423,14 @@ mod tests {
             .and(path("/api/orders"))
             .and(body_string_contains("\"order_type\":\"market\""))
             .respond_with(ResponseTemplate::new(404).set_body_string("unsupported"))
-            .expect(1)
+            .expect(0)
             .with_priority(10)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path("/api/user_command"))
             .respond_with(ResponseTemplate::new(404).set_body_string("unsupported"))
-            .expect(3)
+            .expect(0)
             .with_priority(10)
             .mount(&server)
             .await;
@@ -2442,6 +2443,78 @@ mod tests {
         assert_eq!(result.order_id, "sell-order-accepted");
         assert_eq!(result.side, "sell");
         assert!((result.amount - 3.8).abs() < f64::EPSILON);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_place_sell_order_uses_portfolio_negative_ratio_for_retry_amount() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/trades"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Mirror recent production rejection shape:
+        // requested quantity 0.0115 vs available 0.0095918.
+        Mock::given(method("POST"))
+            .and(path("/api/orders"))
+            .and(query_param("action", "create_order"))
+            .and(body_string_contains("\"amount\":21.25"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "message": "PortfolioNegativeValueError: Trying to update ETH with -0.0115 but quantity was 0.0095918"
+            })))
+            .expect(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/orders"))
+            .and(query_param("action", "create_order"))
+            .and(body_string_contains("\"amount\":17.63"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "sell-order-adjusted",
+                "symbol": "ETH/USDT",
+                "side": "sell",
+                "amount": 17.63,
+                "status": "submitted"
+            })))
+            .expect(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/orders"))
+            .and(query_param("action", "create_orders"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unsupported"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/user_command"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unsupported"))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let result = client
+            .place_sell_order("binance", "ETH/USDT", 21.25)
+            .await
+            .expect("sell order should retry with inferred safe amount");
+        assert_eq!(result.order_id, "sell-order-adjusted");
+        assert_eq!(result.side, "sell");
+        assert!((result.amount - 17.63).abs() < f64::EPSILON);
         server.verify().await;
     }
 
@@ -2788,7 +2861,7 @@ mod tests {
         assert!(
             matches!(
                 availability,
-                crate::trading::SellBalanceAvailability::Available
+                crate::trading::SellBalanceAvailability::Available { .. }
             ),
             "expected sell balance to become available after refresh"
         );

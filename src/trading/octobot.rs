@@ -524,7 +524,8 @@ impl OctobotClient {
         let modes = ordered_submission_modes(preferred_mode);
         let mut attempts = Vec::new();
         let mut submission_amount = rounded_amount;
-        let mut allow_sell_retry = normalized_side == "sell";
+        let mut sell_retry_attempts_remaining: usize =
+            if normalized_side == "sell" { 2 } else { 0 };
 
         loop {
             let canonical_order = json!({
@@ -539,6 +540,7 @@ impl OctobotClient {
             });
 
             let mut saw_portfolio_negative_rejection = false;
+            let mut suggested_retry_amount_usd: Option<f64> = None;
 
             for mode in modes.iter().copied() {
                 let (path, payload, label) = build_order_submission(
@@ -595,16 +597,26 @@ impl OctobotClient {
                         );
                     }
 
-                    OrderSubmissionAttempt::RejectedPortfolioNegative => {
+                    OrderSubmissionAttempt::RejectedPortfolioNegative { retry_amount_usd } => {
                         saw_portfolio_negative_rejection = true;
+                        if let Some(candidate) =
+                            retry_amount_usd.filter(|value| value.is_finite() && *value > 0.0)
+                        {
+                            suggested_retry_amount_usd = Some(
+                                suggested_retry_amount_usd
+                                    .map_or(candidate, |current| current.min(candidate)),
+                            );
+                        }
                         warn!(
                             ?mode,
                             exchange = %exchange,
                             symbol = %symbol,
                             side = %normalized_side,
                             amount_usd = submission_amount,
-                            "trading: OctoBot rejected sell order due to portfolio precision/availability; trying next candidate"
+                            retry_amount_usd = suggested_retry_amount_usd,
+                            "trading: OctoBot rejected sell order due to portfolio precision/availability; retrying with a smaller amount"
                         );
+                        break;
                     }
 
                     OrderSubmissionAttempt::AmbiguousAccepted => {
@@ -625,9 +637,10 @@ impl OctobotClient {
                 }
             }
 
-            if allow_sell_retry
+            if sell_retry_attempts_remaining > 0
                 && saw_portfolio_negative_rejection
-                && let Some(retry_amount) = reduced_sell_retry_amount(submission_amount)
+                && let Some(retry_amount) = suggested_retry_amount_usd
+                    .or_else(|| reduced_sell_retry_amount(submission_amount))
             {
                 attempts.push(format!(
                     "sell-retry amount_usd={submission_amount:.2}->{retry_amount:.2} after portfolio-negative rejection"
@@ -641,7 +654,7 @@ impl OctobotClient {
                     "trading: retrying sell order with reduced amount after portfolio-negative rejection"
                 );
                 submission_amount = retry_amount;
-                allow_sell_retry = false;
+                sell_retry_attempts_remaining = sell_retry_attempts_remaining.saturating_sub(1);
                 continue;
             }
 
@@ -701,7 +714,11 @@ impl OctobotClient {
             if normalize_order_side(side) == Some("sell")
                 && body_has_portfolio_negative_rejection(&body)
             {
-                return Ok(OrderSubmissionAttempt::RejectedPortfolioNegative);
+                return Ok(OrderSubmissionAttempt::RejectedPortfolioNegative {
+                    retry_amount_usd: retry_amount_from_portfolio_negative_rejection(
+                        &body, amount_usd,
+                    ),
+                });
             }
 
             return Ok(OrderSubmissionAttempt::Rejected);
@@ -1170,7 +1187,7 @@ enum OrderSubmissionAttempt {
 
     /// The endpoint rejected a sell request with a portfolio precision/
     /// availability error. This is safe to retry once with a smaller amount.
-    RejectedPortfolioNegative,
+    RejectedPortfolioNegative { retry_amount_usd: Option<f64> },
 
     /// The endpoint returned HTTP 2xx but did not provide a parseable order
     /// acknowledgement and no side-effect was observed within the polling
@@ -1406,6 +1423,60 @@ fn body_has_portfolio_negative_rejection(body: &Value) -> bool {
         lowered.contains("portfolionegativevalueerror")
             || (lowered.contains("trying to update") && lowered.contains("quantity was"))
     })
+}
+
+fn retry_amount_from_portfolio_negative_rejection(
+    body: &Value,
+    current_amount_usd: f64,
+) -> Option<f64> {
+    extract_attempt_message(body)
+        .and_then(|message| {
+            retry_amount_from_portfolio_negative_message(message.as_str(), current_amount_usd)
+        })
+        .or_else(|| reduced_sell_retry_amount(current_amount_usd))
+}
+
+fn retry_amount_from_portfolio_negative_message(
+    message: &str,
+    current_amount_usd: f64,
+) -> Option<f64> {
+    static PORTFOLIO_NEGATIVE_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"(?i)trying to update\s+\S+\s+with\s+(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s+but quantity was\s+(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)",
+        )
+        .expect("valid portfolio negative regex")
+    });
+
+    let captures = PORTFOLIO_NEGATIVE_RE.captures(message)?;
+    let attempted_quantity = captures.get(1)?.as_str().parse::<f64>().ok()?.abs();
+    let available_quantity = captures.get(2)?.as_str().parse::<f64>().ok()?.abs();
+
+    if !attempted_quantity.is_finite()
+        || !available_quantity.is_finite()
+        || attempted_quantity <= 0.0
+        || available_quantity <= 0.0
+    {
+        return None;
+    }
+
+    if available_quantity + f64::EPSILON >= attempted_quantity {
+        return None;
+    }
+
+    let scaled_amount =
+        floor_usd_to_cents(current_amount_usd * (available_quantity / attempted_quantity) * 0.995);
+    if scaled_amount >= 0.01 && scaled_amount + f64::EPSILON < current_amount_usd {
+        Some(scaled_amount)
+    } else {
+        None
+    }
+}
+
+fn floor_usd_to_cents(value: f64) -> f64 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    ((value.max(0.0)) * 100.0).floor() / 100.0
 }
 
 fn reduced_sell_retry_amount(current_amount_usd: f64) -> Option<f64> {
