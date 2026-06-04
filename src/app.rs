@@ -95,6 +95,7 @@ impl OpenAIToolContext {
 #[derive(Clone, Debug, Default)]
 struct OpenAIResponseSchemaContext {
     manager_tool_call: bool,
+    signal_synthesis_output: bool,
 }
 
 impl OpenAIResponseSchemaContext {
@@ -119,7 +120,11 @@ impl OpenAIResponseSchemaContext {
             || (lowered.contains("tool_name")
                 && lowered.contains("arguments")
                 && (lowered.contains("agent_name") || lowered.contains("run_agent")));
-        Self { manager_tool_call }
+        let signal_synthesis_output = prompt_requests_signal_synthesis_output(&context);
+        Self {
+            manager_tool_call,
+            signal_synthesis_output,
+        }
     }
 
     fn normalize_response_text(&self, text: &str) -> Option<String> {
@@ -2676,6 +2681,8 @@ fn degraded_chat_completion_for_upstream_error(
             }
         })
         .to_string()
+    } else if response_schema_context.signal_synthesis_output {
+        signal_synthesis_degraded_payload(reason.as_str()).to_string()
     } else if chat_request_expects_json(request) {
         json!({
             "status": "degraded",
@@ -2718,6 +2725,8 @@ fn degraded_responses_completion_for_upstream_error(
             value = cached;
         }
         serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+    } else if responses_request_targets_signal_synthesis_output(request) {
+        signal_synthesis_degraded_payload(reason.as_str()).to_string()
     } else if responses_request_expects_json(request) {
         json!({
             "status": "degraded",
@@ -2823,6 +2832,48 @@ fn responses_request_expects_json(request: &OpenAIResponseRequest) -> bool {
     }
     let lowered = request.input.to_string().to_ascii_lowercase();
     lowered.contains("json")
+}
+
+fn prompt_requests_signal_synthesis_output(context: &str) -> bool {
+    let lowered = context.to_ascii_lowercase();
+    lowered.contains("signalsynthesisoutput")
+        || (lowered.contains("synthesized_signals")
+            && lowered.contains("market_outlook")
+            && lowered.contains("summary"))
+}
+
+fn responses_request_targets_signal_synthesis_output(request: &OpenAIResponseRequest) -> bool {
+    let mut context = String::new();
+    if let Some(instructions) = request.instructions.as_deref() {
+        context.push_str(instructions);
+        context.push('\n');
+    }
+    if let Some(format) = request.text.as_ref().and_then(|text| text.format.as_ref())
+        && let Ok(serialized) = serde_json::to_string(format)
+    {
+        context.push_str(&serialized);
+        context.push('\n');
+    }
+    context.push_str(&request.input.to_string());
+    prompt_requests_signal_synthesis_output(&context)
+}
+
+fn signal_synthesis_degraded_payload(reason: &str) -> Value {
+    json!({
+        "synthesized_signals": [
+            {
+                "asset": "MARKET",
+                "direction": "neutral",
+                "strength": 0.0,
+                "consensus_level": "weak",
+                "trading_instruction": "Hold / no trade while provider health recovers."
+            }
+        ],
+        "market_outlook": "neutral",
+        "summary": format!(
+            "Degraded fallback: providers unavailable or in adaptive backoff ({reason})."
+        )
+    })
 }
 
 fn maybe_cache_execution_plan_from_chat_success(
@@ -3644,6 +3695,78 @@ mod tests {
         assert_eq!(degraded["status"], "degraded");
         assert_eq!(degraded["action"], "hold");
         assert_eq!(degraded["should_trade"], false);
+        assert_eq!(payload["gail"]["provider"], "gail");
+        assert_eq!(payload["gail"]["resolved_model"], "degraded_safety");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_saturation_signal_synthesis_prompt_returns_signal_synthesis_shape()
+     {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "error": "local Ollama request queue is saturated; backing off before retrying in 14s"
+            })))
+            .mount(&server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/llama3.2",
+                            "base_url": server.uri(),
+                            "messages": [
+                                {"role": "system", "content": "Return only valid JSON for SignalSynthesisOutput with synthesized_signals, market_outlook, and summary."},
+                                {"role": "user", "content": "Provide SignalSynthesisOutput JSON now."}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+        let content = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("completion content");
+        let degraded: Value = serde_json::from_str(content).expect("degraded json payload");
+        let degraded_object = degraded.as_object().expect("degraded object");
+
+        assert_eq!(payload["model"], "ollama/llama3.2");
+        assert!(degraded_object.contains_key("synthesized_signals"));
+        assert_eq!(degraded["market_outlook"], "neutral");
+        assert!(
+            degraded["summary"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert_eq!(
+            degraded["synthesized_signals"]
+                .as_array()
+                .expect("synthesized_signals array")
+                .len(),
+            1
+        );
+        assert!(
+            !degraded_object.contains_key("action"),
+            "signal synthesis fallback should avoid unrelated hold/action keys"
+        );
         assert_eq!(payload["gail"]["provider"], "gail");
         assert_eq!(payload["gail"]["resolved_model"], "degraded_safety");
     }

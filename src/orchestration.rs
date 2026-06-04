@@ -4090,6 +4090,22 @@ fn degraded_fallback_text(
             json!({
                 "steps": []
             })
+        } else if prompt_requests_signal_synthesis_output(prompt_text) {
+            json!({
+                "synthesized_signals": [
+                    {
+                        "asset": "MARKET",
+                        "direction": "neutral",
+                        "strength": 0.0,
+                        "consensus_level": "weak",
+                        "trading_instruction": "Hold / no trade while provider health recovers."
+                    }
+                ],
+                "market_outlook": "neutral",
+                "summary": format!(
+                    "Degraded fallback: providers unavailable or in adaptive backoff ({reason})."
+                )
+            })
         } else {
             json!({
                 "status": "degraded",
@@ -4128,6 +4144,14 @@ fn prompt_requests_manager_tool_call(prompt_text: &str) -> bool {
     lowered.contains("tool_name")
         && lowered.contains("arguments")
         && (lowered.contains("manager") || lowered.contains("tool"))
+}
+
+fn prompt_requests_signal_synthesis_output(prompt_text: &str) -> bool {
+    let lowered = prompt_text.to_ascii_lowercase();
+    lowered.contains("signalsynthesisoutput")
+        || (lowered.contains("synthesized_signals")
+            && lowered.contains("market_outlook")
+            && lowered.contains("summary"))
 }
 
 fn classify_workload(workflow: &str, role: &str) -> WorkloadClass {
@@ -4272,6 +4296,38 @@ mod tests {
         );
         let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
         assert_eq!(value, serde_json::json!({ "steps": [] }));
+    }
+
+    #[test]
+    fn degraded_fallback_matches_signal_synthesis_schema() {
+        let prompt = "Return only valid JSON for SignalSynthesisOutput with synthesized_signals, market_outlook, and summary.";
+        let text = degraded_fallback_text(
+            true,
+            "trading",
+            "assistant",
+            prompt,
+            &["provider unavailable".to_string()],
+        );
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        let object = value.as_object().expect("object");
+        assert!(object.contains_key("synthesized_signals"));
+        assert_eq!(value["market_outlook"], "neutral");
+        assert!(
+            value["summary"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        );
+        assert_eq!(
+            value["synthesized_signals"]
+                .as_array()
+                .expect("synthesized_signals array")
+                .len(),
+            1
+        );
+        assert!(
+            !object.contains_key("action"),
+            "signal synthesis fallback should avoid unrelated hold/action keys"
+        );
     }
 
     #[test]
