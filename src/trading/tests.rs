@@ -230,6 +230,28 @@ mod tests {
         }
     }
 
+    fn make_portfolio_with_balances(
+        balances: &[(&str, f64, f64, Option<f64>)],
+        total_value_usd: Option<f64>,
+    ) -> OctobotPortfolio {
+        let mut currencies = std::collections::HashMap::new();
+        for (asset, free, total, value_usd) in balances {
+            currencies.insert(
+                (*asset).to_string(),
+                CurrencyBalance {
+                    free: *free,
+                    locked: 0.0,
+                    total: *total,
+                    value_usd: *value_usd,
+                },
+            );
+        }
+        OctobotPortfolio {
+            currencies,
+            total_value_usd,
+        }
+    }
+
     fn make_open_order(id: &str) -> OctobotOrder {
         OctobotOrder {
             id: id.to_string(),
@@ -1901,11 +1923,20 @@ mod tests {
         let mut secondary = make_advice("sell", 0.86, 0.9);
         secondary.target_symbol = Some("BNB/USDT".to_string());
         let consensus = consensus_from_advices(vec![primary, secondary], 0);
+        let portfolio = make_portfolio_with_balances(
+            &[
+                ("BNB", 5.0, 5.0, Some(3_000.0)),
+                ("ETH", 0.3, 0.3, Some(900.0)),
+            ],
+            Some(3_900.0),
+        );
 
         let selection = crate::trading::choose_decision_market_candidate(
             &snapshots,
             &consensus,
             Some(&fallback),
+            &portfolio,
+            12.0,
         );
         let selected = selection.snapshot.expect("selected decision market");
         assert_eq!(selected.symbol, "BNB/USDT");
@@ -1926,11 +1957,20 @@ mod tests {
         let mut advice = make_advice("strong_sell", 0.92, 1.0);
         advice.target_symbol = Some("BNB/USDT".to_string());
         let consensus = consensus_from_advices(vec![advice], 0);
+        let portfolio = make_portfolio_with_balances(
+            &[
+                ("ETH", 2.0, 2.0, Some(6_000.0)),
+                ("BTC", 0.1, 0.1, Some(6_800.0)),
+            ],
+            Some(12_800.0),
+        );
 
         let selection = crate::trading::choose_decision_market_candidate(
             &snapshots,
             &consensus,
             Some(&fallback),
+            &portfolio,
+            12.0,
         );
         assert!(
             selection.override_reason.is_some(),
@@ -1945,6 +1985,70 @@ mod tests {
                 .unwrap_or_default()
                 .contains("BNB/USDT")
         );
+    }
+
+    #[test]
+    fn decision_market_selection_excludes_dust_assets_for_sell() {
+        let snapshots = vec![
+            make_snapshot("binance", "ETH/USDT", 3000.0, 12.0, 9_000_000.0),
+            make_snapshot("binance", "BNB/USDT", 650.0, 3.0, 3_000_000.0),
+        ];
+        let fallback = crate::trading::select_best_market_candidate(&snapshots)
+            .expect("fallback market candidate");
+        assert_eq!(fallback.symbol, "ETH/USDT");
+
+        let mut advice = make_advice("sell", 0.95, 0.15);
+        advice.target_symbol = Some("BNB/USDT".to_string());
+        let consensus = consensus_from_advices(vec![advice], 0);
+        let portfolio = make_portfolio_with_balances(
+            &[
+                ("BNB", 0.0002, 0.0002, Some(0.16)),
+                ("ETH", 0.6, 0.6, Some(1_800.0)),
+            ],
+            Some(1_800.16),
+        );
+
+        let selection = crate::trading::choose_decision_market_candidate(
+            &snapshots,
+            &consensus,
+            Some(&fallback),
+            &portfolio,
+            12.0,
+        );
+        let selected = selection.snapshot.expect("sell-eligible fallback market");
+        assert_eq!(selected.symbol, "ETH/USDT");
+        assert!(!selection.used_target_signal);
+        assert_eq!(selection.target_support, 0.0);
+        assert!(
+            !selection.note.contains("BNB/USDT"),
+            "dust target should not appear in sell ranking note"
+        );
+    }
+
+    #[test]
+    fn decision_market_selection_returns_none_when_only_dust_is_sellable() {
+        let snapshots = vec![make_snapshot(
+            "binance",
+            "ETH/USDT",
+            1800.0,
+            -5.0,
+            7_000_000.0,
+        )];
+        let mut advice = make_advice("sell", 0.9, 1.0);
+        advice.target_symbol = None;
+        let consensus = consensus_from_advices(vec![advice], 0);
+        let portfolio =
+            make_portfolio_with_balances(&[("ETH", 0.00009, 0.00009, Some(0.16))], Some(0.16));
+
+        let selection = crate::trading::choose_decision_market_candidate(
+            &snapshots, &consensus, None, &portfolio, 12.0,
+        );
+        assert!(
+            selection.snapshot.is_none(),
+            "sell path should produce no decision market when only dust is available"
+        );
+        assert!(selection.note.contains("no sell-eligible symbols"));
+        assert!(!selection.used_target_signal);
     }
 
     #[test]

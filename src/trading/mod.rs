@@ -485,8 +485,14 @@ async fn run_single_evaluation(
 
     // Select final decision market after consensus so high-confidence
     // target symbols are not silently replaced by generic market ranking.
-    let decision_market_selection =
-        choose_decision_market_candidate(&market_snapshots, &consensus, research_snapshot.as_ref());
+    let min_sellable_usd = effective_micro_trade_floor_usd(state, config).await;
+    let decision_market_selection = choose_decision_market_candidate(
+        &market_snapshots,
+        &consensus,
+        research_snapshot.as_ref(),
+        &portfolio,
+        min_sellable_usd,
+    );
     if let Some(reason) = decision_market_selection.override_reason.as_deref() {
         warn!(
             "trading: consensus target override applied with explicit risk justification: {}",
@@ -1415,6 +1421,31 @@ fn holding_value_usd_for_symbol(portfolio: &OctobotPortfolio, symbol: &str) -> O
         .filter(|value| value.is_finite() && *value > 0.0)
 }
 
+fn sellable_value_usd_for_snapshot(
+    portfolio: &OctobotPortfolio,
+    snapshot: &MarketSnapshot,
+) -> Option<f64> {
+    let base_asset = symbol_base_asset(&snapshot.symbol)?;
+    let balance = portfolio.currencies.get(base_asset)?;
+    sellable_value_usd(
+        balance.free,
+        balance.total,
+        balance.value_usd,
+        Some(snapshot.price),
+    )
+    .filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn snapshot_sellable_above_floor(
+    snapshot: &MarketSnapshot,
+    portfolio: &OctobotPortfolio,
+    min_sellable_usd: f64,
+) -> bool {
+    let floor = min_sellable_usd.max(0.01);
+    sellable_value_usd_for_snapshot(portfolio, snapshot)
+        .is_some_and(|value| value + f64::EPSILON >= floor)
+}
+
 fn symbol_base_asset(symbol: &str) -> Option<&str> {
     symbol
         .split('/')
@@ -2081,6 +2112,8 @@ fn choose_decision_market_candidate(
     snapshots: &[MarketSnapshot],
     consensus: &advisor::AiConsensus,
     fallback_snapshot: Option<&MarketSnapshot>,
+    portfolio: &OctobotPortfolio,
+    min_sellable_usd: f64,
 ) -> DecisionMarketSelection {
     if snapshots.is_empty() {
         return DecisionMarketSelection {
@@ -2094,9 +2127,18 @@ fn choose_decision_market_candidate(
         };
     }
 
+    let consensus_direction = consensus_direction_sign(consensus.signal);
+    let enforce_sell_floor = consensus_direction < 0.0;
+    let is_sell_eligible = |snapshot: &MarketSnapshot| {
+        snapshot_sellable_above_floor(snapshot, portfolio, min_sellable_usd)
+    };
+    let snapshot_allowed =
+        |snapshot: &MarketSnapshot| !enforce_sell_floor || is_sell_eligible(snapshot);
+
     let fallback = fallback_snapshot
         .cloned()
-        .or_else(|| select_best_market_candidate(snapshots));
+        .filter(snapshot_allowed)
+        .or_else(|| select_best_market_candidate_with_filter(snapshots, snapshot_allowed));
     let fallback_label = fallback
         .as_ref()
         .map(snapshot_label)
@@ -2126,6 +2168,9 @@ fn choose_decision_market_candidate(
         let support_abs = signed_support.abs();
 
         if let Some(snapshot) = resolve_target_snapshot_hint(snapshots, target_hint) {
+            if !snapshot_allowed(snapshot) {
+                continue;
+            }
             let key = market_feature_key(&snapshot.exchange, &snapshot.symbol);
             let entry = supports
                 .entry(key)
@@ -2150,7 +2195,6 @@ fn choose_decision_market_candidate(
     }
 
     let mut strongest_target: Option<TargetSnapshotSupport> = None;
-    let consensus_direction = consensus_direction_sign(consensus.signal);
     for support in supports.values() {
         if consensus_direction > 0.0 && support.signed_support <= 0.0 {
             continue;
@@ -2240,12 +2284,20 @@ fn choose_decision_market_candidate(
         };
     }
 
+    let no_sell_eligible_fallback = enforce_sell_floor && fallback.is_none();
     DecisionMarketSelection {
         snapshot: fallback,
-        note: format!(
-            "Decision market defaulted to {} (no aligned AI target support)",
-            fallback_label
-        ),
+        note: if no_sell_eligible_fallback {
+            format!(
+                "Decision market unavailable: no sell-eligible symbols above effective floor ${:.2}",
+                min_sellable_usd.max(0.01)
+            )
+        } else {
+            format!(
+                "Decision market defaulted to {} (no aligned AI target support)",
+                fallback_label
+            )
+        },
         override_reason: None,
         used_target_signal: false,
         target_support: 0.0,
@@ -2381,17 +2433,30 @@ fn snapshot_label(snapshot: &MarketSnapshot) -> String {
 /// Select the best candidate market for trading based on signal quality.
 /// Prefers high-volume, high-momentum markets.
 fn select_best_market_candidate(snapshots: &[MarketSnapshot]) -> Option<MarketSnapshot> {
+    select_best_market_candidate_with_filter(snapshots, |_| true)
+}
+
+fn select_best_market_candidate_with_filter<F>(
+    snapshots: &[MarketSnapshot],
+    predicate: F,
+) -> Option<MarketSnapshot>
+where
+    F: Fn(&MarketSnapshot) -> bool,
+{
     if snapshots.is_empty() {
         return None;
     }
     // Score: abs(24h change) * log(volume + 1) — highest momentum + volume.
-    let best = snapshots.iter().max_by(|a, b| {
-        let score_a = market_score(a);
-        let score_b = market_score(b);
-        score_a
-            .partial_cmp(&score_b)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let best = snapshots
+        .iter()
+        .filter(|snapshot| predicate(snapshot))
+        .max_by(|a, b| {
+            let score_a = market_score(a);
+            let score_b = market_score(b);
+            score_a
+                .partial_cmp(&score_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     best.cloned()
 }
 
