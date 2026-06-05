@@ -2052,6 +2052,130 @@ mod tests {
     }
 
     #[test]
+    fn market_regime_contagion_selects_dynamic_non_btc_leaders() {
+        let snapshots = vec![
+            make_snapshot("binance", "BTC/USDT", 68_000.0, -0.3, 1_000_000.0),
+            make_snapshot("binance", "ETH/USDT", 3_400.0, -6.0, 9_000_000.0),
+            make_snapshot("binance", "BNB/USDT", 620.0, -7.5, 8_000_000.0),
+            make_snapshot("binance", "SOL/USDT", 170.0, -10.0, 12_000_000.0),
+            make_snapshot("binance", "ADA/USDT", 0.42, -5.0, 6_000_000.0),
+            make_snapshot("binance", "XRP/USDT", 0.61, -4.0, 5_000_000.0),
+            make_snapshot("binance", "DOGE/USDT", 0.17, -3.0, 4_000_000.0),
+            make_snapshot("binance", "AVAX/USDT", 42.0, -8.0, 7_000_000.0),
+            make_snapshot("binance", "LINK/USDT", 16.0, -2.0, 3_000_000.0),
+        ];
+
+        let regime = crate::trading::compute_market_regime_contagion(&snapshots);
+        assert_eq!(
+            regime.leaders.len(),
+            3,
+            "leader count should adapt from universe size"
+        );
+        assert!(
+            !regime
+                .leaders
+                .iter()
+                .any(|leader| leader.symbol == "BTC/USDT"),
+            "weak BTC signal should not be hard-pinned as a contagion leader"
+        );
+        assert!(
+            regime.signal < -0.2,
+            "regime signal should capture broad bearish pressure, got {:.3}",
+            regime.signal
+        );
+        assert!(
+            regime.confidence > 0.4,
+            "regime confidence should reflect aligned breadth, got {:.3}",
+            regime.confidence
+        );
+    }
+
+    #[test]
+    fn decision_market_selection_dynamic_sell_target_prioritizes_sell_pressure_and_inventory() {
+        let snapshots = vec![
+            make_snapshot("binance", "ETH/USDT", 3_500.0, 12.0, 16_000_000.0),
+            make_snapshot("binance", "BNB/USDT", 600.0, -6.5, 4_000_000.0),
+            make_snapshot("binance", "BTC/USDT", 68_000.0, 2.0, 20_000_000.0),
+        ];
+        let fallback = crate::trading::select_best_market_candidate(&snapshots)
+            .expect("fallback market candidate");
+        assert_eq!(fallback.symbol, "ETH/USDT");
+
+        let mut sell_one = make_advice("sell", 0.82, 1.0);
+        sell_one.target_symbol = None;
+        let mut sell_two = make_advice("sell", 0.79, 0.9);
+        sell_two.target_symbol = None;
+        let consensus = consensus_from_advices(vec![sell_one, sell_two], 0);
+        let portfolio = make_portfolio_with_balances(
+            &[
+                ("BNB", 4.0, 4.0, Some(2_400.0)),
+                ("ETH", 0.03, 0.03, Some(105.0)),
+            ],
+            Some(2_505.0),
+        );
+
+        let selection = crate::trading::choose_decision_market_candidate(
+            &snapshots,
+            &consensus,
+            Some(&fallback),
+            &portfolio,
+            20.0,
+        );
+        let selected = selection.snapshot.expect("selected decision market");
+        assert_eq!(
+            selected.symbol, "BNB/USDT",
+            "sell fallback should prioritize held asset with bearish pressure"
+        );
+    }
+
+    #[test]
+    fn fuzzy_inputs_apply_bearish_contagion_pressure() {
+        let snapshot = make_snapshot("binance", "SOL/USDT", 170.0, 5.0, 8_000_000.0);
+        let consensus = make_neutral_consensus();
+        let research = crate::trading::refiner::ResearchContext::empty("sol test");
+        let portfolio = make_portfolio(1_000.0);
+        let config = default_config();
+
+        let baseline = crate::trading::compute_fuzzy_inputs(
+            Some(&snapshot),
+            None,
+            &consensus,
+            &research,
+            &portfolio,
+            None,
+            &config,
+        );
+        let bearish_regime = crate::trading::MarketRegimeContagion {
+            signal: -1.0,
+            confidence: 1.0,
+            leaders: Vec::new(),
+        };
+        let blended = crate::trading::compute_fuzzy_inputs(
+            Some(&snapshot),
+            None,
+            &consensus,
+            &research,
+            &portfolio,
+            Some(&bearish_regime),
+            &config,
+        );
+
+        assert!(
+            (baseline.price_trend - 1.0).abs() < 0.001,
+            "baseline should remain fully bullish from local 24h trend"
+        );
+        assert!(
+            (blended.price_trend - 0.30).abs() < 0.01,
+            "contagion blend should dampen trend to ~0.30, got {:.3}",
+            blended.price_trend
+        );
+        assert!(
+            blended.price_trend < baseline.price_trend,
+            "bearish contagion should reduce optimistic local trend"
+        );
+    }
+
+    #[test]
     fn discovery_candidates_exclude_held_assets_and_dedupe_symbol_bases() {
         let portfolio = make_portfolio(1_000.0); // includes BTC + USDT
         let snapshots = vec![

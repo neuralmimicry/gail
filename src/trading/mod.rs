@@ -398,6 +398,7 @@ async fn run_single_evaluation(
     } else {
         HashMap::new()
     };
+    let market_regime = compute_market_regime_contagion(&market_snapshots);
 
     // --- 2. Build research query ---
     // Keep pre-consensus market ranking for research context only.
@@ -486,12 +487,13 @@ async fn run_single_evaluation(
     // Select final decision market after consensus so high-confidence
     // target symbols are not silently replaced by generic market ranking.
     let min_sellable_usd = effective_micro_trade_floor_usd(state, config).await;
-    let decision_market_selection = choose_decision_market_candidate(
+    let decision_market_selection = choose_decision_market_candidate_with_regime(
         &market_snapshots,
         &consensus,
         research_snapshot.as_ref(),
         &portfolio,
         min_sellable_usd,
+        &market_regime,
     );
     if let Some(reason) = decision_market_selection.override_reason.as_deref() {
         warn!(
@@ -517,6 +519,7 @@ async fn run_single_evaluation(
         &consensus,
         &research,
         &portfolio,
+        Some(&market_regime),
         config,
     );
     let fuzzy_out = fuzzy_engine.evaluate(&fuzzy_inputs);
@@ -628,6 +631,9 @@ async fn run_single_evaluation(
                 "market_selection_target_support": decision_market_selection.target_support,
                 "market_selection_target_support_advisors": decision_market_selection.target_support_advisors,
                 "market_selection_high_confidence_target": decision_market_selection.high_confidence_target,
+                "market_regime_signal": market_regime.signal,
+                "market_regime_confidence": market_regime.confidence,
+                "market_regime_leaders": market_regime.leaders,
                 "blended_signal": decision.blended_signal,
                 "roi_feedback_applied": decision.roi_feedback_applied,
                 "roi_feedback_signal_adjustment": decision.roi_feedback_signal_adjustment,
@@ -885,6 +891,7 @@ async fn run_non_portfolio_discovery_cycle(
             .await;
         return;
     }
+    let market_regime = compute_market_regime_contagion(&snapshots);
 
     let candidates = select_non_portfolio_candidates(
         &snapshots,
@@ -914,6 +921,7 @@ async fn run_non_portfolio_discovery_cycle(
             snapshot,
             false,
             historical_features.get(&market_feature_key(&snapshot.exchange, &snapshot.symbol)),
+            Some(&market_regime),
         )
         .await;
         evaluated.push(review);
@@ -1070,6 +1078,7 @@ async fn run_portfolio_pruning_cycle(
             .await;
         return;
     }
+    let market_regime = compute_market_regime_contagion(&snapshots);
 
     let candidates = select_portfolio_pruning_candidates(
         &snapshots,
@@ -1097,6 +1106,7 @@ async fn run_portfolio_pruning_cycle(
             snapshot,
             true,
             historical_features.get(&market_feature_key(&snapshot.exchange, &snapshot.symbol)),
+            Some(&market_regime),
         )
         .await;
         evaluated.push(review);
@@ -1230,6 +1240,7 @@ async fn evaluate_symbol_candidate(
     snapshot: &MarketSnapshot,
     in_portfolio: bool,
     historical_features: Option<&MarketHistoricalFeatures>,
+    market_regime: Option<&MarketRegimeContagion>,
 ) -> EvaluatedSymbol {
     let research_query = build_research_query(config, Some(snapshot));
     let research = refiner
@@ -1256,6 +1267,7 @@ async fn evaluate_symbol_candidate(
         &consensus,
         &research,
         portfolio,
+        market_regime,
         config,
     );
     let fuzzy = fuzzy_engine.evaluate(&fuzzy_inputs);
@@ -2088,6 +2100,9 @@ const TARGET_LOCK_CONSENSUS_CONFIDENCE_MIN: f64 = 0.70;
 const TARGET_LOCK_CONSENSUS_SIGNAL_MIN: f64 = 0.30;
 const TARGET_LOCK_SUPPORT_MIN: f64 = 0.35;
 const SELL_BALANCE_USD_SAFETY_FACTOR: f64 = 0.99;
+const MARKET_REGIME_CONTAGION_PRICE_WEIGHT: f64 = 0.35;
+const MARKET_REGIME_CONTAGION_LEADER_COUNT_MIN: usize = 2;
+const MARKET_REGIME_CONTAGION_LEADER_COUNT_MAX: usize = 6;
 
 #[derive(Clone, Debug)]
 struct DecisionMarketSelection {
@@ -2108,12 +2123,57 @@ struct TargetSnapshotSupport {
     advisors: usize,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct ContagionLeader {
+    exchange: String,
+    symbol: String,
+    pressure: f64,
+    influence: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MarketRegimeContagion {
+    signal: f64,
+    confidence: f64,
+    leaders: Vec<ContagionLeader>,
+}
+
+impl MarketRegimeContagion {
+    fn neutral() -> Self {
+        Self {
+            signal: 0.0,
+            confidence: 0.0,
+            leaders: Vec::new(),
+        }
+    }
+}
+
+#[allow(dead_code)]
 fn choose_decision_market_candidate(
     snapshots: &[MarketSnapshot],
     consensus: &advisor::AiConsensus,
     fallback_snapshot: Option<&MarketSnapshot>,
     portfolio: &OctobotPortfolio,
     min_sellable_usd: f64,
+) -> DecisionMarketSelection {
+    let market_regime = compute_market_regime_contagion(snapshots);
+    choose_decision_market_candidate_with_regime(
+        snapshots,
+        consensus,
+        fallback_snapshot,
+        portfolio,
+        min_sellable_usd,
+        &market_regime,
+    )
+}
+
+fn choose_decision_market_candidate_with_regime(
+    snapshots: &[MarketSnapshot],
+    consensus: &advisor::AiConsensus,
+    fallback_snapshot: Option<&MarketSnapshot>,
+    portfolio: &OctobotPortfolio,
+    min_sellable_usd: f64,
+    market_regime: &MarketRegimeContagion,
 ) -> DecisionMarketSelection {
     if snapshots.is_empty() {
         return DecisionMarketSelection {
@@ -2135,10 +2195,16 @@ fn choose_decision_market_candidate(
     let snapshot_allowed =
         |snapshot: &MarketSnapshot| !enforce_sell_floor || is_sell_eligible(snapshot);
 
-    let fallback = fallback_snapshot
-        .cloned()
-        .filter(snapshot_allowed)
-        .or_else(|| select_best_market_candidate_with_filter(snapshots, snapshot_allowed));
+    let fallback = if enforce_sell_floor {
+        select_dynamic_sell_market_candidate(snapshots, portfolio, min_sellable_usd, market_regime)
+            .or_else(|| fallback_snapshot.cloned().filter(snapshot_allowed))
+            .or_else(|| select_best_market_candidate_with_filter(snapshots, snapshot_allowed))
+    } else {
+        fallback_snapshot
+            .cloned()
+            .filter(snapshot_allowed)
+            .or_else(|| select_best_market_candidate_with_filter(snapshots, snapshot_allowed))
+    };
     let fallback_label = fallback
         .as_ref()
         .map(snapshot_label)
@@ -2460,6 +2526,245 @@ where
     best.cloned()
 }
 
+fn compute_market_regime_contagion(snapshots: &[MarketSnapshot]) -> MarketRegimeContagion {
+    if snapshots.is_empty() {
+        return MarketRegimeContagion::neutral();
+    }
+
+    let adaptive_count = ((snapshots.len() as f64).sqrt().round() as usize)
+        .clamp(
+            MARKET_REGIME_CONTAGION_LEADER_COUNT_MIN,
+            MARKET_REGIME_CONTAGION_LEADER_COUNT_MAX,
+        )
+        .min(snapshots.len().max(1));
+    let leaders = select_contagion_leaders(snapshots, adaptive_count);
+    if leaders.is_empty() {
+        return MarketRegimeContagion::neutral();
+    }
+
+    let mut weighted_signal = 0.0;
+    let mut total_weight = 0.0;
+    for leader in &leaders {
+        let weight = leader.influence.max(0.05);
+        weighted_signal += leader.pressure * weight;
+        total_weight += weight;
+    }
+    if total_weight <= f64::EPSILON {
+        return MarketRegimeContagion::neutral();
+    }
+
+    let signal = (weighted_signal / total_weight).clamp(-1.0, 1.0);
+    let average_influence = (leaders.iter().map(|leader| leader.influence).sum::<f64>()
+        / leaders.len().max(1) as f64)
+        .clamp(0.0, 1.0);
+    let breadth = contagion_breadth_alignment(snapshots, signal);
+    let confidence = (average_influence * 0.6 + breadth * 0.4).clamp(0.0, 1.0);
+
+    MarketRegimeContagion {
+        signal,
+        confidence,
+        leaders,
+    }
+}
+
+fn select_contagion_leaders(
+    snapshots: &[MarketSnapshot],
+    leader_count: usize,
+) -> Vec<ContagionLeader> {
+    if snapshots.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranked = snapshots
+        .iter()
+        .filter(|snapshot| snapshot_is_usable(snapshot))
+        .filter(|snapshot| snapshot_has_stable_quote(snapshot))
+        .filter_map(|snapshot| {
+            let pressure = normalized_price_trend_signal(snapshot);
+            let move_strength = pressure.abs().clamp(0.0, 1.0);
+            let liquidity = normalized_snapshot_liquidity(snapshot);
+            let influence = (move_strength * 0.55 + liquidity * 0.45).clamp(0.0, 1.0);
+            if influence <= f64::EPSILON {
+                return None;
+            }
+            Some(ContagionLeader {
+                exchange: snapshot.exchange.clone(),
+                symbol: snapshot.symbol.clone(),
+                pressure,
+                influence,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    ranked.sort_by(|left, right| {
+        right
+            .influence
+            .partial_cmp(&left.influence)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                right
+                    .pressure
+                    .abs()
+                    .partial_cmp(&left.pressure.abs())
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| right.symbol.cmp(&left.symbol))
+    });
+
+    let mut seen_assets = HashSet::new();
+    ranked
+        .into_iter()
+        .filter(|leader| {
+            symbol_base_asset(&leader.symbol)
+                .is_some_and(|asset| seen_assets.insert(asset.trim().to_ascii_uppercase()))
+        })
+        .take(leader_count.max(1))
+        .collect()
+}
+
+fn contagion_breadth_alignment(snapshots: &[MarketSnapshot], regime_signal: f64) -> f64 {
+    let direction = consensus_direction_sign(regime_signal);
+    if direction.abs() < f64::EPSILON {
+        return 0.0;
+    }
+
+    let mut total = 0usize;
+    let mut aligned = 0usize;
+    for snapshot in snapshots
+        .iter()
+        .filter(|snapshot| snapshot_is_usable(snapshot))
+        .filter(|snapshot| snapshot_has_stable_quote(snapshot))
+    {
+        let pressure = normalized_price_trend_signal(snapshot);
+        let candidate_direction = consensus_direction_sign(pressure);
+        if candidate_direction.abs() < f64::EPSILON {
+            continue;
+        }
+        total += 1;
+        if (candidate_direction - direction).abs() <= f64::EPSILON {
+            aligned += 1;
+        }
+    }
+
+    if total == 0 {
+        0.0
+    } else {
+        (aligned as f64 / total as f64).clamp(0.0, 1.0)
+    }
+}
+
+fn select_dynamic_sell_market_candidate(
+    snapshots: &[MarketSnapshot],
+    portfolio: &OctobotPortfolio,
+    min_sellable_usd: f64,
+    market_regime: &MarketRegimeContagion,
+) -> Option<MarketSnapshot> {
+    if snapshots.is_empty() {
+        return None;
+    }
+
+    let floor = min_sellable_usd.max(0.01);
+    let candidates = snapshots
+        .iter()
+        .filter(|snapshot| snapshot_is_usable(snapshot))
+        .filter(|snapshot| snapshot_has_stable_quote(snapshot))
+        .filter_map(|snapshot| {
+            let sellable = sellable_value_usd_for_snapshot(portfolio, snapshot)?;
+            if sellable + f64::EPSILON < floor {
+                return None;
+            }
+            Some((snapshot, sellable))
+        })
+        .collect::<Vec<_>>();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let total_sellable_usd = candidates
+        .iter()
+        .map(|(_, sellable)| *sellable)
+        .sum::<f64>()
+        .max(0.01);
+    let regime_sell_pressure = (-market_regime.signal).max(0.0) * market_regime.confidence;
+    let leader_influence_by_market = market_regime
+        .leaders
+        .iter()
+        .map(|leader| {
+            (
+                market_feature_key(&leader.exchange, &leader.symbol),
+                leader.influence,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    candidates
+        .into_iter()
+        .max_by(
+            |(left_snapshot, left_sellable), (right_snapshot, right_sellable)| {
+                let left_score = dynamic_sell_candidate_score(
+                    left_snapshot,
+                    *left_sellable,
+                    total_sellable_usd,
+                    regime_sell_pressure,
+                    &leader_influence_by_market,
+                );
+                let right_score = dynamic_sell_candidate_score(
+                    right_snapshot,
+                    *right_sellable,
+                    total_sellable_usd,
+                    regime_sell_pressure,
+                    &leader_influence_by_market,
+                );
+                left_score
+                    .partial_cmp(&right_score)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| {
+                        left_sellable
+                            .partial_cmp(right_sellable)
+                            .unwrap_or(Ordering::Equal)
+                    })
+                    .then_with(|| right_snapshot.symbol.cmp(&left_snapshot.symbol))
+            },
+        )
+        .map(|(snapshot, _)| snapshot.clone())
+}
+
+fn dynamic_sell_candidate_score(
+    snapshot: &MarketSnapshot,
+    sellable_usd: f64,
+    total_sellable_usd: f64,
+    regime_sell_pressure: f64,
+    leader_influence_by_market: &HashMap<String, f64>,
+) -> f64 {
+    let local_sell_pressure = (-normalized_price_trend_signal(snapshot)).max(0.0);
+    let holding_share = (sellable_usd / total_sellable_usd).clamp(0.0, 1.0);
+    let contagion_alignment = (regime_sell_pressure * local_sell_pressure).clamp(0.0, 1.0);
+    let leader_influence = leader_influence_by_market
+        .get(&market_feature_key(&snapshot.exchange, &snapshot.symbol))
+        .copied()
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    let liquidity = normalized_snapshot_liquidity(snapshot);
+
+    let base_score = local_sell_pressure * 0.42
+        + holding_share * 0.33
+        + contagion_alignment * 0.20
+        + leader_influence * 0.05;
+    (base_score * (0.75 + 0.25 * liquidity)).clamp(0.0, 1.0)
+}
+
+fn normalized_price_trend_signal(snapshot: &MarketSnapshot) -> f64 {
+    snapshot
+        .price_change_pct_24h
+        .map(|value| (value / 12.0).clamp(-1.0, 1.0))
+        .unwrap_or(0.0)
+}
+
+fn normalized_snapshot_liquidity(snapshot: &MarketSnapshot) -> f64 {
+    ((snapshot.volume_24h.unwrap_or(0.0) + 1.0).ln() / 18.0).clamp(0.0, 1.0)
+}
+
 fn market_score(snap: &MarketSnapshot) -> f64 {
     let change_abs = snap.price_change_pct_24h.unwrap_or(0.0).abs();
     let vol = snap.volume_24h.unwrap_or(0.0);
@@ -2506,6 +2811,7 @@ fn compute_fuzzy_inputs(
     consensus: &advisor::AiConsensus,
     research: &refiner::ResearchContext,
     portfolio: &OctobotPortfolio,
+    market_regime: Option<&MarketRegimeContagion>,
     config: &TradingConfig,
 ) -> FuzzyInputs {
     let live_price_trend = best_market
@@ -2559,6 +2865,17 @@ fn compute_fuzzy_inputs(
             (live_volume_ratio * (1.0 - weight) + historical_volume * weight).clamp(0.0, 2.0);
         let risk_pressure = history.risk_pressure();
         research_sentiment = (research_sentiment - risk_pressure * 0.25).clamp(-1.0, 1.0);
+    }
+    if let Some(regime) = market_regime {
+        let contagion_confidence = regime.confidence.clamp(0.0, 1.0);
+        if contagion_confidence > f64::EPSILON {
+            let contagion_weight =
+                (MARKET_REGIME_CONTAGION_PRICE_WEIGHT * contagion_confidence).clamp(0.0, 1.0);
+            let contagion_signal = regime.signal.clamp(-1.0, 1.0);
+            price_trend = (price_trend * (1.0 - contagion_weight)
+                + contagion_signal * contagion_weight)
+                .clamp(-1.0, 1.0);
+        }
     }
 
     FuzzyInputs {
