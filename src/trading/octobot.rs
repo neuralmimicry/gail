@@ -39,6 +39,10 @@ pub struct OctobotPortfolio {
     /// Map of currency symbol → balance entry
     pub currencies: std::collections::HashMap<String, CurrencyBalance>,
     pub total_value_usd: Option<f64>,
+    /// Optional per-exchange balances when OctoBot provides exchange-scoped holdings.
+    #[serde(default)]
+    pub exchange_currencies:
+        std::collections::HashMap<String, std::collections::HashMap<String, CurrencyBalance>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -2094,22 +2098,167 @@ fn parse_latest_portfolio_value(body: &Value) -> Option<f64> {
 
 fn parse_portfolio_json(body: &Value) -> OctobotPortfolio {
     let mut portfolio = OctobotPortfolio::default();
-    if let Some(currencies) = body.as_object() {
-        for (symbol, data) in currencies {
-            if symbol == "total_value_usd" {
-                portfolio.total_value_usd = data.as_f64();
+    let Some(entries) = body.as_object() else {
+        return portfolio;
+    };
+
+    for (top_level_key, data) in entries {
+        if top_level_key.eq_ignore_ascii_case("total_value_usd") {
+            portfolio.total_value_usd = json_f64(data);
+            continue;
+        }
+
+        if let Some(balance) = parse_currency_balance(data) {
+            // Currency-first payload:
+            // {
+            //   "DOGE": {"free": 10, "locked": 0, "total": 10, "exchanges": {...}}
+            // }
+            merge_currency_balance(&mut portfolio.currencies, top_level_key, &balance);
+            collect_exchange_balances_for_currency(
+                &mut portfolio.exchange_currencies,
+                top_level_key,
+                data,
+            );
+            continue;
+        }
+
+        // Exchange-first payload:
+        // {
+        //   "bitget": {"DOGE": {"free": 10, ...}, "USDT": {"free": 20, ...}}
+        // }
+        let Some(assets) = data.as_object() else {
+            continue;
+        };
+        for (asset, asset_value) in assets {
+            let Some(balance) = parse_currency_balance(asset_value) else {
                 continue;
-            }
-            let balance = CurrencyBalance {
-                free: data.get("free").and_then(Value::as_f64).unwrap_or(0.0),
-                locked: data.get("locked").and_then(Value::as_f64).unwrap_or(0.0),
-                total: data.get("total").and_then(Value::as_f64).unwrap_or(0.0),
-                value_usd: data.get("value_usd").and_then(Value::as_f64),
             };
-            portfolio.currencies.insert(symbol.clone(), balance);
+            merge_currency_balance(&mut portfolio.currencies, asset, &balance);
+            merge_exchange_currency_balance(
+                &mut portfolio.exchange_currencies,
+                top_level_key,
+                asset,
+                &balance,
+            );
         }
     }
+
     portfolio
+}
+
+fn collect_exchange_balances_for_currency(
+    exchange_currencies: &mut std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, CurrencyBalance>,
+    >,
+    currency: &str,
+    data: &Value,
+) {
+    let Some(exchange_entries) = data
+        .as_object()
+        .and_then(|obj| obj.get("exchanges"))
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+
+    for (exchange, exchange_balance_data) in exchange_entries {
+        let Some(balance) = parse_currency_balance(exchange_balance_data) else {
+            continue;
+        };
+        merge_exchange_currency_balance(exchange_currencies, exchange, currency, &balance);
+    }
+}
+
+fn merge_exchange_currency_balance(
+    exchange_currencies: &mut std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, CurrencyBalance>,
+    >,
+    exchange: &str,
+    currency: &str,
+    balance: &CurrencyBalance,
+) {
+    let exchange_balances = exchange_currencies.entry(exchange.to_string()).or_default();
+    merge_currency_balance(exchange_balances, currency, balance);
+}
+
+fn merge_currency_balance(
+    balances: &mut std::collections::HashMap<String, CurrencyBalance>,
+    currency: &str,
+    incoming: &CurrencyBalance,
+) {
+    let entry = balances.entry(currency.to_string()).or_default();
+    entry.free += incoming.free;
+    entry.locked += incoming.locked;
+    entry.total += incoming.total;
+    entry.value_usd = match (entry.value_usd, incoming.value_usd) {
+        (Some(existing), Some(next)) => Some(existing + next),
+        (Some(existing), None) => Some(existing),
+        (None, Some(next)) => Some(next),
+        (None, None) => None,
+    };
+}
+
+fn parse_currency_balance(value: &Value) -> Option<CurrencyBalance> {
+    if let Some(amount) = json_f64(value) {
+        if !amount.is_finite() {
+            return None;
+        }
+        let normalized = amount.max(0.0);
+        return Some(CurrencyBalance {
+            free: normalized,
+            locked: 0.0,
+            total: normalized,
+            value_usd: None,
+        });
+    }
+
+    let object = value.as_object()?;
+    let free = coalesce_json_f64(object, &["free", "available"]);
+    let locked = coalesce_json_f64(object, &["locked", "used", "in_order", "in_orders"]);
+    let value_usd = coalesce_json_f64(object, &["value_usd", "usd_value", "value"]);
+    let total =
+        coalesce_json_f64(object, &["total", "amount", "balance", "quantity"]).or_else(|| {
+            match (free, locked) {
+                (Some(free), Some(locked)) => Some(free + locked),
+                (Some(free), None) => Some(free),
+                (None, Some(locked)) => Some(locked),
+                (None, None) => None,
+            }
+        });
+    let Some(total) = total else {
+        return None;
+    };
+
+    let normalized_total = total.max(0.0);
+    let normalized_locked = locked
+        .unwrap_or_else(|| (normalized_total - free.unwrap_or(0.0)).max(0.0))
+        .max(0.0);
+    let normalized_free = free
+        .unwrap_or_else(|| (normalized_total - normalized_locked).max(0.0))
+        .max(0.0);
+
+    Some(CurrencyBalance {
+        free: normalized_free,
+        locked: normalized_locked,
+        total: normalized_total,
+        value_usd,
+    })
+}
+
+fn coalesce_json_f64(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<f64> {
+    keys.iter()
+        .filter_map(|key| object.get(*key))
+        .find_map(json_f64)
+}
+
+fn json_f64(value: &Value) -> Option<f64> {
+    value.as_f64().or_else(|| {
+        value
+            .as_str()
+            .and_then(|text| text.trim().parse::<f64>().ok())
+    })
 }
 
 fn parse_portfolio_html(raw: &str) -> Option<OctobotPortfolio> {

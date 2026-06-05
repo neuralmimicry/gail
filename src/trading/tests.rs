@@ -19,7 +19,7 @@ mod tests {
     use crate::trading::degraded_live_execution_reason;
     use crate::trading::fuzzy::{FuzzyEngine, FuzzyInputs};
     use crate::trading::octobot::{
-        CurrencyBalance, MarketSnapshot, OctobotOrder, OctobotPortfolio,
+        CurrencyBalance, MarketSnapshot, OctobotExchange, OctobotOrder, OctobotPortfolio,
     };
     use crate::trading::state::{ExecutedTrade, SharedTradingState, TradeAction, TradeOverride};
 
@@ -227,6 +227,7 @@ mod tests {
         OctobotPortfolio {
             currencies,
             total_value_usd: Some(total_usd),
+            exchange_currencies: std::collections::HashMap::new(),
         }
     }
 
@@ -249,6 +250,7 @@ mod tests {
         OctobotPortfolio {
             currencies,
             total_value_usd,
+            exchange_currencies: std::collections::HashMap::new(),
         }
     }
 
@@ -2238,6 +2240,7 @@ mod tests {
         let portfolio = OctobotPortfolio {
             currencies,
             total_value_usd: Some(5800.0),
+            exchange_currencies: std::collections::HashMap::new(),
         };
         let snapshots = vec![
             make_snapshot("binance", "ETH/USDT", 3500.0, -7.0, 9_000_000.0),
@@ -2956,6 +2959,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn octobot_client_get_portfolio_parses_exchange_scoped_balances() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/portfolio"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "DOGE": {
+                    "free": 821.0,
+                    "locked": 0.0,
+                    "total": 821.0,
+                    "value_usd": 68.14,
+                    "exchanges": {
+                        "bitget": {
+                            "free": 821.0,
+                            "locked": 0.0,
+                            "total": 821.0,
+                            "value_usd": 68.14
+                        }
+                    }
+                },
+                "USDT": {
+                    "free": 100.0,
+                    "locked": 0.0,
+                    "total": 100.0,
+                    "value_usd": 100.0,
+                    "exchanges": {
+                        "bitget": {
+                            "free": 100.0,
+                            "locked": 0.0,
+                            "total": 100.0,
+                            "value_usd": 100.0
+                        }
+                    }
+                },
+                "total_value_usd": 168.14
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/portfolio"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/historical_portfolio_value"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let portfolio = client.get_portfolio().await.unwrap();
+        assert_eq!(portfolio.total_value_usd, Some(168.14));
+        assert_eq!(portfolio.currencies.len(), 2);
+        assert!(portfolio.currencies.contains_key("DOGE"));
+        assert!(portfolio.currencies.contains_key("USDT"));
+        let bitget = portfolio
+            .exchange_currencies
+            .get("bitget")
+            .expect("bitget exchange balances");
+        let doge = bitget.get("DOGE").expect("DOGE balance on bitget");
+        assert_eq!(doge.free, 821.0);
+        assert_eq!(doge.total, 821.0);
+        assert_eq!(doge.value_usd, Some(68.14));
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn octobot_client_get_portfolio_falls_back_to_portfolio_page_when_api_missing() {
         let server = MockServer::start().await;
 
@@ -3172,6 +3245,122 @@ mod tests {
             assert!(eth.total > 0.0);
         }
         server.verify().await;
+    }
+
+    #[test]
+    fn execution_exchange_reroutes_sell_to_exchange_with_base_asset_balance() {
+        let portfolio = OctobotPortfolio {
+            currencies: std::collections::HashMap::from([(
+                "DOGE".to_string(),
+                CurrencyBalance {
+                    free: 821.0,
+                    locked: 0.0,
+                    total: 821.0,
+                    value_usd: Some(68.14),
+                },
+            )]),
+            total_value_usd: Some(68.14),
+            exchange_currencies: std::collections::HashMap::from([(
+                "bitget".to_string(),
+                std::collections::HashMap::from([(
+                    "DOGE".to_string(),
+                    CurrencyBalance {
+                        free: 821.0,
+                        locked: 0.0,
+                        total: 821.0,
+                        value_usd: Some(68.14),
+                    },
+                )]),
+            )]),
+        };
+        let exchanges = vec![
+            OctobotExchange {
+                name: "binance".to_string(),
+                enabled: true,
+                symbols: vec!["DOGE/USDT".to_string()],
+            },
+            OctobotExchange {
+                name: "bitget".to_string(),
+                enabled: true,
+                symbols: vec!["DOGE/USDT".to_string()],
+            },
+        ];
+
+        let reroute = crate::trading::select_execution_exchange_from_portfolio(
+            "binance",
+            "DOGE/USDT",
+            "sell",
+            10.0,
+            &portfolio,
+            &exchanges,
+        )
+        .expect("sell should reroute to exchange with DOGE balance");
+        assert_eq!(reroute.0, "bitget");
+    }
+
+    #[test]
+    fn execution_exchange_reroutes_buy_to_exchange_with_quote_balance() {
+        let portfolio = OctobotPortfolio {
+            currencies: std::collections::HashMap::from([(
+                "USDT".to_string(),
+                CurrencyBalance {
+                    free: 122.0,
+                    locked: 0.0,
+                    total: 122.0,
+                    value_usd: Some(122.0),
+                },
+            )]),
+            total_value_usd: Some(122.0),
+            exchange_currencies: std::collections::HashMap::from([
+                (
+                    "binance".to_string(),
+                    std::collections::HashMap::from([(
+                        "USDT".to_string(),
+                        CurrencyBalance {
+                            free: 2.0,
+                            locked: 0.0,
+                            total: 2.0,
+                            value_usd: Some(2.0),
+                        },
+                    )]),
+                ),
+                (
+                    "bitget".to_string(),
+                    std::collections::HashMap::from([(
+                        "USDT".to_string(),
+                        CurrencyBalance {
+                            free: 120.0,
+                            locked: 0.0,
+                            total: 120.0,
+                            value_usd: Some(120.0),
+                        },
+                    )]),
+                ),
+            ]),
+        };
+        let exchanges = vec![
+            OctobotExchange {
+                name: "binance".to_string(),
+                enabled: true,
+                symbols: vec!["DOGE/USDT".to_string()],
+            },
+            OctobotExchange {
+                name: "bitget".to_string(),
+                enabled: true,
+                symbols: vec!["DOGE/USDT".to_string()],
+            },
+        ];
+
+        let reroute = crate::trading::select_execution_exchange_from_portfolio(
+            "binance",
+            "DOGE/USDT",
+            "buy",
+            25.0,
+            &portfolio,
+            &exchanges,
+        )
+        .expect("buy should reroute to exchange with sufficient USDT");
+        assert_eq!(reroute.0, "bitget");
     }
 
     #[tokio::test]

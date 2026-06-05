@@ -51,7 +51,7 @@ use datalake::{
 };
 use decision::{DecisionEngine, TradeDecision};
 use fuzzy::{FuzzyEngine, FuzzyInputs};
-use octobot::{MarketSnapshot, OctobotClient, OctobotLogEntry, OctobotPortfolio};
+use octobot::{MarketSnapshot, OctobotClient, OctobotExchange, OctobotLogEntry, OctobotPortfolio};
 use refiner::RefinerClient;
 use state::{ExecutedTrade, SharedTradingState, TradeAction, TradingState};
 
@@ -1729,6 +1729,7 @@ async fn execute_if_warranted(
     config: &TradingConfig,
 ) {
     let mut execution_amount_usd = decision.amount_usd;
+    let mut execution_exchange = decision.exchange.clone();
     let min_execution_usd = effective_micro_trade_floor_usd(state, config).await;
 
     match &decision.action {
@@ -1774,6 +1775,32 @@ async fn execute_if_warranted(
         return;
     }
 
+    if side == "buy"
+        && let Some((rerouted_exchange, reason)) = maybe_reroute_execution_exchange(
+            state,
+            &execution_exchange,
+            &decision.symbol,
+            side,
+            execution_amount_usd,
+        )
+        .await
+    {
+        warn!(
+            "trading: rerouting buy execution for {} from {} to {} ({})",
+            decision.symbol, execution_exchange, rerouted_exchange, reason
+        );
+        state
+            .log_warn(
+                "execute",
+                format!(
+                    "Rerouted BUY execution for {} from {} to {} ({})",
+                    decision.symbol, execution_exchange, rerouted_exchange, reason
+                ),
+            )
+            .await;
+        execution_exchange = rerouted_exchange;
+    }
+
     if side == "sell" {
         let base_asset = decision
             .symbol
@@ -1790,9 +1817,34 @@ async fn execute_if_warranted(
                     total,
                     value_usd,
                 } => {
+                    if let Some((rerouted_exchange, reason)) = maybe_reroute_execution_exchange(
+                        state,
+                        &execution_exchange,
+                        &decision.symbol,
+                        side,
+                        execution_amount_usd,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "trading: rerouting sell execution for {} from {} to {} ({})",
+                            decision.symbol, execution_exchange, rerouted_exchange, reason
+                        );
+                        state
+                            .log_warn(
+                                "execute",
+                                format!(
+                                    "Rerouted SELL execution for {} from {} to {} ({})",
+                                    decision.symbol, execution_exchange, rerouted_exchange, reason
+                                ),
+                            )
+                            .await;
+                        execution_exchange = rerouted_exchange;
+                    }
+
                     if let Some(max_sell_amount_usd) = max_sell_amount_usd_from_balance(
                         octobot,
-                        &decision.exchange,
+                        &execution_exchange,
                         &decision.symbol,
                         free,
                         total,
@@ -1898,11 +1950,11 @@ async fn execute_if_warranted(
 
     let result = if side == "buy" {
         octobot
-            .place_buy_order(&decision.exchange, &decision.symbol, execution_amount_usd)
+            .place_buy_order(&execution_exchange, &decision.symbol, execution_amount_usd)
             .await
     } else {
         octobot
-            .place_sell_order(&decision.exchange, &decision.symbol, execution_amount_usd)
+            .place_sell_order(&execution_exchange, &decision.symbol, execution_amount_usd)
             .await
     };
 
@@ -1910,11 +1962,11 @@ async fn execute_if_warranted(
         Ok(order) => {
             info!(
                 "trading: {} order placed — id={} {}/{} ${:.2}",
-                side, order.order_id, decision.exchange, decision.symbol, execution_amount_usd
+                side, order.order_id, execution_exchange, decision.symbol, execution_amount_usd
             );
             let trade = ExecutedTrade {
                 ts: now_ts(),
-                exchange: decision.exchange.clone(),
+                exchange: execution_exchange.clone(),
                 symbol: decision.symbol.clone(),
                 action: decision.action.clone(),
                 amount_usd: execution_amount_usd,
@@ -1937,7 +1989,7 @@ async fn execute_if_warranted(
                     "execute",
                     format!(
                         "{side} order placed: {}/{} ${:.2} id={}",
-                        decision.exchange, decision.symbol, execution_amount_usd, order.order_id
+                        execution_exchange, decision.symbol, execution_amount_usd, order.order_id
                     ),
                     json!({ "order_id": order.order_id, "status": order.status }),
                 )
@@ -1976,6 +2028,200 @@ enum SellBalanceAvailability {
         free: f64,
         total: f64,
     },
+}
+
+#[derive(Clone, Debug)]
+struct ExchangeAssetBalanceCandidate {
+    exchange: String,
+    free: f64,
+    total: f64,
+    value_usd: Option<f64>,
+}
+
+async fn maybe_reroute_execution_exchange(
+    state: &SharedTradingState,
+    requested_exchange: &str,
+    symbol: &str,
+    side: &str,
+    amount_usd: f64,
+) -> Option<(String, String)> {
+    let s = state.0.lock().await;
+    let portfolio = s.current_portfolio.as_ref()?;
+    select_execution_exchange_from_portfolio(
+        requested_exchange,
+        symbol,
+        side,
+        amount_usd,
+        portfolio,
+        &s.available_exchanges,
+    )
+}
+
+fn select_execution_exchange_from_portfolio(
+    requested_exchange: &str,
+    symbol: &str,
+    side: &str,
+    amount_usd: f64,
+    portfolio: &OctobotPortfolio,
+    available_exchanges: &[OctobotExchange],
+) -> Option<(String, String)> {
+    if portfolio.exchange_currencies.is_empty() {
+        return None;
+    }
+
+    let tracked_asset = if side.eq_ignore_ascii_case("sell") {
+        symbol_base_asset(symbol)?
+    } else if side.eq_ignore_ascii_case("buy") {
+        symbol_quote_asset(symbol)?
+    } else {
+        return None;
+    };
+
+    let mut candidates: Vec<ExchangeAssetBalanceCandidate> = portfolio
+        .exchange_currencies
+        .iter()
+        .filter(|(exchange, _)| exchange_supports_symbol(available_exchanges, exchange, symbol))
+        .filter_map(|(exchange, balances)| {
+            let balance = balances
+                .iter()
+                .find(|(asset, _)| asset.eq_ignore_ascii_case(tracked_asset))
+                .map(|(_, balance)| balance)?;
+            if !balance.free.is_finite() || balance.free <= 0.0 {
+                return None;
+            }
+            Some(ExchangeAssetBalanceCandidate {
+                exchange: exchange.clone(),
+                free: balance.free,
+                total: balance.total,
+                value_usd: balance.value_usd,
+            })
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .free
+            .partial_cmp(&left.free)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                right
+                    .total
+                    .partial_cmp(&left.total)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| {
+                right
+                    .value_usd
+                    .unwrap_or(0.0)
+                    .partial_cmp(&left.value_usd.unwrap_or(0.0))
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| left.exchange.cmp(&right.exchange))
+    });
+
+    let requested = candidates
+        .iter()
+        .find(|candidate| candidate.exchange.eq_ignore_ascii_case(requested_exchange));
+
+    if side.eq_ignore_ascii_case("sell") {
+        if let Some(requested) = requested
+            && sell_balance_is_sufficient(requested, amount_usd)
+        {
+            return None;
+        }
+    } else if let Some(requested) = requested
+        && buy_balance_is_sufficient(requested, tracked_asset, amount_usd)
+    {
+        return None;
+    }
+
+    let best = candidates.first()?;
+    if best.exchange.eq_ignore_ascii_case(requested_exchange) {
+        return None;
+    }
+
+    let reason = if side.eq_ignore_ascii_case("sell") {
+        format!(
+            "{} balance for {} available on {} (free={:.8})",
+            tracked_asset, symbol, best.exchange, best.free
+        )
+    } else {
+        format!(
+            "{} buy balance for {} is stronger on {} (free={:.8})",
+            tracked_asset, symbol, best.exchange, best.free
+        )
+    };
+    Some((best.exchange.clone(), reason))
+}
+
+fn exchange_supports_symbol(
+    available_exchanges: &[OctobotExchange],
+    exchange: &str,
+    symbol: &str,
+) -> bool {
+    if available_exchanges.is_empty() {
+        return true;
+    }
+
+    let Some(entry) = available_exchanges
+        .iter()
+        .find(|entry| entry.name.eq_ignore_ascii_case(exchange))
+    else {
+        // Exchange discovery can be temporarily stale; don't block routing
+        // when portfolio data points to a viable exchange.
+        return true;
+    };
+    if entry.symbols.is_empty() {
+        return true;
+    }
+    entry
+        .symbols
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(symbol))
+}
+
+fn buy_balance_is_sufficient(
+    candidate: &ExchangeAssetBalanceCandidate,
+    quote_asset: &str,
+    amount_usd: f64,
+) -> bool {
+    if !amount_usd.is_finite() || amount_usd <= 0.0 {
+        return candidate.free > 0.0;
+    }
+
+    let required = amount_usd * 0.98;
+    if is_stablecoin(quote_asset) {
+        return candidate.free + f64::EPSILON >= required;
+    }
+
+    if let Some(value_usd) = candidate
+        .value_usd
+        .filter(|value| value.is_finite() && *value >= 0.0)
+    {
+        return value_usd + f64::EPSILON >= required;
+    }
+
+    candidate.free > 0.0
+}
+
+fn sell_balance_is_sufficient(candidate: &ExchangeAssetBalanceCandidate, amount_usd: f64) -> bool {
+    if !amount_usd.is_finite() || amount_usd <= 0.0 {
+        return candidate.free > 0.0;
+    }
+
+    let required = amount_usd * 0.98;
+    if let Some(value_usd) = candidate
+        .value_usd
+        .filter(|value| value.is_finite() && *value >= 0.0)
+    {
+        return value_usd + f64::EPSILON >= required;
+    }
+
+    candidate.free > 0.0
 }
 
 async fn ensure_sell_balance_available(
