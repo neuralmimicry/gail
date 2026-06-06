@@ -3083,6 +3083,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn octobot_client_get_portfolio_uses_html_fallback_when_api_returns_html_body() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/portfolio"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<html><body>OctoBot UI page</body></html>"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/portfolio"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"
+                <html><body>
+                  <h2>Portfolio: <span>236.26</span> USDT</h2>
+                  <table>
+                    <tr>
+                      <th>Asset</th><th>Total</th><th>Value in USDT</th><th>Available</th><th>Locked in orders</th>
+                    </tr>
+                    <tr>
+                      <td>DOGE</td>
+                      <td data-toggle="tooltip" title="Binance: 0.0&#10;Bitget: 2688.2668422">2688.2668422</td>
+                      <td>217.848184002414</td>
+                      <td data-toggle="tooltip" title="Binance: 0.0&#10;Bitget: 2688.2668422">2688.2668422</td>
+                      <td data-toggle="tooltip" title="Binance: 0E-7&#10;Bitget: 0E-7">0E-7</td>
+                    </tr>
+                  </table>
+                </body></html>
+                "#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/historical_portfolio_value"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let portfolio = client.get_portfolio().await.unwrap();
+        assert_eq!(portfolio.total_value_usd, Some(236.26));
+        let doge = portfolio.currencies.get("DOGE").expect("DOGE balance");
+        assert_eq!(doge.total, 2688.2668422);
+        assert_eq!(doge.free, 2688.2668422);
+        assert_eq!(doge.locked, 0.0);
+        let bitget = portfolio
+            .exchange_currencies
+            .get("bitget")
+            .expect("bitget exchange balances");
+        let bitget_doge = bitget.get("DOGE").expect("DOGE on bitget");
+        assert_eq!(bitget_doge.total, 2688.2668422);
+        assert_eq!(bitget_doge.free, 2688.2668422);
+        assert_eq!(bitget_doge.locked, 0.0);
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn octobot_client_get_portfolio_parses_multiline_portfolio_table_rows() {
         let server = MockServer::start().await;
 

@@ -396,10 +396,19 @@ impl OctobotClient {
     pub async fn get_portfolio(&self) -> Result<OctobotPortfolio, String> {
         // OctoBot builds differ: some expose `/api/portfolio`, others only the
         // HTML `/portfolio` page.
-        if let Some(body) = self
-            .get_optional_json("/api/portfolio", "portfolio")
-            .await?
-        {
+        let api_portfolio = match self.get_optional_json("/api/portfolio", "portfolio").await {
+            Ok(body) => body,
+            Err(err) if err.contains("parse failed") => {
+                warn!(
+                    "trading: OctoBot /api/portfolio returned a non-JSON body; falling back to /portfolio HTML: {}",
+                    err
+                );
+                None
+            }
+            Err(err) => return Err(err),
+        };
+
+        if let Some(body) = api_portfolio {
             let mut portfolio = parse_portfolio_json(&body);
             if portfolio.total_value_usd.is_none() {
                 self.enrich_portfolio_total_from_history(&mut portfolio)
@@ -2064,6 +2073,9 @@ fn html_table_to_text(raw: &str) -> String {
 
 fn decode_basic_html_entities(value: &str) -> String {
     value
+        .replace("&#10;", "\n")
+        .replace("&#xA;", "\n")
+        .replace("&#xa;", "\n")
         .replace("&nbsp;", " ")
         .replace("&amp;", "&")
         .replace("&lt;", "<")
@@ -2179,7 +2191,10 @@ fn merge_exchange_currency_balance(
     currency: &str,
     balance: &CurrencyBalance,
 ) {
-    let exchange_balances = exchange_currencies.entry(exchange.to_string()).or_default();
+    let Some(normalized_exchange) = normalize_exchange_name(exchange) else {
+        return;
+    };
+    let exchange_balances = exchange_currencies.entry(normalized_exchange).or_default();
     merge_currency_balance(exchange_balances, currency, balance);
 }
 
@@ -2266,24 +2281,24 @@ fn parse_portfolio_html(raw: &str) -> Option<OctobotPortfolio> {
     let mut portfolio = OctobotPortfolio::default();
     portfolio.total_value_usd = parse_portfolio_total_from_text(&text);
 
-    for cols in html_table_rows(raw) {
-        if cols.len() < 5 {
+    for row in html_table_rows(raw) {
+        if row.len() < 5 {
             continue;
         }
-        if cols[0].eq_ignore_ascii_case("asset") {
+        if row[0].text.eq_ignore_ascii_case("asset") {
             continue;
         }
-        let Some(total) = parse_first_number(&cols[1]) else {
+        let Some(total) = parse_first_number(&row[1].text) else {
             continue;
         };
-        let Some(symbol) = extract_portfolio_symbol(&cols[0]) else {
+        let Some(symbol) = extract_portfolio_symbol(&row[0].text) else {
             continue;
         };
-        let free = parse_first_number(&cols[3]).unwrap_or(total);
-        let locked = parse_first_number(&cols[4]).unwrap_or((total - free).max(0.0));
-        let value_usd = parse_first_number(&cols[2]);
+        let free = parse_first_number(&row[3].text).unwrap_or(total);
+        let locked = parse_first_number(&row[4].text).unwrap_or((total - free).max(0.0));
+        let value_usd = parse_first_number(&row[2].text);
         portfolio.currencies.insert(
-            symbol,
+            symbol.clone(),
             CurrencyBalance {
                 free,
                 locked,
@@ -2291,6 +2306,7 @@ fn parse_portfolio_html(raw: &str) -> Option<OctobotPortfolio> {
                 value_usd,
             },
         );
+        collect_exchange_balances_from_html_row(&mut portfolio.exchange_currencies, &symbol, &row);
     }
 
     if portfolio.currencies.is_empty() && portfolio.total_value_usd.is_none() {
@@ -2300,10 +2316,94 @@ fn parse_portfolio_html(raw: &str) -> Option<OctobotPortfolio> {
     }
 }
 
-fn html_table_rows(raw: &str) -> Vec<Vec<String>> {
+fn collect_exchange_balances_from_html_row(
+    exchange_currencies: &mut std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, CurrencyBalance>,
+    >,
+    symbol: &str,
+    row: &[HtmlTableCell],
+) {
+    let mut per_exchange: std::collections::HashMap<String, CurrencyBalance> =
+        std::collections::HashMap::new();
+
+    for (column_index, cell) in row.iter().enumerate() {
+        let Some(title) = cell.title.as_deref() else {
+            continue;
+        };
+        for (exchange, amount) in parse_exchange_tooltip_balances(title) {
+            let entry = per_exchange.entry(exchange).or_default();
+            match column_index {
+                // Total
+                1 => entry.total = entry.total.max(amount),
+                // Value in USDT
+                2 => {
+                    let existing = entry.value_usd.unwrap_or(0.0);
+                    entry.value_usd = Some(existing.max(amount));
+                }
+                // Available
+                3 => entry.free = entry.free.max(amount),
+                // Locked in orders
+                4 => entry.locked = entry.locked.max(amount),
+                _ => {}
+            }
+        }
+    }
+
+    for (exchange, mut balance) in per_exchange {
+        if balance.total <= 0.0 {
+            balance.total = (balance.free + balance.locked).max(0.0);
+        }
+        if balance.free <= 0.0 && balance.total > 0.0 && balance.locked <= 0.0 {
+            balance.free = balance.total;
+        }
+        merge_exchange_currency_balance(exchange_currencies, &exchange, symbol, &balance);
+    }
+}
+
+fn parse_exchange_tooltip_balances(value: &str) -> Vec<(String, f64)> {
+    static EXCHANGE_BALANCE_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"(?i)([a-z0-9][a-z0-9 ._-]{0,31})\s*:\s*([-+]?\d[\d,]*(?:\.\d+)?(?:[eE][-+]?\d+)?)",
+        )
+        .expect("valid exchange tooltip regex")
+    });
+
+    EXCHANGE_BALANCE_RE
+        .captures_iter(value)
+        .filter_map(|capture| {
+            let exchange = capture
+                .get(1)
+                .map(|m| m.as_str())
+                .and_then(normalize_exchange_name)?;
+            let amount = capture
+                .get(2)
+                .and_then(|m| parse_first_number(m.as_str()))
+                .map(|parsed| parsed.max(0.0))?;
+            Some((exchange, amount))
+        })
+        .collect()
+}
+
+fn normalize_exchange_name(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_ascii_lowercase())
+}
+
+#[derive(Clone, Debug, Default)]
+struct HtmlTableCell {
+    text: String,
+    title: Option<String>,
+}
+
+fn html_table_rows(raw: &str) -> Vec<Vec<HtmlTableCell>> {
     let mut rows = Vec::new();
-    let mut current_row: Vec<String> = Vec::new();
+    let mut current_row: Vec<HtmlTableCell> = Vec::new();
     let mut current_cell = String::new();
+    let mut current_cell_title: Option<String> = None;
     let mut in_row = false;
     let mut in_cell = false;
     let mut chars = raw.chars().peekable();
@@ -2346,7 +2446,11 @@ fn html_table_rows(raw: &str) -> Vec<Vec<String>> {
             }
             (true, "tr") => {
                 if in_cell {
-                    finalize_html_cell(&mut current_row, &mut current_cell);
+                    finalize_html_cell(
+                        &mut current_row,
+                        &mut current_cell,
+                        &mut current_cell_title,
+                    );
                     in_cell = false;
                 }
                 if !current_row.is_empty() {
@@ -2358,11 +2462,16 @@ fn html_table_rows(raw: &str) -> Vec<Vec<String>> {
                 if in_row {
                     in_cell = true;
                     current_cell.clear();
+                    current_cell_title = parse_html_cell_title(trimmed);
                 }
             }
             (true, "td") | (true, "th") => {
                 if in_row && in_cell {
-                    finalize_html_cell(&mut current_row, &mut current_cell);
+                    finalize_html_cell(
+                        &mut current_row,
+                        &mut current_cell,
+                        &mut current_cell_title,
+                    );
                     in_cell = false;
                 }
             }
@@ -2371,7 +2480,7 @@ fn html_table_rows(raw: &str) -> Vec<Vec<String>> {
     }
 
     if in_row && in_cell {
-        finalize_html_cell(&mut current_row, &mut current_cell);
+        finalize_html_cell(&mut current_row, &mut current_cell, &mut current_cell_title);
     }
     if !current_row.is_empty() {
         rows.push(current_row);
@@ -2380,15 +2489,47 @@ fn html_table_rows(raw: &str) -> Vec<Vec<String>> {
     rows
 }
 
-fn finalize_html_cell(row: &mut Vec<String>, cell: &mut String) {
+fn finalize_html_cell(row: &mut Vec<HtmlTableCell>, cell: &mut String, title: &mut Option<String>) {
     let normalized = decode_basic_html_entities(cell)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    if !normalized.is_empty() {
-        row.push(normalized);
+    let cell_title = title.take().filter(|value| !value.is_empty());
+    if !normalized.is_empty() || cell_title.is_some() {
+        row.push(HtmlTableCell {
+            text: normalized,
+            title: cell_title,
+        });
     }
     cell.clear();
+}
+
+fn parse_html_cell_title(tag: &str) -> Option<String> {
+    extract_html_attribute(tag, "title")
+        .or_else(|| extract_html_attribute(tag, "data-original-title"))
+        .or_else(|| extract_html_attribute(tag, "data-bs-original-title"))
+        .map(|value| decode_basic_html_entities(&value))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn extract_html_attribute(tag: &str, attribute: &str) -> Option<String> {
+    static HTML_ATTRIBUTE_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"(?i)([a-z_:][-a-z0-9_:.]*)\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))"#)
+            .expect("valid html attribute regex")
+    });
+
+    HTML_ATTRIBUTE_RE.captures_iter(tag).find_map(|capture| {
+        let name = capture.get(1)?.as_str();
+        if !name.eq_ignore_ascii_case(attribute) {
+            return None;
+        }
+        capture
+            .get(3)
+            .or_else(|| capture.get(4))
+            .or_else(|| capture.get(5))
+            .map(|value| value.as_str().to_string())
+    })
 }
 
 fn parse_portfolio_total_from_text(text: &str) -> Option<f64> {
