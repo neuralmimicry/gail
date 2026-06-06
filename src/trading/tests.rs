@@ -3173,6 +3173,240 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn octobot_client_pair_activation_ready_when_pair_is_in_market_status() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/trading"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"
+                <html><body>
+                  <a href="/symbol_market_status?exchange_id=bitget-id&amp;symbol=DOGE%2FUSDT">Bitget : NEUTRAL (Indexing 6 coins)</a>
+                </body></html>
+                "#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/get_config_currency"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("should not call config"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/set_config_currency"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("should not set config"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/watched_symbols"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("should not update watched"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/commands/restart"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("should not restart"))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let activation = client
+            .ensure_trading_pair_active_for_order("bitget", "DOGE/USDT")
+            .await
+            .expect("pair activation should succeed");
+        assert!(activation.ready);
+        assert!(!activation.restart_required);
+        assert!(!activation.changed);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_pair_activation_adds_config_and_restarts_when_pair_is_missing() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/trading"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/get_config_currency"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/set_config_currency"))
+            .and(body_string_contains("\"action\":\"update\""))
+            .and(body_string_contains("\"DOGE/USDT\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": "Currencies list updated"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/watched_symbols"))
+            .and(body_string_contains("\"action\":\"add\""))
+            .and(body_string_contains("\"DOGE/USDT\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!("DOGE/USDT added to watched markets")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/commands/restart"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!("Success")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let activation = client
+            .ensure_trading_pair_active_for_order("bitget", "DOGE/USDT")
+            .await
+            .expect("pair activation should succeed");
+        assert!(!activation.ready);
+        assert!(activation.restart_required);
+        assert!(activation.changed);
+        assert!(activation.message.contains("requested OctoBot restart"));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_pair_activation_uses_restart_cooldown_when_still_inactive() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/trading"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/get_config_currency"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "DOGE": {
+                    "enabled": true,
+                    "pairs": ["DOGE/USDT"]
+                }
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/set_config_currency"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("should not update config"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/watched_symbols"))
+            .and(body_string_contains("\"action\":\"add\""))
+            .and(body_string_contains("\"DOGE/USDT\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!("DOGE/USDT added to watched markets")),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/commands/restart"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!("Success")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let first = client
+            .ensure_trading_pair_active_for_order("bitget", "DOGE/USDT")
+            .await
+            .expect("first activation");
+        let second = client
+            .ensure_trading_pair_active_for_order("bitget", "DOGE/USDT")
+            .await
+            .expect("second activation");
+
+        assert!(!first.ready);
+        assert!(first.restart_required);
+        assert!(!second.ready);
+        assert!(second.restart_required);
+        assert!(
+            second
+                .message
+                .contains("restart already requested recently")
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_remove_trading_pair_configuration_replaces_config_and_restarts() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/get_config_currency"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Bitcoin": {
+                    "enabled": true,
+                    "pairs": ["BTC/USDT", "DOGE/USDT"]
+                },
+                "Ethereum": {
+                    "enabled": true,
+                    "pairs": ["ETH/USDT"]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/set_config_currency"))
+            .and(body_string_contains("\"action\":\"replace\""))
+            .and(body_string_contains("\"BTC/USDT\""))
+            .and(body_string_contains("\"ETH/USDT\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": "Currencies list updated"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/watched_symbols"))
+            .and(body_string_contains("\"action\":\"remove\""))
+            .and(body_string_contains("\"DOGE/USDT\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!("DOGE/USDT removed from watched markets")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/commands/restart"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!("Success")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let activation = client
+            .remove_trading_pair_configuration("DOGE/USDT")
+            .await
+            .expect("remove pair configuration");
+        assert!(!activation.ready);
+        assert!(activation.restart_required);
+        assert!(activation.changed);
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn octobot_client_get_portfolio_parses_exchange_scoped_balances() {
         let server = MockServer::start().await;
 

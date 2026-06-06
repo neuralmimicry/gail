@@ -1948,6 +1948,51 @@ async fn execute_if_warranted(
         return;
     }
 
+    let pair_activation = match octobot
+        .ensure_trading_pair_active_for_order(&execution_exchange, &decision.symbol)
+        .await
+    {
+        Ok(status) => status,
+        Err(err) => {
+            warn!(
+                "trading: {} skipped — failed to validate OctoBot market-status activation for {}/{}: {}",
+                side, execution_exchange, decision.symbol, err
+            );
+            state
+                .log_error(
+                    "execute",
+                    format!(
+                        "{} skipped for {}/{}: failed to validate OctoBot market-status activation ({err})",
+                        side.to_ascii_uppercase(),
+                        execution_exchange,
+                        decision.symbol
+                    ),
+                )
+                .await;
+            return;
+        }
+    };
+
+    if !pair_activation.ready {
+        warn!(
+            "trading: {} skipped — OctoBot pair activation pending for {}/{}: {}",
+            side, execution_exchange, decision.symbol, pair_activation.message
+        );
+        state
+            .log_warn(
+                "execute",
+                format!(
+                    "{} skipped for {}/{}: {}",
+                    side.to_ascii_uppercase(),
+                    execution_exchange,
+                    decision.symbol,
+                    pair_activation.message
+                ),
+            )
+            .await;
+        return;
+    }
+
     let result = if side == "buy" {
         octobot
             .place_buy_order(&execution_exchange, &decision.symbol, execution_amount_usd)

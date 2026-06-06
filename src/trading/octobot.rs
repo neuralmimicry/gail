@@ -37,6 +37,7 @@ const MAX_PARALLEL_MARKET_SNAPSHOT_REQUESTS: usize = 8;
 const MARKET_SNAPSHOT_CANDIDATE_MULTIPLIER: usize = 1;
 const MARKET_SNAPSHOT_UNKNOWN_PROBE_LIMIT_PER_EXCHANGE: usize = 8;
 const MARKET_SNAPSHOT_UNAVAILABLE_COOLDOWN_SECONDS: f64 = 3_600.0;
+const TRADING_PAIR_RESTART_COOLDOWN_SECONDS: f64 = 180.0;
 
 // ---------------------------------------------------------------------------
 // Domain models
@@ -127,6 +128,14 @@ pub struct OctobotOrderResult {
     pub status: String,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct TradingPairActivationStatus {
+    pub ready: bool,
+    pub restart_required: bool,
+    pub changed: bool,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct OctobotLogEntry {
     pub time: Option<String>,
@@ -184,6 +193,11 @@ pub struct OctobotClient {
     /// Exchange+symbol pairs that have previously returned valid market data.
     /// These are prioritized over unproven symbols to reduce noisy probing.
     market_snapshot_available_symbols: Arc<Mutex<HashSet<String>>>,
+
+    /// Exchange+symbol keys with a short restart cooldown to avoid repeatedly
+    /// requesting OctoBot restart on every evaluation while a restart is
+    /// already in progress for the same pair activation.
+    trading_pair_restart_cooldown_until: Arc<Mutex<HashMap<String, f64>>>,
 }
 
 impl OctobotClient {
@@ -219,6 +233,7 @@ impl OctobotClient {
             symbol_scan_offsets: Arc::new(Mutex::new(HashMap::new())),
             market_snapshot_unavailable_until: Arc::new(Mutex::new(HashMap::new())),
             market_snapshot_available_symbols: Arc::new(Mutex::new(HashSet::new())),
+            trading_pair_restart_cooldown_until: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -516,6 +531,327 @@ impl OctobotClient {
             "OctoBot refresh portfolio failed: HTTP {}: {detail}",
             status.as_u16()
         ))
+    }
+
+    // -----------------------------------------------------------------------
+    // Trading pair activation / market status
+    // -----------------------------------------------------------------------
+
+    pub async fn ensure_trading_pair_active_for_order(
+        &self,
+        exchange: &str,
+        symbol: &str,
+    ) -> Result<TradingPairActivationStatus, String> {
+        let Some(exchange_key) = normalize_exchange_name(exchange) else {
+            return Err(format!(
+                "Invalid exchange `{exchange}` while checking OctoBot trading pair activation"
+            ));
+        };
+        let Some(normalized_symbol) = normalize_trading_symbol(symbol) else {
+            return Err(format!(
+                "Invalid symbol `{symbol}` while checking OctoBot trading pair activation"
+            ));
+        };
+
+        if self
+            .market_status_contains_pair(&exchange_key, &normalized_symbol)
+            .await?
+        {
+            self.clear_trading_pair_restart_cooldown(&exchange_key, &normalized_symbol)
+                .await;
+            return Ok(TradingPairActivationStatus {
+                ready: true,
+                restart_required: false,
+                changed: false,
+                message: format!(
+                    "{exchange_key}/{normalized_symbol} already active in OctoBot market status"
+                ),
+            });
+        }
+
+        let config_changed = self.ensure_symbol_in_config(&normalized_symbol).await?;
+        self.ensure_symbol_in_watchlist(&normalized_symbol).await?;
+
+        let restart_key = trading_pair_restart_key(&exchange_key, &normalized_symbol);
+        if self.trading_pair_restart_on_cooldown(&restart_key).await {
+            return Ok(TradingPairActivationStatus {
+                ready: false,
+                restart_required: true,
+                changed: config_changed,
+                message: format!(
+                    "{exchange_key}/{normalized_symbol} not active yet; restart already requested recently, waiting for OctoBot restart to apply pair changes"
+                ),
+            });
+        }
+
+        self.request_restart().await?;
+        self.record_trading_pair_restart_request(&restart_key).await;
+
+        Ok(TradingPairActivationStatus {
+            ready: false,
+            restart_required: true,
+            changed: config_changed,
+            message: format!(
+                "{exchange_key}/{normalized_symbol} was not active in market status; requested OctoBot restart to apply trading pair changes"
+            ),
+        })
+    }
+
+    pub async fn remove_trading_pair_configuration(
+        &self,
+        symbol: &str,
+    ) -> Result<TradingPairActivationStatus, String> {
+        let Some(normalized_symbol) = normalize_trading_symbol(symbol) else {
+            return Err(format!(
+                "Invalid symbol `{symbol}` while removing OctoBot trading pair"
+            ));
+        };
+
+        let config_changed = self.remove_symbol_from_config(&normalized_symbol).await?;
+        self.remove_symbol_from_watchlist(&normalized_symbol)
+            .await?;
+
+        if !config_changed {
+            return Ok(TradingPairActivationStatus {
+                ready: true,
+                restart_required: false,
+                changed: false,
+                message: format!(
+                    "{normalized_symbol} not present in configured currencies; no restart needed"
+                ),
+            });
+        }
+
+        self.request_restart().await?;
+        Ok(TradingPairActivationStatus {
+            ready: false,
+            restart_required: true,
+            changed: true,
+            message: format!(
+                "{normalized_symbol} removed from configured currencies; requested OctoBot restart to apply removal"
+            ),
+        })
+    }
+
+    async fn market_status_contains_pair(
+        &self,
+        exchange: &str,
+        symbol: &str,
+    ) -> Result<bool, String> {
+        let Some(html) = self.get_optional_text("/trading", "trading page").await? else {
+            return Ok(false);
+        };
+        let rows = parse_trading_page_symbol_status_rows(&html);
+        self.observe_trading_page_rows(&rows).await;
+        let Some(exchange_key) = normalize_exchange_name(exchange) else {
+            return Ok(false);
+        };
+
+        Ok(rows.iter().any(|row| {
+            normalize_exchange_name(&row.exchange_name).is_some_and(|name| name == exchange_key)
+                && row.symbol.eq_ignore_ascii_case(symbol)
+        }))
+    }
+
+    async fn observe_trading_page_rows(&self, rows: &[TradingPageSymbolStatusRow]) {
+        if rows.is_empty() {
+            return;
+        }
+        let mut cache = self.exchange_id_by_name.lock().await;
+        for row in rows {
+            if let Some(exchange_key) = normalize_exchange_name(&row.exchange_name) {
+                cache
+                    .entry(exchange_key)
+                    .or_insert_with(|| row.exchange_id.clone());
+            }
+        }
+    }
+
+    async fn ensure_symbol_in_config(&self, symbol: &str) -> Result<bool, String> {
+        let configured = self.get_configured_currency_map().await?;
+        if configured_currency_map_contains_symbol(&configured, symbol) {
+            return Ok(false);
+        }
+
+        let currency_key = best_currency_key_for_symbol(&configured, symbol).unwrap_or_else(|| {
+            symbol_base_asset(symbol)
+                .unwrap_or(symbol)
+                .to_ascii_uppercase()
+        });
+
+        let mut currencies_payload = serde_json::Map::new();
+        currencies_payload.insert(
+            currency_key.clone(),
+            json!({
+                "enabled": true,
+                "pairs": [symbol]
+            }),
+        );
+        let payload = json!({
+            "action": "update",
+            "currencies": Value::Object(currencies_payload)
+        });
+        let (status, body) = self
+            .post_json_with_status("/api/set_config_currency", &payload, "set config currency")
+            .await?;
+        if !status.is_success() {
+            let detail = extract_attempt_message(&body)
+                .unwrap_or_else(|| summarize_order_attempt_body(&body));
+            return Err(format!(
+                "OctoBot set_config_currency failed for {symbol}: HTTP {}: {detail}",
+                status.as_u16()
+            ));
+        }
+
+        Ok(true)
+    }
+
+    async fn remove_symbol_from_config(&self, symbol: &str) -> Result<bool, String> {
+        let configured = self.get_configured_currency_map().await?;
+        if configured.is_empty() {
+            return Ok(false);
+        }
+
+        let mut changed = false;
+        let mut updated = serde_json::Map::new();
+
+        for (currency, entry) in configured {
+            let enabled = entry
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let pairs = configured_currency_pairs(&entry);
+            let filtered_pairs = pairs
+                .into_iter()
+                .filter(|pair| !pair.eq_ignore_ascii_case(symbol))
+                .collect::<Vec<_>>();
+            if filtered_pairs.is_empty() {
+                if configured_currency_contains_symbol(&entry, symbol) {
+                    changed = true;
+                }
+                continue;
+            }
+
+            if filtered_pairs.len() != configured_currency_pairs(&entry).len() {
+                changed = true;
+            }
+
+            updated.insert(
+                currency,
+                json!({
+                    "enabled": enabled,
+                    "pairs": filtered_pairs
+                }),
+            );
+        }
+
+        if !changed {
+            return Ok(false);
+        }
+
+        let payload = json!({
+            "action": "replace",
+            "currencies": Value::Object(updated)
+        });
+        let (status, body) = self
+            .post_json_with_status("/api/set_config_currency", &payload, "set config currency")
+            .await?;
+        if status.is_success() {
+            return Ok(true);
+        }
+
+        let detail =
+            extract_attempt_message(&body).unwrap_or_else(|| summarize_order_attempt_body(&body));
+        Err(format!(
+            "OctoBot set_config_currency replace failed while removing {symbol}: HTTP {}: {detail}",
+            status.as_u16()
+        ))
+    }
+
+    async fn get_configured_currency_map(&self) -> Result<serde_json::Map<String, Value>, String> {
+        let body = self
+            .get_optional_json("/api/get_config_currency", "configured currencies")
+            .await?
+            .unwrap_or_else(|| json!({}));
+        Ok(body.as_object().cloned().unwrap_or_default())
+    }
+
+    async fn ensure_symbol_in_watchlist(&self, symbol: &str) -> Result<(), String> {
+        let payload = json!({
+            "symbol": symbol,
+            "action": "add"
+        });
+        let (status, body) = self
+            .post_json_with_status("/watched_symbols", &payload, "watched symbols")
+            .await?;
+        if status.is_success() {
+            return Ok(());
+        }
+        let detail =
+            extract_attempt_message(&body).unwrap_or_else(|| summarize_order_attempt_body(&body));
+        Err(format!(
+            "OctoBot watched_symbols add failed for {symbol}: HTTP {}: {detail}",
+            status.as_u16()
+        ))
+    }
+
+    async fn remove_symbol_from_watchlist(&self, symbol: &str) -> Result<(), String> {
+        let payload = json!({
+            "symbol": symbol,
+            "action": "remove"
+        });
+        let (status, body) = self
+            .post_json_with_status("/watched_symbols", &payload, "watched symbols")
+            .await?;
+        if status.is_success() {
+            return Ok(());
+        }
+        let detail =
+            extract_attempt_message(&body).unwrap_or_else(|| summarize_order_attempt_body(&body));
+        Err(format!(
+            "OctoBot watched_symbols remove failed for {symbol}: HTTP {}: {detail}",
+            status.as_u16()
+        ))
+    }
+
+    async fn request_restart(&self) -> Result<(), String> {
+        let (status, body) = self
+            .post_json_with_status("/commands/restart", &json!({}), "restart command")
+            .await?;
+        if status.is_success() {
+            return Ok(());
+        }
+        let detail =
+            extract_attempt_message(&body).unwrap_or_else(|| summarize_order_attempt_body(&body));
+        Err(format!(
+            "OctoBot restart command failed: HTTP {}: {detail}",
+            status.as_u16()
+        ))
+    }
+
+    async fn trading_pair_restart_on_cooldown(&self, pair_key: &str) -> bool {
+        let now = current_unix_timestamp_f64();
+        self.trading_pair_restart_cooldown_until
+            .lock()
+            .await
+            .get(pair_key)
+            .is_some_and(|until| *until > now)
+    }
+
+    async fn record_trading_pair_restart_request(&self, pair_key: &str) {
+        let mut cooldown = self.trading_pair_restart_cooldown_until.lock().await;
+        cooldown.insert(
+            pair_key.to_string(),
+            current_unix_timestamp_f64() + TRADING_PAIR_RESTART_COOLDOWN_SECONDS,
+        );
+    }
+
+    async fn clear_trading_pair_restart_cooldown(&self, exchange: &str, symbol: &str) {
+        let key = trading_pair_restart_key(exchange, symbol);
+        self.trading_pair_restart_cooldown_until
+            .lock()
+            .await
+            .remove(&key);
     }
 
     // -----------------------------------------------------------------------
@@ -2124,8 +2460,77 @@ fn split_symbol_assets(symbol: &str) -> Option<(&str, &str)> {
     Some((base, quote))
 }
 
+fn symbol_base_asset(symbol: &str) -> Option<&str> {
+    split_symbol_assets(symbol).map(|(base, _)| base)
+}
+
 fn symbol_quote_asset(symbol: &str) -> Option<&str> {
     split_symbol_assets(symbol).map(|(_, quote)| quote)
+}
+
+fn configured_currency_pairs(entry: &Value) -> Vec<String> {
+    entry
+        .get("pairs")
+        .or_else(|| entry.get("crypto-pairs"))
+        .and_then(Value::as_array)
+        .map(|pairs| {
+            pairs
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(normalize_trading_symbol)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn configured_currency_contains_symbol(entry: &Value, symbol: &str) -> bool {
+    configured_currency_pairs(entry)
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(symbol))
+}
+
+fn configured_currency_map_contains_symbol(
+    configured: &serde_json::Map<String, Value>,
+    symbol: &str,
+) -> bool {
+    configured
+        .values()
+        .filter(|entry| {
+            entry
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        })
+        .any(|entry| configured_currency_contains_symbol(entry, symbol))
+}
+
+fn best_currency_key_for_symbol(
+    configured: &serde_json::Map<String, Value>,
+    symbol: &str,
+) -> Option<String> {
+    let base_asset = symbol_base_asset(symbol)?;
+
+    for (currency, entry) in configured {
+        if configured_currency_pairs(entry).iter().any(|pair| {
+            symbol_base_asset(pair)
+                .is_some_and(|configured_base| configured_base.eq_ignore_ascii_case(base_asset))
+        }) {
+            return Some(currency.clone());
+        }
+    }
+
+    configured
+        .keys()
+        .find(|currency| currency.eq_ignore_ascii_case(base_asset))
+        .cloned()
+}
+
+fn trading_pair_restart_key(exchange: &str, symbol: &str) -> String {
+    format!(
+        "{}|{}",
+        exchange.to_ascii_lowercase(),
+        symbol.to_ascii_uppercase()
+    )
 }
 
 fn is_supported_spot_symbol(symbol: &str) -> bool {
