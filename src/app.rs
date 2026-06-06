@@ -242,6 +242,7 @@ async fn openai_chat_completions(
             if let Some((public_model, fallback)) = degraded_chat_completion_for_upstream_error(
                 &request_for_fallback,
                 &response_schema_context,
+                tool_context.as_ref(),
                 &error,
             ) {
                 if stream_response {
@@ -2654,6 +2655,7 @@ fn gail_response_body(response: &CompletionResponse) -> Value {
 fn degraded_chat_completion_for_upstream_error(
     request: &OpenAIChatCompletionRequest,
     response_schema_context: &OpenAIResponseSchemaContext,
+    tool_context: Option<&OpenAIToolContext>,
     error: &GailError,
 ) -> Option<(String, CompletionResponse)> {
     let reason = transient_openai_fallback_reason(error)?;
@@ -2669,6 +2671,12 @@ fn degraded_chat_completion_for_upstream_error(
             value = cached;
         }
         serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+    } else if tool_context.is_some_and(|context| context.contains("finish")) {
+        json!({
+            "tool_name": "finish",
+            "arguments": {}
+        })
+        .to_string()
     } else if response_schema_context.manager_tool_call {
         json!({
             "tool_name": "finish",
@@ -3697,6 +3705,95 @@ mod tests {
         assert_eq!(degraded["should_trade"], false);
         assert_eq!(payload["gail"]["provider"], "gail");
         assert_eq!(payload["gail"]["resolved_model"], "degraded_safety");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_saturation_with_tools_returns_finish_tool_call() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "error": "local Ollama request queue is saturated; backing off before retrying in 14s"
+            })))
+            .mount(&server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/llama3.2",
+                            "base_url": server.uri(),
+                            "messages": [
+                                {"role": "user", "content": "choose the next team tool"}
+                            ],
+                            "tools": [
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": "run_agent",
+                                        "description": "Run a specific agent",
+                                        "parameters": {
+                                            "type": "object",
+                                            "properties": {
+                                                "agent_name": {"type": "string"}
+                                            },
+                                            "required": ["agent_name"]
+                                        }
+                                    }
+                                },
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": "finish",
+                                        "description": "Finish execution",
+                                        "parameters": {
+                                            "type": "object",
+                                            "properties": {},
+                                            "additionalProperties": false
+                                        }
+                                    }
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+        let choice = &payload["choices"][0];
+
+        assert_eq!(payload["model"], "ollama/llama3.2");
+        assert_eq!(payload["gail"]["provider"], "gail");
+        assert_eq!(payload["gail"]["resolved_model"], "degraded_safety");
+        assert_eq!(choice["finish_reason"], "tool_calls");
+        assert!(choice["message"]["content"].is_null());
+        assert_eq!(
+            choice["message"]["tool_calls"][0]["function"]["name"],
+            "finish"
+        );
+        let args: Value = serde_json::from_str(
+            choice["message"]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .expect("arguments string"),
+        )
+        .expect("arguments json");
+        assert_eq!(args, json!({}));
     }
 
     #[tokio::test]
