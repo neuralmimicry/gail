@@ -4137,6 +4137,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn octobot_client_get_all_market_snapshots_limits_unknown_symbol_probes_per_exchange() {
+        let server = MockServer::start().await;
+
+        let exchange_symbols = (1..=20)
+            .map(|index| format!("S{index:02}/USDT"))
+            .collect::<Vec<_>>();
+
+        Mock::given(method("GET"))
+            .and(path("/api/first_exchange_details"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exchange_name": "binance",
+                "exchange_id": "binance-id"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/exchanges"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/trading"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/get_config_currency"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/get_all_symbols/binance"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!(exchange_symbols)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/dashboard/watched_symbol/.*$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exchange_id": "binance-id",
+                "time_frame": "1h"
+            })))
+            .expect(8)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/dashboard/currency_price_graph_update/binance-id/.*/1h/live$",
+            ))
+            .and(query_param("display_orders", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "error": "No data"
+            })))
+            .expect(8)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/market/ticker"))
+            .and(query_param("exchange", "binance"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let snapshots = client.get_all_market_snapshots(&[], &[], 100).await;
+        assert!(snapshots.is_empty());
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn octobot_client_logs_update_schema_hints() {
         let server = MockServer::start().await;
 

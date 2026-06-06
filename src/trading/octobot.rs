@@ -35,6 +35,7 @@ use crate::{
 const OCTOBOT_API: &str = "octobot";
 const MAX_PARALLEL_MARKET_SNAPSHOT_REQUESTS: usize = 8;
 const MARKET_SNAPSHOT_CANDIDATE_MULTIPLIER: usize = 1;
+const MARKET_SNAPSHOT_UNKNOWN_PROBE_LIMIT_PER_EXCHANGE: usize = 8;
 const MARKET_SNAPSHOT_UNAVAILABLE_COOLDOWN_SECONDS: f64 = 3_600.0;
 
 // ---------------------------------------------------------------------------
@@ -179,6 +180,10 @@ pub struct OctobotClient {
     /// Exchange+symbol pairs that recently returned no market data. Avoid
     /// immediately retrying these pairs on every cycle.
     market_snapshot_unavailable_until: Arc<Mutex<HashMap<String, f64>>>,
+
+    /// Exchange+symbol pairs that have previously returned valid market data.
+    /// These are prioritized over unproven symbols to reduce noisy probing.
+    market_snapshot_available_symbols: Arc<Mutex<HashSet<String>>>,
 }
 
 impl OctobotClient {
@@ -213,6 +218,7 @@ impl OctobotClient {
             exchange_id_by_name: Arc::new(Mutex::new(HashMap::new())),
             symbol_scan_offsets: Arc::new(Mutex::new(HashMap::new())),
             market_snapshot_unavailable_until: Arc::new(Mutex::new(HashMap::new())),
+            market_snapshot_available_symbols: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -2996,7 +3002,8 @@ impl OctobotClient {
             exchange_name: String,
             exchange_key: String,
             symbols: Vec<String>,
-            start_offset: usize,
+            base_offset: usize,
+            rotation_span: usize,
             consumed: usize,
         }
 
@@ -3024,6 +3031,7 @@ impl OctobotClient {
             cache.retain(|_, retry_after| *retry_after > now);
             cache.clone()
         };
+        let available_snapshot = self.market_snapshot_available_symbols.lock().await.clone();
         let offset_snapshot = self.symbol_scan_offsets.lock().await.clone();
 
         let mut states: Vec<ExchangeTargetState> = Vec::new();
@@ -3065,13 +3073,32 @@ impl OctobotClient {
             if symbols.is_empty() {
                 continue;
             }
-            let start_offset =
-                offset_snapshot.get(&exchange_key).copied().unwrap_or(0) % symbols.len();
+            let rotation_span = symbols.len();
+            let base_offset =
+                offset_snapshot.get(&exchange_key).copied().unwrap_or(0) % rotation_span;
+
+            let mut selected = Vec::new();
+            let mut unknown_probe_count = 0usize;
+            for index in 0..rotation_span {
+                let symbol = symbols[(base_offset + index) % rotation_span].clone();
+                if market_snapshot_is_known_available(&available_snapshot, &exchange_key, &symbol) {
+                    selected.push(symbol);
+                    continue;
+                }
+                if unknown_probe_count < MARKET_SNAPSHOT_UNKNOWN_PROBE_LIMIT_PER_EXCHANGE {
+                    selected.push(symbol);
+                    unknown_probe_count += 1;
+                }
+            }
+            if selected.is_empty() {
+                continue;
+            }
             states.push(ExchangeTargetState {
                 exchange_name: exchange.name.clone(),
                 exchange_key,
-                symbols,
-                start_offset,
+                symbols: selected,
+                base_offset,
+                rotation_span,
                 consumed: 0,
             });
         }
@@ -3083,11 +3110,10 @@ impl OctobotClient {
                 if targets.len() >= candidate_limit || state.consumed >= state.symbols.len() {
                     continue;
                 }
-                let index = (state.start_offset + state.consumed) % state.symbols.len();
                 targets.push(MarketTarget {
                     exchange_name: state.exchange_name.clone(),
                     exchange_key: state.exchange_key.clone(),
-                    symbol: state.symbols[index].clone(),
+                    symbol: state.symbols[state.consumed].clone(),
                 });
                 state.consumed += 1;
                 progressed = true;
@@ -3131,6 +3157,8 @@ impl OctobotClient {
         while let Some(result) = join_set.join_next().await {
             match result {
                 Ok((_exchange, exchange_key, symbol, Ok(snapshot))) => {
+                    self.mark_market_snapshot_available(&exchange_key, &symbol)
+                        .await;
                     self.clear_market_snapshot_unavailable(&exchange_key, &symbol)
                         .await;
                     snapshots.push(snapshot);
@@ -3161,6 +3189,8 @@ impl OctobotClient {
                 }
                 Ok((exchange, exchange_key, symbol, Err(err))) => {
                     if is_market_snapshot_unavailable_error(&err) {
+                        self.clear_market_snapshot_available(&exchange_key, &symbol)
+                            .await;
                         self.mark_market_snapshot_unavailable(&exchange_key, &symbol)
                             .await;
                     }
@@ -3215,15 +3245,15 @@ impl OctobotClient {
         {
             let mut offsets = self.symbol_scan_offsets.lock().await;
             for state in states {
-                if state.symbols.is_empty() {
+                if state.rotation_span == 0 {
                     continue;
                 }
                 let requested = requested_by_exchange
                     .get(&state.exchange_key)
                     .copied()
                     .unwrap_or(0)
-                    .min(state.symbols.len());
-                let next_offset = (state.start_offset + requested) % state.symbols.len();
+                    .min(state.rotation_span);
+                let next_offset = (state.base_offset + requested) % state.rotation_span;
                 offsets.insert(state.exchange_key, next_offset);
             }
         }
@@ -3232,7 +3262,7 @@ impl OctobotClient {
     }
 
     async fn mark_market_snapshot_unavailable(&self, exchange_key: &str, symbol: &str) {
-        let key = market_snapshot_cooldown_key(exchange_key, symbol);
+        let key = market_snapshot_symbol_key(exchange_key, symbol);
         let retry_after =
             current_unix_timestamp_f64() + MARKET_SNAPSHOT_UNAVAILABLE_COOLDOWN_SECONDS;
         self.market_snapshot_unavailable_until
@@ -3242,15 +3272,31 @@ impl OctobotClient {
     }
 
     async fn clear_market_snapshot_unavailable(&self, exchange_key: &str, symbol: &str) {
-        let key = market_snapshot_cooldown_key(exchange_key, symbol);
+        let key = market_snapshot_symbol_key(exchange_key, symbol);
         self.market_snapshot_unavailable_until
+            .lock()
+            .await
+            .remove(&key);
+    }
+
+    async fn mark_market_snapshot_available(&self, exchange_key: &str, symbol: &str) {
+        let key = market_snapshot_symbol_key(exchange_key, symbol);
+        self.market_snapshot_available_symbols
+            .lock()
+            .await
+            .insert(key);
+    }
+
+    async fn clear_market_snapshot_available(&self, exchange_key: &str, symbol: &str) {
+        let key = market_snapshot_symbol_key(exchange_key, symbol);
+        self.market_snapshot_available_symbols
             .lock()
             .await
             .remove(&key);
     }
 }
 
-fn market_snapshot_cooldown_key(exchange_key: &str, symbol: &str) -> String {
+fn market_snapshot_symbol_key(exchange_key: &str, symbol: &str) -> String {
     format!(
         "{}|{}",
         exchange_key.to_ascii_lowercase(),
@@ -3264,10 +3310,19 @@ fn market_snapshot_is_cooling_down(
     symbol: &str,
     now: f64,
 ) -> bool {
-    let key = market_snapshot_cooldown_key(exchange_key, symbol);
+    let key = market_snapshot_symbol_key(exchange_key, symbol);
     unavailable
         .get(&key)
         .is_some_and(|retry_after| *retry_after > now)
+}
+
+fn market_snapshot_is_known_available(
+    available: &HashSet<String>,
+    exchange_key: &str,
+    symbol: &str,
+) -> bool {
+    let key = market_snapshot_symbol_key(exchange_key, symbol);
+    available.contains(&key)
 }
 
 fn is_market_snapshot_unavailable_error(error: &str) -> bool {
