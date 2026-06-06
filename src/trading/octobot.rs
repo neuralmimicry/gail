@@ -2665,21 +2665,17 @@ fn parse_trading_page_symbol_status_rows(raw: &str) -> Vec<TradingPageSymbolStat
         };
         let exchange_name = captures
             .get(2)
-            .map(|match_| strip_html_markup(match_.as_str()))
-            .and_then(|label| {
-                if label.is_empty() || normalize_trading_symbol(&label).is_some() {
-                    None
-                } else {
-                    Some(label)
-                }
-            });
+            .and_then(|match_| parse_trading_exchange_name_label(match_.as_str()));
         let Some(exchange_name) = exchange_name else {
+            continue;
+        };
+        let Some(exchange_name_key) = normalize_exchange_name(&exchange_name) else {
             continue;
         };
         let dedupe_key = format!(
             "{}|{}|{}",
             exchange_id.to_ascii_lowercase(),
-            exchange_name.to_ascii_lowercase(),
+            exchange_name_key,
             symbol.to_ascii_uppercase()
         );
         if !seen.insert(dedupe_key) {
@@ -2692,6 +2688,33 @@ fn parse_trading_page_symbol_status_rows(raw: &str) -> Vec<TradingPageSymbolStat
         });
     }
     rows
+}
+
+fn parse_trading_exchange_name_label(raw: &str) -> Option<String> {
+    let mut label = strip_html_markup(raw);
+    if label.is_empty() || normalize_trading_symbol(&label).is_some() {
+        return None;
+    }
+
+    if let Some((head, _)) = label.split_once(':') {
+        label = head.trim().to_string();
+    }
+
+    // Some OctoBot templates append suffixes like "(Indexing 6 coins)".
+    // Strip trailing parenthetical notes to keep the canonical exchange name.
+    while label.ends_with(')') {
+        let Some(start) = label.rfind(" (") else {
+            break;
+        };
+        label.truncate(start);
+        label = label.trim().to_string();
+    }
+
+    let compact = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() || normalize_trading_symbol(&compact).is_some() {
+        return None;
+    }
+    Some(compact)
 }
 
 fn parse_symbol_status_href(href: &str) -> Option<(String, String)> {

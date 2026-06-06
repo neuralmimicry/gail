@@ -1128,7 +1128,18 @@ fn truncate(value: &str, max_chars: usize) -> String {
 }
 
 fn normalize_exchange(exchange: &str) -> String {
-    exchange.trim().to_ascii_lowercase()
+    let mut normalized = exchange.trim().to_ascii_lowercase();
+    if let Some((head, _)) = normalized.split_once(':') {
+        normalized = head.trim().to_string();
+    }
+    while normalized.ends_with(')') {
+        let Some(start) = normalized.rfind(" (") else {
+            break;
+        };
+        normalized.truncate(start);
+        normalized = normalized.trim().to_string();
+    }
+    normalized
 }
 
 fn normalize_symbol(symbol: &str) -> String {
@@ -1145,6 +1156,10 @@ mod tests {
         assert_eq!(
             market_feature_key("Binance", "bnb/usdt"),
             "binance|BNB/USDT"
+        );
+        assert_eq!(
+            market_feature_key("Bitget : NEUTRAL (Indexing 6 coins)", "doge/usdt"),
+            "bitget|DOGE/USDT"
         );
     }
 

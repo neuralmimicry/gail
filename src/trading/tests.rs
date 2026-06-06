@@ -2992,10 +2992,10 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"
                 <html><body>
-                  <a href="/symbol_market_status?exchange_id=binance-id&amp;symbol=BTC%2FUSDT">Binance</a>
-                  <a href="/symbol_market_status?exchange_id=bitget-id&amp;symbol=MEME%2FUSDT">Bitget</a>
-                  <a href="/symbol_market_status?exchange_id=kucoin-id&amp;symbol=XRP%2FUSDT">Kucoin</a>
-                  <a href="/symbol_market_status?exchange_id=xt-id&amp;symbol=DOGE%2FUSDT">Xt</a>
+                  <a href="/symbol_market_status?exchange_id=binance-id&amp;symbol=BTC%2FUSDT">Binance : NEUTRAL (Indexing 6 coins)</a>
+                  <a href="/symbol_market_status?exchange_id=bitget-id&amp;symbol=MEME%2FUSDT">Bitget : NEUTRAL (Indexing 6 coins)</a>
+                  <a href="/symbol_market_status?exchange_id=kucoin-id&amp;symbol=XRP%2FUSDT">Kucoin : NEUTRAL (Indexing 6 coins)</a>
+                  <a href="/symbol_market_status?exchange_id=xt-id&amp;symbol=DOGE%2FUSDT">Xt : NEUTRAL (Indexing 6 coins)</a>
                 </body></html>
                 "#,
             ))
@@ -3030,6 +3030,10 @@ mod tests {
         assert!(exchanges.iter().any(|entry| entry.name == "bitget"));
         assert!(exchanges.iter().any(|entry| entry.name == "kucoin"));
         assert!(exchanges.iter().any(|entry| entry.name == "xt"));
+        assert!(
+            exchanges.iter().all(|entry| !entry.name.contains(':')),
+            "exchange names should be canonicalized without status suffixes"
+        );
 
         let bitget = exchanges
             .iter()
