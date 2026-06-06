@@ -10,7 +10,11 @@
 ///   order cancellation, market snapshots, and general status. Live order
 ///   placement is attempted through known `/api/orders` and `/api/user_command`
 ///   variants to support native OctoBot and custom bridge extensions.
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -21,6 +25,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tracing::{debug, warn};
+use url::form_urlencoded;
 
 use crate::{
     adaptive_schema::{self, AdaptiveApiSchema},
@@ -29,6 +34,7 @@ use crate::{
 
 const OCTOBOT_API: &str = "octobot";
 const MAX_PARALLEL_MARKET_SNAPSHOT_REQUESTS: usize = 8;
+const MARKET_SNAPSHOT_CANDIDATE_MULTIPLIER: usize = 6;
 
 // ---------------------------------------------------------------------------
 // Domain models
@@ -84,6 +90,21 @@ pub struct OctobotExchange {
     pub name: String,
     pub enabled: bool,
     pub symbols: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct TradingPageSymbolStatusRow {
+    exchange_id: String,
+    exchange_name: String,
+    symbol: String,
+}
+
+#[derive(Clone, Debug)]
+struct ExchangeInfoEntry {
+    name: String,
+    enabled: bool,
+    symbols: Vec<String>,
+    exchange_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -147,6 +168,12 @@ pub struct OctobotClient {
     /// order. Once one mode is positively acknowledged, future orders try it
     /// first, but can still fall back if that mode later fails.
     preferred_order_submission_mode: Arc<Mutex<Option<OctobotOrderSubmissionMode>>>,
+
+    /// Exchange name → OctoBot exchange_id mapping discovered from API/HTML surfaces.
+    exchange_id_by_name: Arc<Mutex<HashMap<String, String>>>,
+
+    /// Rotating scan offsets used to poll different subsets of symbols over time.
+    symbol_scan_offsets: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl OctobotClient {
@@ -178,6 +205,8 @@ impl OctobotClient {
             password: password.map(str::to_string),
             api_schema: Arc::new(Mutex::new(api_schema)),
             preferred_order_submission_mode: Arc::new(Mutex::new(None)),
+            exchange_id_by_name: Arc::new(Mutex::new(HashMap::new())),
+            symbol_scan_offsets: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -912,53 +941,121 @@ impl OctobotClient {
     // -----------------------------------------------------------------------
 
     pub async fn get_exchange_info(&self) -> Result<Vec<OctobotExchange>, String> {
-        // Primary path for modern OctoBot builds: explicit first-exchange
-        // endpoint plus symbol discovery from config/runtime routes.
-        let exchange_body = self
+        let mut exchanges_by_key: HashMap<String, OctobotExchange> = HashMap::new();
+        let mut exchange_ids_by_key: HashMap<String, String> = HashMap::new();
+        let mut trading_symbols_by_exchange: HashMap<String, HashSet<String>> = HashMap::new();
+
+        if let Some(exchange_body) = self
             .get_optional_json("/api/first_exchange_details", "first exchange details")
-            .await?;
-        if let Some(exchange_body) = exchange_body {
+            .await?
+        {
             let exchange_data = unwrap_octobot_data(&exchange_body);
-            let exchange_name = exchange_data
+            if let Some(exchange_name_key) = exchange_data
                 .get("exchange_name")
                 .or_else(|| exchange_data.get("name"))
                 .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_string();
-            let symbols = self
-                .configured_symbols(Some(exchange_name.as_str()))
-                .await
-                .unwrap_or_default();
-            return Ok(vec![OctobotExchange {
-                name: exchange_name,
-                enabled: true,
-                symbols,
-            }]);
+                .and_then(normalize_exchange_name)
+            {
+                exchanges_by_key
+                    .entry(exchange_name_key.clone())
+                    .or_insert_with(|| OctobotExchange {
+                        name: exchange_name_key.clone(),
+                        enabled: true,
+                        symbols: Vec::new(),
+                    });
+                if let Some(exchange_id) = exchange_data
+                    .get("exchange_id")
+                    .or_else(|| exchange_data.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    exchange_ids_by_key.insert(exchange_name_key, exchange_id.to_string());
+                }
+            }
         }
 
         if let Some(body) = self
             .get_optional_json("/api/exchanges", "exchanges")
             .await?
         {
-            // Older/custom builds may still expose `/api/exchanges`; enrich
-            // symbol lists if the endpoint omits them.
-            let mut exchanges = parse_exchange_info_array(&body);
-            for exchange in &mut exchanges {
-                if exchange.symbols.is_empty() {
-                    exchange.symbols = self
-                        .configured_symbols(Some(exchange.name.as_str()))
-                        .await
-                        .unwrap_or_default();
+            for entry in parse_exchange_info_entries(&body) {
+                let Some(exchange_name_key) = normalize_exchange_name(&entry.name) else {
+                    continue;
+                };
+                let exchange = exchanges_by_key
+                    .entry(exchange_name_key.clone())
+                    .or_insert_with(|| OctobotExchange {
+                        name: exchange_name_key.clone(),
+                        enabled: entry.enabled,
+                        symbols: Vec::new(),
+                    });
+                exchange.enabled |= entry.enabled;
+                if let Some(exchange_id) = entry.exchange_id {
+                    exchange_ids_by_key
+                        .entry(exchange_name_key.clone())
+                        .or_insert(exchange_id);
                 }
-                exchange.symbols.sort();
-                exchange.symbols.dedup();
-            }
-            if !exchanges.is_empty() {
-                return Ok(exchanges);
+                for symbol in entry.symbols {
+                    trading_symbols_by_exchange
+                        .entry(exchange_name_key.clone())
+                        .or_default()
+                        .insert(symbol);
+                }
             }
         }
 
-        Ok(Vec::new())
+        if let Some(trading_page_html) = self.get_optional_text("/trading", "trading page").await? {
+            for row in parse_trading_page_symbol_status_rows(&trading_page_html) {
+                let Some(exchange_name_key) = normalize_exchange_name(&row.exchange_name) else {
+                    continue;
+                };
+                exchanges_by_key
+                    .entry(exchange_name_key.clone())
+                    .or_insert_with(|| OctobotExchange {
+                        name: exchange_name_key.clone(),
+                        enabled: true,
+                        symbols: Vec::new(),
+                    });
+                exchange_ids_by_key
+                    .entry(exchange_name_key.clone())
+                    .or_insert(row.exchange_id);
+                if let Some(symbol) = normalize_trading_symbol(&row.symbol) {
+                    trading_symbols_by_exchange
+                        .entry(exchange_name_key)
+                        .or_default()
+                        .insert(symbol);
+                }
+            }
+        }
+
+        if exchanges_by_key.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        for exchange in exchanges_by_key.values_mut() {
+            let mut symbols = self
+                .configured_symbols(Some(exchange.name.as_str()))
+                .await
+                .unwrap_or_default();
+            if let Some(extra_symbols) = trading_symbols_by_exchange.get(&exchange.name) {
+                symbols.extend(extra_symbols.iter().cloned());
+            }
+            symbols.sort();
+            symbols.dedup();
+            exchange.symbols = symbols;
+        }
+
+        {
+            let mut cache = self.exchange_id_by_name.lock().await;
+            for (exchange_name_key, exchange_id) in exchange_ids_by_key {
+                cache.insert(exchange_name_key, exchange_id);
+            }
+        }
+
+        let mut exchanges = exchanges_by_key.into_values().collect::<Vec<_>>();
+        exchanges.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(exchanges)
     }
 
     async fn configured_symbols(&self, exchange_name: Option<&str>) -> Result<Vec<String>, String> {
@@ -987,6 +1084,47 @@ impl OctobotClient {
                 }
             }
         }
+        symbols.sort();
+        symbols.dedup();
+
+        // Enrich configured pairs with exchange-listed symbols to broaden
+        // candidate discovery beyond the currently watched subset.
+        if let Some(exchange_name) = exchange_name {
+            let configured_quotes: HashSet<String> = symbols
+                .iter()
+                .filter_map(|symbol| symbol_quote_asset(symbol))
+                .map(str::to_string)
+                .collect();
+
+            let mut discovered_symbols = match self.exchange_symbols(exchange_name).await {
+                Ok(symbols) => symbols,
+                Err(err) => {
+                    debug!(
+                        "trading: exchange symbol enrichment failed for {}: {}",
+                        exchange_name, err
+                    );
+                    Vec::new()
+                }
+            };
+
+            if !configured_quotes.is_empty() {
+                discovered_symbols.retain(|symbol| {
+                    symbol_quote_asset(symbol)
+                        .is_some_and(|quote| configured_quotes.contains(quote))
+                });
+            }
+
+            let mut seen_symbols: HashSet<String> = symbols
+                .iter()
+                .map(|symbol| symbol.to_ascii_uppercase())
+                .collect();
+            for symbol in discovered_symbols {
+                if seen_symbols.insert(symbol.to_ascii_uppercase()) {
+                    symbols.push(symbol);
+                }
+            }
+        }
+
         // Fallback order is intentionally progressive:
         // 1) configured pairs
         // 2) exchange market universe
@@ -995,11 +1133,6 @@ impl OctobotClient {
         //
         // This keeps symbols useful across OctoBot editions where any one
         // endpoint can be disabled, empty, or unavailable.
-        if symbols.is_empty()
-            && let Some(exchange_name) = exchange_name
-        {
-            symbols.extend(self.exchange_symbols(exchange_name).await?);
-        }
         if symbols.is_empty() {
             symbols.extend(self.currency_list_symbols().await?);
         }
@@ -1014,8 +1147,6 @@ impl OctobotClient {
         {
             symbols.push(symbol);
         }
-        symbols.sort();
-        symbols.dedup();
         Ok(symbols)
     }
 
@@ -1054,12 +1185,22 @@ impl OctobotClient {
     ) -> Result<MarketSnapshot, String> {
         // Prefer dashboard routes in current OctoBot builds.
         let web_symbol = symbol.replace('/', "|");
-        if let Some((exchange_id, time_frame)) = self.watched_symbol_context(symbol).await? {
+        if let Some((exchange_id, time_frame)) =
+            self.watched_symbol_context(exchange, symbol).await?
+        {
             let graph_path = format!(
                 "/dashboard/currency_price_graph_update/{exchange_id}/{web_symbol}/{time_frame}/live?display_orders=false"
             );
             if let Some(graph) = self.get_optional_json(&graph_path, "price graph").await? {
-                return Ok(parse_graph_snapshot(exchange, symbol, &graph));
+                if let Some(snapshot) = parse_graph_snapshot(exchange, symbol, &graph) {
+                    return Ok(snapshot);
+                }
+                if let Some(error) = graph_error_message(&graph) {
+                    debug!(
+                        "trading: dashboard graph had no usable data for {}/{}: {}",
+                        exchange, symbol, error
+                    );
+                }
             }
         }
 
@@ -1085,7 +1226,8 @@ impl OctobotClient {
         time_frame: &str,
     ) -> Result<Vec<MarketSnapshot>, String> {
         let web_symbol = symbol.replace('/', "|");
-        let Some((exchange_id, default_time_frame)) = self.watched_symbol_context(symbol).await?
+        let Some((exchange_id, default_time_frame)) =
+            self.watched_symbol_context(exchange, symbol).await?
         else {
             return Ok(Vec::new());
         };
@@ -1113,33 +1255,65 @@ impl OctobotClient {
 
     async fn watched_symbol_context(
         &self,
+        exchange: &str,
         symbol: &str,
     ) -> Result<Option<(String, String)>, String> {
+        let exchange_id_hint = self.exchange_id_for_exchange_name(exchange).await?;
         let web_symbol = symbol.replace('/', "|");
         let watched_path = format!("/dashboard/watched_symbol/{web_symbol}");
-        let Some(watched) = self
+        let mut watched_exchange_id = None;
+        let mut time_frame = "1h".to_string();
+
+        if let Some(watched) = self
             .get_optional_json(&watched_path, "watched symbol")
             .await?
-        else {
+        {
+            watched_exchange_id = watched
+                .get("exchange_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            time_frame = watched
+                .get("time_frame")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("1h")
+                .to_string();
+        }
+
+        let Some(exchange_id) = exchange_id_hint.or(watched_exchange_id) else {
             return Ok(None);
         };
-        let exchange_id = watched
-            .get("exchange_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        let Some(exchange_id) = exchange_id else {
-            return Ok(None);
-        };
-        let time_frame = watched
-            .get("time_frame")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("1h")
-            .to_string();
         Ok(Some((exchange_id, time_frame)))
+    }
+
+    async fn exchange_id_for_exchange_name(
+        &self,
+        exchange_name: &str,
+    ) -> Result<Option<String>, String> {
+        let Some(exchange_name_key) = normalize_exchange_name(exchange_name) else {
+            return Ok(None);
+        };
+
+        if let Some(exchange_id) = self
+            .exchange_id_by_name
+            .lock()
+            .await
+            .get(&exchange_name_key)
+            .cloned()
+        {
+            return Ok(Some(exchange_id));
+        }
+
+        let _ = self.get_exchange_info().await?;
+        Ok(self
+            .exchange_id_by_name
+            .lock()
+            .await
+            .get(&exchange_name_key)
+            .cloned())
     }
 
     pub async fn get_recent_logs(&self, limit: usize) -> Result<Vec<OctobotLogEntry>, String> {
@@ -1674,41 +1848,85 @@ fn order_result_numeric_field(
     })
 }
 
-fn parse_exchange_info_array(body: &Value) -> Vec<OctobotExchange> {
-    let mut exchanges = Vec::new();
-    if let Some(arr) = body.as_array() {
-        for entry in arr {
-            let exchange = OctobotExchange {
-                name: entry
-                    .get("name")
-                    .or_else(|| entry.get("id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string(),
-                enabled: entry
-                    .get("enabled")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true),
-                symbols: entry
-                    .get("symbols")
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(Value::as_str)
-                            .filter_map(normalize_trading_symbol)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            };
-            exchanges.push(exchange);
+fn parse_exchange_info_entries(body: &Value) -> Vec<ExchangeInfoEntry> {
+    let mut entries = Vec::new();
+
+    if let Some(array) = body
+        .as_array()
+        .or_else(|| body.get("exchanges").and_then(Value::as_array))
+        .or_else(|| unwrap_octobot_data(body).as_array())
+    {
+        for entry in array {
+            if let Some(parsed) = parse_exchange_info_entry(entry, None) {
+                entries.push(parsed);
+            }
+        }
+        return entries;
+    }
+
+    if let Some(object) = body
+        .as_object()
+        .or_else(|| unwrap_octobot_data(body).as_object())
+    {
+        for (fallback_name, entry) in object {
+            if let Some(parsed) = parse_exchange_info_entry(entry, Some(fallback_name)) {
+                entries.push(parsed);
+            }
         }
     }
-    exchanges
+
+    entries
+}
+
+fn parse_exchange_info_entry(
+    value: &Value,
+    fallback_name: Option<&str>,
+) -> Option<ExchangeInfoEntry> {
+    let name = value
+        .get("name")
+        .or_else(|| value.get("exchange_name"))
+        .and_then(Value::as_str)
+        .or(fallback_name)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let enabled = value
+        .get("enabled")
+        .or_else(|| value.get("is_enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let mut symbols = value
+        .get("symbols")
+        .or_else(|| value.get("markets"))
+        .map(parse_trading_symbol_candidates)
+        .unwrap_or_default();
+    if symbols.is_empty() {
+        symbols = parse_trading_symbol_candidates(value);
+    }
+    symbols.sort();
+    symbols.dedup();
+
+    let exchange_id = value
+        .get("exchange_id")
+        .or_else(|| value.get("exchangeId"))
+        .or_else(|| value.get("uuid"))
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    Some(ExchangeInfoEntry {
+        name,
+        enabled,
+        symbols,
+        exchange_id,
+    })
 }
 
 fn normalize_trading_symbol(raw: &str) -> Option<String> {
     let candidate = raw.trim().replace('|', "/");
-    if candidate.is_empty() || !candidate.contains('/') {
+    if candidate.is_empty() || !is_supported_spot_symbol(&candidate) {
         return None;
     }
     Some(candidate)
@@ -1775,9 +1993,12 @@ fn parse_ticker_snapshot(exchange: &str, symbol: &str, body: &Value) -> MarketSn
     }
 }
 
-fn parse_graph_snapshot(exchange: &str, symbol: &str, body: &Value) -> MarketSnapshot {
+fn parse_graph_snapshot(exchange: &str, symbol: &str, body: &Value) -> Option<MarketSnapshot> {
     let candles = body.get("candles").unwrap_or(&Value::Null);
     let closes = value_array(candles, "close");
+    if closes.as_ref().is_none_or(Vec::is_empty) {
+        return None;
+    }
     let highs = value_array(candles, "high");
     let lows = value_array(candles, "low");
     let volumes = value_array(candles, "volume").or_else(|| value_array(candles, "vol"));
@@ -1789,7 +2010,7 @@ fn parse_graph_snapshot(exchange: &str, symbol: &str, body: &Value) -> MarketSna
     let price_change_pct_24h = first_close
         .filter(|first| first.abs() > f64::EPSILON)
         .map(|first| ((price - first) / first) * 100.0);
-    MarketSnapshot {
+    Some(MarketSnapshot {
         exchange: exchange.to_string(),
         symbol: symbol.to_string(),
         price,
@@ -1804,7 +2025,7 @@ fn parse_graph_snapshot(exchange: &str, symbol: &str, body: &Value) -> MarketSna
             .as_ref()
             .and_then(|items| items.iter().copied().reduce(f64::min)),
         fetched_at: current_unix_timestamp_f64(),
-    }
+    })
 }
 
 fn parse_graph_history_snapshots(
@@ -1865,6 +2086,38 @@ fn value_array(body: &Value, key: &str) -> Option<Vec<f64>> {
             })
             .collect::<Vec<_>>()
     })
+}
+
+fn split_symbol_assets(symbol: &str) -> Option<(&str, &str)> {
+    let (base, quote) = symbol.split_once('/')?;
+    if base.contains('/') || quote.contains('/') {
+        return None;
+    }
+    Some((base, quote))
+}
+
+fn symbol_quote_asset(symbol: &str) -> Option<&str> {
+    split_symbol_assets(symbol).map(|(_, quote)| quote)
+}
+
+fn is_supported_spot_symbol(symbol: &str) -> bool {
+    let Some((base, quote)) = split_symbol_assets(symbol) else {
+        return false;
+    };
+    if base.is_empty() || quote.is_empty() || quote.len() < 3 {
+        return false;
+    }
+    base.chars().all(|ch| ch.is_ascii_alphanumeric())
+        && quote.chars().all(|ch| ch.is_ascii_alphanumeric())
+}
+
+fn graph_error_message(body: &Value) -> Option<String> {
+    body.get("error")
+        .or_else(|| body.get("message"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_string)
 }
 
 fn value_string_array(body: &Value, key: &str) -> Option<Vec<String>> {
@@ -2393,6 +2646,90 @@ fn normalize_exchange_name(value: &str) -> Option<String> {
     Some(trimmed.to_ascii_lowercase())
 }
 
+fn parse_trading_page_symbol_status_rows(raw: &str) -> Vec<TradingPageSymbolStatusRow> {
+    static SYMBOL_STATUS_LINK_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r#"(?is)<a[^>]+href\s*=\s*["']([^"']*symbol_market_status\?[^"']*)["'][^>]*>(.*?)</a>"#,
+        )
+        .expect("valid symbol market status link regex")
+    });
+
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+    for captures in SYMBOL_STATUS_LINK_RE.captures_iter(raw) {
+        let Some(href_raw) = captures.get(1).map(|match_| match_.as_str()) else {
+            continue;
+        };
+        let Some((exchange_id, symbol)) = parse_symbol_status_href(href_raw) else {
+            continue;
+        };
+        let exchange_name = captures
+            .get(2)
+            .map(|match_| strip_html_markup(match_.as_str()))
+            .and_then(|label| {
+                if label.is_empty() || normalize_trading_symbol(&label).is_some() {
+                    None
+                } else {
+                    Some(label)
+                }
+            });
+        let Some(exchange_name) = exchange_name else {
+            continue;
+        };
+        let dedupe_key = format!(
+            "{}|{}|{}",
+            exchange_id.to_ascii_lowercase(),
+            exchange_name.to_ascii_lowercase(),
+            symbol.to_ascii_uppercase()
+        );
+        if !seen.insert(dedupe_key) {
+            continue;
+        }
+        rows.push(TradingPageSymbolStatusRow {
+            exchange_id,
+            exchange_name,
+            symbol,
+        });
+    }
+    rows
+}
+
+fn parse_symbol_status_href(href: &str) -> Option<(String, String)> {
+    let decoded_href = decode_basic_html_entities(href);
+    let query = decoded_href
+        .split_once('?')
+        .map(|(_, query)| query)
+        .unwrap_or(decoded_href.as_str())
+        .split('#')
+        .next()
+        .unwrap_or_default();
+
+    let mut exchange_id = None;
+    let mut symbol = None;
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        if key.eq_ignore_ascii_case("exchange_id") {
+            exchange_id = Some(value.trim().to_string());
+        } else if key.eq_ignore_ascii_case("symbol") {
+            symbol = normalize_trading_symbol(value.replace('|', "/").as_str());
+        }
+    }
+
+    let exchange_id = exchange_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    let symbol = symbol?;
+    Some((exchange_id, symbol))
+}
+
+fn strip_html_markup(value: &str) -> String {
+    static HTML_TAG_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?is)<[^>]+>").expect("valid html tag regex"));
+    decode_basic_html_entities(HTML_TAG_RE.replace_all(value, " ").as_ref())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[derive(Clone, Debug, Default)]
 struct HtmlTableCell {
     text: String,
@@ -2609,6 +2946,26 @@ impl OctobotClient {
         target_currencies: &[String],
         limit: usize,
     ) -> Vec<MarketSnapshot> {
+        #[derive(Clone, Debug)]
+        struct ExchangeTargetState {
+            exchange_name: String,
+            exchange_key: String,
+            symbols: Vec<String>,
+            start_offset: usize,
+            consumed: usize,
+        }
+
+        #[derive(Clone, Debug)]
+        struct MarketTarget {
+            exchange_name: String,
+            exchange_key: String,
+            symbol: String,
+        }
+
+        let limit = limit.max(1);
+        let candidate_limit = limit
+            .saturating_mul(MARKET_SNAPSHOT_CANDIDATE_MULTIPLIER)
+            .max(limit);
         let exchanges = match self.get_exchange_info().await {
             Ok(exs) => exs,
             Err(err) => {
@@ -2616,93 +2973,197 @@ impl OctobotClient {
                 return Vec::new();
             }
         };
-        let mut targets: Vec<(String, String)> = Vec::new();
-        'outer: for exchange in exchanges.iter().filter(|e| e.enabled) {
+        let offset_snapshot = self.symbol_scan_offsets.lock().await.clone();
+
+        let mut states: Vec<ExchangeTargetState> = Vec::new();
+        for exchange in exchanges.iter().filter(|exchange| exchange.enabled) {
             if !target_exchanges.is_empty()
                 && !target_exchanges
                     .iter()
-                    .any(|t| t.eq_ignore_ascii_case(&exchange.name))
+                    .any(|candidate| candidate.eq_ignore_ascii_case(&exchange.name))
             {
                 continue;
             }
-            for symbol in exchange.symbols.iter().take(limit) {
-                if !target_currencies.is_empty()
-                    && !target_currencies
-                        .iter()
-                        .any(|t| t.eq_ignore_ascii_case(symbol))
-                {
+            let mut symbols = exchange
+                .symbols
+                .iter()
+                .filter(|symbol| {
+                    target_currencies.is_empty()
+                        || target_currencies
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(symbol))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if symbols.is_empty() {
+                continue;
+            }
+            symbols.sort();
+            symbols.dedup();
+            if symbols.is_empty() {
+                continue;
+            }
+            let Some(exchange_key) = normalize_exchange_name(&exchange.name) else {
+                continue;
+            };
+            let start_offset =
+                offset_snapshot.get(&exchange_key).copied().unwrap_or(0) % symbols.len();
+            states.push(ExchangeTargetState {
+                exchange_name: exchange.name.clone(),
+                exchange_key,
+                symbols,
+                start_offset,
+                consumed: 0,
+            });
+        }
+
+        let mut targets: Vec<MarketTarget> = Vec::new();
+        while targets.len() < candidate_limit {
+            let mut progressed = false;
+            for state in &mut states {
+                if targets.len() >= candidate_limit || state.consumed >= state.symbols.len() {
                     continue;
                 }
-                targets.push((exchange.name.clone(), symbol.clone()));
-                if targets.len() >= limit {
-                    break 'outer;
-                }
+                let index = (state.start_offset + state.consumed) % state.symbols.len();
+                targets.push(MarketTarget {
+                    exchange_name: state.exchange_name.clone(),
+                    exchange_key: state.exchange_key.clone(),
+                    symbol: state.symbols[index].clone(),
+                });
+                state.consumed += 1;
+                progressed = true;
+            }
+            if !progressed {
+                break;
             }
         }
+
         if targets.is_empty() {
             return Vec::new();
         }
 
+        let mut requested_by_exchange: HashMap<String, usize> = HashMap::new();
         let mut snapshots = Vec::new();
-        let mut join_set: JoinSet<(String, String, Result<MarketSnapshot, String>)> =
+        let mut join_set: JoinSet<(String, String, String, Result<MarketSnapshot, String>)> =
             JoinSet::new();
         let mut pending = targets.into_iter();
         let max_parallel = MAX_PARALLEL_MARKET_SNAPSHOT_REQUESTS.max(1);
         for _ in 0..max_parallel {
-            let Some((exchange, symbol)) = pending.next() else {
+            let Some(target) = pending.next() else {
                 break;
             };
+            *requested_by_exchange
+                .entry(target.exchange_key.clone())
+                .or_insert(0) += 1;
             let client = self.clone();
             join_set.spawn(async move {
-                let result = client.get_market_snapshot(&exchange, &symbol).await;
-                (exchange, symbol, result)
+                let result = client
+                    .get_market_snapshot(&target.exchange_name, &target.symbol)
+                    .await;
+                (
+                    target.exchange_name,
+                    target.exchange_key,
+                    target.symbol,
+                    result,
+                )
             });
         }
 
         while let Some(result) = join_set.join_next().await {
             match result {
-                Ok((_exchange, _symbol, Ok(snapshot))) => {
+                Ok((_exchange, _exchange_key, _symbol, Ok(snapshot))) => {
                     snapshots.push(snapshot);
                     if snapshots.len() >= limit {
                         join_set.abort_all();
                         break;
                     }
-                    if let Some((next_exchange, next_symbol)) = pending.next() {
+                    if let Some(next_target) = pending.next() {
+                        *requested_by_exchange
+                            .entry(next_target.exchange_key.clone())
+                            .or_insert(0) += 1;
                         let client = self.clone();
                         join_set.spawn(async move {
                             let result = client
-                                .get_market_snapshot(&next_exchange, &next_symbol)
+                                .get_market_snapshot(
+                                    &next_target.exchange_name,
+                                    &next_target.symbol,
+                                )
                                 .await;
-                            (next_exchange, next_symbol, result)
+                            (
+                                next_target.exchange_name,
+                                next_target.exchange_key,
+                                next_target.symbol,
+                                result,
+                            )
                         });
                     }
                 }
-                Ok((exchange, symbol, Err(err))) => {
+                Ok((exchange, exchange_key, symbol, Err(err))) => {
                     warn!("trading: ticker {}/{} failed: {}", exchange, symbol, err);
-                    if let Some((next_exchange, next_symbol)) = pending.next() {
+                    let _ = exchange_key;
+                    if let Some(next_target) = pending.next() {
+                        *requested_by_exchange
+                            .entry(next_target.exchange_key.clone())
+                            .or_insert(0) += 1;
                         let client = self.clone();
                         join_set.spawn(async move {
                             let result = client
-                                .get_market_snapshot(&next_exchange, &next_symbol)
+                                .get_market_snapshot(
+                                    &next_target.exchange_name,
+                                    &next_target.symbol,
+                                )
                                 .await;
-                            (next_exchange, next_symbol, result)
+                            (
+                                next_target.exchange_name,
+                                next_target.exchange_key,
+                                next_target.symbol,
+                                result,
+                            )
                         });
                     }
                 }
                 Err(error) => {
                     warn!("trading: market snapshot task failed: {}", error);
-                    if let Some((next_exchange, next_symbol)) = pending.next() {
+                    if let Some(next_target) = pending.next() {
+                        *requested_by_exchange
+                            .entry(next_target.exchange_key.clone())
+                            .or_insert(0) += 1;
                         let client = self.clone();
                         join_set.spawn(async move {
                             let result = client
-                                .get_market_snapshot(&next_exchange, &next_symbol)
+                                .get_market_snapshot(
+                                    &next_target.exchange_name,
+                                    &next_target.symbol,
+                                )
                                 .await;
-                            (next_exchange, next_symbol, result)
+                            (
+                                next_target.exchange_name,
+                                next_target.exchange_key,
+                                next_target.symbol,
+                                result,
+                            )
                         });
                     }
                 }
             }
         }
+
+        {
+            let mut offsets = self.symbol_scan_offsets.lock().await;
+            for state in states {
+                if state.symbols.is_empty() {
+                    continue;
+                }
+                let requested = requested_by_exchange
+                    .get(&state.exchange_key)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(state.symbols.len());
+                let next_offset = (state.start_offset + requested) % state.symbols.len();
+                offsets.insert(state.exchange_key, next_offset);
+            }
+        }
+
         snapshots
     }
 }
