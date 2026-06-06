@@ -34,7 +34,8 @@ use crate::{
 
 const OCTOBOT_API: &str = "octobot";
 const MAX_PARALLEL_MARKET_SNAPSHOT_REQUESTS: usize = 8;
-const MARKET_SNAPSHOT_CANDIDATE_MULTIPLIER: usize = 6;
+const MARKET_SNAPSHOT_CANDIDATE_MULTIPLIER: usize = 1;
+const MARKET_SNAPSHOT_UNAVAILABLE_COOLDOWN_SECONDS: f64 = 3_600.0;
 
 // ---------------------------------------------------------------------------
 // Domain models
@@ -174,6 +175,10 @@ pub struct OctobotClient {
 
     /// Rotating scan offsets used to poll different subsets of symbols over time.
     symbol_scan_offsets: Arc<Mutex<HashMap<String, usize>>>,
+
+    /// Exchange+symbol pairs that recently returned no market data. Avoid
+    /// immediately retrying these pairs on every cycle.
+    market_snapshot_unavailable_until: Arc<Mutex<HashMap<String, f64>>>,
 }
 
 impl OctobotClient {
@@ -207,6 +212,7 @@ impl OctobotClient {
             preferred_order_submission_mode: Arc::new(Mutex::new(None)),
             exchange_id_by_name: Arc::new(Mutex::new(HashMap::new())),
             symbol_scan_offsets: Arc::new(Mutex::new(HashMap::new())),
+            market_snapshot_unavailable_until: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -3012,6 +3018,12 @@ impl OctobotClient {
                 return Vec::new();
             }
         };
+        let now = current_unix_timestamp_f64();
+        let unavailable_snapshot = {
+            let mut cache = self.market_snapshot_unavailable_until.lock().await;
+            cache.retain(|_, retry_after| *retry_after > now);
+            cache.clone()
+        };
         let offset_snapshot = self.symbol_scan_offsets.lock().await.clone();
 
         let mut states: Vec<ExchangeTargetState> = Vec::new();
@@ -3023,6 +3035,9 @@ impl OctobotClient {
             {
                 continue;
             }
+            let Some(exchange_key) = normalize_exchange_name(&exchange.name) else {
+                continue;
+            };
             let mut symbols = exchange
                 .symbols
                 .iter()
@@ -3031,6 +3046,14 @@ impl OctobotClient {
                         || target_currencies
                             .iter()
                             .any(|candidate| candidate.eq_ignore_ascii_case(symbol))
+                })
+                .filter(|symbol| {
+                    !market_snapshot_is_cooling_down(
+                        &unavailable_snapshot,
+                        &exchange_key,
+                        symbol,
+                        now,
+                    )
                 })
                 .cloned()
                 .collect::<Vec<_>>();
@@ -3042,9 +3065,6 @@ impl OctobotClient {
             if symbols.is_empty() {
                 continue;
             }
-            let Some(exchange_key) = normalize_exchange_name(&exchange.name) else {
-                continue;
-            };
             let start_offset =
                 offset_snapshot.get(&exchange_key).copied().unwrap_or(0) % symbols.len();
             states.push(ExchangeTargetState {
@@ -3110,7 +3130,9 @@ impl OctobotClient {
 
         while let Some(result) = join_set.join_next().await {
             match result {
-                Ok((_exchange, _exchange_key, _symbol, Ok(snapshot))) => {
+                Ok((_exchange, exchange_key, symbol, Ok(snapshot))) => {
+                    self.clear_market_snapshot_unavailable(&exchange_key, &symbol)
+                        .await;
                     snapshots.push(snapshot);
                     if snapshots.len() >= limit {
                         join_set.abort_all();
@@ -3138,8 +3160,11 @@ impl OctobotClient {
                     }
                 }
                 Ok((exchange, exchange_key, symbol, Err(err))) => {
+                    if is_market_snapshot_unavailable_error(&err) {
+                        self.mark_market_snapshot_unavailable(&exchange_key, &symbol)
+                            .await;
+                    }
                     warn!("trading: ticker {}/{} failed: {}", exchange, symbol, err);
-                    let _ = exchange_key;
                     if let Some(next_target) = pending.next() {
                         *requested_by_exchange
                             .entry(next_target.exchange_key.clone())
@@ -3205,6 +3230,48 @@ impl OctobotClient {
 
         snapshots
     }
+
+    async fn mark_market_snapshot_unavailable(&self, exchange_key: &str, symbol: &str) {
+        let key = market_snapshot_cooldown_key(exchange_key, symbol);
+        let retry_after =
+            current_unix_timestamp_f64() + MARKET_SNAPSHOT_UNAVAILABLE_COOLDOWN_SECONDS;
+        self.market_snapshot_unavailable_until
+            .lock()
+            .await
+            .insert(key, retry_after);
+    }
+
+    async fn clear_market_snapshot_unavailable(&self, exchange_key: &str, symbol: &str) {
+        let key = market_snapshot_cooldown_key(exchange_key, symbol);
+        self.market_snapshot_unavailable_until
+            .lock()
+            .await
+            .remove(&key);
+    }
+}
+
+fn market_snapshot_cooldown_key(exchange_key: &str, symbol: &str) -> String {
+    format!(
+        "{}|{}",
+        exchange_key.to_ascii_lowercase(),
+        symbol.to_ascii_uppercase()
+    )
+}
+
+fn market_snapshot_is_cooling_down(
+    unavailable: &HashMap<String, f64>,
+    exchange_key: &str,
+    symbol: &str,
+    now: f64,
+) -> bool {
+    let key = market_snapshot_cooldown_key(exchange_key, symbol);
+    unavailable
+        .get(&key)
+        .is_some_and(|retry_after| *retry_after > now)
+}
+
+fn is_market_snapshot_unavailable_error(error: &str) -> bool {
+    error.contains("no dashboard or ticker endpoint returned data")
 }
 
 // ---------------------------------------------------------------------------

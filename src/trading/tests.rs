@@ -3991,7 +3991,7 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path_regex(r"^/dashboard/watched_symbol/S15(%7C|\|)USDT$"))
+            .and(path_regex(r"^/dashboard/watched_symbol/S03(%7C|\|)USDT$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "exchange_id": "binance-id",
                 "time_frame": "1h"
@@ -4028,6 +4028,111 @@ mod tests {
         let client = OctobotClient::new(&server.uri(), None, 10.0);
         let _ = client.get_all_market_snapshots(&[], &[], 2).await;
         let _ = client.get_all_market_snapshots(&[], &[], 2).await;
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_get_all_market_snapshots_cools_down_unavailable_symbols() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/first_exchange_details"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exchange_name": "binance",
+                "exchange_id": "binance-id"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/exchanges"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/trading"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/get_config_currency"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/get_all_symbols/binance"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!(["BAD/USDT", "GOOD/USDT"])),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/dashboard/watched_symbol/BAD(%7C|\|)USDT$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exchange_id": "binance-id",
+                "time_frame": "1h"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/dashboard/watched_symbol/GOOD(%7C|\|)USDT$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exchange_id": "binance-id",
+                "time_frame": "1h"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/dashboard/currency_price_graph_update/binance-id/BAD(%7C|\|)USDT/1h/live$",
+            ))
+            .and(query_param("display_orders", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "error": "No data"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/market/ticker"))
+            .and(query_param("exchange", "binance"))
+            .and(query_param("symbol", "BAD/USDT"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/dashboard/currency_price_graph_update/binance-id/GOOD(%7C|\|)USDT/1h/live$",
+            ))
+            .and(query_param("display_orders", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "candles": {
+                    "close": [1.0, 1.05],
+                    "high": [1.01, 1.06],
+                    "low": [0.99, 1.0],
+                    "volume": [100.0, 120.0]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let first = client.get_all_market_snapshots(&[], &[], 1).await;
+        assert_eq!(first.len(), 0);
+        let second = client.get_all_market_snapshots(&[], &[], 1).await;
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].symbol, "GOOD/USDT");
         server.verify().await;
     }
 
