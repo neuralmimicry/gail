@@ -1034,15 +1034,31 @@ impl OctobotClient {
         }
 
         for exchange in exchanges_by_key.values_mut() {
-            let mut symbols = self
+            let mut configured_symbols = self
                 .configured_symbols(Some(exchange.name.as_str()))
                 .await
                 .unwrap_or_default();
-            if let Some(extra_symbols) = trading_symbols_by_exchange.get(&exchange.name) {
-                symbols.extend(extra_symbols.iter().cloned());
+            configured_symbols.sort();
+            configured_symbols.dedup();
+
+            let mut prioritized_trading_symbols = trading_symbols_by_exchange
+                .get(&exchange.name)
+                .map(|symbols| symbols.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            prioritized_trading_symbols.sort();
+            prioritized_trading_symbols.dedup();
+
+            let mut symbols = Vec::new();
+            let mut seen_symbols = HashSet::new();
+            for symbol in prioritized_trading_symbols
+                .into_iter()
+                .chain(configured_symbols.into_iter())
+            {
+                let symbol_key = symbol.to_ascii_uppercase();
+                if seen_symbols.insert(symbol_key) {
+                    symbols.push(symbol);
+                }
             }
-            symbols.sort();
-            symbols.dedup();
             exchange.symbols = symbols;
         }
 
