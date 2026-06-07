@@ -571,8 +571,6 @@ async fn run_single_evaluation(
             .await;
         decision = TradeDecision {
             action: TradeAction::Hold,
-            exchange: String::new(),
-            symbol: String::new(),
             amount_usd: 0.0,
             rationale: format!("Execution gated: {reason}"),
             ..decision
@@ -582,13 +580,25 @@ async fn run_single_evaluation(
     decision.rationale =
         merge_rationale_note(&decision.rationale, decision_market_selection.note.as_str());
 
+    let logged_exchange = if decision.exchange.is_empty() {
+        decision_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.exchange.as_str())
+            .unwrap_or("n/a")
+    } else {
+        decision.exchange.as_str()
+    };
+    let logged_symbol = if decision.symbol.is_empty() {
+        decision_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.symbol.as_str())
+            .unwrap_or("n/a")
+    } else {
+        decision.symbol.as_str()
+    };
     info!(
         "trading: decision = {:?} exchange={} symbol={} amount=${:.2} confidence={:.2}",
-        decision.action,
-        decision.exchange,
-        decision.symbol,
-        decision.amount_usd,
-        decision.confidence
+        decision.action, logged_exchange, logged_symbol, decision.amount_usd, decision.confidence
     );
 
     state
@@ -598,8 +608,8 @@ async fn run_single_evaluation(
             format!(
                 "{:?} {}/{} ${:.2} conf={:.2}",
                 decision.action,
-                decision.exchange,
-                decision.symbol,
+                logged_exchange,
+                logged_symbol,
                 decision.amount_usd,
                 decision.confidence
             ),

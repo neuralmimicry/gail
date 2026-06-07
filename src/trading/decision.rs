@@ -116,6 +116,9 @@ impl DecisionEngine {
         let base_blended_signal = fuzzy.signal * self.fuzzy_weight + consensus.signal * ai_weight;
         let base_blended_confidence =
             fuzzy.confidence * self.fuzzy_weight + consensus.confidence * ai_weight;
+        let (target_exchange, target_symbol) = best_market
+            .map(|market| (market.exchange.clone(), market.symbol.clone()))
+            .unwrap_or_else(|| (String::new(), String::new()));
 
         // Optional historical ROI feedback: if recent directional decisions
         // have been consistently poor, Gail dampens new signals/confidence.
@@ -151,10 +154,13 @@ impl DecisionEngine {
         if blended_confidence < effective_config.fuzzy_confidence_threshold {
             return TradeDecision {
                 action: TradeAction::Hold,
+                exchange: target_exchange.clone(),
+                symbol: target_symbol.clone(),
                 rationale: format!(
                     "Confidence {:.2} below threshold {:.2}",
                     blended_confidence, effective_config.fuzzy_confidence_threshold
                 ),
+                confidence: blended_confidence,
                 fuzzy_signal: fuzzy.signal,
                 fuzzy_confidence: fuzzy.confidence,
                 ai_signal: consensus.signal,
@@ -169,10 +175,13 @@ impl DecisionEngine {
         if open >= effective_config.max_open_positions && blended_signal > 0.0 {
             return TradeDecision {
                 action: TradeAction::Hold,
+                exchange: target_exchange.clone(),
+                symbol: target_symbol.clone(),
                 rationale: format!(
                     "Max open positions reached ({}/{})",
                     open, effective_config.max_open_positions
                 ),
+                confidence: blended_confidence,
                 fuzzy_signal: fuzzy.signal,
                 fuzzy_confidence: fuzzy.confidence,
                 ai_signal: consensus.signal,
@@ -188,10 +197,13 @@ impl DecisionEngine {
             if elapsed < effective_config.min_trade_interval_seconds as f64 {
                 return TradeDecision {
                     action: TradeAction::Hold,
+                    exchange: target_exchange.clone(),
+                    symbol: target_symbol.clone(),
                     rationale: format!(
                         "Cooldown: {:.0}s remaining",
                         effective_config.min_trade_interval_seconds as f64 - elapsed
                     ),
+                    confidence: blended_confidence,
                     fuzzy_signal: fuzzy.signal,
                     fuzzy_confidence: fuzzy.confidence,
                     ai_signal: consensus.signal,
@@ -211,7 +223,10 @@ impl DecisionEngine {
             None => {
                 return TradeDecision {
                     action: TradeAction::Hold,
+                    exchange: target_exchange.clone(),
+                    symbol: target_symbol.clone(),
                     rationale: "No target market available".to_string(),
+                    confidence: blended_confidence,
                     fuzzy_signal: fuzzy.signal,
                     fuzzy_confidence: fuzzy.confidence,
                     ai_signal: consensus.signal,

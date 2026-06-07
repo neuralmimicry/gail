@@ -1235,6 +1235,14 @@ mod tests {
             decision.rationale.contains("Confidence"),
             "rationale should mention confidence gate"
         );
+        assert_eq!(
+            decision.exchange, "binance",
+            "hold decisions should retain decision market exchange context"
+        );
+        assert_eq!(
+            decision.symbol, "BTC/USDT",
+            "hold decisions should retain decision market symbol context"
+        );
     }
 
     #[test]
@@ -1263,6 +1271,8 @@ mod tests {
                 || decision.rationale.contains("Confidence"),
             "rationale should mention position gate or confidence gate"
         );
+        assert_eq!(decision.exchange, "binance");
+        assert_eq!(decision.symbol, "BTC/USDT");
     }
 
     #[test]
@@ -1295,6 +1305,8 @@ mod tests {
                 || decision.rationale.contains("Confidence"),
             "rationale should mention cooldown"
         );
+        assert_eq!(decision.exchange, "binance");
+        assert_eq!(decision.symbol, "BTC/USDT");
     }
 
     #[test]
@@ -1428,6 +1440,10 @@ mod tests {
             decision.action,
             TradeAction::Hold,
             "missing market snapshot should produce hold"
+        );
+        assert!(
+            decision.exchange.is_empty() && decision.symbol.is_empty(),
+            "when no decision market exists, hold context should remain empty"
         );
     }
 
