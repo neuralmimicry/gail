@@ -36,7 +36,10 @@ const OCTOBOT_API: &str = "octobot";
 const MAX_PARALLEL_MARKET_SNAPSHOT_REQUESTS: usize = 8;
 const MARKET_SNAPSHOT_CANDIDATE_MULTIPLIER: usize = 1;
 const MARKET_SNAPSHOT_UNKNOWN_PROBE_LIMIT_PER_EXCHANGE: usize = 8;
-const MARKET_SNAPSHOT_UNAVAILABLE_COOLDOWN_SECONDS: f64 = 3_600.0;
+const MARKET_SNAPSHOT_UNAVAILABLE_BASE_COOLDOWN_SECONDS: f64 = 3_600.0;
+const MARKET_SNAPSHOT_UNAVAILABLE_MAX_COOLDOWN_SECONDS: f64 = 43_200.0;
+const MARKET_SNAPSHOT_BLACKLIST_STRIKE_THRESHOLD: u32 = 5;
+const MARKET_SNAPSHOT_BLACKLIST_COOLDOWN_SECONDS: f64 = 86_400.0;
 const TRADING_PAIR_RESTART_COOLDOWN_SECONDS: f64 = 180.0;
 
 // ---------------------------------------------------------------------------
@@ -190,6 +193,14 @@ pub struct OctobotClient {
     /// immediately retrying these pairs on every cycle.
     market_snapshot_unavailable_until: Arc<Mutex<HashMap<String, f64>>>,
 
+    /// Exchange+symbol pairs with consecutive snapshot misses. Higher strike
+    /// counts receive longer retry cooldowns and can be temporarily blacklisted.
+    market_snapshot_unavailable_strikes: Arc<Mutex<HashMap<String, u32>>>,
+
+    /// Exchange+symbol pairs that repeatedly returned no market data and are
+    /// temporarily skipped for a longer period.
+    market_snapshot_blacklisted_until: Arc<Mutex<HashMap<String, f64>>>,
+
     /// Exchange+symbol pairs that have previously returned valid market data.
     /// These are prioritized over unproven symbols to reduce noisy probing.
     market_snapshot_available_symbols: Arc<Mutex<HashSet<String>>>,
@@ -232,6 +243,8 @@ impl OctobotClient {
             exchange_id_by_name: Arc::new(Mutex::new(HashMap::new())),
             symbol_scan_offsets: Arc::new(Mutex::new(HashMap::new())),
             market_snapshot_unavailable_until: Arc::new(Mutex::new(HashMap::new())),
+            market_snapshot_unavailable_strikes: Arc::new(Mutex::new(HashMap::new())),
+            market_snapshot_blacklisted_until: Arc::new(Mutex::new(HashMap::new())),
             market_snapshot_available_symbols: Arc::new(Mutex::new(HashSet::new())),
             trading_pair_restart_cooldown_until: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -3436,6 +3449,11 @@ impl OctobotClient {
             cache.retain(|_, retry_after| *retry_after > now);
             cache.clone()
         };
+        let blacklisted_snapshot = {
+            let mut cache = self.market_snapshot_blacklisted_until.lock().await;
+            cache.retain(|_, retry_after| *retry_after > now);
+            cache.clone()
+        };
         let available_snapshot = self.market_snapshot_available_symbols.lock().await.clone();
         let offset_snapshot = self.symbol_scan_offsets.lock().await.clone();
 
@@ -3468,13 +3486,20 @@ impl OctobotClient {
                         now,
                     )
                 })
+                .filter(|symbol| {
+                    !market_snapshot_is_blacklisted(
+                        &blacklisted_snapshot,
+                        &exchange_key,
+                        symbol,
+                        now,
+                    )
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             if symbols.is_empty() {
                 continue;
             }
-            symbols.sort();
-            symbols.dedup();
+            symbols = dedupe_symbols_preserving_order(symbols);
             if symbols.is_empty() {
                 continue;
             }
@@ -3668,17 +3693,39 @@ impl OctobotClient {
 
     async fn mark_market_snapshot_unavailable(&self, exchange_key: &str, symbol: &str) {
         let key = market_snapshot_symbol_key(exchange_key, symbol);
-        let retry_after =
-            current_unix_timestamp_f64() + MARKET_SNAPSHOT_UNAVAILABLE_COOLDOWN_SECONDS;
+        let strikes = {
+            let mut strike_map = self.market_snapshot_unavailable_strikes.lock().await;
+            let entry = strike_map.entry(key.clone()).or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry
+        };
+        let now = current_unix_timestamp_f64();
+        let cooldown_seconds = market_snapshot_cooldown_for_strikes(strikes);
+        let retry_after = now + cooldown_seconds;
         self.market_snapshot_unavailable_until
             .lock()
             .await
             .insert(key, retry_after);
+
+        if strikes >= MARKET_SNAPSHOT_BLACKLIST_STRIKE_THRESHOLD {
+            self.market_snapshot_blacklisted_until.lock().await.insert(
+                market_snapshot_symbol_key(exchange_key, symbol),
+                now + MARKET_SNAPSHOT_BLACKLIST_COOLDOWN_SECONDS,
+            );
+        }
     }
 
     async fn clear_market_snapshot_unavailable(&self, exchange_key: &str, symbol: &str) {
         let key = market_snapshot_symbol_key(exchange_key, symbol);
         self.market_snapshot_unavailable_until
+            .lock()
+            .await
+            .remove(&key);
+        self.market_snapshot_unavailable_strikes
+            .lock()
+            .await
+            .remove(&key);
+        self.market_snapshot_blacklisted_until
             .lock()
             .await
             .remove(&key);
@@ -3721,6 +3768,18 @@ fn market_snapshot_is_cooling_down(
         .is_some_and(|retry_after| *retry_after > now)
 }
 
+fn market_snapshot_is_blacklisted(
+    blacklist: &HashMap<String, f64>,
+    exchange_key: &str,
+    symbol: &str,
+    now: f64,
+) -> bool {
+    let key = market_snapshot_symbol_key(exchange_key, symbol);
+    blacklist
+        .get(&key)
+        .is_some_and(|retry_after| *retry_after > now)
+}
+
 fn market_snapshot_is_known_available(
     available: &HashSet<String>,
     exchange_key: &str,
@@ -3732,6 +3791,25 @@ fn market_snapshot_is_known_available(
 
 fn is_market_snapshot_unavailable_error(error: &str) -> bool {
     error.contains("no dashboard or ticker endpoint returned data")
+}
+
+fn dedupe_symbols_preserving_order(symbols: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::with_capacity(symbols.len());
+    for symbol in symbols {
+        let symbol_key = symbol.to_ascii_uppercase();
+        if seen.insert(symbol_key) {
+            deduped.push(symbol);
+        }
+    }
+    deduped
+}
+
+fn market_snapshot_cooldown_for_strikes(strikes: u32) -> f64 {
+    let exponent = strikes.saturating_sub(1).min(12);
+    let multiplier = 2u32.pow(exponent) as f64;
+    (MARKET_SNAPSHOT_UNAVAILABLE_BASE_COOLDOWN_SECONDS * multiplier)
+        .min(MARKET_SNAPSHOT_UNAVAILABLE_MAX_COOLDOWN_SECONDS)
 }
 
 // ---------------------------------------------------------------------------

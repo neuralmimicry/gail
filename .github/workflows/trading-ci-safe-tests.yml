@@ -21,8 +21,16 @@ concurrency:
 
 jobs:
   trading-ci-safe-tests:
-    name: Trading tests (no libtorch)
-    runs-on: ubuntu-latest
+    name: Trading tests (no libtorch) (${{ matrix.arch }})
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs_on: '["self-hosted","Linux","X64"]'
+          - arch: arm64
+            runs_on: '["self-hosted","Linux","ARM64"]'
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
