@@ -201,7 +201,7 @@ pub struct TradingConfig {
     /// Whether to run periodic backtests as a safety check on the approach.
     pub backtesting_enabled: bool,
 
-    /// How often Gail triggers an automatic backtest (seconds).  Default: 86400 (daily).
+    /// How often Gail triggers an automatic backtest (seconds). Default: 3600 (hourly).
     pub backtest_interval_seconds: u64,
 
     /// Minimum profitability % required for the approach to be assessed as "viable".
@@ -318,17 +318,21 @@ impl Default for TradingConfig {
             ],
             market_datalake_bootstrap_retry_seconds: 1_800,
             backtesting_enabled: true,
-            backtest_interval_seconds: 86_400,
+            backtest_interval_seconds: 3_600,
             backtest_profitability_threshold: 0.0,
             backtest_data_files: Vec::new(),
-            backtest_symbols: vec!["BTC/USDT".to_string()],
+            backtest_symbols: Vec::new(),
             backtest_lookback_days: 30,
             backtest_data_catalog_path: String::new(),
-            backtest_data_catalog_refresh_seconds: 1_800,
+            backtest_data_catalog_refresh_seconds: 900,
             backtest_data_collection_enabled: true,
-            backtest_data_collection_exchange: "binance".to_string(),
-            backtest_data_collection_time_frames: vec!["1h".to_string(), "1d".to_string()],
-            backtest_data_collection_cooldown_seconds: 3_600,
+            backtest_data_collection_exchange: "auto".to_string(),
+            backtest_data_collection_time_frames: vec![
+                "1h".to_string(),
+                "4h".to_string(),
+                "1d".to_string(),
+            ],
+            backtest_data_collection_cooldown_seconds: 900,
             backtest_pause_on_failure: false,
             live_execution_enabled: true,
         }
@@ -456,10 +460,12 @@ impl TradingConfig {
         self.backtest_data_catalog_path = self.backtest_data_catalog_path.trim().to_string();
         self.backtest_data_catalog_refresh_seconds =
             self.backtest_data_catalog_refresh_seconds.clamp(60, 86_400);
-        self.backtest_data_collection_exchange =
-            self.backtest_data_collection_exchange.trim().to_string();
+        self.backtest_data_collection_exchange = self
+            .backtest_data_collection_exchange
+            .trim()
+            .to_ascii_lowercase();
         if self.backtest_data_collection_exchange.is_empty() {
-            self.backtest_data_collection_exchange = "binance".to_string();
+            self.backtest_data_collection_exchange = "auto".to_string();
         }
         let mut seen_backtest_time_frames: HashSet<String> = HashSet::new();
         self.backtest_data_collection_time_frames = self
@@ -470,7 +476,8 @@ impl TradingConfig {
             .filter(|time_frame| seen_backtest_time_frames.insert(time_frame.to_ascii_lowercase()))
             .collect();
         if self.backtest_data_collection_time_frames.is_empty() {
-            self.backtest_data_collection_time_frames = vec!["1h".to_string(), "1d".to_string()];
+            self.backtest_data_collection_time_frames =
+                vec!["1h".to_string(), "4h".to_string(), "1d".to_string()];
         }
         self.backtest_data_collection_cooldown_seconds =
             self.backtest_data_collection_cooldown_seconds.max(60);

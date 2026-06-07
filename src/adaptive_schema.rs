@@ -206,7 +206,7 @@ impl AdaptiveApiSchema {
             AdaptiveEndpointSchema::new(method, normalize_path_template(path), label)
         });
         endpoint.label = label.to_string();
-        endpoint.success_count += 1;
+        endpoint.success_count = endpoint.success_count.saturating_add(1);
         endpoint.last_observed_at = Some(now);
         endpoint.last_success_at = Some(now);
         endpoint.last_status = Some(200);
@@ -232,7 +232,7 @@ impl AdaptiveApiSchema {
             AdaptiveEndpointSchema::new(method, normalize_path_template(path), label)
         });
         endpoint.label = label.to_string();
-        endpoint.failure_count += 1;
+        endpoint.failure_count = endpoint.failure_count.saturating_add(1);
         endpoint.last_observed_at = Some(now);
         endpoint.last_failure_at = Some(now);
         endpoint.last_status = status;

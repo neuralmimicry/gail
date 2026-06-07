@@ -136,9 +136,10 @@ impl DecisionEngine {
             blended_confidence =
                 (blended_confidence * adjustment.confidence_multiplier).clamp(0.0, 1.0);
         }
+        let adaptive_gate = adaptive_confidence_gate(&effective_config, consensus);
 
         debug!(
-            "trading: decision — fuzzy={:.3}/{:.3} ai={:.3}/{:.3} blended_base={:.3}/{:.3} blended_adj={:.3}/{:.3} roi_applied={}",
+            "trading: decision — fuzzy={:.3}/{:.3} ai={:.3}/{:.3} blended_base={:.3}/{:.3} blended_adj={:.3}/{:.3} gate={:.3}/{:.3} coverage={:.2} responders={} failures={} roi_applied={}",
             fuzzy.signal,
             fuzzy.confidence,
             consensus.signal,
@@ -147,18 +148,28 @@ impl DecisionEngine {
             base_blended_confidence,
             blended_signal,
             blended_confidence,
+            adaptive_gate.threshold,
+            adaptive_gate.base_threshold,
+            adaptive_gate.coverage,
+            adaptive_gate.responders,
+            adaptive_gate.failures,
             roi_feedback.is_some()
         );
 
         // Confidence threshold gate.
-        if blended_confidence < effective_config.fuzzy_confidence_threshold {
+        if blended_confidence < adaptive_gate.threshold {
             return TradeDecision {
                 action: TradeAction::Hold,
                 exchange: target_exchange.clone(),
                 symbol: target_symbol.clone(),
                 rationale: format!(
-                    "Confidence {:.2} below threshold {:.2}",
-                    blended_confidence, effective_config.fuzzy_confidence_threshold
+                    "Confidence {:.2} below adaptive threshold {:.2} (base {:.2}, coverage {:.0}%, responders={}, failures={})",
+                    blended_confidence,
+                    adaptive_gate.threshold,
+                    adaptive_gate.base_threshold,
+                    adaptive_gate.coverage * 100.0,
+                    adaptive_gate.responders,
+                    adaptive_gate.failures
                 ),
                 confidence: blended_confidence,
                 fuzzy_signal: fuzzy.signal,
@@ -343,6 +354,62 @@ struct EffectiveConfig {
     decision_roi_feedback_max_signal_adjustment: f64,
     decision_roi_feedback_max_confidence_penalty: f64,
     decision_roi_feedback_max_confidence_boost: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AdaptiveConfidenceGate {
+    threshold: f64,
+    base_threshold: f64,
+    coverage: f64,
+    responders: usize,
+    failures: usize,
+}
+
+fn adaptive_confidence_gate(
+    config: &EffectiveConfig,
+    consensus: &AiConsensus,
+) -> AdaptiveConfidenceGate {
+    let base_threshold = config.fuzzy_confidence_threshold.clamp(0.0, 1.0);
+    let responders = consensus.responders;
+    let failures = consensus.failures;
+    let total = (responders + failures).max(1) as f64;
+    let coverage = responders as f64 / total;
+    let agreement = consensus
+        .vote_distribution
+        .get("agreement")
+        .and_then(serde_json::Value::as_f64)
+        .map(|value| value.clamp(0.0, 1.0))
+        .unwrap_or(1.0);
+    let average_risk = consensus
+        .vote_distribution
+        .get("average_risk")
+        .and_then(serde_json::Value::as_f64)
+        .map(|value| value.clamp(0.0, 1.0))
+        .unwrap_or(0.5);
+
+    let mut threshold = base_threshold;
+    let should_relax = responders > 0 && (failures > 0 || responders < 2);
+    if should_relax {
+        let responder_depth = (responders as f64 / 3.0).clamp(0.0, 1.0);
+        let degradation = ((1.0 - coverage) * 0.45
+            + (1.0 - responder_depth) * 0.30
+            + (1.0 - agreement) * 0.15
+            + average_risk * 0.10)
+            .clamp(0.0, 1.0);
+        let floor = (base_threshold * 0.68).clamp(0.42, 0.70);
+        threshold = base_threshold - (base_threshold - floor) * degradation;
+        if average_risk >= 0.80 {
+            threshold = threshold.max(base_threshold * 0.95);
+        }
+    }
+
+    AdaptiveConfidenceGate {
+        threshold: threshold.clamp(0.35, 0.95),
+        base_threshold,
+        coverage,
+        responders,
+        failures,
+    }
 }
 
 impl EffectiveConfig {

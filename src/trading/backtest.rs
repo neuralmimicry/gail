@@ -25,7 +25,16 @@ use super::config::TradingConfig;
 use super::octobot::{BacktestRunReport, BacktestStartRequest, OctobotClient};
 
 const DEFAULT_BACKTEST_CATALOG_FILENAME: &str = "backtest_data_catalog.json";
-const DEFAULT_BACKTEST_COLLECTION_SYMBOL: &str = "BTC/USDT";
+const DEFAULT_BACKTEST_COLLECTION_SYMBOLS: [&str; 8] = [
+    "BTC/USDT",
+    "ETH/USDT",
+    "SOL/USDT",
+    "XRP/USDT",
+    "DOGE/USDT",
+    "BNB/USDT",
+    "ADA/USDT",
+    "MEME/USDT",
+];
 const BACKTEST_MAX_FILES_PER_SYMBOL_TIMEFRAME: usize = 3;
 const BACKTEST_MAX_UNKNOWN_TIMEFRAME_FILES_PER_SYMBOL: usize = 2;
 const BACKTEST_MAX_GENERIC_COLLECTOR_FILES: usize = 8;
@@ -33,6 +42,8 @@ const BACKTEST_MAX_SUBSET_RUNS_PER_CYCLE: usize = 6;
 const BACKTEST_MIN_SUBSET_RUNS_PER_CYCLE: usize = 2;
 const BACKTEST_TARGET_SUCCESSFUL_SUBSET_RUNS_PER_CYCLE: usize = 1;
 const BACKTEST_MAX_SINGLE_UNKNOWN_FILE_SUBSETS: usize = 4;
+const BACKTEST_MAX_AUTO_COLLECTION_SYMBOLS: usize = 24;
+const BACKTEST_MAX_AUTO_COLLECTION_EXCHANGES: usize = 4;
 
 fn now_ts() -> f64 {
     SystemTime::now()
@@ -196,9 +207,16 @@ pub struct BacktestEngine {
 
 #[derive(Clone, Debug)]
 enum DataCollectionRequestOutcome {
-    Started,
-    AlreadyRunning,
-    CoolingDown { retry_after_seconds: u64 },
+    Started {
+        exchange: String,
+        symbols: Vec<String>,
+    },
+    AlreadyRunning {
+        exchange: Option<String>,
+    },
+    CoolingDown {
+        retry_after_seconds: u64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -421,21 +439,25 @@ impl BacktestEngine {
                         .maybe_request_data_collection(config, &catalog_path, &mut catalog, now)
                         .await
                     {
-                        Ok(DataCollectionRequestOutcome::Started) => {
-                            let symbols = configured_collection_symbols(config);
+                        Ok(DataCollectionRequestOutcome::Started { exchange, symbols }) => {
                             info!(
                                 "trading: backtest data appears stale (age={:?}s), started OctoBot historical data collection for {} on {} [{}] while continuing with {} backtest files",
                                 selected_data_age.map(|age| age.round() as u64),
                                 symbols.join(", "),
-                                config.backtest_data_collection_exchange,
+                                exchange,
                                 config.backtest_data_collection_time_frames.join(", "),
                                 cached_selected.len(),
                             );
                         }
-                        Ok(DataCollectionRequestOutcome::AlreadyRunning) => {
+                        Ok(DataCollectionRequestOutcome::AlreadyRunning { exchange }) => {
+                            let exchange_note = exchange
+                                .as_deref()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| "auto".to_string());
                             info!(
-                                "trading: backtest data appears stale (age={:?}s), OctoBot data collector already running; continuing with {} backtest files",
+                                "trading: backtest data appears stale (age={:?}s), OctoBot data collector already running on {}; continuing with {} backtest files",
                                 selected_data_age.map(|age| age.round() as u64),
+                                exchange_note,
                                 cached_selected.len(),
                             );
                         }
@@ -497,24 +519,26 @@ impl BacktestEngine {
         }
 
         if config.backtest_data_collection_enabled {
-            let symbols = configured_collection_symbols(config);
             match self
                 .maybe_request_data_collection(config, &catalog_path, &mut catalog, now)
                 .await
             {
-                Ok(DataCollectionRequestOutcome::Started) => {
+                Ok(DataCollectionRequestOutcome::Started { exchange, symbols }) => {
                     return Err(format!(
                         "no OctoBot backtesting .data files matched Gail's configured backtest symbols; started OctoBot historical data collection for {} on {} [{}]",
                         symbols.join(", "),
-                        config.backtest_data_collection_exchange,
+                        exchange,
                         config.backtest_data_collection_time_frames.join(", ")
                     ));
                 }
-                Ok(DataCollectionRequestOutcome::AlreadyRunning) => {
-                    return Err(
-                        "no OctoBot backtesting .data files matched Gail's configured backtest symbols; OctoBot data collector is already running"
-                            .to_string(),
-                    );
+                Ok(DataCollectionRequestOutcome::AlreadyRunning { exchange }) => {
+                    let exchange_note = exchange
+                        .as_deref()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "auto".to_string());
+                    return Err(format!(
+                        "no OctoBot backtesting .data files matched Gail's configured backtest symbols; OctoBot data collector is already running on {exchange_note}"
+                    ));
                 }
                 Ok(DataCollectionRequestOutcome::CoolingDown {
                     retry_after_seconds,
@@ -552,35 +576,115 @@ impl BacktestEngine {
             });
         }
 
-        let collector_symbols = configured_collection_symbols(config);
+        let collector_symbols = self.resolve_collection_symbols(config).await;
+        let collector_exchanges = self.resolve_collection_exchanges(config).await;
         let now_ms = (now * 1000.0) as i64;
         let start_ms = now_ms - (config.backtest_lookback_days as i64) * 86_400_000;
-        match self
-            .octobot
-            .start_data_collector(
-                &config.backtest_data_collection_exchange,
-                &collector_symbols,
-                &config.backtest_data_collection_time_frames,
-                Some(start_ms),
-                Some(now_ms),
-            )
-            .await
-        {
-            Ok(()) => {
-                catalog.last_collection_requested_at = Some(now);
-                persist_backtest_data_catalog(catalog_path, catalog).await;
-                Ok(DataCollectionRequestOutcome::Started)
-            }
-            Err(err) => {
-                if err.to_ascii_lowercase().contains("already running") {
+        let mut errors = Vec::new();
+        for exchange in collector_exchanges {
+            match self
+                .octobot
+                .start_data_collector(
+                    &exchange,
+                    &collector_symbols,
+                    &config.backtest_data_collection_time_frames,
+                    Some(start_ms),
+                    Some(now_ms),
+                )
+                .await
+            {
+                Ok(()) => {
                     catalog.last_collection_requested_at = Some(now);
                     persist_backtest_data_catalog(catalog_path, catalog).await;
-                    Ok(DataCollectionRequestOutcome::AlreadyRunning)
-                } else {
-                    Err(err)
+                    return Ok(DataCollectionRequestOutcome::Started {
+                        exchange,
+                        symbols: collector_symbols.clone(),
+                    });
+                }
+                Err(err) => {
+                    if err.to_ascii_lowercase().contains("already running") {
+                        catalog.last_collection_requested_at = Some(now);
+                        persist_backtest_data_catalog(catalog_path, catalog).await;
+                        return Ok(DataCollectionRequestOutcome::AlreadyRunning {
+                            exchange: Some(exchange),
+                        });
+                    }
+                    errors.push(format!("{exchange}: {err}"));
                 }
             }
         }
+
+        if errors.is_empty() {
+            Err("no eligible exchange available for OctoBot data collection".to_string())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    async fn resolve_collection_exchanges(&self, config: &TradingConfig) -> Vec<String> {
+        let configured = config.backtest_data_collection_exchange.trim();
+        if !configured.is_empty() && !configured.eq_ignore_ascii_case("auto") {
+            return vec![configured.to_ascii_lowercase()];
+        }
+
+        let mut discovered = match self.octobot.get_exchange_info().await {
+            Ok(exchanges) => exchanges
+                .into_iter()
+                .filter(|exchange| exchange.enabled)
+                .map(|exchange| exchange.name)
+                .collect::<Vec<_>>(),
+            Err(err) => {
+                warn!(
+                    "trading: failed to auto-discover exchanges for backtest collection: {}",
+                    err
+                );
+                Vec::new()
+            }
+        };
+        discovered = dedupe_strings_preserving_order(discovered);
+        discovered.truncate(BACKTEST_MAX_AUTO_COLLECTION_EXCHANGES);
+        if discovered.is_empty() {
+            vec!["binance".to_string()]
+        } else {
+            discovered
+        }
+    }
+
+    async fn resolve_collection_symbols(&self, config: &TradingConfig) -> Vec<String> {
+        if !config.backtest_symbols.is_empty() {
+            let configured = normalize_collection_symbols(config.backtest_symbols.clone());
+            if !configured.is_empty() {
+                return configured;
+            }
+        }
+
+        let mut discovered = Vec::new();
+        if let Ok(exchanges) = self.octobot.get_exchange_info().await {
+            for exchange in exchanges.into_iter().filter(|exchange| exchange.enabled) {
+                for symbol in exchange
+                    .market_status_symbols
+                    .into_iter()
+                    .chain(exchange.symbols.into_iter())
+                {
+                    if let Some(normalized) = normalize_collection_symbol(symbol.as_str()) {
+                        if !normalized.ends_with("/USDT") {
+                            continue;
+                        }
+                        discovered.push(normalized);
+                    }
+                }
+            }
+        }
+        discovered = dedupe_strings_preserving_order(discovered);
+        if !discovered.is_empty() {
+            discovered.truncate(BACKTEST_MAX_AUTO_COLLECTION_SYMBOLS);
+            return discovered;
+        }
+
+        DEFAULT_BACKTEST_COLLECTION_SYMBOLS
+            .iter()
+            .map(|symbol| symbol.to_string())
+            .collect()
     }
 
     async fn discover_and_cache_backtest_files(
@@ -1121,12 +1225,39 @@ fn selected_backtest_data_age_seconds(
         .map(|timestamp| (now - timestamp).max(0.0))
 }
 
-fn configured_collection_symbols(config: &TradingConfig) -> Vec<String> {
-    if config.backtest_symbols.is_empty() {
-        vec![DEFAULT_BACKTEST_COLLECTION_SYMBOL.to_string()]
-    } else {
-        config.backtest_symbols.clone()
+fn normalize_collection_symbol(value: &str) -> Option<String> {
+    let cleaned = value.trim().replace('|', "/");
+    let mut parts = cleaned.split('/');
+    let base = parts.next()?.trim();
+    let quote = parts.next()?.trim();
+    if base.is_empty() || quote.is_empty() || parts.next().is_some() {
+        return None;
     }
+    Some(format!(
+        "{}/{}",
+        base.to_ascii_uppercase(),
+        quote.to_ascii_uppercase()
+    ))
+}
+
+fn normalize_collection_symbols(symbols: Vec<String>) -> Vec<String> {
+    let normalized = symbols
+        .into_iter()
+        .filter_map(|symbol| normalize_collection_symbol(symbol.as_str()))
+        .collect::<Vec<_>>();
+    dedupe_strings_preserving_order(normalized)
+}
+
+fn dedupe_strings_preserving_order(values: Vec<String>) -> Vec<String> {
+    let mut deduped = Vec::new();
+    let mut seen = HashSet::new();
+    for value in values {
+        let key = value.to_ascii_lowercase();
+        if seen.insert(key) {
+            deduped.push(value);
+        }
+    }
+    deduped
 }
 
 fn resolve_backtest_catalog_path(config: &TradingConfig) -> PathBuf {

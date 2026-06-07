@@ -1654,29 +1654,34 @@ pub(crate) fn degraded_live_execution_reason(
     let requested = config.max_parallel_advisors.max(1);
     let attempted = (consensus.responders + consensus.failures).max(1);
     let expected = requested.min(attempted);
-    if expected >= 2 && consensus.responders * 2 < expected {
+    let coverage = consensus_coverage(consensus);
+    let average_risk = consensus_average_risk(consensus);
+    let agreement = consensus_agreement(consensus);
+    let single_responder_is_strong = consensus.responders == 1
+        && consensus.confidence >= 0.62
+        && average_risk < 0.68
+        && agreement >= 0.55;
+
+    if expected >= 2 && consensus.responders * 2 < expected && !single_responder_is_strong {
         return Some(format!(
             "Advisor quorum too low ({}/{} responders)",
             consensus.responders, expected
         ));
     }
 
-    let coverage = consensus_coverage(consensus);
-    if consensus.failures > 0 && coverage < 0.5 {
+    if consensus.failures > 0 && coverage < 0.35 && !single_responder_is_strong {
         return Some(format!(
             "Advisor coverage too low after failures ({:.0}% coverage)",
             coverage * 100.0
         ));
     }
 
-    let average_risk = consensus_average_risk(consensus);
     if average_risk >= 0.72 {
         return Some(format!(
             "Consensus risk too high ({average_risk:.2} >= 0.72)"
         ));
     }
 
-    let agreement = consensus_agreement(consensus);
     if consensus.responders >= 3 && agreement < 0.30 {
         return Some(format!(
             "Advisor disagreement too high ({agreement:.2} agreement)"

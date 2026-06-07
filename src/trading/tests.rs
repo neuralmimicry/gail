@@ -350,9 +350,15 @@ mod tests {
         assert_eq!(cfg.market_datalake_bootstrap_retry_seconds, 1_800);
         assert!(cfg.backtesting_enabled);
         assert!(cfg.backtest_data_collection_enabled);
-        assert_eq!(cfg.backtest_data_collection_exchange, "binance");
-        assert_eq!(cfg.backtest_data_collection_time_frames, vec!["1h", "1d"]);
-        assert_eq!(cfg.backtest_data_catalog_refresh_seconds, 1_800);
+        assert_eq!(cfg.backtest_interval_seconds, 3_600);
+        assert!(cfg.backtest_symbols.is_empty());
+        assert_eq!(cfg.backtest_data_collection_exchange, "auto");
+        assert_eq!(
+            cfg.backtest_data_collection_time_frames,
+            vec!["1h", "4h", "1d"]
+        );
+        assert_eq!(cfg.backtest_data_catalog_refresh_seconds, 900);
+        assert_eq!(cfg.backtest_data_collection_cooldown_seconds, 900);
     }
 
     #[test]
@@ -489,7 +495,7 @@ mod tests {
             vec!["1h".to_string(), "4h".to_string()]
         );
         assert!(cfg.market_datalake_bootstrap_retry_seconds >= 60);
-        assert_eq!(cfg.backtest_data_collection_exchange, "binance");
+        assert_eq!(cfg.backtest_data_collection_exchange, "auto");
         assert_eq!(cfg.backtest_data_collection_time_frames, vec!["1h"]);
         assert!(cfg.backtest_data_catalog_refresh_seconds >= 60);
         assert!(cfg.backtest_data_collection_cooldown_seconds >= 60);
@@ -1140,6 +1146,29 @@ mod tests {
         assert!(reason.is_none(), "stable consensus should not be blocked");
     }
 
+    #[test]
+    fn degraded_execution_guard_allows_strong_single_responder_during_failures() {
+        let config = default_config();
+        let consensus = AiConsensus {
+            action: "buy".to_string(),
+            confidence: 0.7,
+            signal: 0.6,
+            vote_distribution: json!({
+                "average_risk": 0.2,
+                "coverage": 0.2,
+                "agreement": 0.8
+            }),
+            advices: vec![make_advice("buy", 0.7, 1.0)],
+            responders: 1,
+            failures: 4,
+        };
+        let reason = degraded_live_execution_reason(&consensus, &config);
+        assert!(
+            reason.is_none(),
+            "strong single-responder consensus should be allowed during provider degradation"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // DecisionEngine tests
     // -----------------------------------------------------------------------
@@ -1242,6 +1271,78 @@ mod tests {
         assert_eq!(
             decision.symbol, "BTC/USDT",
             "hold decisions should retain decision market symbol context"
+        );
+    }
+
+    #[test]
+    fn decision_confidence_gate_relaxes_when_advisors_are_degraded_but_responding() {
+        let engine = DecisionEngine::new(0.5);
+        use crate::trading::fuzzy::FuzzyDecision;
+        let fuzzy = FuzzyDecision {
+            signal: 0.8,
+            confidence: 0.55,
+            label: "buy".to_string(),
+            term_activations: Default::default(),
+        };
+        let consensus = AiConsensus {
+            action: "buy".to_string(),
+            confidence: 0.55,
+            signal: 0.8,
+            vote_distribution: json!({
+                "agreement": 1.0,
+                "average_risk": 0.2
+            }),
+            advices: vec![],
+            responders: 1,
+            failures: 4,
+        };
+        let state = make_default_state();
+        let config = TradingConfig {
+            enabled: true,
+            octobot_base_url: "http://x".to_string(),
+            fuzzy_confidence_threshold: 0.65,
+            ..TradingConfig::default()
+        };
+        let snap = make_snapshot("binance", "BTC/USDT", 50000.0, 5.0, 1_000_000.0);
+        let decision = engine.decide(&fuzzy, &consensus, Some(&snap), &state, &config);
+        assert!(
+            matches!(decision.action, TradeAction::Buy | TradeAction::StrongBuy),
+            "degraded advisor health should relax confidence gate enough for strong signals"
+        );
+    }
+
+    #[test]
+    fn decision_confidence_gate_does_not_relax_when_no_advisor_responded() {
+        let engine = DecisionEngine::new(0.5);
+        use crate::trading::fuzzy::FuzzyDecision;
+        let fuzzy = FuzzyDecision {
+            signal: 0.8,
+            confidence: 0.55,
+            label: "buy".to_string(),
+            term_activations: Default::default(),
+        };
+        let consensus = AiConsensus {
+            action: "hold".to_string(),
+            confidence: 0.0,
+            signal: 0.0,
+            vote_distribution: json!({}),
+            advices: vec![],
+            responders: 0,
+            failures: 4,
+        };
+        let state = make_default_state();
+        let config = TradingConfig {
+            enabled: true,
+            octobot_base_url: "http://x".to_string(),
+            fuzzy_confidence_threshold: 0.65,
+            ..TradingConfig::default()
+        };
+        let snap = make_snapshot("binance", "BTC/USDT", 50000.0, 5.0, 1_000_000.0);
+        let decision = engine.decide(&fuzzy, &consensus, Some(&snap), &state, &config);
+        assert_eq!(decision.action, TradeAction::Hold);
+        assert!(
+            decision.rationale.contains("adaptive threshold"),
+            "hold rationale should show adaptive gate context"
         );
     }
 
@@ -4000,7 +4101,7 @@ mod tests {
                 "exchange_id": "binance-id",
                 "time_frame": "1h"
             })))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -4243,7 +4344,7 @@ mod tests {
                 "exchange_id": "binance-id",
                 "time_frame": "1h"
             })))
-            .expect(1)
+            .expect(0)
             .with_priority(1)
             .mount(&server)
             .await;
@@ -4324,7 +4425,7 @@ mod tests {
                 "exchange_id": "binance-id",
                 "time_frame": "1h"
             })))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -4333,7 +4434,7 @@ mod tests {
                 "exchange_id": "binance-id",
                 "time_frame": "1h"
             })))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
 
@@ -4436,7 +4537,7 @@ mod tests {
                 "exchange_id": "binance-id",
                 "time_frame": "1h"
             })))
-            .expect(2)
+            .expect(0)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -4531,7 +4632,7 @@ mod tests {
                 "exchange_id": "binance-id",
                 "time_frame": "1h"
             })))
-            .expect(8)
+            .expect(0)
             .mount(&server)
             .await;
         Mock::given(method("GET"))

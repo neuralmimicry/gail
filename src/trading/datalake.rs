@@ -759,9 +759,11 @@ async fn load_samples_from_file(
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(sample) = serde_json::from_str::<MarketSample>(&line) else {
+        let Ok(mut sample) = serde_json::from_str::<MarketSample>(&line) else {
             continue;
         };
+        sample.exchange = normalize_exchange(&sample.exchange);
+        sample.symbol = normalize_symbol(&sample.symbol);
         if sample.captured_ts + f64::EPSILON < since_ts {
             continue;
         }
@@ -929,24 +931,20 @@ async fn load_samples_from_postgres(
                 high_24h,
                 low_24h
             FROM gail_market_snapshots
-            WHERE exchange = $1
-              AND symbol = $2
-              AND captured_ts >= $3
+            WHERE symbol = $1
+              AND captured_ts >= $2
             ORDER BY captured_bucket ASC
             "#,
-            &[
-                &normalize_exchange(exchange),
-                &normalize_symbol(symbol),
-                &since_ts,
-            ],
+            &[&normalize_symbol(symbol), &since_ts],
         )
         .await
         .map_err(|error| format!("failed to query market datalake samples: {error}"))?;
+    let target_exchange = normalize_exchange(exchange);
     Ok(rows
         .into_iter()
         .map(|row| MarketSample {
-            exchange: row.get("exchange"),
-            symbol: row.get("symbol"),
+            exchange: normalize_exchange(row.get::<_, String>("exchange").as_str()),
+            symbol: normalize_symbol(row.get::<_, String>("symbol").as_str()),
             captured_bucket: row.get("captured_bucket"),
             captured_ts: row.get("captured_ts"),
             price: row.get("price"),
@@ -955,6 +953,7 @@ async fn load_samples_from_postgres(
             high_24h: row.get("high_24h"),
             low_24h: row.get("low_24h"),
         })
+        .filter(|sample| sample.exchange == target_exchange)
         .collect::<Vec<_>>())
 }
 
@@ -1139,7 +1138,19 @@ fn normalize_exchange(exchange: &str) -> String {
         normalized.truncate(start);
         normalized = normalized.trim().to_string();
     }
-    normalized
+    let compact = normalized
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    match compact.as_str() {
+        "ku coin" => "kucoin".to_string(),
+        "bit get" => "bitget".to_string(),
+        "x t" => "xt".to_string(),
+        _ => compact,
+    }
 }
 
 fn normalize_symbol(symbol: &str) -> String {

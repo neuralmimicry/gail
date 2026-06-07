@@ -158,7 +158,9 @@ impl TradingAdvisor {
             }
         }
 
-        if !advices.iter().any(|advice| advice.parsed_ok) {
+        let min_responder_target = max_advisors.clamp(1, 2);
+        let mut parsed_responders = advices.iter().filter(|advice| advice.parsed_ok).count();
+        if parsed_responders < min_responder_target {
             let fallback_candidates = self.select_providers(max_advisors.max(1).saturating_add(3));
             for profile in fallback_candidates {
                 if !attempted_provider_ids.insert(provider_identity(&profile)) {
@@ -178,6 +180,9 @@ impl TradingAdvisor {
                 let parsed_ok = advice.parsed_ok;
                 advices.push(advice);
                 if parsed_ok {
+                    parsed_responders += 1;
+                }
+                if parsed_responders >= min_responder_target {
                     break;
                 }
             }

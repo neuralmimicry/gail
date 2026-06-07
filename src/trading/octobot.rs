@@ -1652,6 +1652,9 @@ impl OctobotClient {
         symbol: &str,
     ) -> Result<Option<(String, String)>, String> {
         let exchange_id_hint = self.exchange_id_for_exchange_name(exchange).await?;
+        if let Some(exchange_id) = exchange_id_hint {
+            return Ok(Some((exchange_id, "1h".to_string())));
+        }
         let web_symbol = symbol.replace('/', "|");
         let watched_path = format!("/dashboard/watched_symbol/{web_symbol}");
         let mut watched_exchange_id = None;
@@ -1676,7 +1679,7 @@ impl OctobotClient {
                 .to_string();
         }
 
-        let Some(exchange_id) = exchange_id_hint.or(watched_exchange_id) else {
+        let Some(exchange_id) = watched_exchange_id else {
             return Ok(None);
         };
         Ok(Some((exchange_id, time_frame)))
@@ -3101,11 +3104,43 @@ fn parse_exchange_tooltip_balances(value: &str) -> Vec<(String, f64)> {
 }
 
 fn normalize_exchange_name(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
+    let mut normalized = decode_basic_html_entities(value)
+        .trim()
+        .to_ascii_lowercase();
+    if normalized.is_empty() {
         return None;
     }
-    Some(trimmed.to_ascii_lowercase())
+
+    if let Some((head, _)) = normalized.split_once(':') {
+        normalized = head.trim().to_string();
+    }
+
+    while normalized.ends_with(')') {
+        let Some(start) = normalized.rfind(" (") else {
+            break;
+        };
+        normalized.truncate(start);
+        normalized = normalized.trim().to_string();
+    }
+
+    let compact = normalized
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.is_empty() {
+        return None;
+    }
+
+    let canonical = match compact.as_str() {
+        "ku coin" => "kucoin",
+        "bit get" => "bitget",
+        "x t" => "xt",
+        other => other,
+    };
+    Some(canonical.to_string())
 }
 
 fn parse_trading_page_symbol_status_rows(raw: &str) -> Vec<TradingPageSymbolStatusRow> {
