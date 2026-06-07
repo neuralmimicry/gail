@@ -397,6 +397,7 @@ impl BacktestEngine {
             || catalog.updated_at <= 0.0
             || now - catalog.updated_at >= catalog_refresh_seconds;
 
+        let mut refreshed_selected: Option<Vec<String>> = None;
         if catalog_is_stale {
             match self
                 .discover_and_cache_backtest_files(
@@ -406,8 +407,9 @@ impl BacktestEngine {
                 )
                 .await
             {
-                Ok(selected) if !selected.is_empty() => return Ok(selected),
-                Ok(_) => {}
+                Ok(selected) => {
+                    refreshed_selected = Some(selected);
+                }
                 Err(err) => {
                     warn!(
                         "trading: OctoBot backtest data-file discovery failed: {}",
@@ -424,8 +426,9 @@ impl BacktestEngine {
             );
         }
 
-        let cached_selected =
-            select_backtest_data_files(catalog.files.clone(), &config.backtest_symbols);
+        let cached_selected = refreshed_selected.unwrap_or_else(|| {
+            select_backtest_data_files(catalog.files.clone(), &config.backtest_symbols)
+        });
         if !cached_selected.is_empty() {
             if config.backtest_data_collection_enabled {
                 let stale_after_seconds = config.backtest_data_collection_cooldown_seconds as f64;

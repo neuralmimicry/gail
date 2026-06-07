@@ -5330,6 +5330,14 @@ mod tests {
     async fn backtest_engine_run_with_config_uses_generic_collector_files_without_retriggering_collection()
      {
         let server = MockServer::start().await;
+        let fresh_collector_file = format!(
+            "ExchangeHistoryDataCollector_{}.data",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("unix epoch")
+                .as_secs_f64()
+                + 60.0
+        );
 
         Mock::given(method("GET"))
             .and(path("/backtesting"))
@@ -5337,9 +5345,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/html; charset=utf-8")
-                    .set_body_string(
-                        r#"<td>ExchangeHistoryDataCollector_1779194074.4955919.data</td>"#,
-                    ),
+                    .set_body_string(format!(r#"<td>{fresh_collector_file}</td>"#)),
             )
             .expect(1)
             .mount(&server)
@@ -5358,9 +5364,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/backtesting"))
             .and(query_param("action_type", "start_backtesting"))
-            .and(body_string_contains(
-                "ExchangeHistoryDataCollector_1779194074.4955919.data",
-            ))
+            .and(body_string_contains(fresh_collector_file.clone()))
             .respond_with(ResponseTemplate::new(200).set_body_string("\"Backtesting started\""))
             .expect(1)
             .mount(&server)
@@ -5417,8 +5421,99 @@ mod tests {
         );
         let persisted_catalog = std::fs::read_to_string(catalog_path).expect("catalog persisted");
         assert!(
-            persisted_catalog.contains("ExchangeHistoryDataCollector_1779194074.4955919.data"),
+            persisted_catalog.contains(fresh_collector_file.as_str()),
             "catalog should persist discovered generic collector file names"
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn backtest_engine_run_with_config_refreshes_stale_discovered_files_without_blocking() {
+        let server = MockServer::start().await;
+        let stale_collector_file = "ExchangeHistoryDataCollector_1700000000.0.data";
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_data_files"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string(format!(r#"<td>{stale_collector_file}</td>"#)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/data_collector"))
+            .and(query_param("action_type", "start_collector"))
+            .and(body_string_contains("\"symbols\":[\"BTC/USDT\"]"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json("Historical data collection started."),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/backtesting"))
+            .and(query_param("action_type", "start_backtesting"))
+            .and(body_string_contains(stale_collector_file))
+            .respond_with(ResponseTemplate::new(200).set_body_string("\"Backtesting started\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting_run_id"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "backtesting_id": 93 })),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_report"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(octobot_report_body(4.2, 2.0, 6)),
+            )
+            .mount(&server)
+            .await;
+
+        let temp = tempdir().expect("tempdir");
+        let catalog_path = temp.path().join("backtest_data_catalog.json");
+        let mut config = TradingConfig {
+            data_path: temp
+                .path()
+                .join("trading_state.json")
+                .to_string_lossy()
+                .to_string(),
+            backtest_data_catalog_path: catalog_path.to_string_lossy().to_string(),
+            backtest_symbols: vec!["BTC/USDT".to_string()],
+            backtest_data_collection_enabled: true,
+            backtest_data_collection_exchange: "binance".to_string(),
+            backtest_data_collection_time_frames: vec!["1h".to_string()],
+            backtest_data_collection_cooldown_seconds: 300,
+            ..TradingConfig::default()
+        };
+        config.normalize();
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let engine = BacktestEngine::with_poll_params(client, 0.0, Duration::from_millis(1), 5);
+        let summary = engine.run_with_config(&config).await;
+
+        assert_eq!(summary.assessment, ApproachAssessment::Viable);
+        assert_eq!(summary.run_id, Some(93));
+        let persisted_catalog = std::fs::read_to_string(catalog_path).expect("catalog persisted");
+        assert!(
+            persisted_catalog.contains(stale_collector_file),
+            "catalog should persist stale discovered files"
+        );
+        assert!(
+            persisted_catalog.contains("last_collection_requested_at"),
+            "catalog should record stale-data collection refresh timestamp"
         );
         server.verify().await;
     }
