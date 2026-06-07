@@ -95,6 +95,11 @@ pub struct OctobotTrade {
 pub struct OctobotExchange {
     pub name: String,
     pub enabled: bool,
+    /// Symbols currently visible on OctoBot's market-status surface (`/trading`).
+    ///
+    /// These are the most reliable candidates for dashboard snapshot routes.
+    #[serde(default)]
+    pub market_status_symbols: Vec<String>,
     pub symbols: Vec<String>,
 }
 
@@ -1322,6 +1327,7 @@ impl OctobotClient {
                     .or_insert_with(|| OctobotExchange {
                         name: exchange_name_key.clone(),
                         enabled: true,
+                        market_status_symbols: Vec::new(),
                         symbols: Vec::new(),
                     });
                 if let Some(exchange_id) = exchange_data
@@ -1349,6 +1355,7 @@ impl OctobotClient {
                     .or_insert_with(|| OctobotExchange {
                         name: exchange_name_key.clone(),
                         enabled: entry.enabled,
+                        market_status_symbols: Vec::new(),
                         symbols: Vec::new(),
                     });
                 exchange.enabled |= entry.enabled;
@@ -1376,6 +1383,7 @@ impl OctobotClient {
                     .or_insert_with(|| OctobotExchange {
                         name: exchange_name_key.clone(),
                         enabled: true,
+                        market_status_symbols: Vec::new(),
                         symbols: Vec::new(),
                     });
                 exchange_ids_by_key
@@ -1395,8 +1403,11 @@ impl OctobotClient {
         }
 
         for exchange in exchanges_by_key.values_mut() {
+            let has_market_status_symbols = trading_symbols_by_exchange
+                .get(&exchange.name)
+                .is_some_and(|symbols| !symbols.is_empty());
             let mut configured_symbols = self
-                .configured_symbols(Some(exchange.name.as_str()))
+                .configured_symbols(Some(exchange.name.as_str()), !has_market_status_symbols)
                 .await
                 .unwrap_or_default();
             configured_symbols.sort();
@@ -1408,6 +1419,7 @@ impl OctobotClient {
                 .unwrap_or_default();
             prioritized_trading_symbols.sort();
             prioritized_trading_symbols.dedup();
+            exchange.market_status_symbols = prioritized_trading_symbols.clone();
 
             let mut symbols = Vec::new();
             let mut seen_symbols = HashSet::new();
@@ -1435,7 +1447,11 @@ impl OctobotClient {
         Ok(exchanges)
     }
 
-    async fn configured_symbols(&self, exchange_name: Option<&str>) -> Result<Vec<String>, String> {
+    async fn configured_symbols(
+        &self,
+        exchange_name: Option<&str>,
+        enrich_with_exchange_symbols: bool,
+    ) -> Result<Vec<String>, String> {
         let body = self
             .get_optional_json("/api/get_config_currency", "configured currencies")
             .await?
@@ -1466,7 +1482,7 @@ impl OctobotClient {
 
         // Enrich configured pairs with exchange-listed symbols to broaden
         // candidate discovery beyond the currently watched subset.
-        if let Some(exchange_name) = exchange_name {
+        if enrich_with_exchange_symbols && let Some(exchange_name) = exchange_name {
             let configured_quotes: HashSet<String> = symbols
                 .iter()
                 .filter_map(|symbol| symbol_quote_asset(symbol))
@@ -3391,6 +3407,7 @@ impl OctobotClient {
                         .get("enabled")
                         .and_then(Value::as_bool)
                         .unwrap_or(true),
+                    market_status_symbols: Vec::new(),
                     symbols: entry
                         .get("symbols")
                         .and_then(Value::as_array)
@@ -3469,6 +3486,19 @@ impl OctobotClient {
             let Some(exchange_key) = normalize_exchange_name(&exchange.name) else {
                 continue;
             };
+            let mut market_status_symbols = exchange
+                .market_status_symbols
+                .iter()
+                .filter(|symbol| {
+                    target_currencies.is_empty()
+                        || target_currencies
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(symbol))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            market_status_symbols = dedupe_symbols_preserving_order(market_status_symbols);
+
             let mut symbols = exchange
                 .symbols
                 .iter()
@@ -3503,23 +3533,38 @@ impl OctobotClient {
             if symbols.is_empty() {
                 continue;
             }
+            let has_market_status_symbols = !market_status_symbols.is_empty();
+            if has_market_status_symbols {
+                symbols = market_status_symbols;
+            }
             let rotation_span = symbols.len();
             let base_offset =
                 offset_snapshot.get(&exchange_key).copied().unwrap_or(0) % rotation_span;
 
-            let mut selected = Vec::new();
-            let mut unknown_probe_count = 0usize;
-            for index in 0..rotation_span {
-                let symbol = symbols[(base_offset + index) % rotation_span].clone();
-                if market_snapshot_is_known_available(&available_snapshot, &exchange_key, &symbol) {
-                    selected.push(symbol);
-                    continue;
+            let selected = if has_market_status_symbols {
+                (0..rotation_span)
+                    .map(|index| symbols[(base_offset + index) % rotation_span].clone())
+                    .collect::<Vec<_>>()
+            } else {
+                let mut selected = Vec::new();
+                let mut unknown_probe_count = 0usize;
+                for index in 0..rotation_span {
+                    let symbol = symbols[(base_offset + index) % rotation_span].clone();
+                    if market_snapshot_is_known_available(
+                        &available_snapshot,
+                        &exchange_key,
+                        &symbol,
+                    ) {
+                        selected.push(symbol);
+                        continue;
+                    }
+                    if unknown_probe_count < MARKET_SNAPSHOT_UNKNOWN_PROBE_LIMIT_PER_EXCHANGE {
+                        selected.push(symbol);
+                        unknown_probe_count += 1;
+                    }
                 }
-                if unknown_probe_count < MARKET_SNAPSHOT_UNKNOWN_PROBE_LIMIT_PER_EXCHANGE {
-                    selected.push(symbol);
-                    unknown_probe_count += 1;
-                }
-            }
+                selected
+            };
             if selected.is_empty() {
                 continue;
             }

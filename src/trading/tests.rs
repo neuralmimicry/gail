@@ -3033,8 +3033,10 @@ mod tests {
             .and(path_regex(
                 r"^/api/get_all_symbols/(binance|bitget|kucoin|xt)$",
             ))
-            .respond_with(ResponseTemplate::new(404))
-            .expect(4)
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string("should not query exchange universe"),
+            )
+            .expect(0)
             .mount(&server)
             .await;
 
@@ -3067,7 +3069,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn octobot_client_get_exchange_info_prioritizes_trading_symbols_before_exchange_symbols()
+    async fn octobot_client_get_exchange_info_uses_trading_symbols_as_primary_market_status_source()
     {
         let server = MockServer::start().await;
 
@@ -3107,14 +3109,10 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/api/get_all_symbols/binance"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                "0G/USDT",
-                "1000CAT/USDT",
-                "BTC/USDT",
-                "DOGE/USDT",
-                "ETH/USDT"
-            ])))
-            .expect(1)
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string("should not query exchange universe"),
+            )
+            .expect(0)
             .mount(&server)
             .await;
 
@@ -3125,19 +3123,10 @@ mod tests {
             .find(|entry| entry.name == "binance")
             .expect("binance exchange");
 
-        assert!(
-            binance.symbols.len() >= 4,
-            "expected merged symbol list with trading + exchange symbols"
-        );
+        assert_eq!(binance.symbols.len(), 2);
         assert_eq!(binance.symbols[0], "BTC/USDT");
         assert_eq!(binance.symbols[1], "DOGE/USDT");
-        assert!(binance.symbols.iter().any(|symbol| symbol == "0G/USDT"));
-        assert!(
-            binance
-                .symbols
-                .iter()
-                .any(|symbol| symbol == "1000CAT/USDT")
-        );
+        assert_eq!(binance.market_status_symbols, binance.symbols);
 
         server.verify().await;
     }
@@ -3803,11 +3792,13 @@ mod tests {
             OctobotExchange {
                 name: "binance".to_string(),
                 enabled: true,
+                market_status_symbols: Vec::new(),
                 symbols: vec!["DOGE/USDT".to_string()],
             },
             OctobotExchange {
                 name: "bitget".to_string(),
                 enabled: true,
+                market_status_symbols: Vec::new(),
                 symbols: vec!["DOGE/USDT".to_string()],
             },
         ];
@@ -3868,11 +3859,13 @@ mod tests {
             OctobotExchange {
                 name: "binance".to_string(),
                 enabled: true,
+                market_status_symbols: Vec::new(),
                 symbols: vec!["DOGE/USDT".to_string()],
             },
             OctobotExchange {
                 name: "bitget".to_string(),
                 enabled: true,
+                market_status_symbols: Vec::new(),
                 symbols: vec!["DOGE/USDT".to_string()],
             },
         ];
@@ -3987,14 +3980,18 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/api/get_all_symbols/binance"))
-            .respond_with(ResponseTemplate::new(404))
-            .expect(1)
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string("should not query exchange universe"),
+            )
+            .expect(0)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/api/get_all_symbols/bitget"))
-            .respond_with(ResponseTemplate::new(404))
-            .expect(1)
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string("should not query exchange universe"),
+            )
+            .expect(0)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -4383,6 +4380,107 @@ mod tests {
         let second = client.get_all_market_snapshots(&[], &[], 1).await;
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].symbol, "GOOD/USDT");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_get_all_market_snapshots_prefers_market_status_symbols_over_exchange_universe()
+     {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/first_exchange_details"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exchange_name": "binance",
+                "exchange_id": "binance-id"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/exchanges"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/trading"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"
+                <html><body>
+                  <a href="/symbol_market_status?exchange_id=binance-id&amp;symbol=BTC%2FUSDT">Binance : NEUTRAL (Indexing 6 coins)</a>
+                  <a href="/symbol_market_status?exchange_id=binance-id&amp;symbol=DOGE%2FUSDT">Binance : NEUTRAL (Indexing 6 coins)</a>
+                </body></html>
+                "#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/get_config_currency"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/get_all_symbols/binance"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string("should not query exchange universe"),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/dashboard/watched_symbol/.*$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exchange_id": "binance-id",
+                "time_frame": "1h"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/dashboard/currency_price_graph_update/binance-id/.*/1h/live$",
+            ))
+            .and(query_param("display_orders", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "candles": {
+                    "close": [1.0, 1.05],
+                    "high": [1.01, 1.06],
+                    "low": [0.99, 1.0],
+                    "volume": [100.0, 120.0]
+                }
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/market/ticker"))
+            .and(query_param("exchange", "binance"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let snapshots = client.get_all_market_snapshots(&[], &[], 100).await;
+        assert_eq!(snapshots.len(), 2);
+        assert!(
+            snapshots
+                .iter()
+                .any(|snapshot| snapshot.symbol == "BTC/USDT")
+        );
+        assert!(
+            snapshots
+                .iter()
+                .any(|snapshot| snapshot.symbol == "DOGE/USDT")
+        );
+        assert!(
+            snapshots
+                .iter()
+                .all(|snapshot| snapshot.symbol == "BTC/USDT" || snapshot.symbol == "DOGE/USDT")
+        );
         server.verify().await;
     }
 
