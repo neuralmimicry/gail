@@ -5322,6 +5322,100 @@ mod tests {
         server.verify().await;
     }
 
+    #[tokio::test]
+    async fn backtest_engine_run_with_config_refreshes_stale_cached_files_without_blocking() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_data_files"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("not available"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/data_collector"))
+            .and(query_param("action_type", "start_collector"))
+            .and(body_string_contains("\"symbols\":[\"BTC/USDT\"]"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json("Historical data collection started."),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/backtesting"))
+            .and(query_param("action_type", "start_backtesting"))
+            .and(body_string_contains(
+                "user/backtesting/collector/binance_BTC_USDT_1h_1710000000_1710100000.data",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("\"Backtesting started\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting_run_id"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "backtesting_id": 91 })),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_report"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(octobot_report_body(4.5, 2.0, 7)),
+            )
+            .mount(&server)
+            .await;
+
+        let temp = tempdir().expect("tempdir");
+        let catalog_path = temp.path().join("backtest_data_catalog.json");
+        std::fs::write(
+            &catalog_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "files": ["user/backtesting/collector/binance_BTC_USDT_1h_1710000000_1710100000.data"],
+                "updated_at": 1_700_000_000.0
+            }))
+            .expect("catalog json"),
+        )
+        .expect("write catalog");
+
+        let mut config = TradingConfig {
+            data_path: temp
+                .path()
+                .join("trading_state.json")
+                .to_string_lossy()
+                .to_string(),
+            backtest_data_catalog_path: catalog_path.to_string_lossy().to_string(),
+            backtest_symbols: vec!["BTC/USDT".to_string()],
+            backtest_data_collection_enabled: true,
+            backtest_data_collection_exchange: "binance".to_string(),
+            backtest_data_collection_time_frames: vec!["1h".to_string()],
+            backtest_data_collection_cooldown_seconds: 300,
+            ..TradingConfig::default()
+        };
+        config.normalize();
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let engine = BacktestEngine::with_poll_params(client, 0.0, Duration::from_millis(1), 5);
+        let summary = engine.run_with_config(&config).await;
+
+        assert_eq!(summary.assessment, ApproachAssessment::Viable);
+        assert_eq!(summary.run_id, Some(91));
+        let persisted_catalog = std::fs::read_to_string(catalog_path).expect("catalog persisted");
+        assert!(
+            persisted_catalog.contains("last_collection_requested_at"),
+            "catalog should record stale-data collection refresh timestamp"
+        );
+        server.verify().await;
+    }
+
     // -----------------------------------------------------------------------
     // BacktestEngine: full run with mock OctoBot — profitable approach
     // -----------------------------------------------------------------------

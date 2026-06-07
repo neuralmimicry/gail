@@ -12,7 +12,7 @@
 ///   POST /data_collector?action_type=start_collector — collect missing data
 ///   GET  /backtesting_run_id                         — latest run ID
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -26,6 +26,9 @@ use super::octobot::{BacktestRunReport, BacktestStartRequest, OctobotClient};
 
 const DEFAULT_BACKTEST_CATALOG_FILENAME: &str = "backtest_data_catalog.json";
 const DEFAULT_BACKTEST_COLLECTION_SYMBOL: &str = "BTC/USDT";
+const BACKTEST_MAX_FILES_PER_SYMBOL_TIMEFRAME: usize = 3;
+const BACKTEST_MAX_UNKNOWN_TIMEFRAME_FILES_PER_SYMBOL: usize = 2;
+const BACKTEST_MAX_GENERIC_COLLECTOR_FILES: usize = 8;
 
 fn now_ts() -> f64 {
     SystemTime::now()
@@ -187,6 +190,13 @@ pub struct BacktestEngine {
     max_polls: usize,
 }
 
+#[derive(Clone, Debug)]
+enum DataCollectionRequestOutcome {
+    Started,
+    AlreadyRunning,
+    CoolingDown { retry_after_seconds: u64 },
+}
+
 impl BacktestEngine {
     /// Create a new engine.  Uses sensible poll defaults (5 s interval, 60 polls = 5 min timeout).
     pub fn new(octobot: OctobotClient, profitability_threshold: f64) -> Self {
@@ -340,6 +350,56 @@ impl BacktestEngine {
         let cached_selected =
             select_backtest_data_files(catalog.files.clone(), &config.backtest_symbols);
         if !cached_selected.is_empty() {
+            if config.backtest_data_collection_enabled {
+                let stale_after_seconds = config.backtest_data_collection_cooldown_seconds as f64;
+                let selected_data_age =
+                    selected_backtest_data_age_seconds(&cached_selected, catalog.updated_at, now);
+                let data_is_stale = selected_data_age
+                    .map(|age| age >= stale_after_seconds)
+                    .unwrap_or(true);
+                if data_is_stale {
+                    match self
+                        .maybe_request_data_collection(config, &catalog_path, &mut catalog, now)
+                        .await
+                    {
+                        Ok(DataCollectionRequestOutcome::Started) => {
+                            let symbols = configured_collection_symbols(config);
+                            info!(
+                                "trading: backtest data appears stale (age={:?}s), started OctoBot historical data collection for {} on {} [{}] while continuing with {} backtest files",
+                                selected_data_age.map(|age| age.round() as u64),
+                                symbols.join(", "),
+                                config.backtest_data_collection_exchange,
+                                config.backtest_data_collection_time_frames.join(", "),
+                                cached_selected.len(),
+                            );
+                        }
+                        Ok(DataCollectionRequestOutcome::AlreadyRunning) => {
+                            info!(
+                                "trading: backtest data appears stale (age={:?}s), OctoBot data collector already running; continuing with {} backtest files",
+                                selected_data_age.map(|age| age.round() as u64),
+                                cached_selected.len(),
+                            );
+                        }
+                        Ok(DataCollectionRequestOutcome::CoolingDown {
+                            retry_after_seconds,
+                        }) => {
+                            debug!(
+                                "trading: backtest data appears stale (age={:?}s) but collector refresh is on cooldown (~{}s remaining); continuing with {} backtest files",
+                                selected_data_age.map(|age| age.round() as u64),
+                                retry_after_seconds,
+                                cached_selected.len(),
+                            );
+                        }
+                        Err(err) => {
+                            warn!(
+                                "trading: failed to refresh backtest data collection for stale files: {}; continuing with {} cached backtest files",
+                                err,
+                                cached_selected.len(),
+                            );
+                        }
+                    }
+                }
+            }
             if catalog_is_stale {
                 warn!(
                     "trading: using stale cached backtest data-file catalog path={} files={} age={:.0}s",
@@ -378,57 +438,33 @@ impl BacktestEngine {
         }
 
         if config.backtest_data_collection_enabled {
-            let cooldown_seconds = config.backtest_data_collection_cooldown_seconds as f64;
-            if let Some(last_request_at) = catalog.last_collection_requested_at
-                && cooldown_seconds > 0.0
-                && now - last_request_at < cooldown_seconds
-            {
-                let retry_after_seconds =
-                    (cooldown_seconds - (now - last_request_at)).ceil() as u64;
-                return Err(format!(
-                    "no OctoBot backtesting .data files matched Gail's configured backtest symbols; waiting for OctoBot collector output (retry in ~{retry_after_seconds}s)"
-                ));
-            }
-
-            let collector_symbols = if config.backtest_symbols.is_empty() {
-                vec![DEFAULT_BACKTEST_COLLECTION_SYMBOL.to_string()]
-            } else {
-                config.backtest_symbols.clone()
-            };
-            let now_ms = (now * 1000.0) as i64;
-            let start_ms = now_ms - (config.backtest_lookback_days as i64) * 86_400_000;
-
+            let symbols = configured_collection_symbols(config);
             match self
-                .octobot
-                .start_data_collector(
-                    &config.backtest_data_collection_exchange,
-                    &collector_symbols,
-                    &config.backtest_data_collection_time_frames,
-                    Some(start_ms),
-                    Some(now_ms),
-                )
+                .maybe_request_data_collection(config, &catalog_path, &mut catalog, now)
                 .await
             {
-                Ok(()) => {
-                    catalog.last_collection_requested_at = Some(now);
-                    persist_backtest_data_catalog(&catalog_path, &catalog).await;
+                Ok(DataCollectionRequestOutcome::Started) => {
                     return Err(format!(
                         "no OctoBot backtesting .data files matched Gail's configured backtest symbols; started OctoBot historical data collection for {} on {} [{}]",
-                        collector_symbols.join(", "),
+                        symbols.join(", "),
                         config.backtest_data_collection_exchange,
                         config.backtest_data_collection_time_frames.join(", ")
                     ));
                 }
+                Ok(DataCollectionRequestOutcome::AlreadyRunning) => {
+                    return Err(
+                        "no OctoBot backtesting .data files matched Gail's configured backtest symbols; OctoBot data collector is already running"
+                            .to_string(),
+                    );
+                }
+                Ok(DataCollectionRequestOutcome::CoolingDown {
+                    retry_after_seconds,
+                }) => {
+                    return Err(format!(
+                        "no OctoBot backtesting .data files matched Gail's configured backtest symbols; waiting for OctoBot collector output (retry in ~{retry_after_seconds}s)"
+                    ));
+                }
                 Err(err) => {
-                    let err_lower = err.to_ascii_lowercase();
-                    if err_lower.contains("already running") {
-                        catalog.last_collection_requested_at = Some(now);
-                        persist_backtest_data_catalog(&catalog_path, &catalog).await;
-                        return Err(
-                            "no OctoBot backtesting .data files matched Gail's configured backtest symbols; OctoBot data collector is already running"
-                                .to_string(),
-                        );
-                    }
                     return Err(format!(
                         "no OctoBot backtesting .data files matched Gail's configured backtest symbols; failed to start OctoBot data collector: {err}"
                     ));
@@ -437,6 +473,55 @@ impl BacktestEngine {
         }
 
         Err("no OctoBot backtesting .data files matched Gail's configured backtest symbols; collect or configure backtest data files before enabling Gail backtesting".to_string())
+    }
+
+    async fn maybe_request_data_collection(
+        &self,
+        config: &TradingConfig,
+        catalog_path: &PathBuf,
+        catalog: &mut BacktestDataCatalog,
+        now: f64,
+    ) -> Result<DataCollectionRequestOutcome, String> {
+        let cooldown_seconds = config.backtest_data_collection_cooldown_seconds as f64;
+        if let Some(last_request_at) = catalog.last_collection_requested_at
+            && cooldown_seconds > 0.0
+            && now - last_request_at < cooldown_seconds
+        {
+            let retry_after_seconds = (cooldown_seconds - (now - last_request_at)).ceil() as u64;
+            return Ok(DataCollectionRequestOutcome::CoolingDown {
+                retry_after_seconds,
+            });
+        }
+
+        let collector_symbols = configured_collection_symbols(config);
+        let now_ms = (now * 1000.0) as i64;
+        let start_ms = now_ms - (config.backtest_lookback_days as i64) * 86_400_000;
+        match self
+            .octobot
+            .start_data_collector(
+                &config.backtest_data_collection_exchange,
+                &collector_symbols,
+                &config.backtest_data_collection_time_frames,
+                Some(start_ms),
+                Some(now_ms),
+            )
+            .await
+        {
+            Ok(()) => {
+                catalog.last_collection_requested_at = Some(now);
+                persist_backtest_data_catalog(catalog_path, catalog).await;
+                Ok(DataCollectionRequestOutcome::Started)
+            }
+            Err(err) => {
+                if err.to_ascii_lowercase().contains("already running") {
+                    catalog.last_collection_requested_at = Some(now);
+                    persist_backtest_data_catalog(catalog_path, catalog).await;
+                    Ok(DataCollectionRequestOutcome::AlreadyRunning)
+                } else {
+                    Err(err)
+                }
+            }
+        }
     }
 
     async fn discover_and_cache_backtest_files(
@@ -489,18 +574,21 @@ fn select_backtest_data_files(available: Vec<String>, symbols: &[String]) -> Vec
             continue;
         }
 
-        // Keep one best file per timeframe for each requested symbol.
+        // Keep several best files per timeframe to accumulate richer history
+        // while avoiding unbounded growth.
         sort_backtest_data_file_candidates(&mut symbol_candidates);
-        let mut seen_timeframes = HashSet::new();
-        let mut included_unknown_timeframe = false;
+        let mut timeframe_counts: HashMap<u64, usize> = HashMap::new();
+        let mut unknown_timeframe_count = 0usize;
         for candidate in symbol_candidates {
             if let Some(timeframe_seconds) = candidate.timeframe_seconds {
-                if seen_timeframes.insert(timeframe_seconds) {
+                let count = timeframe_counts.entry(timeframe_seconds).or_insert(0);
+                if *count < BACKTEST_MAX_FILES_PER_SYMBOL_TIMEFRAME {
                     selected.push(candidate.path);
+                    *count += 1;
                 }
-            } else if !included_unknown_timeframe {
+            } else if unknown_timeframe_count < BACKTEST_MAX_UNKNOWN_TIMEFRAME_FILES_PER_SYMBOL {
                 selected.push(candidate.path);
-                included_unknown_timeframe = true;
+                unknown_timeframe_count += 1;
             }
         }
     }
@@ -517,7 +605,7 @@ fn select_backtest_data_files(available: Vec<String>, symbols: &[String]) -> Vec
         sort_backtest_data_file_candidates(&mut candidates);
         return candidates
             .into_iter()
-            .take(1)
+            .take(BACKTEST_MAX_GENERIC_COLLECTOR_FILES)
             .map(|candidate| candidate.path)
             .collect();
     }
@@ -717,6 +805,34 @@ fn generic_collector_file_timestamp(value: &str) -> Option<f64> {
                 .and_then(|rest| rest.strip_suffix(suffix))
         })?;
     timestamp.parse::<f64>().ok()
+}
+
+fn newest_selected_backtest_data_ts(
+    selected_files: &[String],
+    catalog_updated_at: f64,
+) -> Option<f64> {
+    let from_files = selected_files
+        .iter()
+        .filter_map(|file| BacktestDataFileCandidate::from_path(file.to_string()).freshness_ts)
+        .max_by(|left, right| left.total_cmp(right));
+    from_files.or_else(|| (catalog_updated_at > 0.0).then_some(catalog_updated_at))
+}
+
+fn selected_backtest_data_age_seconds(
+    selected_files: &[String],
+    catalog_updated_at: f64,
+    now: f64,
+) -> Option<f64> {
+    newest_selected_backtest_data_ts(selected_files, catalog_updated_at)
+        .map(|timestamp| (now - timestamp).max(0.0))
+}
+
+fn configured_collection_symbols(config: &TradingConfig) -> Vec<String> {
+    if config.backtest_symbols.is_empty() {
+        vec![DEFAULT_BACKTEST_COLLECTION_SYMBOL.to_string()]
+    } else {
+        config.backtest_symbols.clone()
+    }
 }
 
 fn resolve_backtest_catalog_path(config: &TradingConfig) -> PathBuf {
@@ -935,6 +1051,8 @@ mod tests {
                     .to_string(),
                 "user/backtesting/collector/binance_BTC_USDT_4h_1710200000_1710600000.data"
                     .to_string(),
+                "user/backtesting/collector/binance_BTC_USDT_4h_1710000000_1710100000.data"
+                    .to_string(),
                 "user/backtesting/collector/binance_BTC_USDT_1h_1710000000_1710100000.data"
                     .to_string(),
             ]
@@ -950,7 +1068,62 @@ mod tests {
         let selected = select_backtest_data_files(available.clone(), &["BTC/USDT".to_string()]);
         assert_eq!(
             selected,
-            vec!["ExchangeHistoryDataCollector_1779194074.4955919.data"]
+            vec![
+                "ExchangeHistoryDataCollector_1779194074.4955919.data".to_string(),
+                "ExchangeHistoryDataCollector_1779194033.964632.data".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn backtest_file_selection_caps_files_per_timeframe() {
+        let available = vec![
+            "user/backtesting/collector/binance_BTC_USDT_1h_1710800000_1710900000.data".to_string(),
+            "user/backtesting/collector/binance_BTC_USDT_1h_1710700000_1710800000.data".to_string(),
+            "user/backtesting/collector/binance_BTC_USDT_1h_1710600000_1710700000.data".to_string(),
+            "user/backtesting/collector/binance_BTC_USDT_1h_1710500000_1710600000.data".to_string(),
+        ];
+        let selected = select_backtest_data_files(available, &["BTC/USDT".to_string()]);
+        assert_eq!(selected.len(), BACKTEST_MAX_FILES_PER_SYMBOL_TIMEFRAME);
+        assert!(
+            selected.contains(
+                &"user/backtesting/collector/binance_BTC_USDT_1h_1710800000_1710900000.data"
+                    .to_string()
+            )
+        );
+        assert!(
+            selected.contains(
+                &"user/backtesting/collector/binance_BTC_USDT_1h_1710700000_1710800000.data"
+                    .to_string()
+            )
+        );
+        assert!(
+            selected.contains(
+                &"user/backtesting/collector/binance_BTC_USDT_1h_1710600000_1710700000.data"
+                    .to_string()
+            )
+        );
+        assert!(
+            !selected.contains(
+                &"user/backtesting/collector/binance_BTC_USDT_1h_1710500000_1710600000.data"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn selected_backtest_data_age_uses_newest_file_timestamp() {
+        let now = 1_800_000_000.0;
+        let selected = vec![
+            "ExchangeHistoryDataCollector_1779194033.964632.data".to_string(),
+            "ExchangeHistoryDataCollector_1779194074.4955919.data".to_string(),
+        ];
+        let age = selected_backtest_data_age_seconds(&selected, 1_700_000_000.0, now)
+            .expect("age should be calculated");
+        let expected_age = now - 1_779_194_074.4955919;
+        assert!(
+            (age - expected_age).abs() < 1e-6,
+            "age={age} expected={expected_age}"
         );
     }
 
