@@ -21,6 +21,10 @@ use tokio_postgres::NoTls;
 
 use crate::config::GailConfig;
 
+const POSTGRES_PERSIST_FAILURE_BASE_BACKOFF_SECONDS: f64 = 5.0;
+const POSTGRES_PERSIST_FAILURE_MAX_BACKOFF_SECONDS: f64 = 180.0;
+const POSTGRES_PERSIST_TOO_MANY_CLIENTS_BACKOFF_SECONDS: f64 = 30.0;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LlmLedgerRecord {
@@ -128,6 +132,9 @@ impl LlmLedger {
         let max_response_chars = config.llm_ledger.max_response_chars;
         let (queue_tx, mut queue_rx) = mpsc::channel(queue_capacity);
         tokio::spawn(async move {
+            let mut postgres_client: Option<tokio_postgres::Client> = None;
+            let mut postgres_failure_streak: u32 = 0;
+            let mut postgres_cooldown_until: f64 = 0.0;
             while let Some(record) = queue_rx.recv().await {
                 if let Err(error) = persist_file_record(&path, &record).await {
                     tracing::warn!(
@@ -136,13 +143,50 @@ impl LlmLedger {
                         "failed to persist Gail LLM ledger record to file"
                     );
                 }
-                if let Some(dsn) = postgres_dsn.as_deref()
-                    && let Err(error) = persist_postgres_record(dsn, &record).await
-                {
-                    tracing::warn!(
-                        error = %error,
-                        "failed to persist Gail LLM ledger record to Postgres"
-                    );
+                if let Some(dsn) = postgres_dsn.as_deref() {
+                    let now = now_ts();
+                    if now < postgres_cooldown_until {
+                        continue;
+                    }
+                    if postgres_client.is_none() {
+                        match connect_client(dsn).await {
+                            Ok(client) => {
+                                postgres_client = Some(client);
+                            }
+                            Err(error) => {
+                                postgres_failure_streak = postgres_failure_streak.saturating_add(1);
+                                let backoff_seconds =
+                                    postgres_backoff_seconds(&error, postgres_failure_streak);
+                                postgres_cooldown_until = now + backoff_seconds;
+                                tracing::warn!(
+                                    error = %describe_postgres_error(&error),
+                                    failure_streak = postgres_failure_streak,
+                                    backoff_seconds,
+                                    "failed to connect Postgres client for Gail LLM ledger persistence"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
+                    if let Some(client) = postgres_client.as_ref()
+                        && let Err(error) = persist_postgres_record(client, &record).await
+                    {
+                        postgres_client = None;
+                        postgres_failure_streak = postgres_failure_streak.saturating_add(1);
+                        let backoff_seconds =
+                            postgres_backoff_seconds(&error, postgres_failure_streak);
+                        postgres_cooldown_until = now + backoff_seconds;
+                        tracing::warn!(
+                            error = %describe_postgres_error(&error),
+                            failure_streak = postgres_failure_streak,
+                            backoff_seconds,
+                            "failed to persist Gail LLM ledger record to Postgres"
+                        );
+                    } else {
+                        postgres_failure_streak = 0;
+                        postgres_cooldown_until = 0.0;
+                    }
                 }
             }
         });
@@ -545,10 +589,9 @@ async fn persist_file_record(path: &Path, record: &LlmLedgerRecord) -> std::io::
 }
 
 async fn persist_postgres_record(
-    dsn: &str,
+    client: &tokio_postgres::Client,
     record: &LlmLedgerRecord,
 ) -> Result<(), tokio_postgres::Error> {
-    let client = connect_client(dsn).await?;
     let message_roles = serde_json::to_value(&record.message_roles).unwrap_or_else(|_| json!([]));
     let latency_ms = record
         .latency_ms
@@ -629,6 +672,40 @@ async fn persist_postgres_record(
         )
         .await?;
     Ok(())
+}
+
+fn describe_postgres_error(error: &tokio_postgres::Error) -> String {
+    if let Some(db_error) = error.as_db_error() {
+        let mut details = format!("{} ({})", db_error.message(), db_error.code().code());
+        if let Some(detail) = db_error.detail() {
+            details.push_str(": ");
+            details.push_str(detail);
+        }
+        return details;
+    }
+    error.to_string()
+}
+
+fn postgres_backoff_seconds(error: &tokio_postgres::Error, failure_streak: u32) -> f64 {
+    if error_indicates_too_many_clients(error) {
+        return POSTGRES_PERSIST_TOO_MANY_CLIENTS_BACKOFF_SECONDS;
+    }
+    let exponent = failure_streak.saturating_sub(1).min(8);
+    let multiplier = 2u32.pow(exponent) as f64;
+    (POSTGRES_PERSIST_FAILURE_BASE_BACKOFF_SECONDS * multiplier)
+        .min(POSTGRES_PERSIST_FAILURE_MAX_BACKOFF_SECONDS)
+}
+
+fn error_indicates_too_many_clients(error: &tokio_postgres::Error) -> bool {
+    if let Some(db_error) = error.as_db_error()
+        && db_error.code().code() == "53300"
+    {
+        return true;
+    }
+    error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("too many clients")
 }
 
 fn truncate_chars(value: &str, limit: usize) -> String {

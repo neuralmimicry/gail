@@ -16,6 +16,9 @@ use tokio_postgres::NoTls;
 const MAX_ACTIONS_PER_ISSUE: usize = 30;
 const MAX_RECENT_EVENTS: usize = 120;
 const SAVE_MIN_INTERVAL_SECONDS: f64 = 2.0;
+const API_ISSUES_POSTGRES_FAILURE_BASE_BACKOFF_SECONDS: f64 = 5.0;
+const API_ISSUES_POSTGRES_FAILURE_MAX_BACKOFF_SECONDS: f64 = 180.0;
+const API_ISSUES_POSTGRES_TOO_MANY_CLIENTS_BACKOFF_SECONDS: f64 = 30.0;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -97,6 +100,16 @@ struct SaveRequest {
 }
 
 static GLOBAL_STORE: Lazy<Mutex<GlobalStore>> = Lazy::new(|| Mutex::new(GlobalStore::default()));
+static POSTGRES_WRITER: Lazy<Mutex<PostgresWriterState>> =
+    Lazy::new(|| Mutex::new(PostgresWriterState::default()));
+
+#[derive(Debug, Default)]
+struct PostgresWriterState {
+    dsn: Option<String>,
+    client: Option<tokio_postgres::Client>,
+    failure_streak: u32,
+    cooldown_until: f64,
+}
 
 impl Default for ApiIssue {
     fn default() -> Self {
@@ -579,16 +592,59 @@ async fn persist_file(path: &PathBuf, snapshot: &ApiIssueRegistry) -> std::io::R
     Ok(store.registry.storage.last_file_save_at)
 }
 
-async fn persist_postgres(
-    dsn: &str,
-    snapshot: &ApiIssueRegistry,
-) -> Result<(), tokio_postgres::Error> {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            tracing::debug!(error = %error, "Gail API issue Postgres connection ended");
+async fn persist_postgres(dsn: &str, snapshot: &ApiIssueRegistry) -> Result<(), String> {
+    let mut writer = POSTGRES_WRITER.lock().await;
+    let now = now_ts();
+    if writer.cooldown_until > now {
+        let remaining = (writer.cooldown_until - now).ceil().max(1.0);
+        return Err(format!(
+            "Postgres persistence is cooling down for {}s after recent failures",
+            remaining as u64
+        ));
+    }
+
+    let dsn_changed = writer.dsn.as_deref().is_none_or(|active| active != dsn);
+    if writer.client.is_none() || dsn_changed {
+        let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.map_err(|error| {
+            apply_postgres_failure_backoff(&mut writer, &error);
+            describe_postgres_error(&error)
+        })?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                tracing::debug!(error = %error, "Gail API issue Postgres connection ended");
+            }
+        });
+        ensure_postgres_tables(&client).await.map_err(|error| {
+            apply_postgres_failure_backoff(&mut writer, &error);
+            describe_postgres_error(&error)
+        })?;
+        writer.client = Some(client);
+        writer.dsn = Some(dsn.to_string());
+        writer.failure_streak = 0;
+        writer.cooldown_until = 0.0;
+    }
+
+    let Some(client) = writer.client.as_ref() else {
+        return Err("Postgres writer is not connected".to_string());
+    };
+
+    match persist_postgres_snapshot(client, snapshot).await {
+        Ok(()) => {
+            writer.failure_streak = 0;
+            writer.cooldown_until = 0.0;
+            Ok(())
         }
-    });
+        Err(error) => {
+            writer.client = None;
+            apply_postgres_failure_backoff(&mut writer, &error);
+            Err(describe_postgres_error(&error))
+        }
+    }
+}
+
+async fn ensure_postgres_tables(
+    client: &tokio_postgres::Client,
+) -> Result<(), tokio_postgres::Error> {
     client
         .batch_execute(
             r#"
@@ -611,7 +667,13 @@ async fn persist_postgres(
             );
             "#,
         )
-        .await?;
+        .await
+}
+
+async fn persist_postgres_snapshot(
+    client: &tokio_postgres::Client,
+    snapshot: &ApiIssueRegistry,
+) -> Result<(), tokio_postgres::Error> {
     let payload = serde_json::to_value(snapshot).unwrap_or_else(|_| json!({}));
     client
         .execute(
@@ -651,6 +713,45 @@ async fn persist_postgres(
             .await?;
     }
     Ok(())
+}
+
+fn apply_postgres_failure_backoff(state: &mut PostgresWriterState, error: &tokio_postgres::Error) {
+    state.failure_streak = state.failure_streak.saturating_add(1);
+    state.cooldown_until = now_ts() + postgres_backoff_seconds(error, state.failure_streak);
+}
+
+fn describe_postgres_error(error: &tokio_postgres::Error) -> String {
+    if let Some(db_error) = error.as_db_error() {
+        let mut details = format!("{} ({})", db_error.message(), db_error.code().code());
+        if let Some(detail) = db_error.detail() {
+            details.push_str(": ");
+            details.push_str(detail);
+        }
+        return details;
+    }
+    error.to_string()
+}
+
+fn postgres_backoff_seconds(error: &tokio_postgres::Error, failure_streak: u32) -> f64 {
+    if postgres_error_is_too_many_clients(error) {
+        return API_ISSUES_POSTGRES_TOO_MANY_CLIENTS_BACKOFF_SECONDS;
+    }
+    let exponent = failure_streak.saturating_sub(1).min(8);
+    let multiplier = 2u32.pow(exponent) as f64;
+    (API_ISSUES_POSTGRES_FAILURE_BASE_BACKOFF_SECONDS * multiplier)
+        .min(API_ISSUES_POSTGRES_FAILURE_MAX_BACKOFF_SECONDS)
+}
+
+fn postgres_error_is_too_many_clients(error: &tokio_postgres::Error) -> bool {
+    if let Some(db_error) = error.as_db_error()
+        && db_error.code().code() == "53300"
+    {
+        return true;
+    }
+    error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("too many clients")
 }
 
 fn issue_id(api: &str, provider: Option<&str>, endpoint: &str, category: &str) -> String {
