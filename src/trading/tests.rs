@@ -5416,6 +5416,106 @@ mod tests {
         server.verify().await;
     }
 
+    #[tokio::test]
+    async fn backtest_engine_run_with_config_retries_other_subsets_after_missing_timeframe_error() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/data_collector"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string(
+                        r#"
+                        <td>ExchangeHistoryDataCollector_1779200000.0.data</td>
+                        <td>ExchangeHistoryDataCollector_1779190000.0.data</td>
+                        "#,
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_data_files"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("unused"))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/backtesting"))
+            .and(query_param("action_type", "start_backtesting"))
+            .and(body_string_contains(
+                "ExchangeHistoryDataCollector_1779200000.0.data",
+            ))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string("Missing time frame in data file: 1h"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/backtesting"))
+            .and(query_param("action_type", "start_backtesting"))
+            .and(body_string_contains(
+                "ExchangeHistoryDataCollector_1779190000.0.data",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("\"Backtesting started\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting_run_id"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "backtesting_id": 92 })),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_report"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(octobot_report_body(5.0, 2.0, 8)),
+            )
+            .mount(&server)
+            .await;
+
+        let temp = tempdir().expect("tempdir");
+        let catalog_path = temp.path().join("backtest_data_catalog.json");
+        let mut config = TradingConfig {
+            data_path: temp
+                .path()
+                .join("trading_state.json")
+                .to_string_lossy()
+                .to_string(),
+            backtest_data_catalog_path: catalog_path.to_string_lossy().to_string(),
+            backtest_symbols: vec!["BTC/USDT".to_string()],
+            backtest_data_collection_enabled: false,
+            ..TradingConfig::default()
+        };
+        config.normalize();
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let engine = BacktestEngine::with_poll_params(client, 1.0, Duration::from_millis(1), 5);
+        let summary = engine.run_with_config(&config).await;
+
+        assert_eq!(summary.assessment, ApproachAssessment::Viable);
+        assert_eq!(summary.run_id, Some(92));
+        assert_eq!(summary.profitability_pct, Some(5.0));
+        assert!(
+            summary.notes.contains("successful_subsets=1/2"),
+            "summary should aggregate subset retries: {}",
+            summary.notes
+        );
+        server.verify().await;
+    }
+
     // -----------------------------------------------------------------------
     // BacktestEngine: full run with mock OctoBot — profitable approach
     // -----------------------------------------------------------------------

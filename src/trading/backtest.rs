@@ -12,7 +12,7 @@
 ///   POST /data_collector?action_type=start_collector — collect missing data
 ///   GET  /backtesting_run_id                         — latest run ID
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -29,6 +29,10 @@ const DEFAULT_BACKTEST_COLLECTION_SYMBOL: &str = "BTC/USDT";
 const BACKTEST_MAX_FILES_PER_SYMBOL_TIMEFRAME: usize = 3;
 const BACKTEST_MAX_UNKNOWN_TIMEFRAME_FILES_PER_SYMBOL: usize = 2;
 const BACKTEST_MAX_GENERIC_COLLECTOR_FILES: usize = 8;
+const BACKTEST_MAX_SUBSET_RUNS_PER_CYCLE: usize = 6;
+const BACKTEST_MIN_SUBSET_RUNS_PER_CYCLE: usize = 2;
+const BACKTEST_TARGET_SUCCESSFUL_SUBSET_RUNS_PER_CYCLE: usize = 1;
+const BACKTEST_MAX_SINGLE_UNKNOWN_FILE_SUBSETS: usize = 4;
 
 fn now_ts() -> f64 {
     SystemTime::now()
@@ -197,6 +201,19 @@ enum DataCollectionRequestOutcome {
     CoolingDown { retry_after_seconds: u64 },
 }
 
+#[derive(Clone, Debug)]
+struct BacktestFileSubset {
+    label: String,
+    files: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct BacktestSubsetOutcome {
+    label: String,
+    file_count: usize,
+    summary: BacktestSummary,
+}
+
 impl BacktestEngine {
     /// Create a new engine.  Uses sensible poll defaults (5 s interval, 60 polls = 5 min timeout).
     pub fn new(octobot: OctobotClient, profitability_threshold: f64) -> Self {
@@ -298,13 +315,55 @@ impl BacktestEngine {
             }
         };
 
-        let request = BacktestStartRequest {
-            files,
-            start_timestamp: Some(start_ms),
-            end_timestamp: Some(now_ms),
-            enable_logs: false,
-        };
-        self.run(&request).await
+        let subsets = build_backtest_file_subsets(files);
+        if subsets.is_empty() {
+            return BacktestSummary::incomplete(
+                "no backtest file subsets available after selection".to_string(),
+            );
+        }
+
+        let minimum_runs = subsets.len().min(BACKTEST_MIN_SUBSET_RUNS_PER_CYCLE);
+        let mut successful_runs = 0usize;
+        let mut outcomes = Vec::new();
+        for (index, subset) in subsets.iter().enumerate() {
+            info!(
+                "trading: running backtest subset {}/{} label={} files={}",
+                index + 1,
+                subsets.len(),
+                subset.label,
+                subset.files.len()
+            );
+            let request = BacktestStartRequest {
+                files: subset.files.clone(),
+                start_timestamp: Some(start_ms),
+                end_timestamp: Some(now_ms),
+                enable_logs: false,
+            };
+            let summary = self.run(&request).await;
+            if summary.profitability_pct.is_some() {
+                successful_runs += 1;
+            }
+            info!(
+                "trading: backtest subset complete label={} assessment={} profit={:?}% files={}",
+                subset.label,
+                summary.assessment,
+                summary.profitability_pct,
+                subset.files.len()
+            );
+            outcomes.push(BacktestSubsetOutcome {
+                label: subset.label.clone(),
+                file_count: subset.files.len(),
+                summary,
+            });
+            let attempted_runs = outcomes.len();
+            if attempted_runs >= minimum_runs
+                && successful_runs >= BACKTEST_TARGET_SUCCESSFUL_SUBSET_RUNS_PER_CYCLE
+            {
+                break;
+            }
+        }
+
+        aggregate_backtest_subset_outcomes(outcomes, self.profitability_threshold)
     }
 
     async fn resolve_backtest_files(&self, config: &TradingConfig) -> Result<Vec<String>, String> {
@@ -611,6 +670,241 @@ fn select_backtest_data_files(available: Vec<String>, symbols: &[String]) -> Vec
     }
 
     Vec::new()
+}
+
+fn build_backtest_file_subsets(selected_files: Vec<String>) -> Vec<BacktestFileSubset> {
+    let selected_files = dedupe_backtest_data_files(selected_files);
+    if selected_files.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = selected_files
+        .into_iter()
+        .map(BacktestDataFileCandidate::from_path)
+        .collect::<Vec<_>>();
+    sort_backtest_data_file_candidates(&mut candidates);
+
+    let mut known_by_timeframe: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+    let mut unknown_timeframe_files = Vec::new();
+    for candidate in &candidates {
+        if let Some(timeframe_seconds) = candidate.timeframe_seconds {
+            known_by_timeframe
+                .entry(timeframe_seconds)
+                .or_default()
+                .push(candidate.path.clone());
+        } else {
+            unknown_timeframe_files.push(candidate.path.clone());
+        }
+    }
+
+    let mut subsets = Vec::new();
+    let mut seen = HashSet::new();
+    let one_hour_files = known_by_timeframe.get(&3_600).cloned().unwrap_or_default();
+    if !one_hour_files.is_empty() {
+        push_backtest_file_subset(
+            &mut subsets,
+            &mut seen,
+            "primary_1h".to_string(),
+            one_hour_files.clone(),
+        );
+    }
+
+    for (timeframe_seconds, timeframe_files) in known_by_timeframe
+        .iter()
+        .filter(|(timeframe_seconds, _)| **timeframe_seconds >= 86_400)
+    {
+        if one_hour_files.is_empty() {
+            break;
+        }
+        let mut combined = one_hour_files.clone();
+        combined.extend(timeframe_files.clone());
+        push_backtest_file_subset(
+            &mut subsets,
+            &mut seen,
+            format!(
+                "1h_plus_{}",
+                timeframe_label_from_seconds(*timeframe_seconds)
+            ),
+            combined,
+        );
+    }
+
+    for (index, file) in unknown_timeframe_files
+        .into_iter()
+        .take(BACKTEST_MAX_SINGLE_UNKNOWN_FILE_SUBSETS)
+        .enumerate()
+    {
+        push_backtest_file_subset(
+            &mut subsets,
+            &mut seen,
+            format!("single_unknown_{}", index + 1),
+            vec![file],
+        );
+    }
+
+    for (timeframe_seconds, timeframe_files) in known_by_timeframe.iter().rev() {
+        push_backtest_file_subset(
+            &mut subsets,
+            &mut seen,
+            format!("{}_only", timeframe_label_from_seconds(*timeframe_seconds)),
+            timeframe_files.clone(),
+        );
+    }
+
+    let all_files = candidates
+        .iter()
+        .map(|candidate| candidate.path.clone())
+        .collect::<Vec<_>>();
+    push_backtest_file_subset(
+        &mut subsets,
+        &mut seen,
+        "combined_all".to_string(),
+        all_files,
+    );
+
+    subsets.truncate(BACKTEST_MAX_SUBSET_RUNS_PER_CYCLE);
+    subsets
+}
+
+fn push_backtest_file_subset(
+    subsets: &mut Vec<BacktestFileSubset>,
+    seen: &mut HashSet<String>,
+    label: String,
+    files: Vec<String>,
+) {
+    let files = dedupe_backtest_data_files(files);
+    if files.is_empty() {
+        return;
+    }
+    let mut fingerprint_files = files.clone();
+    fingerprint_files.sort();
+    let fingerprint = fingerprint_files.join("\n");
+    if seen.insert(fingerprint) {
+        subsets.push(BacktestFileSubset { label, files });
+    }
+}
+
+fn timeframe_label_from_seconds(timeframe_seconds: u64) -> String {
+    if timeframe_seconds.is_multiple_of(2_592_000) {
+        return format!("{}M", timeframe_seconds / 2_592_000);
+    }
+    if timeframe_seconds.is_multiple_of(604_800) {
+        return format!("{}w", timeframe_seconds / 604_800);
+    }
+    if timeframe_seconds.is_multiple_of(86_400) {
+        return format!("{}d", timeframe_seconds / 86_400);
+    }
+    if timeframe_seconds.is_multiple_of(3_600) {
+        return format!("{}h", timeframe_seconds / 3_600);
+    }
+    if timeframe_seconds.is_multiple_of(60) {
+        return format!("{}m", timeframe_seconds / 60);
+    }
+    format!("{}s", timeframe_seconds)
+}
+
+fn aggregate_backtest_subset_outcomes(
+    outcomes: Vec<BacktestSubsetOutcome>,
+    profitability_threshold: f64,
+) -> BacktestSummary {
+    if outcomes.is_empty() {
+        return BacktestSummary::incomplete(
+            "no backtest subsets were executed; skipping backtest cycle".to_string(),
+        );
+    }
+
+    let successful = outcomes
+        .iter()
+        .filter(|outcome| outcome.summary.profitability_pct.is_some())
+        .collect::<Vec<_>>();
+    if successful.is_empty() {
+        let mut summary = outcomes[0].summary.clone();
+        summary.notes = format!(
+            "{}; subset outcomes: {}",
+            summary.notes,
+            summarize_subset_outcomes(&outcomes)
+        );
+        return summary;
+    }
+
+    let profitability_values = successful
+        .iter()
+        .filter_map(|outcome| outcome.summary.profitability_pct)
+        .collect::<Vec<_>>();
+    let market_avg_values = successful
+        .iter()
+        .filter_map(|outcome| outcome.summary.market_avg_pct)
+        .collect::<Vec<_>>();
+    let profitability_pct = if profitability_values.is_empty() {
+        None
+    } else {
+        Some(profitability_values.iter().sum::<f64>() / profitability_values.len() as f64)
+    };
+    let market_avg_pct = if market_avg_values.is_empty() {
+        None
+    } else {
+        Some(market_avg_values.iter().sum::<f64>() / market_avg_values.len() as f64)
+    };
+
+    let beats_market = match (profitability_pct, market_avg_pct) {
+        (Some(profitability), Some(market_avg)) => Some(profitability > market_avg),
+        _ => None,
+    };
+
+    let total_trades = successful
+        .iter()
+        .map(|outcome| outcome.summary.total_trades)
+        .sum::<usize>();
+    let errors_count = outcomes
+        .iter()
+        .map(|outcome| outcome.summary.errors_count)
+        .sum::<usize>();
+
+    let mut symbols = successful
+        .iter()
+        .flat_map(|outcome| outcome.summary.symbols.clone())
+        .collect::<Vec<_>>();
+    symbols.sort();
+    symbols.dedup();
+
+    let run_id = successful
+        .iter()
+        .rev()
+        .find_map(|outcome| outcome.summary.run_id);
+    let assessment = assess(profitability_pct, profitability_threshold);
+    BacktestSummary {
+        run_at: now_ts(),
+        assessment,
+        profitability_pct,
+        market_avg_pct,
+        beats_market,
+        total_trades,
+        errors_count,
+        symbols,
+        notes: format!(
+            "multi-run backtest: successful_subsets={}/{}; outcomes={}",
+            successful.len(),
+            outcomes.len(),
+            summarize_subset_outcomes(&outcomes)
+        ),
+        run_id,
+    }
+}
+
+fn summarize_subset_outcomes(outcomes: &[BacktestSubsetOutcome]) -> String {
+    outcomes
+        .iter()
+        .map(|outcome| {
+            format!(
+                "{}(files={},assessment={},profit={:?})",
+                outcome.label,
+                outcome.file_count,
+                outcome.summary.assessment,
+                outcome.summary.profitability_pct
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 #[derive(Clone, Debug)]
@@ -1161,6 +1455,93 @@ mod tests {
                 "user/backtesting/collector/binance_BTC_USDT_1h.data".to_string(),
                 "user/backtesting/collector/binance_ETH_USDT_1h.data".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn backtest_file_subsets_prioritize_1h_and_include_unknown_singletons() {
+        let selected = vec![
+            "user/backtesting/collector/binance_BTC_USDT_1h.data".to_string(),
+            "user/backtesting/collector/binance_BTC_USDT_1d.data".to_string(),
+            "ExchangeHistoryDataCollector_1779194074.4955919.data".to_string(),
+        ];
+        let subsets = build_backtest_file_subsets(selected);
+        assert!(!subsets.is_empty(), "subsets should be generated");
+        assert_eq!(subsets[0].label, "primary_1h");
+        assert_eq!(
+            subsets[0].files,
+            vec!["user/backtesting/collector/binance_BTC_USDT_1h.data".to_string()]
+        );
+        assert!(
+            subsets.iter().any(|subset| subset.label == "1h_plus_1d"
+                && subset
+                    .files
+                    .contains(&"user/backtesting/collector/binance_BTC_USDT_1h.data".to_string())
+                && subset
+                    .files
+                    .contains(&"user/backtesting/collector/binance_BTC_USDT_1d.data".to_string())),
+            "subsets should include 1h + 1d combination"
+        );
+        assert!(
+            subsets
+                .iter()
+                .any(|subset| subset.label.starts_with("single_unknown_")),
+            "subsets should include unknown-timeframe single-file attempts"
+        );
+    }
+
+    #[test]
+    fn aggregate_backtest_subset_outcomes_uses_successful_subset_average() {
+        let outcomes = vec![
+            BacktestSubsetOutcome {
+                label: "subset_1".to_string(),
+                file_count: 1,
+                summary: BacktestSummary {
+                    run_at: now_ts(),
+                    assessment: ApproachAssessment::Viable,
+                    profitability_pct: Some(4.0),
+                    market_avg_pct: Some(2.0),
+                    beats_market: Some(true),
+                    total_trades: 5,
+                    errors_count: 0,
+                    symbols: vec!["BTC/USDT".to_string()],
+                    notes: "ok".to_string(),
+                    run_id: Some(11),
+                },
+            },
+            BacktestSubsetOutcome {
+                label: "subset_2".to_string(),
+                file_count: 1,
+                summary: BacktestSummary {
+                    run_at: now_ts(),
+                    assessment: ApproachAssessment::Marginal,
+                    profitability_pct: Some(2.0),
+                    market_avg_pct: Some(1.0),
+                    beats_market: Some(true),
+                    total_trades: 4,
+                    errors_count: 0,
+                    symbols: vec!["BTC/USDT".to_string()],
+                    notes: "ok".to_string(),
+                    run_id: Some(12),
+                },
+            },
+            BacktestSubsetOutcome {
+                label: "subset_3".to_string(),
+                file_count: 1,
+                summary: BacktestSummary::incomplete("start failed"),
+            },
+        ];
+
+        let summary = aggregate_backtest_subset_outcomes(outcomes, 1.0);
+        assert_eq!(summary.assessment, ApproachAssessment::Viable);
+        assert_eq!(summary.profitability_pct, Some(3.0));
+        assert_eq!(summary.market_avg_pct, Some(1.5));
+        assert_eq!(summary.beats_market, Some(true));
+        assert_eq!(summary.run_id, Some(12));
+        assert!(
+            summary.notes.contains("successful_subsets=2/3"),
+            "notes should include multi-run summary: {}",
+            summary.notes
         );
     }
 }
