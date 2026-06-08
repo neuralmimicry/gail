@@ -1712,6 +1712,8 @@ mod tests {
 
     #[tokio::test]
     async fn completion_fails_over_from_request_endpoint_to_provider_endpoint() {
+        reset_test_runtime_state().await;
+
         let bad = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/tags"))
@@ -1779,6 +1781,8 @@ mod tests {
 
     #[tokio::test]
     async fn completion_skips_embedding_only_inventory_for_generate_requests() {
+        reset_test_runtime_state().await;
+
         let endpoint = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/tags"))
