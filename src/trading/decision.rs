@@ -109,13 +109,15 @@ impl DecisionEngine {
         }
 
         // Effective config (apply runtime overrides if present).
-        let effective_config = EffectiveConfig::from(config, &state.config_overrides);
+        let effective_config =
+            EffectiveConfig::from(config, &state.config_overrides, self.fuzzy_weight);
 
         // Blend fuzzy signal and AI consensus signal.
-        let ai_weight = 1.0 - self.fuzzy_weight;
-        let base_blended_signal = fuzzy.signal * self.fuzzy_weight + consensus.signal * ai_weight;
+        let fuzzy_weight = effective_config.fuzzy_weight;
+        let ai_weight = 1.0 - fuzzy_weight;
+        let base_blended_signal = fuzzy.signal * fuzzy_weight + consensus.signal * ai_weight;
         let base_blended_confidence =
-            fuzzy.confidence * self.fuzzy_weight + consensus.confidence * ai_weight;
+            fuzzy.confidence * fuzzy_weight + consensus.confidence * ai_weight;
         let (target_exchange, target_symbol) = best_market
             .map(|market| (market.exchange.clone(), market.symbol.clone()))
             .unwrap_or_else(|| (String::new(), String::new()));
@@ -342,6 +344,7 @@ impl DecisionEngine {
 // ---------------------------------------------------------------------------
 
 struct EffectiveConfig {
+    fuzzy_weight: f64,
     fuzzy_confidence_threshold: f64,
     max_open_positions: usize,
     min_trade_interval_seconds: u64,
@@ -416,9 +419,14 @@ impl EffectiveConfig {
     fn from(
         base: &TradingConfig,
         overrides: &Option<super::config::TradingConfigOverride>,
+        default_fuzzy_weight: f64,
     ) -> Self {
         let ov = overrides.as_ref();
         Self {
+            fuzzy_weight: ov
+                .and_then(|o| o.fuzzy_weight)
+                .unwrap_or(default_fuzzy_weight)
+                .clamp(0.0, 1.0),
             fuzzy_confidence_threshold: ov
                 .and_then(|o| o.fuzzy_confidence_threshold)
                 .unwrap_or(base.fuzzy_confidence_threshold),
@@ -435,13 +443,22 @@ impl EffectiveConfig {
             decision_roi_feedback_enabled: base.decision_roi_feedback_enabled,
             decision_roi_feedback_lookback_trades: base.decision_roi_feedback_lookback_trades,
             decision_roi_feedback_min_samples: base.decision_roi_feedback_min_samples,
-            decision_roi_feedback_target_roi_pct: base.decision_roi_feedback_target_roi_pct,
-            decision_roi_feedback_max_signal_adjustment: base
-                .decision_roi_feedback_max_signal_adjustment,
-            decision_roi_feedback_max_confidence_penalty: base
-                .decision_roi_feedback_max_confidence_penalty,
-            decision_roi_feedback_max_confidence_boost: base
-                .decision_roi_feedback_max_confidence_boost,
+            decision_roi_feedback_target_roi_pct: ov
+                .and_then(|o| o.decision_roi_feedback_target_roi_pct)
+                .unwrap_or(base.decision_roi_feedback_target_roi_pct)
+                .clamp(0.1, 50.0),
+            decision_roi_feedback_max_signal_adjustment: ov
+                .and_then(|o| o.decision_roi_feedback_max_signal_adjustment)
+                .unwrap_or(base.decision_roi_feedback_max_signal_adjustment)
+                .clamp(0.0, 0.5),
+            decision_roi_feedback_max_confidence_penalty: ov
+                .and_then(|o| o.decision_roi_feedback_max_confidence_penalty)
+                .unwrap_or(base.decision_roi_feedback_max_confidence_penalty)
+                .clamp(0.0, 0.95),
+            decision_roi_feedback_max_confidence_boost: ov
+                .and_then(|o| o.decision_roi_feedback_max_confidence_boost)
+                .unwrap_or(base.decision_roi_feedback_max_confidence_boost)
+                .clamp(0.0, 0.5),
         }
     }
 }

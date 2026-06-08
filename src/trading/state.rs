@@ -129,6 +129,31 @@ pub struct TradeOverride {
 }
 
 // ---------------------------------------------------------------------------
+// Backtest auto-tuning trial state
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BacktestAutoTuneTrial {
+    pub started_at: f64,
+    pub history_len_at_start: usize,
+    pub baseline_mean_profit_pct: f64,
+    pub baseline_median_profit_pct: f64,
+    pub baseline_samples: usize,
+    pub previous_overrides: Option<TradingConfigOverride>,
+    pub candidate_overrides: TradingConfigOverride,
+    pub trigger_assessment: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BacktestAutoTuneState {
+    pub active_trial: Option<BacktestAutoTuneTrial>,
+    pub cooldown_until: Option<f64>,
+    pub last_action: Option<String>,
+    pub last_action_at: Option<f64>,
+}
+
+// ---------------------------------------------------------------------------
 // Runtime status snapshot (lightweight, for status endpoint)
 // ---------------------------------------------------------------------------
 
@@ -176,6 +201,9 @@ pub struct TradingState {
     pub last_backtest: Option<BacktestSummary>,
     /// Ring buffer of historical backtest summaries (most recent last).
     pub backtest_history: VecDeque<BacktestSummary>,
+    /// Runtime state for guarded backtest-driven strategy tuning.
+    #[serde(default)]
+    pub backtest_auto_tune: BacktestAutoTuneState,
     /// Adaptive reference of OctoBot API endpoint shapes and semantic hints.
     #[serde(default)]
     pub api_schema: AdaptiveApiSchema,
@@ -204,6 +232,7 @@ impl TradingState {
             trade_ring_size,
             last_backtest: None,
             backtest_history: VecDeque::with_capacity(20),
+            backtest_auto_tune: BacktestAutoTuneState::default(),
             api_schema: AdaptiveApiSchema::default(),
             observed_external_log_fingerprints: VecDeque::with_capacity(500),
         }
@@ -393,6 +422,7 @@ impl SharedTradingState {
                     state.config_overrides = restored.config_overrides;
                     state.last_backtest = restored.last_backtest;
                     state.backtest_history = restored.backtest_history;
+                    state.backtest_auto_tune = restored.backtest_auto_tune;
                     state.api_schema = restored.api_schema;
                     state.observed_external_log_fingerprints =
                         restored.observed_external_log_fingerprints;
@@ -469,6 +499,10 @@ fn repair_legacy_state_payload(payload: &mut serde_json::Value) -> bool {
             "observed_external_log_fingerprints".to_string(),
             serde_json::json!([]),
         );
+        repaired = true;
+    }
+    if !root.contains_key("backtest_auto_tune") {
+        root.insert("backtest_auto_tune".to_string(), serde_json::json!({}));
         repaired = true;
     }
 

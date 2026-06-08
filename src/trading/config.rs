@@ -485,7 +485,7 @@ impl TradingConfig {
 }
 
 /// Runtime-mutable overrides for TradingConfig, settable via the API without restarting Gail.
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct TradingConfigOverride {
     pub evaluation_interval_seconds: Option<u64>,
@@ -493,6 +493,11 @@ pub struct TradingConfigOverride {
     pub micro_trade_min_usd: Option<f64>,
     pub max_open_positions: Option<usize>,
     pub fuzzy_confidence_threshold: Option<f64>,
+    pub fuzzy_weight: Option<f64>,
+    pub decision_roi_feedback_target_roi_pct: Option<f64>,
+    pub decision_roi_feedback_max_signal_adjustment: Option<f64>,
+    pub decision_roi_feedback_max_confidence_penalty: Option<f64>,
+    pub decision_roi_feedback_max_confidence_boost: Option<f64>,
     pub target_exchanges: Option<Vec<String>>,
     pub target_currencies: Option<Vec<String>>,
 }

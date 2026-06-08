@@ -65,6 +65,12 @@ fn now_ts() -> f64 {
         .unwrap_or(0.0)
 }
 
+const BACKTEST_AUTOTUNE_BASELINE_RUNS: usize = 4;
+const BACKTEST_AUTOTUNE_VALIDATION_RUNS: usize = 2;
+const BACKTEST_AUTOTUNE_MIN_MEAN_IMPROVEMENT_PCT: f64 = 0.35;
+const BACKTEST_AUTOTUNE_MAX_MEDIAN_REGRESSION_PCT: f64 = 0.25;
+const BACKTEST_AUTOTUNE_COOLDOWN_SECONDS: f64 = 3_600.0;
+
 // ---------------------------------------------------------------------------
 // Handle for controlling the background task
 // ---------------------------------------------------------------------------
@@ -322,7 +328,8 @@ async fn run_evaluation_loop(
                             && summary.assessment == backtest::ApproachAssessment::Unprofitable;
                         {
                             let mut s = state.0.lock().await;
-                            s.record_backtest(summary);
+                            s.record_backtest(summary.clone());
+                            apply_backtest_auto_tuning(&config, &mut s, &summary);
                             if should_pause {
                                 s.paused = true;
                                 s.log_warn("backtest", "Trading paused: approach assessed as unprofitable");
@@ -1732,6 +1739,333 @@ fn apply_trade_floor_feedback(
             }),
         );
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BacktestProfitStats {
+    mean: f64,
+    median: f64,
+    min: f64,
+}
+
+fn collect_successful_backtest_profits(
+    history: &std::collections::VecDeque<backtest::BacktestSummary>,
+) -> Vec<f64> {
+    history
+        .iter()
+        .filter_map(|summary| summary.profitability_pct)
+        .filter(|profit| profit.is_finite())
+        .collect()
+}
+
+fn calculate_backtest_profit_stats(values: &[f64]) -> Option<BacktestProfitStats> {
+    if values.is_empty() {
+        return None;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|left, right| left.total_cmp(right));
+    let middle = sorted.len() / 2;
+    let median = if sorted.len().is_multiple_of(2) {
+        (sorted[middle - 1] + sorted[middle]) / 2.0
+    } else {
+        sorted[middle]
+    };
+    let min = sorted[0];
+    Some(BacktestProfitStats { mean, median, min })
+}
+
+fn round_tuning_value(value: f64) -> f64 {
+    (value * 10_000.0).round() / 10_000.0
+}
+
+fn propose_backtest_tuning_candidate(
+    config: &TradingConfig,
+    state: &TradingState,
+    latest_profit_pct: f64,
+    assessment: &backtest::ApproachAssessment,
+) -> Option<(TradingConfigOverride, String)> {
+    let mut candidate = state.config_overrides.clone().unwrap_or_default();
+    let current_threshold = candidate
+        .fuzzy_confidence_threshold
+        .unwrap_or(config.fuzzy_confidence_threshold);
+    let current_max_positions = candidate
+        .max_open_positions
+        .unwrap_or(config.max_open_positions)
+        .max(1);
+    let current_min_usd = candidate
+        .micro_trade_min_usd
+        .unwrap_or(config.micro_trade_min_usd)
+        .max(0.01);
+    let current_max_usd = candidate
+        .micro_trade_max_usd
+        .unwrap_or(config.micro_trade_max_usd)
+        .max(current_min_usd);
+    let current_fuzzy_weight = candidate.fuzzy_weight.unwrap_or(config.fuzzy_weight);
+    let current_roi_penalty = candidate
+        .decision_roi_feedback_max_confidence_penalty
+        .unwrap_or(config.decision_roi_feedback_max_confidence_penalty);
+    let current_roi_signal_adjustment = candidate
+        .decision_roi_feedback_max_signal_adjustment
+        .unwrap_or(config.decision_roi_feedback_max_signal_adjustment);
+
+    let (threshold_step, size_scale, weight_step, reduce_positions) = match assessment {
+        backtest::ApproachAssessment::Marginal => {
+            let scale = if latest_profit_pct < 0.0 { 0.95 } else { 0.98 };
+            (0.02, scale, -0.03, latest_profit_pct < 0.0)
+        }
+        backtest::ApproachAssessment::Unprofitable => (0.05, 0.88, -0.06, true),
+        _ => return None,
+    };
+
+    let mut reasons = Vec::new();
+
+    let new_threshold = (current_threshold + threshold_step).clamp(0.42, 0.92);
+    if new_threshold > current_threshold + f64::EPSILON {
+        candidate.fuzzy_confidence_threshold = Some(round_tuning_value(new_threshold));
+        reasons.push(format!(
+            "raise confidence gate {:.2}→{:.2}",
+            current_threshold, new_threshold
+        ));
+    }
+
+    let new_weight = (current_fuzzy_weight + weight_step).clamp(0.15, 0.85);
+    if (new_weight - current_fuzzy_weight).abs() > f64::EPSILON {
+        candidate.fuzzy_weight = Some(round_tuning_value(new_weight));
+        reasons.push(format!(
+            "shift fuzzy blend {:.2}→{:.2}",
+            current_fuzzy_weight, new_weight
+        ));
+    }
+
+    let new_max_usd = (current_max_usd * size_scale)
+        .max(current_min_usd)
+        .max(0.01);
+    if new_max_usd + f64::EPSILON < current_max_usd {
+        candidate.micro_trade_max_usd = Some(round_tuning_value(new_max_usd));
+        reasons.push(format!(
+            "cap max trade ${:.2}→${:.2}",
+            current_max_usd, new_max_usd
+        ));
+    }
+
+    if reduce_positions && current_max_positions > 1 {
+        let new_max_positions = current_max_positions.saturating_sub(1).max(1);
+        if new_max_positions < current_max_positions {
+            candidate.max_open_positions = Some(new_max_positions);
+            reasons.push(format!(
+                "reduce max positions {}→{}",
+                current_max_positions, new_max_positions
+            ));
+        }
+    }
+
+    if latest_profit_pct < 0.0 {
+        let penalty_step = if matches!(assessment, backtest::ApproachAssessment::Unprofitable) {
+            0.07
+        } else {
+            0.03
+        };
+        let new_penalty = (current_roi_penalty + penalty_step).clamp(0.0, 0.95);
+        if new_penalty > current_roi_penalty + f64::EPSILON {
+            candidate.decision_roi_feedback_max_confidence_penalty =
+                Some(round_tuning_value(new_penalty));
+            reasons.push(format!(
+                "increase ROI confidence penalty {:.2}→{:.2}",
+                current_roi_penalty, new_penalty
+            ));
+        }
+
+        let signal_step = if matches!(assessment, backtest::ApproachAssessment::Unprofitable) {
+            0.05
+        } else {
+            0.02
+        };
+        let new_signal_adjustment = (current_roi_signal_adjustment + signal_step).clamp(0.0, 0.5);
+        if new_signal_adjustment > current_roi_signal_adjustment + f64::EPSILON {
+            candidate.decision_roi_feedback_max_signal_adjustment =
+                Some(round_tuning_value(new_signal_adjustment));
+            reasons.push(format!(
+                "increase ROI signal adaptation {:.2}→{:.2}",
+                current_roi_signal_adjustment, new_signal_adjustment
+            ));
+        }
+    }
+
+    let candidate_max = candidate
+        .micro_trade_max_usd
+        .unwrap_or(config.micro_trade_max_usd)
+        .max(0.01);
+    let candidate_min = candidate
+        .micro_trade_min_usd
+        .unwrap_or(config.micro_trade_min_usd)
+        .max(0.01);
+    if candidate_min > candidate_max {
+        candidate.micro_trade_min_usd = Some(round_tuning_value(candidate_max));
+    }
+
+    if reasons.is_empty() {
+        None
+    } else {
+        Some((candidate, reasons.join("; ")))
+    }
+}
+
+fn apply_backtest_auto_tuning(
+    config: &TradingConfig,
+    state: &mut TradingState,
+    latest_summary: &backtest::BacktestSummary,
+) {
+    let Some(latest_profit_pct) = latest_summary.profitability_pct.filter(|p| p.is_finite()) else {
+        return;
+    };
+    let now = now_ts();
+
+    if let Some(trial) = state.backtest_auto_tune.active_trial.clone() {
+        let mut validation_profits = state
+            .backtest_history
+            .iter()
+            .skip(trial.history_len_at_start)
+            .filter_map(|summary| summary.profitability_pct)
+            .filter(|profit| profit.is_finite())
+            .collect::<Vec<_>>();
+        if validation_profits.len() >= BACKTEST_AUTOTUNE_VALIDATION_RUNS {
+            if validation_profits.len() > BACKTEST_AUTOTUNE_VALIDATION_RUNS {
+                let skip = validation_profits.len() - BACKTEST_AUTOTUNE_VALIDATION_RUNS;
+                validation_profits = validation_profits.into_iter().skip(skip).collect();
+            }
+            if let Some(validation_stats) = calculate_backtest_profit_stats(&validation_profits) {
+                let mean_improvement = validation_stats.mean - trial.baseline_mean_profit_pct;
+                let median_regression = trial.baseline_median_profit_pct - validation_stats.median;
+                let acceptable = mean_improvement >= BACKTEST_AUTOTUNE_MIN_MEAN_IMPROVEMENT_PCT
+                    && median_regression <= BACKTEST_AUTOTUNE_MAX_MEDIAN_REGRESSION_PCT;
+
+                if acceptable {
+                    let action = format!(
+                        "Kept adaptive tuning profile (validation mean {:+.2}% vs baseline {:+.2}%, median {:+.2}% vs {:+.2}%)",
+                        validation_stats.mean,
+                        trial.baseline_mean_profit_pct,
+                        validation_stats.median,
+                        trial.baseline_median_profit_pct
+                    );
+                    state.backtest_auto_tune.active_trial = None;
+                    state.backtest_auto_tune.cooldown_until = None;
+                    state.backtest_auto_tune.last_action = Some(action.clone());
+                    state.backtest_auto_tune.last_action_at = Some(now);
+                    state.log(
+                        "info",
+                        "backtest_tuning",
+                        action,
+                        json!({
+                            "validation_runs": validation_profits.len(),
+                            "validation_mean_profit_pct": validation_stats.mean,
+                            "validation_median_profit_pct": validation_stats.median,
+                            "validation_min_profit_pct": validation_stats.min,
+                            "baseline_mean_profit_pct": trial.baseline_mean_profit_pct,
+                            "baseline_median_profit_pct": trial.baseline_median_profit_pct,
+                            "trigger_assessment": trial.trigger_assessment,
+                        }),
+                    );
+                } else {
+                    let action = format!(
+                        "Reverted adaptive tuning profile (validation mean {:+.2}% vs baseline {:+.2}%)",
+                        validation_stats.mean, trial.baseline_mean_profit_pct
+                    );
+                    state.config_overrides = trial.previous_overrides.clone();
+                    state.backtest_auto_tune.active_trial = None;
+                    state.backtest_auto_tune.cooldown_until =
+                        Some(now + BACKTEST_AUTOTUNE_COOLDOWN_SECONDS);
+                    state.backtest_auto_tune.last_action = Some(action.clone());
+                    state.backtest_auto_tune.last_action_at = Some(now);
+                    state.log(
+                        "warn",
+                        "backtest_tuning",
+                        action,
+                        json!({
+                            "validation_runs": validation_profits.len(),
+                            "validation_mean_profit_pct": validation_stats.mean,
+                            "validation_median_profit_pct": validation_stats.median,
+                            "validation_min_profit_pct": validation_stats.min,
+                            "baseline_mean_profit_pct": trial.baseline_mean_profit_pct,
+                            "baseline_median_profit_pct": trial.baseline_median_profit_pct,
+                            "cooldown_seconds": BACKTEST_AUTOTUNE_COOLDOWN_SECONDS,
+                            "trigger_assessment": trial.trigger_assessment,
+                        }),
+                    );
+                }
+            }
+        }
+        return;
+    }
+
+    if let Some(cooldown_until) = state.backtest_auto_tune.cooldown_until
+        && now < cooldown_until
+    {
+        return;
+    }
+
+    if !matches!(
+        latest_summary.assessment,
+        backtest::ApproachAssessment::Marginal | backtest::ApproachAssessment::Unprofitable
+    ) {
+        return;
+    }
+
+    let successful_profits = collect_successful_backtest_profits(&state.backtest_history);
+    if successful_profits.len() < BACKTEST_AUTOTUNE_BASELINE_RUNS {
+        return;
+    }
+    let baseline_slice = &successful_profits[successful_profits
+        .len()
+        .saturating_sub(BACKTEST_AUTOTUNE_BASELINE_RUNS)..];
+    let Some(baseline_stats) = calculate_backtest_profit_stats(baseline_slice) else {
+        return;
+    };
+
+    let Some((candidate_overrides, rationale)) = propose_backtest_tuning_candidate(
+        config,
+        state,
+        latest_profit_pct,
+        &latest_summary.assessment,
+    ) else {
+        return;
+    };
+    let previous_overrides = state.config_overrides.clone();
+    if previous_overrides.as_ref() == Some(&candidate_overrides) {
+        return;
+    }
+
+    state.config_overrides = Some(candidate_overrides.clone());
+    state.backtest_auto_tune.active_trial = Some(state::BacktestAutoTuneTrial {
+        started_at: now,
+        history_len_at_start: state.backtest_history.len(),
+        baseline_mean_profit_pct: baseline_stats.mean,
+        baseline_median_profit_pct: baseline_stats.median,
+        baseline_samples: baseline_slice.len(),
+        previous_overrides,
+        candidate_overrides,
+        trigger_assessment: latest_summary.assessment.to_string(),
+    });
+    let action = format!(
+        "Started adaptive tuning trial after {} backtest (profit {:+.2}%): {}",
+        latest_summary.assessment, latest_profit_pct, rationale
+    );
+    state.backtest_auto_tune.last_action = Some(action.clone());
+    state.backtest_auto_tune.last_action_at = Some(now);
+    state.log(
+        "warn",
+        "backtest_tuning",
+        action,
+        json!({
+            "baseline_runs": baseline_slice.len(),
+            "baseline_mean_profit_pct": baseline_stats.mean,
+            "baseline_median_profit_pct": baseline_stats.median,
+            "latest_profit_pct": latest_profit_pct,
+            "latest_assessment": latest_summary.assessment.to_string(),
+            "validation_runs_required": BACKTEST_AUTOTUNE_VALIDATION_RUNS,
+            "min_mean_improvement_pct": BACKTEST_AUTOTUNE_MIN_MEAN_IMPROVEMENT_PCT,
+        }),
+    );
 }
 
 fn adaptive_schema_has_observations(schema: &adaptive_schema::AdaptiveApiSchema) -> bool {

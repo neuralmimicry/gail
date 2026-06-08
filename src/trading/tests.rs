@@ -556,6 +556,11 @@ mod tests {
         assert!(ov.evaluation_interval_seconds.is_none());
         assert!(ov.micro_trade_max_usd.is_none());
         assert!(ov.fuzzy_confidence_threshold.is_none());
+        assert!(ov.fuzzy_weight.is_none());
+        assert!(ov.decision_roi_feedback_target_roi_pct.is_none());
+        assert!(ov.decision_roi_feedback_max_signal_adjustment.is_none());
+        assert!(ov.decision_roi_feedback_max_confidence_penalty.is_none());
+        assert!(ov.decision_roi_feedback_max_confidence_boost.is_none());
         assert!(ov.target_exchanges.is_none());
         assert!(ov.target_currencies.is_none());
     }
@@ -593,6 +598,123 @@ mod tests {
         assert_eq!(overrides.micro_trade_min_usd, Some(5.0));
         assert_eq!(overrides.micro_trade_max_usd, Some(5.0));
         assert_eq!(state.activity_log.len(), 1);
+    }
+
+    #[test]
+    fn backtest_auto_tuning_starts_validation_trial_on_marginal_results() {
+        use crate::trading::backtest::{ApproachAssessment, BacktestSummary};
+        use crate::trading::state::TradingState;
+
+        fn summary(ts: f64, profit: f64, assessment: ApproachAssessment) -> BacktestSummary {
+            BacktestSummary {
+                run_at: ts,
+                assessment,
+                profitability_pct: Some(profit),
+                market_avg_pct: Some(0.0),
+                beats_market: Some(profit > 0.0),
+                total_trades: 8,
+                errors_count: 0,
+                symbols: vec!["BTC/USDT".to_string()],
+                notes: "test".to_string(),
+                run_id: None,
+            }
+        }
+
+        let config = TradingConfig::default();
+        let mut state = TradingState::new(200, 200);
+        let mut ts = 1_000.0;
+        for profit in [-2.4, -2.1, -1.8, -1.5, -1.3] {
+            state.record_backtest(summary(ts, profit, ApproachAssessment::Marginal));
+            ts += 1.0;
+        }
+        let latest = state
+            .backtest_history
+            .back()
+            .cloned()
+            .expect("latest backtest summary");
+
+        crate::trading::apply_backtest_auto_tuning(&config, &mut state, &latest);
+
+        assert!(
+            state.backtest_auto_tune.active_trial.is_some(),
+            "expected auto-tune trial to start after marginal sequence"
+        );
+        let overrides = state
+            .config_overrides
+            .as_ref()
+            .expect("auto-tune should apply candidate overrides");
+        assert!(
+            overrides
+                .fuzzy_confidence_threshold
+                .unwrap_or(config.fuzzy_confidence_threshold)
+                >= config.fuzzy_confidence_threshold,
+            "expected stricter confidence gate"
+        );
+        assert!(
+            overrides
+                .micro_trade_max_usd
+                .unwrap_or(config.micro_trade_max_usd)
+                <= config.micro_trade_max_usd,
+            "expected reduced risk sizing"
+        );
+    }
+
+    #[test]
+    fn backtest_auto_tuning_reverts_candidate_when_validation_underperforms() {
+        use crate::trading::backtest::{ApproachAssessment, BacktestSummary};
+        use crate::trading::state::TradingState;
+
+        fn summary(ts: f64, profit: f64, assessment: ApproachAssessment) -> BacktestSummary {
+            BacktestSummary {
+                run_at: ts,
+                assessment,
+                profitability_pct: Some(profit),
+                market_avg_pct: Some(0.0),
+                beats_market: Some(profit > 0.0),
+                total_trades: 8,
+                errors_count: 0,
+                symbols: vec!["BTC/USDT".to_string()],
+                notes: "test".to_string(),
+                run_id: None,
+            }
+        }
+
+        let config = TradingConfig::default();
+        let mut state = TradingState::new(200, 200);
+        let mut ts = 2_000.0;
+        for profit in [-2.6, -2.3, -2.1, -1.9, -1.8] {
+            state.record_backtest(summary(ts, profit, ApproachAssessment::Marginal));
+            ts += 1.0;
+        }
+        let latest = state
+            .backtest_history
+            .back()
+            .cloned()
+            .expect("latest backtest summary");
+        crate::trading::apply_backtest_auto_tuning(&config, &mut state, &latest);
+        assert!(state.backtest_auto_tune.active_trial.is_some());
+        assert!(state.config_overrides.is_some());
+
+        // Validation runs that fail to improve should trigger reversion.
+        for profit in [-2.5, -2.7] {
+            let validation = summary(ts, profit, ApproachAssessment::Unprofitable);
+            ts += 1.0;
+            state.record_backtest(validation.clone());
+            crate::trading::apply_backtest_auto_tuning(&config, &mut state, &validation);
+        }
+
+        assert!(
+            state.backtest_auto_tune.active_trial.is_none(),
+            "trial should complete and clear"
+        );
+        assert!(
+            state.config_overrides.is_none(),
+            "underperforming validation should revert candidate overrides"
+        );
+        assert!(
+            state.backtest_auto_tune.cooldown_until.is_some(),
+            "reversion should trigger cooldown"
+        );
     }
 
     // -----------------------------------------------------------------------
