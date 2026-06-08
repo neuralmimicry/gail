@@ -34,6 +34,11 @@ use crate::{
 
 const OCTOBOT_API: &str = "octobot";
 const MAX_PARALLEL_MARKET_SNAPSHOT_REQUESTS: usize = 8;
+/// OctoBot API hard-cap for market snapshot requests per fetch.
+///
+/// Gail must not request more than this in one call. Coverage across the
+/// larger universe is handled by rotation offsets between fetch cycles.
+pub const OCTOBOT_MARKET_SNAPSHOT_HARD_LIMIT: usize = 20;
 const MARKET_SNAPSHOT_CANDIDATE_MULTIPLIER: usize = 1;
 const MARKET_SNAPSHOT_UNKNOWN_PROBE_LIMIT_PER_EXCHANGE: usize = 8;
 const MARKET_SNAPSHOT_UNAVAILABLE_BASE_COOLDOWN_SECONDS: f64 = 3_600.0;
@@ -3484,7 +3489,15 @@ impl OctobotClient {
             symbol: String,
         }
 
-        let limit = limit.max(1);
+        let requested_limit = limit.max(1);
+        let limit = requested_limit.min(OCTOBOT_MARKET_SNAPSHOT_HARD_LIMIT);
+        if requested_limit > OCTOBOT_MARKET_SNAPSHOT_HARD_LIMIT {
+            debug!(
+                requested_limit,
+                capped_limit = limit,
+                "trading: capping market snapshot request to OctoBot hard limit"
+            );
+        }
         let candidate_limit = limit
             .saturating_mul(MARKET_SNAPSHOT_CANDIDATE_MULTIPLIER)
             .max(limit);

@@ -4662,6 +4662,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn octobot_client_get_all_market_snapshots_caps_to_hard_limit_with_sliding_window() {
+        let server = MockServer::start().await;
+
+        let symbols = (1..=30)
+            .map(|index| format!("S{index:02}/USDT"))
+            .collect::<Vec<_>>();
+        let trading_html = {
+            let rows = symbols
+                .iter()
+                .map(|symbol| {
+                    let encoded = symbol.replace('/', "%2F");
+                    format!(
+                        "<a href=\"/symbol_market_status?exchange_id=binance-id&amp;symbol={encoded}\">Binance : NEUTRAL (Indexing 30 coins)</a>"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("<html><body>{rows}</body></html>")
+        };
+
+        Mock::given(method("GET"))
+            .and(path("/api/first_exchange_details"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exchange_name": "binance",
+                "exchange_id": "binance-id"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/exchanges"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/trading"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(trading_html))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/get_config_currency"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/get_all_symbols/binance"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("should not be queried"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/dashboard/watched_symbol/.*$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exchange_id": "binance-id",
+                "time_frame": "1h"
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/dashboard/currency_price_graph_update/binance-id/.*/1h/live$",
+            ))
+            .and(query_param("display_orders", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "candles": {
+                    "close": [1.0, 1.05],
+                    "high": [1.01, 1.06],
+                    "low": [0.99, 1.0],
+                    "volume": [100.0, 120.0]
+                }
+            })))
+            .expect(40)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/market/ticker"))
+            .and(query_param("exchange", "binance"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let first = client.get_all_market_snapshots(&[], &[], 100).await;
+        let second = client.get_all_market_snapshots(&[], &[], 100).await;
+
+        assert_eq!(
+            first.len(),
+            crate::trading::octobot::OCTOBOT_MARKET_SNAPSHOT_HARD_LIMIT
+        );
+        assert_eq!(
+            second.len(),
+            crate::trading::octobot::OCTOBOT_MARKET_SNAPSHOT_HARD_LIMIT
+        );
+
+        let first_symbols = first
+            .iter()
+            .map(|snapshot| snapshot.symbol.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let second_symbols = second
+            .iter()
+            .map(|snapshot| snapshot.symbol.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let combined = first_symbols
+            .union(&second_symbols)
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            combined.len(),
+            symbols.len(),
+            "sliding window should traverse full symbol universe across cycles while each cycle remains hard-capped"
+        );
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn octobot_client_get_all_market_snapshots_limits_unknown_symbol_probes_per_exchange() {
         let server = MockServer::start().await;
 

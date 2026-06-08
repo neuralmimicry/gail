@@ -51,7 +51,10 @@ use datalake::{
 };
 use decision::{DecisionEngine, TradeDecision};
 use fuzzy::{FuzzyEngine, FuzzyInputs};
-use octobot::{MarketSnapshot, OctobotClient, OctobotExchange, OctobotLogEntry, OctobotPortfolio};
+use octobot::{
+    MarketSnapshot, OCTOBOT_MARKET_SNAPSHOT_HARD_LIMIT, OctobotClient, OctobotExchange,
+    OctobotLogEntry, OctobotPortfolio,
+};
 use refiner::RefinerClient;
 use state::{ExecutedTrade, SharedTradingState, TradeAction, TradingState};
 
@@ -373,8 +376,13 @@ async fn run_single_evaluation(
     // --- 1. Fetch market data from OctoBot ---
     let (target_exchanges, target_currencies) = resolve_target_market_filters(config, state).await;
 
+    let evaluation_snapshot_limit = OCTOBOT_MARKET_SNAPSHOT_HARD_LIMIT;
     let market_snapshots = octobot
-        .get_all_market_snapshots(&target_exchanges, &target_currencies, 20)
+        .get_all_market_snapshots(
+            &target_exchanges,
+            &target_currencies,
+            evaluation_snapshot_limit,
+        )
         .await;
     let historical_features = if let Some(lake) = market_data_lake {
         let ingest_summary = lake.ingest_snapshots(&market_snapshots).await;
