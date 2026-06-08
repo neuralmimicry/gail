@@ -290,6 +290,29 @@ mod tests {
         }
     }
 
+    fn make_decision_candidate(
+        action: TradeAction,
+        exchange: &str,
+        symbol: &str,
+        confidence: f64,
+        blended_signal: f64,
+        amount_usd: f64,
+        composite_score: f64,
+    ) -> crate::trading::DecisionCandidate {
+        let mut decision = crate::trading::decision::TradeDecision::hold("candidate");
+        decision.action = action;
+        decision.exchange = exchange.to_string();
+        decision.symbol = symbol.to_string();
+        decision.confidence = confidence;
+        decision.blended_signal = blended_signal;
+        decision.amount_usd = amount_usd;
+        crate::trading::DecisionCandidate {
+            decision,
+            market_history: None,
+            composite_score,
+        }
+    }
+
     fn default_config() -> TradingConfig {
         TradingConfig {
             enabled: true,
@@ -2413,6 +2436,59 @@ mod tests {
         assert!(
             sell_score < 0.0,
             "sell score should be negative, got {sell_score}"
+        );
+    }
+
+    #[test]
+    fn actionable_decision_filter_excludes_hold_and_cancel() {
+        assert!(crate::trading::decision_is_actionable(&TradeAction::Buy));
+        assert!(crate::trading::decision_is_actionable(
+            &TradeAction::StrongBuy
+        ));
+        assert!(crate::trading::decision_is_actionable(&TradeAction::Sell));
+        assert!(crate::trading::decision_is_actionable(
+            &TradeAction::StrongSell
+        ));
+        assert!(!crate::trading::decision_is_actionable(&TradeAction::Hold));
+        assert!(!crate::trading::decision_is_actionable(
+            &TradeAction::Cancel
+        ));
+    }
+
+    #[test]
+    fn actionable_decisions_sort_by_confidence_then_signal_then_composite_score() {
+        let mut candidates = vec![
+            make_decision_candidate(TradeAction::Buy, "xt", "MEME/USDT", 0.92, 0.44, 6.0, 0.65),
+            make_decision_candidate(
+                TradeAction::Sell,
+                "bitget",
+                "DOGE/USDT",
+                0.85,
+                -0.98,
+                6.0,
+                -0.92,
+            ),
+            make_decision_candidate(
+                TradeAction::StrongBuy,
+                "kucoin",
+                "SOL/USDT",
+                0.92,
+                0.79,
+                6.0,
+                0.31,
+            ),
+        ];
+
+        crate::trading::sort_decision_candidates_for_execution(&mut candidates);
+        let ranked = candidates
+            .iter()
+            .map(|candidate| candidate.decision.symbol.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ranked,
+            vec!["SOL/USDT", "MEME/USDT", "DOGE/USDT"],
+            "ranked actionable list should prioritise highest confidence and strongest signal"
         );
     }
 

@@ -484,70 +484,8 @@ async fn run_single_evaluation(
         consensus.action, consensus.signal, consensus.confidence, consensus.responders
     );
 
-    // Select final decision market after consensus so high-confidence
-    // target symbols are not silently replaced by generic market ranking.
-    let min_sellable_usd = effective_micro_trade_floor_usd(state, config).await;
-    let decision_market_selection = choose_decision_market_candidate_with_regime(
-        &market_snapshots,
-        &consensus,
-        research_snapshot.as_ref(),
-        &portfolio,
-        min_sellable_usd,
-        &market_regime,
-    );
-    if let Some(reason) = decision_market_selection.override_reason.as_deref() {
-        warn!(
-            "trading: consensus target override applied with explicit risk justification: {}",
-            reason
-        );
-    }
-    debug!(
-        "trading: decision market selection => {}",
-        decision_market_selection.note
-    );
-    let decision_snapshot = decision_market_selection.snapshot.clone();
-    let decision_snapshot_history = decision_snapshot.as_ref().and_then(|snapshot| {
-        historical_features
-            .get(&market_feature_key(&snapshot.exchange, &snapshot.symbol))
-            .cloned()
-    });
-
-    // --- 4. Compute fuzzy inputs ---
-    let fuzzy_inputs = compute_fuzzy_inputs(
-        decision_snapshot.as_ref(),
-        decision_snapshot_history.as_ref(),
-        &consensus,
-        &research,
-        &portfolio,
-        Some(&market_regime),
-        config,
-    );
-    let fuzzy_out = fuzzy_engine.evaluate(&fuzzy_inputs);
-
-    debug!(
-        "trading: fuzzy = signal={:.3} confidence={:.2} label={}",
-        fuzzy_out.signal, fuzzy_out.confidence, fuzzy_out.label
-    );
-
-    // --- 5. Make decision ---
-    let mut decision = {
-        let s = state.0.lock().await;
-        decision_engine.decide(
-            &fuzzy_out,
-            &consensus,
-            decision_snapshot.as_ref(),
-            &s,
-            config,
-        )
-    };
-
-    if !decision.override_applied
-        && !matches!(decision.action, TradeAction::Hold | TradeAction::Cancel)
-        && let Some(reason) = degraded_live_execution_reason(&consensus, config)
-    {
-        let previous_action = decision.action.clone();
-        let previous_confidence = decision.confidence;
-        let previous_amount = decision.amount_usd;
+    let execution_gate_reason = degraded_live_execution_reason(&consensus, config);
+    if let Some(reason) = execution_gate_reason.as_deref() {
         warn!(
             "trading: live execution gated by AI quality checks: {}",
             reason
@@ -558,9 +496,6 @@ async fn run_single_evaluation(
                 "decision",
                 format!("Execution gated: {reason}"),
                 json!({
-                    "previous_action": previous_action.to_string(),
-                    "previous_confidence": previous_confidence,
-                    "previous_amount_usd": previous_amount,
                     "responders": consensus.responders,
                     "failures": consensus.failures,
                     "coverage": consensus_coverage(&consensus),
@@ -569,95 +504,192 @@ async fn run_single_evaluation(
                 }),
             )
             .await;
-        decision = TradeDecision {
-            action: TradeAction::Hold,
-            amount_usd: 0.0,
-            rationale: format!("Execution gated: {reason}"),
-            ..decision
-        };
     }
 
-    decision.rationale =
-        merge_rationale_note(&decision.rationale, decision_market_selection.note.as_str());
-
-    let logged_exchange = if decision.exchange.is_empty() {
-        decision_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.exchange.as_str())
-            .unwrap_or("n/a")
-    } else {
-        decision.exchange.as_str()
+    let pending_override = {
+        let s = state.0.lock().await;
+        s.pending_override.is_some()
     };
-    let logged_symbol = if decision.symbol.is_empty() {
-        decision_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.symbol.as_str())
-            .unwrap_or("n/a")
+    let evaluation_targets = if market_snapshots.is_empty() {
+        vec![None]
     } else {
-        decision.symbol.as_str()
+        market_snapshots.iter().map(Some).collect::<Vec<_>>()
     };
-    info!(
-        "trading: decision = {:?} exchange={} symbol={} amount=${:.2} confidence={:.2}",
-        decision.action, logged_exchange, logged_symbol, decision.amount_usd, decision.confidence
-    );
+    let mut evaluated_decisions = Vec::new();
 
+    for snapshot in evaluation_targets {
+        let snapshot_history = snapshot.and_then(|target| {
+            historical_features
+                .get(&market_feature_key(&target.exchange, &target.symbol))
+                .cloned()
+        });
+        let fuzzy_inputs = compute_fuzzy_inputs(
+            snapshot,
+            snapshot_history.as_ref(),
+            &consensus,
+            &research,
+            &portfolio,
+            Some(&market_regime),
+            config,
+        );
+        let fuzzy_out = fuzzy_engine.evaluate(&fuzzy_inputs);
+
+        let mut decision = {
+            let s = state.0.lock().await;
+            decision_engine.decide(&fuzzy_out, &consensus, snapshot, &s, config)
+        };
+
+        if !decision.override_applied
+            && decision_is_actionable(&decision.action)
+            && let Some(reason) = execution_gate_reason.as_deref()
+        {
+            decision = TradeDecision {
+                action: TradeAction::Hold,
+                amount_usd: 0.0,
+                rationale: format!("Execution gated: {reason}"),
+                ..decision
+            };
+        }
+
+        if decision.exchange.trim().is_empty()
+            && let Some(target) = snapshot
+        {
+            decision.exchange = target.exchange.clone();
+        }
+        if decision.symbol.trim().is_empty()
+            && let Some(target) = snapshot
+        {
+            decision.symbol = target.symbol.clone();
+        }
+
+        let logged_exchange = if decision.exchange.trim().is_empty() {
+            "n/a"
+        } else {
+            decision.exchange.as_str()
+        };
+        let logged_symbol = if decision.symbol.trim().is_empty() {
+            "n/a"
+        } else {
+            decision.symbol.as_str()
+        };
+        let composite_score = snapshot
+            .map(|target| composite_symbol_score(target, &decision))
+            .unwrap_or(0.0);
+        info!(
+            "trading: decision = {:?} exchange={} symbol={} amount=${:.2} confidence={:.2}",
+            decision.action,
+            logged_exchange,
+            logged_symbol,
+            decision.amount_usd,
+            decision.confidence
+        );
+
+        evaluated_decisions.push(DecisionCandidate {
+            decision,
+            market_history: snapshot_history,
+            composite_score,
+        });
+
+        // Operator overrides should only be evaluated and executed once.
+        if pending_override {
+            break;
+        }
+    }
+
+    let mut actionable_decisions = evaluated_decisions
+        .iter()
+        .filter(|candidate| decision_is_actionable(&candidate.decision.action))
+        .cloned()
+        .collect::<Vec<_>>();
+    sort_decision_candidates_for_execution(&mut actionable_decisions);
+
+    let mut deduped_actionables = Vec::new();
+    let mut seen_markets = HashSet::new();
+    for candidate in actionable_decisions {
+        let exchange = candidate.decision.exchange.trim();
+        let symbol = candidate.decision.symbol.trim();
+        if !exchange.is_empty() && !symbol.is_empty() {
+            let key = format!(
+                "{}|{}",
+                exchange.to_ascii_uppercase(),
+                symbol.to_ascii_uppercase()
+            );
+            if !seen_markets.insert(key) {
+                continue;
+            }
+        }
+        deduped_actionables.push(candidate);
+    }
+
+    let ranked_actionables = deduped_actionables
+        .iter()
+        .enumerate()
+        .map(|(idx, candidate)| {
+            json!({
+                "rank": idx + 1,
+                "exchange": candidate.decision.exchange,
+                "symbol": candidate.decision.symbol,
+                "action": candidate.decision.action,
+                "confidence": candidate.decision.confidence,
+                "blended_signal": candidate.decision.blended_signal,
+                "composite_score": candidate.composite_score,
+                "amount_usd": candidate.decision.amount_usd,
+            })
+        })
+        .collect::<Vec<_>>();
+    let decision_rollup = evaluated_decisions
+        .iter()
+        .map(|candidate| {
+            json!({
+                "exchange": candidate.decision.exchange,
+                "symbol": candidate.decision.symbol,
+                "action": candidate.decision.action,
+                "confidence": candidate.decision.confidence,
+                "blended_signal": candidate.decision.blended_signal,
+                "composite_score": candidate.composite_score,
+                "fuzzy_signal": candidate.decision.fuzzy_signal,
+                "fuzzy_confidence": candidate.decision.fuzzy_confidence,
+                "rationale": truncate_message(&candidate.decision.rationale, 240),
+                "market_history": candidate.market_history,
+            })
+        })
+        .collect::<Vec<_>>();
     state
         .log(
             "info",
             "decision",
             format!(
-                "{:?} {}/{} ${:.2} conf={:.2}",
-                decision.action,
-                logged_exchange,
-                logged_symbol,
-                decision.amount_usd,
-                decision.confidence
+                "Evaluated {} markets; actionable trades={}",
+                evaluated_decisions.len(),
+                deduped_actionables.len()
             ),
             json!({
-                "fuzzy_signal": fuzzy_out.signal,
-                "fuzzy_confidence": fuzzy_out.confidence,
                 "ai_signal": consensus.signal,
                 "ai_confidence": consensus.confidence,
                 "ai_action": consensus.action,
                 "ai_responders": consensus.responders,
                 "ai_failures": consensus.failures,
                 "ai_vote_distribution": consensus.vote_distribution,
-                "market_history": decision_snapshot_history,
+                "market_regime_signal": market_regime.signal,
+                "market_regime_confidence": market_regime.confidence,
+                "market_regime_leaders": market_regime.leaders,
                 "research_market": research_snapshot.as_ref().map(|snapshot| {
                     json!({
                         "exchange": snapshot.exchange,
                         "symbol": snapshot.symbol,
                     })
                 }),
-                "decision_market": decision_snapshot.as_ref().map(|snapshot| {
-                    json!({
-                        "exchange": snapshot.exchange,
-                        "symbol": snapshot.symbol,
-                    })
-                }),
-                "market_selection_note": decision_market_selection.note,
-                "market_selection_override_reason": decision_market_selection.override_reason,
-                "market_selection_used_target": decision_market_selection.used_target_signal,
-                "market_selection_target_support": decision_market_selection.target_support,
-                "market_selection_target_support_advisors": decision_market_selection.target_support_advisors,
-                "market_selection_high_confidence_target": decision_market_selection.high_confidence_target,
-                "market_regime_signal": market_regime.signal,
-                "market_regime_confidence": market_regime.confidence,
-                "market_regime_leaders": market_regime.leaders,
-                "blended_signal": decision.blended_signal,
-                "roi_feedback_applied": decision.roi_feedback_applied,
-                "roi_feedback_signal_adjustment": decision.roi_feedback_signal_adjustment,
-                "roi_feedback_confidence_multiplier": decision.roi_feedback_confidence_multiplier,
-                "roi_feedback_samples": decision.roi_feedback_samples,
-                "roi_feedback_avg_directional_roi": decision.roi_feedback_avg_directional_roi,
-                "roi_feedback_win_rate": decision.roi_feedback_win_rate,
-                "rationale": decision.rationale
+                "execution_gate_reason": execution_gate_reason,
+                "decisions": decision_rollup,
+                "ranked_actionables": ranked_actionables,
             }),
         )
         .await;
 
-    // --- 6. Execute trade if warranted ---
-    execute_if_warranted(octobot, &decision, state, config).await;
+    // --- 6. Execute ranked actionable decisions ---
+    for candidate in &deduped_actionables {
+        execute_if_warranted(octobot, &candidate.decision, state, config).await;
+    }
 
     // Increment evaluation counter.
     {
@@ -831,6 +863,64 @@ struct SymbolScorecard {
 struct EvaluatedSymbol {
     decision: TradeDecision,
     scorecard: SymbolScorecard,
+}
+
+#[derive(Clone, Debug)]
+struct DecisionCandidate {
+    decision: TradeDecision,
+    market_history: Option<MarketHistoricalFeatures>,
+    composite_score: f64,
+}
+
+fn decision_is_actionable(action: &TradeAction) -> bool {
+    matches!(
+        action,
+        TradeAction::Buy | TradeAction::StrongBuy | TradeAction::Sell | TradeAction::StrongSell
+    )
+}
+
+fn sort_decision_candidates_for_execution(candidates: &mut [DecisionCandidate]) {
+    candidates.sort_by(|left, right| {
+        right
+            .decision
+            .confidence
+            .partial_cmp(&left.decision.confidence)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                right
+                    .decision
+                    .blended_signal
+                    .abs()
+                    .partial_cmp(&left.decision.blended_signal.abs())
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| {
+                right
+                    .composite_score
+                    .abs()
+                    .partial_cmp(&left.composite_score.abs())
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| {
+                right
+                    .decision
+                    .amount_usd
+                    .partial_cmp(&left.decision.amount_usd)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| {
+                left.decision
+                    .exchange
+                    .to_ascii_uppercase()
+                    .cmp(&right.decision.exchange.to_ascii_uppercase())
+            })
+            .then_with(|| {
+                left.decision
+                    .symbol
+                    .to_ascii_uppercase()
+                    .cmp(&right.decision.symbol.to_ascii_uppercase())
+            })
+    });
 }
 
 async fn run_non_portfolio_discovery_cycle(
@@ -2417,7 +2507,6 @@ struct DecisionMarketSelection {
     override_reason: Option<String>,
     used_target_signal: bool,
     target_support: f64,
-    target_support_advisors: usize,
     high_confidence_target: bool,
 }
 
@@ -2488,7 +2577,6 @@ fn choose_decision_market_candidate_with_regime(
             override_reason: None,
             used_target_signal: false,
             target_support: 0.0,
-            target_support_advisors: 0,
             high_confidence_target: false,
         };
     }
@@ -2614,7 +2702,6 @@ fn choose_decision_market_candidate_with_regime(
                 override_reason: None,
                 used_target_signal: true,
                 target_support: support_abs,
-                target_support_advisors: target.advisors,
                 high_confidence_target,
             };
         }
@@ -2632,7 +2719,6 @@ fn choose_decision_market_candidate_with_regime(
             override_reason: None,
             used_target_signal: false,
             target_support: support_abs,
-            target_support_advisors: target.advisors,
             high_confidence_target: false,
         };
     }
@@ -2651,7 +2737,6 @@ fn choose_decision_market_candidate_with_regime(
             override_reason: Some(reason),
             used_target_signal: false,
             target_support: support,
-            target_support_advisors: 0,
             high_confidence_target: true,
         };
     }
@@ -2673,7 +2758,6 @@ fn choose_decision_market_candidate_with_regime(
         override_reason: None,
         used_target_signal: false,
         target_support: 0.0,
-        target_support_advisors: 0,
         high_confidence_target: false,
     }
 }
@@ -2773,20 +2857,6 @@ fn should_lock_target_by_consensus(
         && consensus.signal.abs() >= TARGET_LOCK_CONSENSUS_SIGNAL_MIN
         && target_support >= TARGET_LOCK_SUPPORT_MIN
         && advisors >= 1
-}
-
-fn merge_rationale_note(rationale: &str, note: &str) -> String {
-    let rationale = rationale.trim();
-    let note = note.trim();
-    if note.is_empty() {
-        rationale.to_string()
-    } else if rationale.is_empty() {
-        note.to_string()
-    } else if rationale.contains(note) {
-        rationale.to_string()
-    } else {
-        format!("{rationale} | {note}")
-    }
 }
 
 fn snapshot_is_usable(snapshot: &MarketSnapshot) -> bool {
