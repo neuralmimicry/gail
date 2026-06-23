@@ -1,5 +1,13 @@
 # Gail
 
+## Sponsor NeuralMimicry
+
+Gail is the open-source shared AI middleware for NeuralMimicry services — consolidating multi-provider LLM routing, neuromorphic specialist access, AER translation, continuous fine-tuning, and an autonomous crypto-trading bridge in a single non-blocking Rust service. NeuralMimicry is an independent open-source initiative and we rely on community support to sustain this work.
+
+**[☕ Support us on Crowdfunder](https://www.crowdfunder.co.uk/p/qr/aWggxwPW?utm_campaign=sharemodal&utm_medium=referral&utm_source=shortlink)**
+
+---
+
 Gail is the shared AI middleware for NeuralMimicry services. It consolidates LLM routing, provider orchestration, neuromorphic specialist access, AER translation, transcription, orchestration-status surfaces, and a live crypto-trading bridge — all in one non-blocking Rust service.
 
 The service is designed so Refiner can delegate immediately, while Tracey and Continuum/NMC can consume the same HTTP contract without re-implementing provider selection or neuromorphic transport glue.
