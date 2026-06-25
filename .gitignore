@@ -27,3 +27,9 @@ Thumbs.db
 # Runtime adaptive API observations
 /data/adaptive_api_schema.json
 /data/api_issues.json
+log.txt
+check_errors.txt
+.output.txt
+logs/
+tracey.log*
+loader/tracey-loader.manifest.json

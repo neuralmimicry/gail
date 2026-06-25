@@ -21,7 +21,11 @@ use crate::{
     },
 };
 
-const DEFAULT_AARNN_REPO_ROOT: &str = "/home/pbisaacs/Developer/neuralmimicry/aarnn_rust";
+fn default_aarnn_repo_root() -> String {
+    std::env::var("GAIL_AARNN_REPO_ROOT")
+        .or_else(|_| std::env::var("NM_AARNN_REPO_ROOT"))
+        .unwrap_or_else(|_| "/opt/neuralmimicry/aarnn_rust".to_string())
+}
 const DEFAULT_SOCKET_PATH: &str = "/tmp/aarnn_rust.nn";
 const NEUROMORPHIC_KEYWORDS: &[&str] = &[
     "aarnn",
@@ -1005,9 +1009,8 @@ fn legacy_aarnn_engine(client: Client) -> Option<SpecialistEngine> {
         .ok()
         .or_else(|| env::var("REFINER_AARNN_REPO_ROOT").ok())
         .or_else(|| {
-            Path::new(DEFAULT_AARNN_REPO_ROOT)
-                .exists()
-                .then(|| DEFAULT_AARNN_REPO_ROOT.to_string())
+            let fallback = default_aarnn_repo_root();
+            Path::new(&fallback).exists().then_some(fallback)
         });
     let endpoint = env::var("GAIL_AARNN_ENDPOINT")
         .ok()

@@ -34,9 +34,9 @@ rules are documented in:
 
 ### Cluster logs (Kubernetes)
 
-- `kubectl --kubeconfig /home/pbisaacs/.kube/config-continuum-gail -n gail logs deployment/gail`
-- `kubectl --kubeconfig /home/pbisaacs/.kube/config-continuum-gail -n gail logs deployment/gail-mirror-worker`
-- `kubectl --kubeconfig /home/pbisaacs/.kube/config-continuum-gail -n gail logs deployment/gail-trainer-worker`
+- `kubectl --kubeconfig ~/.kube/config-continuum-gail -n gail logs deployment/gail`
+- `kubectl --kubeconfig ~/.kube/config-continuum-gail -n gail logs deployment/gail-mirror-worker`
+- `kubectl --kubeconfig ~/.kube/config-continuum-gail -n gail logs deployment/gail-trainer-worker`
 
 ## Common Failure Modes
 
