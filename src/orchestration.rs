@@ -556,6 +556,61 @@ impl GailService {
             }
         };
         drop(workload_permit);
+        if response.text.trim().is_empty() {
+            let error = GailError::upstream(
+                response.provider.as_str(),
+                Some(StatusCode::BAD_GATEWAY),
+                format!(
+                    "empty response text from {}/{}",
+                    response.provider, response.model
+                ),
+            );
+            api_issues::observe_provider_failure(
+                candidate.provider_type.as_str(),
+                candidate.configured_model.as_str(),
+                "direct",
+                "assistant",
+                "empty_response",
+                "warning",
+                &error.to_string(),
+                Some(self.health_ttl_seconds()),
+            )
+            .await;
+            self.record_llm_interaction(LlmLedgerRecord {
+                request_id: request_id.clone(),
+                conversation_id: request_id.clone(),
+                workflow: "direct".to_string(),
+                role: "assistant".to_string(),
+                provider_requested: Some(effective_request.provider.clone()),
+                model_requested: effective_request.model.clone(),
+                provider_resolved: Some(response.provider.clone()),
+                model_resolved: Some(response.model.clone()),
+                request_category: effective_request.request_category.clone(),
+                system_prompt: effective_request.system.clone(),
+                prompt_text: prompt_text.clone(),
+                response_text: None,
+                message_roles: effective_request
+                    .messages
+                    .iter()
+                    .map(|message| message.role.clone())
+                    .collect(),
+                status: "error".to_string(),
+                error_text: Some(error.to_string()),
+                latency_ms: Some(response.latency_ms),
+                usage: response
+                    .usage
+                    .as_ref()
+                    .and_then(|value| serde_json::to_value(value).ok()),
+                raw: response.raw.clone(),
+                metadata: Some(json!({
+                    "source": "direct_complete",
+                    "reason": "empty_response",
+                })),
+                created_ts: current_ts(),
+            })
+            .await;
+            return Err(error);
+        }
         api_issues::observe_provider_recovery(
             candidate.provider_type.as_str(),
             candidate.configured_model.as_str(),
@@ -2521,8 +2576,21 @@ impl GailService {
                 match adapter.complete(&effective).await {
                     Ok(response) => {
                         let latency_ms = started.elapsed().as_millis() as u64;
-                        if response.text.trim().is_empty() && retry_empty && attempts < 2 {
-                            continue;
+                        if response.text.trim().is_empty() {
+                            if retry_empty && attempts < 2 {
+                                continue;
+                            }
+                            return InvocationResult {
+                                candidate: candidate_for_invocation.clone(),
+                                response: None,
+                                error: Some(format!(
+                                    "empty response text from {}/{}",
+                                    candidate_for_invocation.profile.provider_type, response.model
+                                )),
+                                latency_ms: Some(latency_ms),
+                                quality: -1.0,
+                                score: f64::NEG_INFINITY,
+                            };
                         }
                         if violates_strict_model_policy(
                             effective.strict_no_downgrade.unwrap_or(false),
@@ -2658,7 +2726,7 @@ impl GailService {
                 .orchestration
                 .workload_pool_wait_timeout_ms,
         )
-        .clamp(1, 60_000)
+        .clamp(1, 300_000)
     }
 
     fn model_floor_b(&self, workload_class: WorkloadClass) -> Option<f64> {

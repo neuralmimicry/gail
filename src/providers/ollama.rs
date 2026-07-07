@@ -22,7 +22,7 @@ use crate::{
 use super::{
     ProviderHealth, ProviderInvocationResponse, TranscriptionInput, data_url_parts, env_bool,
     env_float, env_int, error_message, infer_capabilities_from_model, infer_capabilities_from_text,
-    is_model_not_found, post_json_with_retries, response_with_usage,
+    is_model_not_found, looks_like_json_request, post_json_with_retries, response_with_usage,
 };
 
 async fn acquire_ollama_request_permit(
@@ -393,10 +393,18 @@ impl OllamaProvider {
         let mut model = request.model.clone().unwrap_or_else(|| self.model.clone());
         let prompt = collapse_messages(request);
         let max_predict = env_int("GAIL_OLLAMA_MAX_PREDICT", 512).max(1) as u32;
-        let num_predict = request
+        let requested_predict = request
             .max_tokens
             .map(|value| value.max(1).min(max_predict))
             .unwrap_or(max_predict);
+        let json_min_predict = env_int("GAIL_OLLAMA_JSON_MIN_PREDICT", 0).max(0) as u32;
+        let num_predict = if json_min_predict > 0
+            && looks_like_json_request(&request.messages, request.system.as_deref())
+        {
+            requested_predict.max(json_min_predict.min(max_predict))
+        } else {
+            requested_predict
+        };
         let default_timeout = env_int("GAIL_OLLAMA_TIMEOUT_SECONDS", 90).max(1);
         let timeout_seconds = request
             .timeout_seconds
@@ -451,6 +459,9 @@ impl OllamaProvider {
                 },
                 "stream": false,
             });
+            if env_bool("GAIL_OLLAMA_DISABLE_THINKING", true) {
+                payload["think"] = json!(false);
+            }
             if !images.is_empty() {
                 payload["images"] = json!(images);
             }
@@ -487,6 +498,20 @@ impl OllamaProvider {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            if text.trim().is_empty() {
+                return Err(GailError::upstream(
+                    "ollama",
+                    Some(StatusCode::BAD_GATEWAY),
+                    empty_ollama_response_message(&data, &model, &base_url),
+                ));
+            }
+            if ollama_stopped_at_length(&data) {
+                return Err(GailError::upstream(
+                    "ollama",
+                    Some(StatusCode::BAD_GATEWAY),
+                    truncated_ollama_response_message(&data, &model, &base_url, num_predict),
+                ));
+            }
             let prompt_tokens_actual = data
                 .get("prompt_eval_count")
                 .and_then(Value::as_u64)
@@ -1031,6 +1056,55 @@ impl OllamaProvider {
             recommended_downloads,
         })
     }
+}
+
+fn empty_ollama_response_message(data: &Value, model: &str, base_url: &str) -> String {
+    let done_reason = data
+        .get("done_reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let thinking_chars = data
+        .get("thinking")
+        .and_then(Value::as_str)
+        .map(|value| value.trim().chars().count())
+        .unwrap_or(0);
+
+    match (done_reason, thinking_chars) {
+        (Some("length"), thinking_chars) if thinking_chars > 0 => format!(
+            "empty Ollama response text from model {model} at {base_url}; model returned {thinking_chars} thinking chars and stopped at length before final output"
+        ),
+        (Some("length"), _) => format!(
+            "empty Ollama response text from model {model} at {base_url}; model stopped at length before final output"
+        ),
+        (_, thinking_chars) if thinking_chars > 0 => format!(
+            "empty Ollama response text from model {model} at {base_url}; model returned {thinking_chars} thinking chars but no final output"
+        ),
+        _ => format!("empty Ollama response text from model {model} at {base_url}"),
+    }
+}
+
+fn ollama_stopped_at_length(data: &Value) -> bool {
+    data.get("done_reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| value == "length")
+}
+
+fn truncated_ollama_response_message(
+    data: &Value,
+    model: &str,
+    base_url: &str,
+    num_predict: u32,
+) -> String {
+    let eval_count = data
+        .get("eval_count")
+        .and_then(Value::as_u64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!(
+        "truncated Ollama response text from model {model} at {base_url}; model stopped at length after eval_count={eval_count}, num_predict={num_predict}"
+    )
 }
 
 fn model_size_billions(model: &str) -> Option<f64> {
@@ -1837,5 +1911,127 @@ mod tests {
                 .to_string()
                 .contains("is not safely available locally")
         );
+    }
+
+    #[tokio::test]
+    async fn completion_rejects_empty_generate_response_text() {
+        reset_test_runtime_state().await;
+
+        let endpoint = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&endpoint)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "",
+                "prompt_eval_count": 2,
+                "eval_count": 0
+            })))
+            .mount(&endpoint)
+            .await;
+
+        let provider = OllamaProvider {
+            client: Client::new(),
+            model: "llama3.2".to_string(),
+            default_model: "llama3.2".to_string(),
+            base_url: endpoint.uri(),
+        };
+        let request = ProviderCompletionRequest {
+            provider: "ollama".to_string(),
+            model: Some("llama3.2".to_string()),
+            api_key: None,
+            access_token: None,
+            base_url: Some(endpoint.uri()),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: MessageContent::Text("hello".to_string()),
+            }],
+            system: None,
+            max_tokens: Some(8),
+            temperature: Some(0.0),
+            timeout_seconds: Some(4),
+            reasoning_effort: None,
+            request_category: None,
+            workflow: None,
+            role: None,
+            min_model_size_b: None,
+            strict_no_downgrade: None,
+        };
+
+        let error = provider
+            .complete_once(&request, 0)
+            .await
+            .expect_err("empty responses should fail");
+        assert!(error.to_string().contains("empty Ollama response text"));
+    }
+
+    #[tokio::test]
+    async fn completion_rejects_thinking_without_final_generate_response() {
+        reset_test_runtime_state().await;
+
+        let endpoint = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "qwen3.6"}]
+            })))
+            .mount(&endpoint)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "",
+                "thinking": "I will reason about the JSON first.",
+                "done": true,
+                "done_reason": "length",
+                "prompt_eval_count": 2,
+                "eval_count": 512
+            })))
+            .mount(&endpoint)
+            .await;
+
+        let provider = OllamaProvider {
+            client: Client::new(),
+            model: "qwen3.6".to_string(),
+            default_model: "qwen3.6".to_string(),
+            base_url: endpoint.uri(),
+        };
+        let request = ProviderCompletionRequest {
+            provider: "ollama".to_string(),
+            model: Some("qwen3.6".to_string()),
+            api_key: None,
+            access_token: None,
+            base_url: Some(endpoint.uri()),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: MessageContent::Text(
+                    "Return only JSON. Do not use thinking. /no_think".to_string(),
+                ),
+            }],
+            system: None,
+            max_tokens: Some(8),
+            temperature: Some(0.0),
+            timeout_seconds: Some(4),
+            reasoning_effort: None,
+            request_category: Some("json".to_string()),
+            workflow: None,
+            role: None,
+            min_model_size_b: None,
+            strict_no_downgrade: None,
+        };
+
+        let error = provider
+            .complete_once(&request, 0)
+            .await
+            .expect_err("thinking-only responses should fail");
+        let message = error.to_string();
+        assert!(message.contains("empty Ollama response text"));
+        assert!(message.contains("thinking"));
+        assert!(message.contains("length"));
     }
 }

@@ -403,12 +403,7 @@ ARG CMAKE_BUILD_PARALLEL_LEVEL=auto
 ENV DEBIAN_FRONTEND=noninteractive \
     BUILD_JOBS=${BUILD_JOBS} \
     CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} \
-    CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL} \
-    LIBTORCH=/opt/libtorch \
-    LD_LIBRARY_PATH=/opt/libtorch/lib \
-    LIBTORCH_CXX11_ABI=1
-
-COPY --from=libtorch /opt/libtorch /opt/libtorch
+    CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}
 
 RUN set -eu; \
     apt-get update; \
@@ -430,9 +425,7 @@ RUN set -eu; \
         python3-pip \
         python3-venv; \
     rm -rf /var/lib/apt/lists/*; \
-    echo "/opt/libtorch/lib" > /etc/ld.so.conf.d/libtorch.conf; \
-    ldconfig; \
-    cat /opt/libtorch/gail-libtorch-build.env
+    ldconfig
 
 WORKDIR /src
 
@@ -457,7 +450,7 @@ RUN set -eu; \
             bash scripts/set-release-version.sh "${release_version}"; \
         fi; \
     fi; \
-    cargo build --locked --release --bins -j "${CARGO_BUILD_JOBS}"; \
+    cargo build --locked --release --bin gail --no-default-features -j "${CARGO_BUILD_JOBS}"; \
     package_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)"; \
     if [ -z "${package_version}" ]; then \
         echo "Could not determine Gail package version from Cargo.toml" >&2; \
@@ -470,7 +463,6 @@ RUN set -eu; \
         --deb-version "${deb_version}" \
         --arch "${deb_arch}" \
         --binary target/release/gail \
-        --trainer-binary target/release/gail-qlora-sft \
         --out-dir /out
 
 FROM docker.io/library/debian:bookworm-slim
@@ -502,7 +494,6 @@ LABEL org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" 
       org.opencontainers.image.created="${IMAGE_CREATED}" \
       org.opencontainers.image.description="Gail runtime image with native libtorch/tch training, Python training tooling and OpenCL runtime detection"
 
-COPY --from=libtorch /opt/libtorch /opt/libtorch
 COPY --from=source-deb /out/*.deb /tmp/source-gail.deb
 COPY gail.yaml /tmp/gail-defaults/gail.yaml
 COPY config/ai-routing-profiles.json /tmp/gail-defaults/ai-routing-profiles.json
@@ -646,7 +637,6 @@ RUN set -eu; \
             echo "Skipping bitsandbytes on ${pip_arch}; no reliable pre-built wheel is assumed" >&2; \
         fi; \
     fi; \
-    echo "/opt/libtorch/lib" > /etc/ld.so.conf.d/libtorch.conf; \
     ldconfig; \
     chown -R "${APP_UID}:${APP_GID}" /app /var/lib/gail /opt/gail-python; \
     rm -rf /tmp/gail-defaults; \

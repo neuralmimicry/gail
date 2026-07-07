@@ -95,6 +95,7 @@ impl OpenAIToolContext {
 #[derive(Clone, Debug, Default)]
 struct OpenAIResponseSchemaContext {
     manager_tool_call: bool,
+    structured_json: bool,
     signal_synthesis_output: bool,
 }
 
@@ -121,15 +122,29 @@ impl OpenAIResponseSchemaContext {
                 && lowered.contains("arguments")
                 && (lowered.contains("agent_name") || lowered.contains("run_agent")));
         let signal_synthesis_output = prompt_requests_signal_synthesis_output(&context);
+        let structured_json = response_format_expects_json(request.response_format.as_ref());
         Self {
             manager_tool_call,
+            structured_json,
             signal_synthesis_output,
+        }
+    }
+
+    fn from_response_request(request: &OpenAIResponseRequest) -> Self {
+        let structured_json = response_format_expects_json(
+            request.text.as_ref().and_then(|item| item.format.as_ref()),
+        );
+        Self {
+            structured_json,
+            ..Self::default()
         }
     }
 
     fn normalize_response_text(&self, text: &str) -> Option<String> {
         if self.manager_tool_call {
             normalize_manager_tool_call_text(text)
+        } else if self.structured_json {
+            normalize_json_response_text(text)
         } else {
             None
         }
@@ -272,8 +287,14 @@ async fn openai_responses(
     }
     let stream_response = request.stream.unwrap_or(false);
     let request_for_fallback = request.clone();
+    let response_schema_context = OpenAIResponseSchemaContext::from_response_request(&request);
     match dispatch_openai_responses(&service, request).await {
-        Ok((public_model, response)) => {
+        Ok((public_model, mut response)) => {
+            if let Some(normalized) =
+                response_schema_context.normalize_response_text(response.text.as_str())
+            {
+                response.text = normalized;
+            }
             maybe_cache_execution_plan_from_responses_success(&request_for_fallback, &response);
             if stream_response {
                 openai_responses_stream(public_model, response).into_response()
@@ -2384,6 +2405,12 @@ fn normalize_manager_tool_call_text(text: &str) -> Option<String> {
     .ok()
 }
 
+fn normalize_json_response_text(text: &str) -> Option<String> {
+    let value = extract_json_value(text)?;
+    let normalized = serde_json::to_string(&value).ok()?;
+    (normalized != text.trim()).then_some(normalized)
+}
+
 fn extract_tool_call_value(text: &str) -> Option<Value> {
     extract_minimax_tool_call_value(text).or_else(|| extract_bracket_tool_call_value(text))
 }
@@ -3076,6 +3103,19 @@ fn response_format_targets_execution_plan(format: Option<&OpenAIResponseFormat>)
     schema_value_looks_like_execution_plan(schema)
 }
 
+fn response_format_expects_json(format: Option<&OpenAIResponseFormat>) -> bool {
+    let Some(format) = format else {
+        return false;
+    };
+    let kind = format
+        .format_type
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    matches!(kind.as_str(), "json_object" | "json_schema") || format.json_schema.is_some()
+}
+
 fn schema_value_looks_like_execution_plan(schema: &Value) -> bool {
     if schema
         .get("title")
@@ -3705,6 +3745,159 @@ mod tests {
         assert_eq!(degraded["should_trade"], false);
         assert_eq!(payload["gail"]["provider"], "gail");
         assert_eq!(payload["gail"]["resolved_model"], "degraded_safety");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_execution_plan_strips_fenced_json() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "qwen2.5-coder:1.5b"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "```json\n{\"steps\":[],\"loop\":false,\"loop_condition\":null,\"max_iterations\":null}\n```",
+                "prompt_eval_count": 11,
+                "eval_count": 7
+            })))
+            .mount(&server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/qwen2.5-coder:1.5b",
+                            "base_url": server.uri(),
+                            "response_format": {
+                                "type": "json_schema",
+                                "json_schema": {
+                                    "name": "ExecutionPlan",
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "loop": {"type": "boolean"},
+                                            "loop_condition": {
+                                                "anyOf": [{"type": "string"}, {"type": "null"}]
+                                            },
+                                            "max_iterations": {
+                                                "anyOf": [{"type": "integer"}, {"type": "null"}]
+                                            },
+                                            "steps": {
+                                                "type": "array",
+                                                "items": {"type": "object"}
+                                            }
+                                        },
+                                        "required": ["steps", "loop", "loop_condition", "max_iterations"],
+                                        "additionalProperties": false
+                                    }
+                                }
+                            },
+                            "messages": [
+                                {"role": "user", "content": "Generate the next execution plan."}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+
+        let payload = read_json(response).await;
+        let content = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("completion content");
+        assert!(
+            !content.trim_start().starts_with("```"),
+            "ExecutionPlan content must be raw JSON, not a Markdown fenced block"
+        );
+        let parsed: Value = serde_json::from_str(content).expect("execution plan json");
+        assert_eq!(parsed["steps"].as_array().expect("steps").len(), 0);
+        assert_eq!(parsed["loop"], false);
+        assert!(parsed["loop_condition"].is_null());
+        assert!(parsed["max_iterations"].is_null());
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_json_schema_strips_fenced_json() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "qwen2.5-coder:1.5b"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "```json\n{\"decision\":\"hold\",\"confidence\":0.0}\n```",
+                "prompt_eval_count": 11,
+                "eval_count": 7
+            })))
+            .mount(&server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/qwen2.5-coder:1.5b",
+                            "base_url": server.uri(),
+                            "response_format": {
+                                "type": "json_schema",
+                                "json_schema": {
+                                    "name": "TradingDecision",
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "decision": {"type": "string"},
+                                            "confidence": {"type": "number"}
+                                        },
+                                        "required": ["decision", "confidence"],
+                                        "additionalProperties": false
+                                    }
+                                }
+                            },
+                            "messages": [
+                                {"role": "user", "content": "Return a JSON decision."}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+
+        let payload = read_json(response).await;
+        let content = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("completion content");
+        assert!(
+            !content.trim_start().starts_with("```"),
+            "JSON schema content must be raw JSON, not a Markdown fenced block"
+        );
+        let parsed: Value = serde_json::from_str(content).expect("schema json");
+        assert_eq!(parsed["decision"], "hold");
+        assert_eq!(parsed["confidence"], 0.0);
     }
 
     #[tokio::test]

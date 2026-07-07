@@ -491,7 +491,7 @@ impl GailConfig {
         self.orchestration.workload_pool_wait_timeout_ms = self
             .orchestration
             .workload_pool_wait_timeout_ms
-            .clamp(1, 60_000);
+            .clamp(1, 300_000);
         if self.orchestration.health_ttl_seconds < 30.0 {
             self.orchestration.health_ttl_seconds = 30.0;
         }

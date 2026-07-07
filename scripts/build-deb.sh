@@ -15,7 +15,7 @@ Options:
   --config PATH         Gail config to install. Defaults to gail.yaml.
   --routing PATH        Routing profiles JSON. Defaults to config/ai-routing-profiles.json.
   --trainer-binary PATH Rust trainer binary to install as /usr/bin/gail-qlora-sft.
-                        Defaults to <dirname(--binary)>/gail-qlora-sft.
+                        Defaults to <dirname(--binary)>/gail-qlora-sft when present.
 USAGE
 }
 
@@ -48,12 +48,17 @@ done
 [[ -n "$version" && -n "$deb_arch" && -n "$binary_path" ]] || { usage; exit 2; }
 deb_version="${deb_version:-$version}"
 if [[ -z "$trainer_binary_path" ]]; then
-  trainer_binary_path="$(cd "$(dirname "$binary_path")" && pwd)/gail-qlora-sft"
+  default_trainer_binary_path="$(cd "$(dirname "$binary_path")" && pwd)/gail-qlora-sft"
+  if [[ -x "$default_trainer_binary_path" ]]; then
+    trainer_binary_path="$default_trainer_binary_path"
+  fi
 fi
 nm_validate_deb_arch "$deb_arch"
 nm_validate_deb_version "$deb_version"
 [[ -x "$binary_path" ]] || nm_die "binary is missing or not executable: $binary_path"
-[[ -x "$trainer_binary_path" ]] || nm_die "trainer binary is missing or not executable: $trainer_binary_path"
+if [[ -n "$trainer_binary_path" ]]; then
+  [[ -x "$trainer_binary_path" ]] || nm_die "trainer binary is missing or not executable: $trainer_binary_path"
+fi
 [[ -f "$config_path" ]] || nm_die "config file is missing: $config_path"
 [[ -f "$routing_path" ]] || nm_die "routing profiles file is missing: $routing_path"
 [[ -f "${REPO_ROOT}/packaging/deb/gail.service" ]] || nm_die "systemd service file is missing: ${REPO_ROOT}/packaging/deb/gail.service"
@@ -67,7 +72,9 @@ control_dir="${package_root}/DEBIAN"
 install -d -m 0755 "$control_dir"
 
 install -D -m 0755 "$binary_path" "${package_root}/usr/bin/gail"
-install -D -m 0755 "$trainer_binary_path" "${package_root}/usr/bin/gail-qlora-sft"
+if [[ -n "$trainer_binary_path" ]]; then
+  install -D -m 0755 "$trainer_binary_path" "${package_root}/usr/bin/gail-qlora-sft"
+fi
 install -D -m 0644 "$config_path" "${package_root}/etc/gail/gail.yaml"
 install -D -m 0644 "$routing_path" "${package_root}/etc/gail/ai-routing-profiles.json"
 install -D -m 0644 "${REPO_ROOT}/packaging/deb/gail.service" "${package_root}/lib/systemd/system/gail.service"
@@ -171,7 +178,11 @@ POSTRM
 chmod 0755 "${control_dir}/postinst" "${control_dir}/prerm" "${control_dir}/postrm"
 
 installed_size="$(du -sk "$package_root" | awk '{print $1}')"
-depends="$(nm_compute_deb_depends "${package_root}/usr/bin/gail" "${package_root}/usr/bin/gail-qlora-sft")"
+deb_binaries=("${package_root}/usr/bin/gail")
+if [[ -x "${package_root}/usr/bin/gail-qlora-sft" ]]; then
+  deb_binaries+=("${package_root}/usr/bin/gail-qlora-sft")
+fi
+depends="$(nm_compute_deb_depends "${deb_binaries[@]}")"
 [[ -n "$depends" ]] || depends='ca-certificates, libc6, libgcc-s1'
 
 cat > "${control_dir}/control" <<CONTROL
