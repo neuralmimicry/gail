@@ -162,10 +162,10 @@ pub fn provider_request_from_profile(
             .access_token
             .clone()
             .or_else(|| profile.access_token.clone()),
-        base_url: request
+        base_url: profile
             .base_url
             .clone()
-            .or_else(|| profile.base_url.clone()),
+            .or_else(|| request.base_url.clone()),
         messages: request.messages.clone(),
         system: request.system.clone(),
         max_tokens: request.max_tokens,

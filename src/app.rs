@@ -1076,6 +1076,11 @@ async fn dispatch_openai_chat_completion(
     service: &GailService,
     request: OpenAIChatCompletionRequest,
 ) -> Result<(String, CompletionResponse)> {
+    let explicit_request_provider_override = explicit_request_has_provider_override(
+        request.api_key.as_deref(),
+        request.access_token.as_deref(),
+        request.base_url.as_deref(),
+    );
     let route = resolve_openai_route(service, &request.model, request.provider.as_deref())?;
     let public_model = match &route {
         OpenAIResolvedRoute::Orchestrated { public_model, .. }
@@ -1119,7 +1124,7 @@ async fn dispatch_openai_chat_completion(
             model,
             profile,
             ..
-        } => {
+        } if explicit_request_provider_override => {
             let direct_request = build_direct_provider_request(
                 provider,
                 model,
@@ -1138,6 +1143,7 @@ async fn dispatch_openai_chat_completion(
             );
             service.direct_complete(direct_request).await?
         }
+        OpenAIResolvedRoute::Explicit { .. } => service.complete(completion_request).await?,
     };
     Ok((public_model, response))
 }
@@ -1146,6 +1152,11 @@ async fn dispatch_openai_responses(
     service: &GailService,
     request: OpenAIResponseRequest,
 ) -> Result<(String, CompletionResponse)> {
+    let explicit_request_provider_override = explicit_request_has_provider_override(
+        request.api_key.as_deref(),
+        request.access_token.as_deref(),
+        request.base_url.as_deref(),
+    );
     let route = resolve_openai_route(service, &request.model, request.provider.as_deref())?;
     let public_model = match &route {
         OpenAIResolvedRoute::Orchestrated { public_model, .. }
@@ -1188,7 +1199,7 @@ async fn dispatch_openai_responses(
             model,
             profile,
             ..
-        } => {
+        } if explicit_request_provider_override => {
             let direct_request = build_direct_provider_request(
                 provider,
                 model,
@@ -1207,6 +1218,7 @@ async fn dispatch_openai_responses(
             );
             service.direct_complete(direct_request).await?
         }
+        OpenAIResolvedRoute::Explicit { .. } => service.complete(completion_request).await?,
     };
     Ok((public_model, response))
 }
@@ -1247,6 +1259,22 @@ fn build_direct_provider_request(
         min_model_size_b: None,
         strict_no_downgrade: None,
     }
+}
+
+fn explicit_request_has_provider_override(
+    api_key: Option<&str>,
+    access_token: Option<&str>,
+    base_url: Option<&str>,
+) -> bool {
+    api_key
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+        || access_token
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        || base_url
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
 }
 
 fn build_completion_request(
@@ -1295,31 +1323,52 @@ fn build_completion_request(
             model,
             profile,
             ..
-        } => CompletionRequest {
-            workflow,
-            role,
-            preferred_provider: Some(provider),
-            preferred_model: model.or_else(|| profile.as_ref().and_then(|item| item.model.clone())),
-            preferred_api_key: api_key
-                .or_else(|| profile.as_ref().and_then(|item| item.api_key.clone())),
-            preferred_access_token: access_token
-                .or_else(|| profile.as_ref().and_then(|item| item.access_token.clone())),
-            fallback_provider: None,
-            fallback_model: None,
-            fallback_api_key: None,
-            fallback_access_token: None,
-            base_url: base_url.or_else(|| profile.as_ref().and_then(|item| item.base_url.clone())),
-            include_configured: Some(false),
-            selection_mode,
-            max_candidates: Some(1),
-            messages,
-            system,
-            max_tokens,
-            temperature,
-            timeout_seconds: None,
-            reasoning_effort,
-            request_category,
-        },
+        } => {
+            let explicit_provider_override = explicit_request_has_provider_override(
+                api_key.as_deref(),
+                access_token.as_deref(),
+                base_url.as_deref(),
+            );
+            CompletionRequest {
+                workflow,
+                role,
+                preferred_provider: Some(provider),
+                preferred_model: model
+                    .or_else(|| profile.as_ref().and_then(|item| item.model.clone())),
+                preferred_api_key: api_key
+                    .or_else(|| profile.as_ref().and_then(|item| item.api_key.clone())),
+                preferred_access_token: access_token
+                    .or_else(|| profile.as_ref().and_then(|item| item.access_token.clone())),
+                fallback_provider: None,
+                fallback_model: None,
+                fallback_api_key: None,
+                fallback_access_token: None,
+                base_url: base_url
+                    .or_else(|| profile.as_ref().and_then(|item| item.base_url.clone())),
+                include_configured: if explicit_provider_override {
+                    Some(false)
+                } else {
+                    Some(include_configured.unwrap_or(true))
+                },
+                selection_mode: if explicit_provider_override {
+                    selection_mode
+                } else {
+                    Some(selection_mode.unwrap_or(crate::models::SelectionMode::Fastest))
+                },
+                max_candidates: if explicit_provider_override {
+                    Some(1)
+                } else {
+                    Some(max_candidates.unwrap_or(2).max(1))
+                },
+                messages,
+                system,
+                max_tokens,
+                temperature,
+                timeout_seconds: None,
+                reasoning_effort,
+                request_category,
+            }
+        }
     }
 }
 
@@ -3690,6 +3739,220 @@ mod tests {
         assert_eq!(payload["choices"][0]["message"]["content"], "mocked answer");
         assert_eq!(payload["gail"]["provider"], "ollama");
         assert_eq!(payload["gail"]["resolved_model"], "llama3.2");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_explicit_openai_model_uses_fastest_configured_endpoint_pool() {
+        let qc00 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "qwen3-32b-centriq2400"}]
+            })))
+            .mount(&qc00)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(320))
+                    .set_body_json(json!({
+                        "id": "chatcmpl-qc00",
+                        "object": "chat.completion",
+                        "model": "qwen3-32b-centriq2400",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "qc00"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+                    })),
+            )
+            .mount(&qc00)
+            .await;
+
+        let qc02 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "qwen3-32b-centriq2400"}]
+            })))
+            .mount(&qc02)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-qc02",
+                "object": "chat.completion",
+                "model": "qwen3-32b-centriq2400",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "qc02"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+            })))
+            .mount(&qc02)
+            .await;
+
+        let mut config = GailConfig::default();
+        config.providers = vec![
+            ProviderProfile {
+                name: "LlamaCppQC00".to_string(),
+                provider_type: "openai".to_string(),
+                model: Some("qwen3-32b-centriq2400".to_string()),
+                api_key: Some("llamacpp-local".to_string()),
+                base_url: Some(qc00.uri()),
+                preferred: true,
+                ..ProviderProfile::default()
+            },
+            ProviderProfile {
+                name: "LlamaCppQC02".to_string(),
+                provider_type: "openai".to_string(),
+                model: Some("qwen3-32b-centriq2400".to_string()),
+                api_key: Some("llamacpp-local".to_string()),
+                base_url: Some(qc02.uri()),
+                preferred: true,
+                ..ProviderProfile::default()
+            },
+        ];
+        let app = build_router(test_service_with_config(config).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "openai/qwen3-32b-centriq2400",
+                            "messages": [
+                                {"role": "user", "content": "hello"}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+
+        assert_eq!(payload["model"], "openai/qwen3-32b-centriq2400");
+        assert_eq!(
+            payload["choices"][0]["message"]["content"], "qc02",
+            "unexpected response payload: {payload}"
+        );
+        assert_eq!(payload["gail"]["provider"], "openai");
+        assert_eq!(payload["gail"]["resolved_model"], "qwen3-32b-centriq2400");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_explicit_ollama_model_uses_fastest_configured_endpoint_pool() {
+        let qc00 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "qwen3-32b-centriq2400"}]
+            })))
+            .mount(&qc00)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(320))
+                    .set_body_json(json!({
+                        "id": "chatcmpl-qc00",
+                        "object": "chat.completion",
+                        "model": "qwen3-32b-centriq2400",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "qc00"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+                    })),
+            )
+            .mount(&qc00)
+            .await;
+
+        let qc02 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "qwen3-32b-centriq2400"}]
+            })))
+            .mount(&qc02)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-qc02",
+                "object": "chat.completion",
+                "model": "qwen3-32b-centriq2400",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "qc02"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+            })))
+            .mount(&qc02)
+            .await;
+
+        let mut config = GailConfig::default();
+        config.providers = vec![
+            ProviderProfile {
+                name: "LlamaCppQC00".to_string(),
+                provider_type: "openai".to_string(),
+                model: Some("qwen3-32b-centriq2400".to_string()),
+                api_key: Some("llamacpp-local".to_string()),
+                base_url: Some(qc00.uri()),
+                preferred: true,
+                ..ProviderProfile::default()
+            },
+            ProviderProfile {
+                name: "LlamaCppQC02".to_string(),
+                provider_type: "openai".to_string(),
+                model: Some("qwen3-32b-centriq2400".to_string()),
+                api_key: Some("llamacpp-local".to_string()),
+                base_url: Some(qc02.uri()),
+                preferred: true,
+                ..ProviderProfile::default()
+            },
+        ];
+        let app = build_router(test_service_with_config(config).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/qwen3.6:35b",
+                            "messages": [
+                                {"role": "user", "content": "hello"}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+
+        assert_eq!(payload["model"], "ollama/qwen3.6:35b");
+        assert_eq!(
+            payload["choices"][0]["message"]["content"], "qc02",
+            "unexpected response payload: {payload}"
+        );
+        assert_eq!(payload["gail"]["provider"], "openai");
+        assert_eq!(payload["gail"]["resolved_model"], "qwen3-32b-centriq2400");
     }
 
     #[tokio::test]

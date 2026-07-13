@@ -449,7 +449,7 @@ impl OllamaProvider {
             let selected_model = resolution
                 .selected_model
                 .clone()
-                .ok_or_else(|| GailError::upstream("ollama", None, format!("Ollama model {} is not safely available locally. Recommended downloads: {}", resolution.requested_model, resolution.recommended_downloads.join(", "))))?;
+                .ok_or_else(|| GailError::upstream("ollama", None, format!("Ollama model {} is not safely available locally at {}. Recommended downloads: {}", resolution.requested_model, base_url, resolution.recommended_downloads.join(", "))))?;
             model = selected_model.clone();
             let mut payload = json!({
                 "model": model,
@@ -999,13 +999,15 @@ impl OllamaProvider {
                 });
             }
         }
-        if let Some(selected_model) = select_best_local_model(
-            &generative_models,
-            requested_model,
-            prompt_text,
-            required_min_size_b,
-            &resource_snapshot,
-        ) {
+        if !strict_no_downgrade
+            && let Some(selected_model) = select_best_local_model(
+                &generative_models,
+                requested_model,
+                prompt_text,
+                required_min_size_b,
+                &resource_snapshot,
+            )
+        {
             return Ok(ModelResolution {
                 selected_model: Some(selected_model),
                 requested_model: requested_model.to_string(),
@@ -1053,9 +1055,23 @@ impl OllamaProvider {
                 }
             }
         }
-        if strict_no_downgrade && required_min_size_b > 0.0 {
+        let has_related_generative_model = generative_models.iter().any(|entry| {
+            entry
+                .get("name")
+                .and_then(Value::as_str)
+                .map(|name| model_families_look_related(requested_model, name))
+                .unwrap_or(false)
+        });
+        if strict_no_downgrade {
+            tracing::warn!(
+                requested_model = %requested_model,
+                base_url = %base_url,
+                has_related_generative_model,
+                listed_generative_models = generative_models.len(),
+                "strict no-downgrade is enabled and inventory resolution did not find an exact local match; probing requested Ollama model directly"
+            );
             return Ok(ModelResolution {
-                selected_model: None,
+                selected_model: Some(requested_model.to_string()),
                 requested_model: requested_model.to_string(),
                 recommended_downloads,
             });
@@ -1579,6 +1595,28 @@ fn aliases_for_model(model: &str) -> Vec<String> {
     vec![normalized.clone(), base, bare]
 }
 
+fn normalized_model_family(model: &str) -> String {
+    model
+        .split_once(':')
+        .map(|(family, _)| family)
+        .unwrap_or(model)
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect::<String>()
+}
+
+fn model_families_look_related(requested_model: &str, candidate_model: &str) -> bool {
+    let requested = normalized_model_family(requested_model);
+    let candidate = normalized_model_family(candidate_model);
+    if requested.is_empty() || candidate.is_empty() {
+        return false;
+    }
+    requested == candidate
+        || requested.starts_with(candidate.as_str())
+        || candidate.starts_with(requested.as_str())
+}
+
 fn select_matching_installed_model(tags: &Value, requested_model: &str) -> Option<String> {
     let models = tags.get("models").and_then(Value::as_array)?;
     select_matching_model_from_entries(models, requested_model)
@@ -1711,6 +1749,13 @@ mod tests {
         assert!(model_meets_size_floor("llama3.2:3b", 1.5));
         assert!(!model_meets_size_floor("llama3.2:1b", 1.5));
         assert!(model_meets_size_floor("mistral", 1.5));
+    }
+
+    #[test]
+    fn model_family_related_detection_handles_minor_version_names() {
+        assert!(model_families_look_related("qwen3.6:35b", "qwen3:32b"));
+        assert!(model_families_look_related("qwen3:32b", "qwen3.6:35b"));
+        assert!(!model_families_look_related("llama3.1:8b", "mistral:7b"));
     }
 
     #[test]
@@ -1913,7 +1958,7 @@ mod tests {
             workflow: None,
             role: None,
             min_model_size_b: Some(1.5),
-            strict_no_downgrade: Some(true),
+            strict_no_downgrade: None,
         };
 
         let error = provider
@@ -1983,6 +2028,65 @@ mod tests {
             .expect("strict no-downgrade should allow installed model");
         assert_eq!(response.model, "qwen3.6:9999b");
         assert_eq!(response.text, "ok");
+    }
+
+    #[tokio::test]
+    async fn completion_probes_requested_model_when_strict_no_downgrade_and_tags_miss_exact_match()
+    {
+        reset_test_runtime_state().await;
+
+        let endpoint = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "qwen3:32b"}]
+            })))
+            .mount(&endpoint)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "strict requested model",
+                "prompt_eval_count": 2,
+                "eval_count": 1
+            })))
+            .mount(&endpoint)
+            .await;
+
+        let provider = OllamaProvider {
+            client: Client::new(),
+            model: "qwen3.6:35b".to_string(),
+            default_model: "qwen3.6:35b".to_string(),
+            base_url: endpoint.uri(),
+        };
+        let request = ProviderCompletionRequest {
+            provider: "ollama".to_string(),
+            model: Some("qwen3.6:35b".to_string()),
+            api_key: None,
+            access_token: None,
+            base_url: Some(endpoint.uri()),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: MessageContent::Text("hello".to_string()),
+            }],
+            system: None,
+            max_tokens: Some(8),
+            temperature: Some(0.0),
+            timeout_seconds: Some(4),
+            reasoning_effort: None,
+            request_category: None,
+            workflow: None,
+            role: None,
+            min_model_size_b: None,
+            strict_no_downgrade: Some(true),
+        };
+
+        let response = provider
+            .complete_once(&request, 0)
+            .await
+            .expect("strict no-downgrade should probe requested model directly");
+        assert_eq!(response.model, "qwen3.6:35b");
+        assert_eq!(response.text, "strict requested model");
     }
 
     #[tokio::test]

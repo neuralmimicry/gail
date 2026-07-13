@@ -922,7 +922,7 @@ impl GailService {
             let unattempted = ranked
                 .iter()
                 .filter(|item| {
-                    !attempted_candidate_ids.contains(&item.candidate.candidate_id())
+                    !attempted_candidate_ids.contains(&candidate_attempt_key(&item.candidate))
                         && !throttled_provider_types.contains(&item.candidate.provider_type)
                 })
                 .cloned()
@@ -1050,7 +1050,7 @@ impl GailService {
             }
             wave_index += 1;
             for candidate in &selected {
-                attempted_candidate_ids.insert(candidate.candidate_id());
+                attempted_candidate_ids.insert(candidate_attempt_key(candidate));
             }
 
             info!(
@@ -1929,11 +1929,20 @@ impl GailService {
     ) -> Vec<ProviderCandidate> {
         let mut candidates = Vec::new();
         if let Some(provider) = request.preferred_provider.as_ref() {
-            if request_candidate_model_allowed(
+            let normalized_provider = normalize_provider_type(provider);
+            let has_request_endpoint_override =
+                has_usable_value(request.preferred_api_key.as_deref())
+                    || has_usable_value(request.preferred_access_token.as_deref())
+                    || has_usable_value(request.base_url.as_deref());
+            let skip_implicit_ollama_request_candidate = include_configured
+                && normalized_provider == "ollama"
+                && !has_request_endpoint_override;
+            let request_model_allowed = request_candidate_model_allowed(
                 &self.inner.config,
                 provider,
                 request.preferred_model.as_deref(),
-            ) {
+            );
+            if request_model_allowed && !skip_implicit_ollama_request_candidate {
                 candidates.push(self.request_candidate(
                     provider,
                     request.preferred_model.clone(),
@@ -1943,11 +1952,17 @@ impl GailService {
                     true,
                     "request_primary",
                 ));
-            } else {
+            } else if !request_model_allowed {
                 tracing::warn!(
                     provider = %provider,
                     requested_model = ?request.preferred_model,
                     "ignoring unconfigured Ollama request model; using configured provider profiles"
+                );
+            } else {
+                tracing::debug!(
+                    provider = %provider,
+                    requested_model = ?request.preferred_model,
+                    "skipping implicit Ollama request model candidate in configured-pool mode"
                 );
             }
         }
@@ -1988,7 +2003,16 @@ impl GailService {
                     .cloned()
                     .map(ProviderCandidate::from_profile),
             );
-            append_local_ollama_fallback_candidate(&mut candidates);
+            let prefer_ollama_family = request
+                .preferred_provider
+                .as_deref()
+                .map(normalize_provider_type)
+                .is_some_and(|provider| provider == "ollama");
+            let append_ollama_fallback = request.preferred_provider.is_none()
+                || (prefer_ollama_family && candidates.is_empty());
+            if append_ollama_fallback {
+                append_local_ollama_fallback_candidate(&mut candidates);
+            }
         }
         dedupe_candidates(candidates)
             .into_iter()
@@ -3078,17 +3102,21 @@ fn dedupe_candidates(candidates: Vec<ProviderCandidate>) -> Vec<ProviderCandidat
     let mut seen = HashSet::new();
     let mut deduped = Vec::new();
     for candidate in candidates {
-        let key = format!(
-            "{}::{}::{}",
-            candidate.provider_type,
-            candidate.configured_model,
-            candidate.profile.base_url.clone().unwrap_or_default()
-        );
+        let key = candidate_attempt_key(&candidate);
         if seen.insert(key) {
             deduped.push(candidate);
         }
     }
     deduped
+}
+
+fn candidate_attempt_key(candidate: &ProviderCandidate) -> String {
+    format!(
+        "{}::{}::{}",
+        candidate.provider_type,
+        candidate.configured_model.trim(),
+        candidate.profile.base_url.as_deref().unwrap_or("").trim()
+    )
 }
 
 fn append_local_ollama_fallback_candidate(candidates: &mut Vec<ProviderCandidate>) {
@@ -3240,8 +3268,8 @@ fn select_ranked_candidates(
             if !selected_provider_types.insert(item.candidate.provider_type.clone()) {
                 continue;
             }
-            let candidate_id = item.candidate.candidate_id();
-            if selected_ids.insert(candidate_id) {
+            let candidate_key = candidate_attempt_key(&item.candidate);
+            if selected_ids.insert(candidate_key) {
                 selected.push(item.candidate.clone());
                 if selected.len() == target {
                     return ensure_local_fallback_selected(selected, local_fallback, target);
@@ -3252,8 +3280,8 @@ fn select_ranked_candidates(
 
     for health_ok in [true, false] {
         for item in ranked.iter().filter(|item| item.health_ok == health_ok) {
-            let candidate_id = item.candidate.candidate_id();
-            if selected_ids.insert(candidate_id) {
+            let candidate_key = candidate_attempt_key(&item.candidate);
+            if selected_ids.insert(candidate_key) {
                 selected.push(item.candidate.clone());
                 if selected.len() == target {
                     return ensure_local_fallback_selected(selected, local_fallback, target);
@@ -4502,6 +4530,49 @@ mod tests {
         assert_eq!(labels.len(), 2);
         assert_eq!(labels[0], "nvidia/moonshotai/kimi-k2-instruct-0905");
         assert!(labels[1].starts_with("ollama/llama3.2"));
+    }
+
+    #[test]
+    fn select_ranked_candidates_can_include_multiple_endpoints_for_same_provider_model() {
+        fn ranked(base_url: &str, score: f64) -> RankedCandidate {
+            RankedCandidate {
+                score,
+                health_ok: true,
+                health_mode: None,
+                candidate: ProviderCandidate::from_profile(ProviderProfile {
+                    name: format!("llamacpp-{}", base_url.replace(':', "-")),
+                    provider_type: "openai".to_string(),
+                    model: Some("qwen3-32b-centriq2400".to_string()),
+                    api_key: Some("token".to_string()),
+                    base_url: Some(base_url.to_string()),
+                    ..ProviderProfile::default()
+                }),
+            }
+        }
+
+        let selected = select_ranked_candidates(
+            vec![
+                ranked("http://192.168.1.60:18080/v1", 5.0),
+                ranked("http://192.168.1.62:18080/v1", 4.9),
+            ],
+            2,
+        );
+
+        assert_eq!(selected.len(), 2);
+        let selected_base_urls = selected
+            .iter()
+            .map(|candidate| candidate.profile.base_url.clone().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert!(
+            selected_base_urls
+                .iter()
+                .any(|url| url == "http://192.168.1.60:18080/v1")
+        );
+        assert!(
+            selected_base_urls
+                .iter()
+                .any(|url| url == "http://192.168.1.62:18080/v1")
+        );
     }
 
     #[test]
