@@ -393,6 +393,7 @@ impl OllamaProvider {
         let mut model = request.model.clone().unwrap_or_else(|| self.model.clone());
         let prompt = collapse_messages(request);
         let max_predict = env_int("GAIL_OLLAMA_MAX_PREDICT", 512).max(1) as u32;
+        let num_ctx = env_int("GAIL_OLLAMA_NUM_CTX", 0).max(0) as u32;
         let requested_predict = request
             .max_tokens
             .map(|value| value.max(1).min(max_predict))
@@ -459,6 +460,9 @@ impl OllamaProvider {
                 },
                 "stream": false,
             });
+            if num_ctx > 0 {
+                payload["options"]["num_ctx"] = json!(num_ctx);
+            }
             if env_bool("GAIL_OLLAMA_DISABLE_THINKING", true) {
                 payload["think"] = json!(false);
             }
@@ -542,6 +546,9 @@ impl OllamaProvider {
             data["gail_ollama_queue_wait_ms"] = json!(queue_wait_ms);
             data["gail_ollama_inference_ms"] = json!(inference_ms);
             data["gail_ollama_total_tokens_estimate"] = json!(total_tokens_estimate);
+            if num_ctx > 0 {
+                data["gail_ollama_num_ctx"] = json!(num_ctx);
+            }
             data["gail_local_usage"] = json!({
                 "provider": "ollama",
                 "queue_wait_ms": queue_wait_ms,
@@ -972,16 +979,25 @@ impl OllamaProvider {
         });
         let resource_snapshot = local_resource_snapshot();
         if let Some(model) = select_matching_model_from_entries(&generative_models, requested_model)
-            .filter(|model| {
-                model_meets_size_floor(model.as_str(), required_min_size_b)
-                    && model_fits_resources(model.as_str(), &resource_snapshot)
-            })
         {
-            return Ok(ModelResolution {
-                selected_model: Some(model),
-                requested_model: requested_model.to_string(),
-                recommended_downloads: Vec::new(),
-            });
+            let meets_size_floor = model_meets_size_floor(model.as_str(), required_min_size_b);
+            let fits_resources = model_fits_resources(model.as_str(), &resource_snapshot);
+            if meets_size_floor && (fits_resources || strict_no_downgrade) {
+                if !fits_resources && strict_no_downgrade {
+                    tracing::warn!(
+                        requested_model = %requested_model,
+                        selected_model = %model,
+                        memory_available_mb = resource_snapshot.memory_available_mb,
+                        disk_available_mb = resource_snapshot.disk_available_mb,
+                        "using installed Ollama model despite local resource guard due to strict no-downgrade policy"
+                    );
+                }
+                return Ok(ModelResolution {
+                    selected_model: Some(model),
+                    requested_model: requested_model.to_string(),
+                    recommended_downloads: Vec::new(),
+                });
+            }
         }
         if let Some(selected_model) = select_best_local_model(
             &generative_models,
@@ -1005,16 +1021,14 @@ impl OllamaProvider {
                 recommended_downloads: vec![requested_model.to_string()],
             });
         }
+        recommended_downloads.push(requested_model.to_string());
         if let Some(candidate) =
             next_size_up_pull_candidate(requested_model, required_min_size_b.max(requested_size_b))
+            && !recommended_downloads
+                .iter()
+                .any(|model| model.eq_ignore_ascii_case(candidate.as_str()))
         {
             recommended_downloads.push(candidate);
-        }
-        if !recommended_downloads
-            .iter()
-            .any(|model| model.eq_ignore_ascii_case(requested_model))
-        {
-            recommended_downloads.push(requested_model.to_string());
         }
         if allow_pull {
             let pull_timeout = env_int("GAIL_OLLAMA_PULL_TIMEOUT_SECONDS", 240).max(5);
@@ -1911,6 +1925,64 @@ mod tests {
                 .to_string()
                 .contains("is not safely available locally")
         );
+    }
+
+    #[tokio::test]
+    async fn completion_allows_installed_model_when_strict_no_downgrade_is_enabled() {
+        reset_test_runtime_state().await;
+
+        let endpoint = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "qwen3.6:9999b"}]
+            })))
+            .mount(&endpoint)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "ok",
+                "prompt_eval_count": 2,
+                "eval_count": 1
+            })))
+            .mount(&endpoint)
+            .await;
+
+        let provider = OllamaProvider {
+            client: Client::new(),
+            model: "qwen3.6:9999b".to_string(),
+            default_model: "qwen3.6:9999b".to_string(),
+            base_url: endpoint.uri(),
+        };
+        let request = ProviderCompletionRequest {
+            provider: "ollama".to_string(),
+            model: Some("qwen3.6:9999b".to_string()),
+            api_key: None,
+            access_token: None,
+            base_url: Some(endpoint.uri()),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: MessageContent::Text("hello".to_string()),
+            }],
+            system: None,
+            max_tokens: Some(8),
+            temperature: Some(0.0),
+            timeout_seconds: Some(4),
+            reasoning_effort: None,
+            request_category: None,
+            workflow: None,
+            role: None,
+            min_model_size_b: None,
+            strict_no_downgrade: Some(true),
+        };
+
+        let response = provider
+            .complete_once(&request, 0)
+            .await
+            .expect("strict no-downgrade should allow installed model");
+        assert_eq!(response.model, "qwen3.6:9999b");
+        assert_eq!(response.text, "ok");
     }
 
     #[tokio::test]
