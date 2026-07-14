@@ -3956,6 +3956,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_chat_completions_explicit_unconfigured_ollama_model_skips_configured_ollama_profiles()
+     {
+        let qc00 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "qwen3-32b-centriq2400"}]
+            })))
+            .mount(&qc00)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(320))
+                    .set_body_json(json!({
+                        "id": "chatcmpl-qc00",
+                        "object": "chat.completion",
+                        "model": "qwen3-32b-centriq2400",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "qc00"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+                    })),
+            )
+            .mount(&qc00)
+            .await;
+
+        let qc02 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "qwen3-32b-centriq2400"}]
+            })))
+            .mount(&qc02)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-qc02",
+                "object": "chat.completion",
+                "model": "qwen3-32b-centriq2400",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "qc02"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+            })))
+            .mount(&qc02)
+            .await;
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "qwen3.5:4b"}]
+            })))
+            .mount(&ollama)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "qwen3.5:4b",
+                "response": "ollama",
+                "done": true,
+                "prompt_eval_count": 2,
+                "eval_count": 1
+            })))
+            .mount(&ollama)
+            .await;
+
+        let mut config = GailConfig::default();
+        config.providers = vec![
+            ProviderProfile {
+                name: "OllamaLocal".to_string(),
+                provider_type: "ollama".to_string(),
+                model: Some("qwen3.5:4b".to_string()),
+                base_url: Some(ollama.uri()),
+                preferred: true,
+                weight: 0.9,
+                ..ProviderProfile::default()
+            },
+            ProviderProfile {
+                name: "LlamaCppQC00".to_string(),
+                provider_type: "openai".to_string(),
+                model: Some("qwen3-32b-centriq2400".to_string()),
+                api_key: Some("llamacpp-local".to_string()),
+                base_url: Some(qc00.uri()),
+                preferred: true,
+                ..ProviderProfile::default()
+            },
+            ProviderProfile {
+                name: "LlamaCppQC02".to_string(),
+                provider_type: "openai".to_string(),
+                model: Some("qwen3-32b-centriq2400".to_string()),
+                api_key: Some("llamacpp-local".to_string()),
+                base_url: Some(qc02.uri()),
+                preferred: true,
+                ..ProviderProfile::default()
+            },
+        ];
+        let app = build_router(test_service_with_config(config).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/qwen3.6:35b",
+                            "messages": [
+                                {"role": "user", "content": "hello"}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+
+        assert_eq!(payload["model"], "ollama/qwen3.6:35b");
+        let choice_content = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            matches!(choice_content, "qc00" | "qc02"),
+            "unexpected response payload: {payload}"
+        );
+        assert_eq!(payload["gail"]["provider"], "openai");
+        assert_eq!(payload["gail"]["resolved_model"], "qwen3-32b-centriq2400");
+        let candidate_providers = payload["gail"]["trace"]["candidates"]
+            .as_array()
+            .expect("candidates")
+            .iter()
+            .filter_map(|item| item.get("provider").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(
+            !candidate_providers
+                .iter()
+                .any(|provider| *provider == "ollama"),
+            "unexpected trace providers: {candidate_providers:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn openai_chat_completions_explicit_ollama_saturation_returns_degraded_success_payload() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))

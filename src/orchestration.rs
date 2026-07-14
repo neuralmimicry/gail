@@ -141,6 +141,40 @@ struct LoadReservation {
     resource_cost_vram_mb: u64,
 }
 
+struct LoadReservationGuard {
+    service: GailService,
+    reservation: Option<LoadReservation>,
+}
+
+impl LoadReservationGuard {
+    fn new(service: GailService, reservation: LoadReservation) -> Self {
+        Self {
+            service,
+            reservation: Some(reservation),
+        }
+    }
+
+    async fn release(mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            self.service.release_candidate_load(reservation).await;
+        }
+    }
+}
+
+impl Drop for LoadReservationGuard {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let service = self.service.clone();
+            handle.spawn(async move {
+                service.release_candidate_load(reservation).await;
+            });
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkloadClass {
     Interactive,
@@ -1928,6 +1962,7 @@ impl GailService {
         include_configured: bool,
     ) -> Vec<ProviderCandidate> {
         let mut candidates = Vec::new();
+        let mut skip_configured_ollama_profiles = false;
         if let Some(provider) = request.preferred_provider.as_ref() {
             let normalized_provider = normalize_provider_type(provider);
             let has_request_endpoint_override =
@@ -1958,6 +1993,9 @@ impl GailService {
                     requested_model = ?request.preferred_model,
                     "ignoring unconfigured Ollama request model; using configured provider profiles"
                 );
+                skip_configured_ollama_profiles = include_configured
+                    && normalized_provider == "ollama"
+                    && !has_request_endpoint_override;
             } else {
                 tracing::debug!(
                     provider = %provider,
@@ -2000,9 +2038,20 @@ impl GailService {
                     .config
                     .providers
                     .iter()
+                    .filter(|profile| {
+                        !(skip_configured_ollama_profiles
+                            && normalize_provider_type(profile.provider_type.as_str()) == "ollama")
+                    })
                     .cloned()
                     .map(ProviderCandidate::from_profile),
             );
+            if skip_configured_ollama_profiles {
+                tracing::info!(
+                    requested_provider = ?request.preferred_provider,
+                    requested_model = ?request.preferred_model,
+                    "skipping configured Ollama profiles for unconfigured explicit Ollama request"
+                );
+            }
             let prefer_ollama_family = request
                 .preferred_provider
                 .as_deref()
@@ -2556,6 +2605,7 @@ impl GailService {
                 score: f64::NEG_INFINITY,
             };
         };
+        let load_reservation_guard = LoadReservationGuard::new(self.clone(), load_reservation);
         let quota_retries = env_int_any(&["LLM_RATE_LIMIT_RETRIES"], 2) as usize;
         let timeout_retries = env_int_any(&["LLM_TIMEOUT_RETRIES"], 0) as usize;
         let quota_backoff_base = env_float_any(&["LLM_RATE_LIMIT_BACKOFF_BASE"], 1.0).max(0.1);
@@ -2697,7 +2747,7 @@ impl GailService {
         } else {
             invocation.await
         };
-        self.release_candidate_load(load_reservation).await;
+        load_reservation_guard.release().await;
         result
     }
 
@@ -3033,14 +3083,21 @@ impl ProviderCandidate {
     }
 
     fn endpoint_scope(&self) -> Option<String> {
-        if !is_ollama_candidate(self) {
-            return None;
+        if is_ollama_candidate(self) {
+            let explicit_name = self.profile.name.trim();
+            if !explicit_name.is_empty()
+                && !explicit_name.eq_ignore_ascii_case(self.provider_type.as_str())
+            {
+                return Some(sanitize_candidate_scope(explicit_name, "endpoint"));
+            }
+            return self
+                .profile
+                .base_url
+                .as_deref()
+                .and_then(candidate_scope_from_base_url);
         }
-        let explicit_name = self.profile.name.trim();
-        if !explicit_name.is_empty()
-            && !explicit_name.eq_ignore_ascii_case(self.provider_type.as_str())
-        {
-            return Some(sanitize_candidate_scope(explicit_name, "endpoint"));
+        if !self.provider_type.eq_ignore_ascii_case("openai") {
+            return None;
         }
         self.profile
             .base_url
@@ -4488,7 +4545,7 @@ mod tests {
         assert_eq!(labels.len(), 3);
         assert_eq!(labels[0], "nvidia/moonshotai/kimi-k2-instruct-0905");
         assert!(labels[1].starts_with("ollama/llama3.2"));
-        assert_eq!(labels[2], "openai/gpt-5.3-codex");
+        assert!(labels[2].starts_with("openai/gpt-5.3-codex@"));
     }
 
     #[test]
@@ -4661,6 +4718,85 @@ mod tests {
                 .starts_with("ollama/qwen2.5-coder:1.5b@")
         );
         assert_eq!(nvidia.candidate_id(), "nvidia/minimaxai/minimax-m2.7");
+    }
+
+    #[test]
+    fn candidate_id_scopes_openai_endpoints() {
+        let first = ProviderCandidate::from_profile(ProviderProfile {
+            name: "LlamaCppQC00".to_string(),
+            provider_type: "openai".to_string(),
+            model: Some("qwen3-32b-centriq2400".to_string()),
+            api_key: Some("token".to_string()),
+            base_url: Some("http://192.168.1.60:18080/v1".to_string()),
+            ..ProviderProfile::default()
+        });
+        let second = ProviderCandidate::from_profile(ProviderProfile {
+            name: "LlamaCppQC02".to_string(),
+            provider_type: "openai".to_string(),
+            model: Some("qwen3-32b-centriq2400".to_string()),
+            api_key: Some("token".to_string()),
+            base_url: Some("http://192.168.1.62:18080/v1".to_string()),
+            ..ProviderProfile::default()
+        });
+        let openai_cloud = ProviderCandidate::from_profile(ProviderProfile {
+            provider_type: "openai".to_string(),
+            model: Some("gpt-5.3-codex".to_string()),
+            api_key: Some("token".to_string()),
+            ..ProviderProfile::default()
+        });
+
+        assert_ne!(first.candidate_id(), second.candidate_id());
+        assert!(
+            first
+                .candidate_id()
+                .starts_with("openai/qwen3-32b-centriq2400@")
+        );
+        assert!(
+            second
+                .candidate_id()
+                .starts_with("openai/qwen3-32b-centriq2400@")
+        );
+        assert_eq!(openai_cloud.candidate_id(), "openai/gpt-5.3-codex");
+    }
+
+    #[tokio::test]
+    async fn load_reservation_guard_drop_releases_candidate_slot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = GailConfig::default();
+        config.storage.metrics_path = temp.path().join("metrics.json").display().to_string();
+        config.storage.adaptive_schema_path =
+            temp.path().join("adaptive.json").display().to_string();
+        config.storage.api_issues_path = temp.path().join("api_issues.json").display().to_string();
+        config.storage.llm_ledger_path = temp.path().join("llm_ledger.jsonl").display().to_string();
+        config.storage.trainer_output_path = temp.path().join("training").display().to_string();
+        config.providers = vec![ProviderProfile {
+            name: "LlamaCppQC00".to_string(),
+            provider_type: "openai".to_string(),
+            model: Some("qwen3-32b-centriq2400".to_string()),
+            api_key: Some("token".to_string()),
+            base_url: Some("http://192.168.1.60:18080/v1".to_string()),
+            max_concurrent_requests: Some(1),
+            ..ProviderProfile::default()
+        }];
+        let service = GailService::new(config).await.expect("service");
+        let candidate = ProviderCandidate::from_profile(service.config().providers[0].clone());
+
+        let reservation = service
+            .reserve_candidate_load(&candidate)
+            .await
+            .expect("reserve load");
+        let guard = LoadReservationGuard::new(service.clone(), reservation);
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let second = service.reserve_candidate_load(&candidate).await;
+        assert!(
+            second.is_some(),
+            "candidate reservation should be released after guard drop"
+        );
+        if let Some(reservation) = second {
+            service.release_candidate_load(reservation).await;
+        }
     }
 
     #[test]

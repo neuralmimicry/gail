@@ -1,10 +1,12 @@
 use std::{
+    env,
     path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::Client;
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tokio::{
     fs::{self, OpenOptions},
@@ -137,6 +139,163 @@ struct TrainingOutcome {
     status: String,
 }
 
+/// End-to-end trainer execution plan shared with the child training process.
+///
+/// The worker derives this plan from runtime hardware and exposes it as
+/// environment variables and a JSON artifact (`training_execution_plan.json`).
+#[derive(Debug, Clone, Serialize)]
+struct TrainingExecutionPlan {
+    profile: String,
+    backend: String,
+    device: String,
+    device_index: Option<usize>,
+    gpu_count: usize,
+    gpu_memory_mb: u64,
+    gpu_free_memory_mb: u64,
+    cpu_threads_available: usize,
+    cpu_intraop_threads: usize,
+    cpu_interop_threads: usize,
+    tokenizer_threads: usize,
+    async_worker_threads: usize,
+    prefetch_batches: usize,
+    compute_dtype: String,
+    quantisation_backend: String,
+    dynamic_padding: bool,
+    sequence_packing: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TrainingArtifactMode {
+    Production,
+    DevelopmentFixture,
+}
+
+fn training_artifact_mode() -> TrainingArtifactMode {
+    let configured = env::var("GAIL_TRAIN_ARTIFACT_MODE")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "production".to_string());
+    if configured == "development_fixture" || env_bool("GAIL_TRAIN_ALLOW_SYNTHETIC_MODEL", false) {
+        return TrainingArtifactMode::DevelopmentFixture;
+    }
+    TrainingArtifactMode::Production
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(min, max.max(min))
+}
+
+fn env_string(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn build_training_execution_plan(
+    trainer: &TrainerConfig,
+    hardware: &HardwareProfile,
+) -> TrainingExecutionPlan {
+    let gpu_count = hardware.gpu_count();
+    let use_gpu = gpu_count > 0;
+    let cpu_threads_available = hardware.preferred_worker_threads().max(1);
+    let cpu_intraop_threads = env_usize(
+        "GAIL_TRAIN_CPU_INTRAOP_THREADS",
+        cpu_threads_available.saturating_sub(2),
+        1,
+        256,
+    );
+    let cpu_interop_threads = env_usize(
+        "GAIL_TRAIN_CPU_INTEROP_THREADS",
+        if cpu_intraop_threads >= 24 { 1 } else { 2 },
+        1,
+        32,
+    );
+    let tokenizer_threads = env_usize(
+        "GAIL_TRAIN_TOKENIZER_THREADS",
+        (cpu_intraop_threads / 3).clamp(2, 16),
+        1,
+        64,
+    );
+    let async_worker_threads = env_usize(
+        "GAIL_TRAIN_ASYNC_WORKER_THREADS",
+        (cpu_threads_available / 12).clamp(2, 4),
+        1,
+        32,
+    );
+    let prefetch_batches = env_usize("GAIL_TRAIN_PREFETCH_BATCHES", 2, 1, 32);
+    let dynamic_padding = !env_bool("GAIL_TRAIN_DISABLE_DYNAMIC_PADDING", false);
+    let sequence_packing = env_bool("GAIL_TRAIN_SEQUENCE_PACKING", true);
+    let quantisation_backend = if env_bool("GAIL_TCH_BASE_PREQUANTISED", false) {
+        "prequantised_base".to_string()
+    } else {
+        "none".to_string()
+    };
+    let compute_dtype = env_string("GAIL_TRAIN_COMPUTE_DTYPE").unwrap_or_else(|| {
+        if use_gpu {
+            "fp16".to_string()
+        } else {
+            "fp32".to_string()
+        }
+    });
+    let profile = if hardware.cpu_arch.eq_ignore_ascii_case("aarch64") && use_gpu {
+        "centriq_rtx3060_12gb".to_string()
+    } else if hardware.cpu_arch.eq_ignore_ascii_case("aarch64") {
+        "centriq_cpu_armv8".to_string()
+    } else if use_gpu {
+        "generic_cuda".to_string()
+    } else {
+        "generic_cpu".to_string()
+    };
+    let backend = if trainer.algorithm.eq_ignore_ascii_case("qlora_sft") && use_gpu {
+        "cuda_qlora".to_string()
+    } else if use_gpu {
+        "cuda_lora".to_string()
+    } else {
+        "cpu_lora".to_string()
+    };
+    TrainingExecutionPlan {
+        profile,
+        backend,
+        device: if use_gpu {
+            "cuda".to_string()
+        } else {
+            "cpu".to_string()
+        },
+        device_index: if use_gpu { Some(0) } else { None },
+        gpu_count,
+        gpu_memory_mb: hardware.total_gpu_memory_mb(),
+        gpu_free_memory_mb: hardware.total_gpu_free_memory_mb(),
+        cpu_threads_available,
+        cpu_intraop_threads,
+        cpu_interop_threads,
+        tokenizer_threads,
+        async_worker_threads,
+        prefetch_batches,
+        compute_dtype,
+        quantisation_backend,
+        dynamic_padding,
+        sequence_packing,
+    }
+}
+
 async fn run_training_pipeline(
     trainer: &TrainerConfig,
     hardware: &HardwareProfile,
@@ -147,14 +306,28 @@ async fn run_training_pipeline(
     fs::create_dir_all(snapshot_dir).await.map_err(|error| {
         GailError::invalid_config(format!("failed to create snapshot output path: {error}"))
     })?;
+    let execution_plan = build_training_execution_plan(trainer, hardware);
+    let artifact_mode = training_artifact_mode();
+    write_json(
+        snapshot_dir.join("training_execution_plan.json").as_path(),
+        &serde_json::to_value(&execution_plan).unwrap_or(Value::Null),
+    )
+    .await?;
     let mut pipeline_report = json!({
         "snapshot_id": snapshot_id,
         "algorithm": trainer.algorithm,
         "dataset_path": dataset_path.to_string_lossy().to_string(),
         "snapshot_dir": snapshot_dir.to_string_lossy().to_string(),
+        "artifact_mode": artifact_mode,
         "cpu_cores": hardware.cpu_cores,
+        "cpu_arch": hardware.cpu_arch,
+        "cpu_model": hardware.cpu_model,
+        "total_memory_mb": hardware.total_memory_mb,
+        "available_memory_mb": hardware.available_memory_mb,
         "gpu_count": hardware.gpu_count(),
         "gpu_memory_mb": hardware.total_gpu_memory_mb(),
+        "gpu_free_memory_mb": hardware.total_gpu_free_memory_mb(),
+        "execution_plan": execution_plan,
         "started_ts": now_ts(),
     });
     let training_invocation =
@@ -166,6 +339,7 @@ async fn run_training_pipeline(
             command_line.as_str(),
             trainer,
             hardware,
+            &execution_plan,
             snapshot_id,
             dataset_path,
             snapshot_dir,
@@ -224,17 +398,12 @@ async fn execute_training_command(
     command_line: &str,
     trainer: &TrainerConfig,
     hardware: &HardwareProfile,
+    execution_plan: &TrainingExecutionPlan,
     snapshot_id: &str,
     dataset_path: &Path,
     snapshot_dir: &Path,
 ) -> Result<CommandOutcome> {
     let started = tokio::time::Instant::now();
-    let cpu_threads = hardware.preferred_worker_threads().max(1).to_string();
-    let train_device = if hardware.gpu_count() > 0 {
-        "cuda"
-    } else {
-        "cpu"
-    };
 
     let mut command = Command::new("bash");
     command
@@ -253,23 +422,96 @@ async fn execute_training_command(
             "GAIL_TRAIN_OUTPUT_DIR",
             snapshot_dir.to_string_lossy().to_string(),
         )
-        .env("GAIL_TRAIN_CPU_THREADS", cpu_threads.as_str())
-        .env("GAIL_TRAIN_DEVICE", train_device)
+        .env(
+            "GAIL_TRAIN_CPU_THREADS",
+            execution_plan.cpu_intraop_threads.to_string(),
+        )
+        .env(
+            "GAIL_TRAIN_CPU_INTRAOP_THREADS",
+            execution_plan.cpu_intraop_threads.to_string(),
+        )
+        .env(
+            "GAIL_TRAIN_CPU_INTEROP_THREADS",
+            execution_plan.cpu_interop_threads.to_string(),
+        )
+        .env(
+            "GAIL_TRAIN_TOKENIZER_THREADS",
+            execution_plan.tokenizer_threads.to_string(),
+        )
+        .env(
+            "GAIL_TRAIN_ASYNC_WORKER_THREADS",
+            execution_plan.async_worker_threads.to_string(),
+        )
+        .env(
+            "GAIL_TRAIN_PREFETCH_BATCHES",
+            execution_plan.prefetch_batches.to_string(),
+        )
+        .env(
+            "GAIL_TRAIN_DYNAMIC_PADDING",
+            if execution_plan.dynamic_padding {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .env(
+            "GAIL_TRAIN_SEQUENCE_PACKING",
+            if execution_plan.sequence_packing {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .env("GAIL_TRAIN_COMPUTE_DTYPE", &execution_plan.compute_dtype)
+        .env("GAIL_TRAIN_DEVICE", &execution_plan.device)
+        .env("GAIL_TRAIN_EXECUTION_PROFILE", &execution_plan.profile)
+        .env("GAIL_TRAIN_BACKEND", &execution_plan.backend)
         .env("GAIL_TRAIN_GPU_COUNT", hardware.gpu_count().to_string())
         .env(
             "GAIL_TRAIN_GPU_MEMORY_MB",
             hardware.total_gpu_memory_mb().to_string(),
         )
+        .env(
+            "GAIL_TRAIN_GPU_FREE_MEMORY_MB",
+            hardware.total_gpu_free_memory_mb().to_string(),
+        )
+        .env(
+            "GAIL_TRAIN_ARTIFACT_MODE",
+            match training_artifact_mode() {
+                TrainingArtifactMode::Production => "production",
+                TrainingArtifactMode::DevelopmentFixture => "development_fixture",
+            },
+        )
         // Make the child process GPU/CPU-aware for common Rust, BLAS and Python backends.
-        .env("RAYON_NUM_THREADS", cpu_threads.as_str())
-        .env("TOKIO_WORKER_THREADS", cpu_threads.as_str())
-        .env("OMP_NUM_THREADS", cpu_threads.as_str())
-        .env("MKL_NUM_THREADS", cpu_threads.as_str())
-        .env("OPENBLAS_NUM_THREADS", cpu_threads.as_str())
-        .env("NUMEXPR_NUM_THREADS", cpu_threads.as_str());
+        .env(
+            "RAYON_NUM_THREADS",
+            execution_plan.tokenizer_threads.to_string(),
+        )
+        .env(
+            "TOKIO_WORKER_THREADS",
+            execution_plan.async_worker_threads.to_string(),
+        )
+        .env(
+            "OMP_NUM_THREADS",
+            execution_plan.cpu_intraop_threads.to_string(),
+        )
+        .env(
+            "MKL_NUM_THREADS",
+            execution_plan.cpu_intraop_threads.to_string(),
+        )
+        .env(
+            "OPENBLAS_NUM_THREADS",
+            execution_plan.cpu_intraop_threads.to_string(),
+        )
+        .env(
+            "NUMEXPR_NUM_THREADS",
+            execution_plan.tokenizer_threads.to_string(),
+        );
 
     if hardware.gpu_count() == 0 {
         command.env("CUDA_VISIBLE_DEVICES", "");
+    } else if let Some(index) = execution_plan.device_index {
+        command.env("CUDA_VISIBLE_DEVICES", index.to_string());
     }
 
     let mut child = command.spawn().map_err(|error| {
@@ -407,6 +649,7 @@ async fn ensure_torchscript_artifacts(
     base_model: &str,
     dataset_path: &Path,
 ) -> Result<(PathBuf, PathBuf)> {
+    let artifact_mode = training_artifact_mode();
     let explicit_model_module = std::env::var("GAIL_TCH_MODEL_MODULE")
         .ok()
         .map(|value| value.trim().to_string())
@@ -429,6 +672,16 @@ async fn ensure_torchscript_artifacts(
     if has_explicit_overrides {
         return Err(GailError::invalid_config(format!(
             "TorchScript model module/tokenizer not found (model_module={}, tokenizer={}). Verify GAIL_TCH_MODEL_MODULE and GAIL_TCH_TOKENIZER.",
+            model_module.display(),
+            tokenizer.display()
+        )));
+    }
+
+    if matches!(artifact_mode, TrainingArtifactMode::Production) {
+        return Err(GailError::invalid_config(format!(
+            "TorchScript artifacts are required for production training and were not found \
+            (model_module={}, tokenizer={}). Provide explicit artifacts or set \
+            GAIL_TRAIN_ARTIFACT_MODE=development_fixture for synthetic bootstrap only.",
             model_module.display(),
             tokenizer.display()
         )));
@@ -488,7 +741,7 @@ async fn bootstrap_torchscript_artifacts(
         lora_rank,
         vocab_size,
         hf_model_hint = hf_model_hint.as_deref().unwrap_or(""),
-        "TorchScript artifacts missing; bootstrapping local loss-mode module and tokenizer"
+        "TorchScript artifacts missing; bootstrapping development fixture module/tokenizer"
     );
     fs::write(&bootstrap_script_path, TORCHSCRIPT_BOOTSTRAP_PYTHON)
         .await
@@ -868,9 +1121,29 @@ async fn register_snapshot_with_ollama(
         snapshot_id,
         &modelfile,
     );
+    let parsed_modelfile = parse_modelfile(&modelfile);
+    let requires_modelfile_adapter = !parsed_modelfile.adapters.is_empty();
     let client = ollama_api_client();
-    let create_result = ollama_api_post(&client, trainer, "create", &create_payload).await;
-    if let Err(primary_error) = create_result {
+    if requires_modelfile_adapter {
+        ollama_api_post(
+            &client,
+            trainer,
+            "create",
+            &json!({
+                "model": tagged_model.as_str(),
+                "modelfile": modelfile.as_str(),
+                "stream": false
+            }),
+        )
+        .await
+        .map_err(|error| {
+            GailError::invalid_config(format!(
+                "Ollama API /api/create failed for ADAPTER Modelfile payload: {error}"
+            ))
+        })?;
+    } else if let Err(primary_error) =
+        ollama_api_post(&client, trainer, "create", &create_payload).await
+    {
         let primary_error_text = primary_error.to_string();
         tracing::warn!(
             model = %tagged_model,
@@ -1090,6 +1363,7 @@ struct ParsedModelfile {
     from: Option<String>,
     system: Option<String>,
     parameters: Map<String, Value>,
+    adapters: Vec<String>,
 }
 
 fn build_ollama_create_payload_from_modelfile(
@@ -1140,6 +1414,13 @@ fn parse_modelfile(modelfile: &str) -> ParsedModelfile {
         }
         if directive.eq_ignore_ascii_case("SYSTEM") {
             parsed.system = Some(unquote_modelfile_value(rest));
+            continue;
+        }
+        if directive.eq_ignore_ascii_case("ADAPTER") {
+            let adapter = unquote_modelfile_value(rest);
+            if !adapter.trim().is_empty() {
+                parsed.adapters.push(adapter);
+            }
             continue;
         }
         if directive.eq_ignore_ascii_case("PARAMETER") {
@@ -1338,6 +1619,7 @@ mod tests {
             r#"
             # comment
             FROM qwen2.5-coder:1.5b
+            ADAPTER ./adapter
             PARAMETER temperature 0.2
             PARAMETER num_ctx 4096
             PARAMETER mirostat true
@@ -1345,6 +1627,7 @@ mod tests {
             "#,
         );
         assert_eq!(parsed.from.as_deref(), Some("qwen2.5-coder:1.5b"));
+        assert_eq!(parsed.adapters, vec!["./adapter".to_string()]);
         assert_eq!(parsed.system.as_deref(), Some("hello world"));
         assert_eq!(parsed.parameters.get("temperature"), Some(&json!(0.2)));
         assert_eq!(parsed.parameters.get("num_ctx"), Some(&json!(4096)));
@@ -1383,5 +1666,57 @@ mod tests {
             json!("You are the Gail in-house continuously trained model snapshot 456.")
         );
         assert!(payload.get("parameters").is_none());
+    }
+
+    #[test]
+    fn build_training_execution_plan_cpu_uses_arm_profile() {
+        let trainer = TrainerConfig {
+            algorithm: "lora_sft".to_string(),
+            ..TrainerConfig::default()
+        };
+        let hardware = HardwareProfile {
+            cpu_cores: 46,
+            cpu_arch: "aarch64".to_string(),
+            cpu_model: Some("Qualcomm Centriq 2400".to_string()),
+            total_memory_mb: 64 * 1024,
+            available_memory_mb: 48 * 1024,
+            gpus: Vec::new(),
+        };
+        let plan = build_training_execution_plan(&trainer, &hardware);
+        assert_eq!(plan.device, "cpu");
+        assert_eq!(plan.backend, "cpu_lora");
+        assert_eq!(plan.profile, "centriq_cpu_armv8");
+        assert_eq!(plan.gpu_count, 0);
+        assert!(plan.dynamic_padding);
+        assert!(plan.sequence_packing);
+    }
+
+    #[test]
+    fn build_training_execution_plan_gpu_uses_cuda_qlora_backend() {
+        let trainer = TrainerConfig {
+            algorithm: "qlora_sft".to_string(),
+            ..TrainerConfig::default()
+        };
+        let hardware = HardwareProfile {
+            cpu_cores: 46,
+            cpu_arch: "aarch64".to_string(),
+            cpu_model: Some("Qualcomm Centriq 2400".to_string()),
+            total_memory_mb: 64 * 1024,
+            available_memory_mb: 48 * 1024,
+            gpus: vec![crate::hardware::GpuDevice {
+                index: 0,
+                name: "NVIDIA GeForce RTX 3060".to_string(),
+                memory_mb: 12_288,
+                free_memory_mb: 11_000,
+                compute_capability: Some("8.6".to_string()),
+            }],
+        };
+        let plan = build_training_execution_plan(&trainer, &hardware);
+        assert_eq!(plan.device, "cuda");
+        assert_eq!(plan.backend, "cuda_qlora");
+        assert_eq!(plan.profile, "centriq_rtx3060_12gb");
+        assert_eq!(plan.gpu_count, 1);
+        assert_eq!(plan.gpu_memory_mb, 12_288);
+        assert_eq!(plan.gpu_free_memory_mb, 11_000);
     }
 }
