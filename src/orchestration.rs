@@ -4240,9 +4240,7 @@ fn degraded_fallback_text(
                 }
             })
         } else if prompt_requests_execution_plan(prompt_text) {
-            json!({
-                "steps": []
-            })
+            degraded_execution_plan_payload(prompt_text)
         } else if prompt_requests_signal_synthesis_output(prompt_text) {
             json!({
                 "synthesized_signals": [
@@ -4283,6 +4281,223 @@ fn degraded_fallback_text(
     format!(
         "Gail degraded fallback: every configured AI provider is unavailable or in adaptive backoff. Reason: {reason}."
     )
+}
+
+#[derive(Clone, Debug)]
+struct PromptAgentDescriptor {
+    name: String,
+    channel: Option<String>,
+}
+
+fn degraded_execution_plan_payload(prompt_text: &str) -> Value {
+    let steps = build_degraded_execution_plan_steps(prompt_text);
+    if execution_plan_prompt_needs_loop_fields(prompt_text) {
+        json!({
+            "steps": steps,
+            "loop": false,
+            "loop_condition": null,
+            "max_iterations": null,
+        })
+    } else {
+        json!({
+            "steps": steps,
+        })
+    }
+}
+
+fn execution_plan_prompt_needs_loop_fields(prompt_text: &str) -> bool {
+    let lowered = prompt_text.to_ascii_lowercase();
+    lowered.contains("loop_condition")
+        || lowered.contains("max_iterations")
+        || lowered.contains("\"loop\"")
+}
+
+fn build_degraded_execution_plan_steps(prompt_text: &str) -> Vec<Value> {
+    let agents = parse_prompt_agents(prompt_text);
+    if agents.is_empty() {
+        return Vec::new();
+    }
+
+    let channel_to_agent = agents
+        .iter()
+        .filter_map(|agent| {
+            agent
+                .channel
+                .as_ref()
+                .map(|channel| (channel.trim().to_ascii_lowercase(), agent.name.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
+    for (source_channel, target_channel) in parse_prompt_relations(prompt_text) {
+        let Some(source_agent) =
+            channel_to_agent.get(source_channel.trim().to_ascii_lowercase().as_str())
+        else {
+            continue;
+        };
+        let Some(target_agent) =
+            channel_to_agent.get(target_channel.trim().to_ascii_lowercase().as_str())
+        else {
+            continue;
+        };
+        let wait_for = dependencies.entry(target_agent.clone()).or_default();
+        if !wait_for.iter().any(|existing| existing == source_agent) {
+            wait_for.push(source_agent.clone());
+        }
+    }
+
+    let mut fallback_steps = Vec::with_capacity(agents.len());
+    let mut previous_agent: Option<String> = None;
+    for agent in agents {
+        let agent_name = agent.name;
+        let mut wait_for = dependencies.remove(agent_name.as_str()).unwrap_or_default();
+        if wait_for.is_empty()
+            && let Some(previous) = previous_agent.as_ref()
+        {
+            wait_for.push(previous.clone());
+        }
+        let current_agent = agent_name.clone();
+        fallback_steps.push(json!({
+            "agent_name": agent_name,
+            "instructions": [],
+            "wait_for": wait_for,
+            "skip": false,
+            "step_type": "agent",
+            "debate_config": null,
+        }));
+        previous_agent = Some(current_agent);
+    }
+
+    fallback_steps
+}
+
+fn parse_prompt_agents(prompt_text: &str) -> Vec<PromptAgentDescriptor> {
+    let Some(section) = extract_labeled_section(
+        prompt_text,
+        "Agents:",
+        &["Relations:", "Initial Data:", "Instructions:"],
+    ) else {
+        return Vec::new();
+    };
+
+    let mut agents = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(section) {
+        for item in items {
+            let Some(name) = item.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let normalized = name.trim();
+            if normalized.is_empty() {
+                continue;
+            }
+            let dedupe_key = normalized.to_ascii_lowercase();
+            if !seen.insert(dedupe_key) {
+                continue;
+            }
+            let channel = item
+                .get("channel")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            agents.push(PromptAgentDescriptor {
+                name: normalized.to_string(),
+                channel,
+            });
+        }
+        if !agents.is_empty() {
+            return agents;
+        }
+    }
+
+    let names = extract_named_values_from_section(section, "name");
+    let channels = extract_named_values_from_section(section, "channel");
+    for (index, name) in names.into_iter().enumerate() {
+        let normalized = name.trim();
+        if normalized.is_empty() {
+            continue;
+        }
+        let dedupe_key = normalized.to_ascii_lowercase();
+        if !seen.insert(dedupe_key) {
+            continue;
+        }
+        let channel = channels
+            .get(index)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        agents.push(PromptAgentDescriptor {
+            name: normalized.to_string(),
+            channel,
+        });
+    }
+
+    agents
+}
+
+fn parse_prompt_relations(prompt_text: &str) -> Vec<(String, String)> {
+    let Some(section) = extract_labeled_section(
+        prompt_text,
+        "Relations:",
+        &["Initial Data:", "Instructions:"],
+    ) else {
+        return Vec::new();
+    };
+
+    if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(section) {
+        let parsed = items
+            .iter()
+            .filter_map(|item| {
+                let source = item.get("source")?.as_str()?.trim();
+                let target = item.get("target")?.as_str()?.trim();
+                if source.is_empty() || target.is_empty() {
+                    return None;
+                }
+                Some((source.to_string(), target.to_string()))
+            })
+            .collect::<Vec<_>>();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+
+    let sources = extract_named_values_from_section(section, "source");
+    let targets = extract_named_values_from_section(section, "target");
+    sources.into_iter().zip(targets).collect()
+}
+
+fn extract_labeled_section<'a>(
+    text: &'a str,
+    label: &str,
+    end_markers: &[&str],
+) -> Option<&'a str> {
+    let start = text.find(label)?;
+    let after_label = &text[start + label.len()..];
+    let mut end = after_label.len();
+    for marker in end_markers {
+        if let Some(position) = after_label.find(marker) {
+            end = end.min(position);
+        }
+    }
+    Some(after_label[..end].trim())
+}
+
+fn extract_named_values_from_section(section: &str, field_name: &str) -> Vec<String> {
+    let needle = format!("\"{field_name}\"");
+    section
+        .split(needle.as_str())
+        .skip(1)
+        .filter_map(|tail| {
+            let (_, after_colon) = tail.split_once(':')?;
+            let (_, after_start_quote) = after_colon.split_once('"')?;
+            let (value, _) = after_start_quote.split_once('"')?;
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        })
+        .collect()
 }
 
 fn prompt_requests_execution_plan(prompt_text: &str) -> bool {
@@ -4449,6 +4664,48 @@ mod tests {
         );
         let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
         assert_eq!(value, serde_json::json!({ "steps": [] }));
+    }
+
+    #[test]
+    fn degraded_fallback_execution_plan_uses_prompt_agents_when_available() {
+        let prompt = r#"Analyze the following team structure and create an execution plan:
+Team: SimpleAIEvaluatorAgentsTeam
+Agents: [
+  {"name":"SentimentAnalysisAIAgentProducer","channel":"SentimentAnalysisAIAgentChannel"},
+  {"name":"SummarizationAIAgentProducer","channel":"SummarizationAIAgentChannel"}
+]
+Relations: [
+  {"source":"SentimentAnalysisAIAgentChannel","target":"SummarizationAIAgentChannel"}
+]
+Initial Data: {}
+Instructions: None
+Return only a JSON data instance that satisfies this schema:
+{"name":"ExecutionPlan","schema":{"type":"object","properties":{"steps":{"type":"array"},"loop":{"type":"boolean"},"loop_condition":{"anyOf":[{"type":"string"},{"type":"null"}]},"max_iterations":{"anyOf":[{"type":"integer"},{"type":"null"}]}},"required":["steps","loop","loop_condition","max_iterations"],"additionalProperties":false}}"#;
+        let text = degraded_fallback_text(
+            true,
+            "general",
+            "general",
+            prompt,
+            &["provider unavailable".to_string()],
+        );
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        let steps = value["steps"].as_array().expect("steps array");
+        assert_eq!(steps.len(), 2);
+        assert_eq!(
+            steps[0]["agent_name"],
+            serde_json::Value::String("SentimentAnalysisAIAgentProducer".to_string())
+        );
+        assert_eq!(
+            steps[1]["agent_name"],
+            serde_json::Value::String("SummarizationAIAgentProducer".to_string())
+        );
+        assert_eq!(
+            steps[1]["wait_for"],
+            serde_json::json!(["SentimentAnalysisAIAgentProducer"])
+        );
+        assert_eq!(value["loop"], serde_json::Value::Bool(false));
+        assert_eq!(value["loop_condition"], serde_json::Value::Null);
+        assert_eq!(value["max_iterations"], serde_json::Value::Null);
     }
 
     #[test]

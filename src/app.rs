@@ -2735,6 +2735,7 @@ fn degraded_chat_completion_for_upstream_error(
     error: &GailError,
 ) -> Option<(String, CompletionResponse)> {
     let reason = transient_openai_fallback_reason(error)?;
+    let request_context = openai_chat_request_context_text(request);
     let text = if let Some(schema) =
         schema_value_from_response_format(request.response_format.as_ref())
         && let Some(mut value) = minimal_json_from_schema(schema)
@@ -2745,6 +2746,11 @@ fn degraded_chat_completion_for_upstream_error(
             && let Some(cached) = load_cached_execution_plan(cache_key.as_str(), schema)
         {
             value = cached;
+        }
+        if response_format_targets_execution_plan(request.response_format.as_ref())
+            && execution_plan_is_blank(&value)
+        {
+            fill_execution_plan_steps_from_context(&mut value, request_context.as_str());
         }
         serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
     } else if tool_context.is_some_and(|context| context.contains("finish")) {
@@ -2796,6 +2802,7 @@ fn degraded_responses_completion_for_upstream_error(
     error: &GailError,
 ) -> Option<(String, CompletionResponse)> {
     let reason = transient_openai_fallback_reason(error)?;
+    let request_context = openai_responses_request_context_text(request);
     let text = if let Some(schema) = schema_value_from_response_format(
         request.text.as_ref().and_then(|text| text.format.as_ref()),
     ) && let Some(mut value) = minimal_json_from_schema(schema)
@@ -2807,6 +2814,12 @@ fn degraded_responses_completion_for_upstream_error(
             && let Some(cached) = load_cached_execution_plan(cache_key.as_str(), schema)
         {
             value = cached;
+        }
+        if response_format_targets_execution_plan(
+            request.text.as_ref().and_then(|text| text.format.as_ref()),
+        ) && execution_plan_is_blank(&value)
+        {
+            fill_execution_plan_steps_from_context(&mut value, request_context.as_str());
         }
         serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
     } else if responses_request_targets_signal_synthesis_output(request) {
@@ -3203,6 +3216,96 @@ fn execution_plan_is_blank(value: &Value) -> bool {
 
 fn execution_plan_has_steps(value: &Value) -> bool {
     execution_plan_steps_len(value).is_some_and(|len| len > 0)
+}
+
+fn fill_execution_plan_steps_from_context(value: &mut Value, context: &str) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    let Some(steps) = execution_plan_steps_from_context(context) else {
+        return false;
+    };
+    object.insert("steps".to_string(), Value::Array(steps));
+    true
+}
+
+fn execution_plan_steps_from_context(context: &str) -> Option<Vec<Value>> {
+    let agents_section = extract_labeled_section(
+        context,
+        "Agents:",
+        &["Relations:", "Initial Data:", "Instructions:"],
+    )?;
+    let names = extract_named_values_from_section(agents_section, "name");
+    let channels = extract_named_values_from_section(agents_section, "channel");
+
+    let mut ordered_agents = Vec::new();
+    let mut seen_agents = HashSet::new();
+    let mut channel_to_agent = HashMap::new();
+    for (index, name) in names.into_iter().enumerate() {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let dedupe_key = trimmed.to_ascii_lowercase();
+        if seen_agents.insert(dedupe_key) {
+            ordered_agents.push(trimmed.to_string());
+        }
+        if let Some(channel) = channels.get(index) {
+            let channel_name = channel.trim();
+            if !channel_name.is_empty() {
+                channel_to_agent.insert(channel_name.to_ascii_lowercase(), trimmed.to_string());
+            }
+        }
+    }
+
+    if ordered_agents.is_empty() {
+        return None;
+    }
+
+    let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
+    if let Some(relations_section) =
+        extract_labeled_section(context, "Relations:", &["Initial Data:", "Instructions:"])
+    {
+        let sources = extract_named_values_from_section(relations_section, "source");
+        let targets = extract_named_values_from_section(relations_section, "target");
+        for (source, target) in sources.into_iter().zip(targets) {
+            let source_key = source.trim().to_ascii_lowercase();
+            let target_key = target.trim().to_ascii_lowercase();
+            let Some(source_agent) = channel_to_agent.get(source_key.as_str()) else {
+                continue;
+            };
+            let Some(target_agent) = channel_to_agent.get(target_key.as_str()) else {
+                continue;
+            };
+            let wait_for = dependencies.entry(target_agent.clone()).or_default();
+            if !wait_for.iter().any(|existing| existing == source_agent) {
+                wait_for.push(source_agent.clone());
+            }
+        }
+    }
+
+    let mut steps = Vec::with_capacity(ordered_agents.len());
+    let mut previous_agent: Option<String> = None;
+    for agent_name in ordered_agents {
+        let mut wait_for = dependencies.remove(agent_name.as_str()).unwrap_or_default();
+        if wait_for.is_empty()
+            && let Some(previous) = previous_agent.as_ref()
+        {
+            wait_for.push(previous.clone());
+        }
+        let current_agent = agent_name.clone();
+        steps.push(json!({
+            "agent_name": agent_name,
+            "instructions": [],
+            "wait_for": wait_for,
+            "skip": false,
+            "step_type": "agent",
+            "debate_config": null,
+        }));
+        previous_agent = Some(current_agent);
+    }
+
+    Some(steps)
 }
 
 fn json_matches_object_schema_requirements(schema: &Value, value: &Value) -> bool {
@@ -4557,6 +4660,96 @@ mod tests {
             degraded["steps"].as_array().expect("steps array").len(),
             0,
             "schema fallback should avoid non-schema keys like status/decision"
+        );
+        assert_eq!(payload["gail"]["provider"], "gail");
+        assert_eq!(payload["gail"]["resolved_model"], "degraded_safety");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_saturation_synthesizes_execution_plan_from_context() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "error": "local Ollama request queue is saturated; backing off before retrying in 14s"
+            })))
+            .mount(&server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let team_name = format!("SaturationFallbackTeam{}", uuid::Uuid::new_v4().simple());
+        let manager_prompt = format!(
+            "Analyze the following team structure and create an execution plan:\n\
+             Team: {team_name}\n\
+             Agents: [{{\"name\":\"SentimentAnalysisAIAgentProducer\",\"channel\":\"SentimentAnalysisAIAgentChannel\"}},{{\"name\":\"SummarizationAIAgentProducer\",\"channel\":\"SummarizationAIAgentChannel\"}}]\n\
+             Relations: [{{\"source\":\"SentimentAnalysisAIAgentChannel\",\"target\":\"SummarizationAIAgentChannel\"}}]\n\
+             Initial Data: {{}}\n\
+             Instructions: None"
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/llama3.2",
+                            "base_url": server.uri(),
+                            "response_format": {
+                                "type": "json_schema",
+                                "json_schema": {
+                                    "name": "ExecutionPlan",
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "steps": {"type": "array", "items": {"type": "object"}},
+                                            "loop": {"type": "boolean"},
+                                            "loop_condition": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                                            "max_iterations": {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+                                        },
+                                        "required": ["steps", "loop", "loop_condition", "max_iterations"],
+                                        "additionalProperties": false
+                                    }
+                                }
+                            },
+                            "messages": [
+                                {"role": "user", "content": manager_prompt}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+        let content = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("completion content");
+        let degraded: Value = serde_json::from_str(content).expect("degraded json payload");
+        let steps = degraded["steps"].as_array().expect("steps array");
+
+        assert_eq!(steps.len(), 2);
+        assert_eq!(
+            steps[0]["agent_name"],
+            Value::String("SentimentAnalysisAIAgentProducer".to_string())
+        );
+        assert_eq!(
+            steps[1]["agent_name"],
+            Value::String("SummarizationAIAgentProducer".to_string())
+        );
+        assert_eq!(
+            steps[1]["wait_for"],
+            json!(["SentimentAnalysisAIAgentProducer"])
         );
         assert_eq!(payload["gail"]["provider"], "gail");
         assert_eq!(payload["gail"]["resolved_model"], "degraded_safety");
@@ -5951,6 +6144,97 @@ mod tests {
             "schema fallback should avoid non-schema keys like status/decision"
         );
         assert_eq!(payload["output"][0]["type"], "text");
+        assert_eq!(payload["gail"]["provider"], "gail");
+        assert_eq!(payload["gail"]["resolved_model"], "degraded_safety");
+    }
+
+    #[tokio::test]
+    async fn openai_responses_saturation_synthesizes_execution_plan_from_context() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "error": "local Ollama request queue is saturated; backing off before retrying in 14s"
+            })))
+            .mount(&server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let team_name = format!("ResponsesFallbackTeam{}", uuid::Uuid::new_v4().simple());
+        let manager_prompt = format!(
+            "Analyze the following team structure and create an execution plan:\n\
+             Team: {team_name}\n\
+             Agents: [{{\"name\":\"TechnicalAnalysisAIAgentProducer\",\"channel\":\"TechnicalAnalysisAIAgentChannel\"}},{{\"name\":\"SummarizationAIAgentProducer\",\"channel\":\"SummarizationAIAgentChannel\"}}]\n\
+             Relations: [{{\"source\":\"TechnicalAnalysisAIAgentChannel\",\"target\":\"SummarizationAIAgentChannel\"}}]\n\
+             Initial Data: {{}}\n\
+             Instructions: None"
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/llama3.2",
+                            "base_url": server.uri(),
+                            "text": {
+                                "format": {
+                                    "type": "json_schema",
+                                    "json_schema": {
+                                        "name": "ExecutionPlan",
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "steps": {"type": "array", "items": {"type": "object"}},
+                                                "loop": {"type": "boolean"},
+                                                "loop_condition": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                                                "max_iterations": {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+                                            },
+                                            "required": ["steps", "loop", "loop_condition", "max_iterations"],
+                                            "additionalProperties": false
+                                        }
+                                    }
+                                }
+                            },
+                            "input": [
+                                {"type": "input_text", "text": manager_prompt}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+        let degraded: Value =
+            serde_json::from_str(payload["output_text"].as_str().expect("output text"))
+                .expect("degraded json payload");
+        let steps = degraded["steps"].as_array().expect("steps array");
+
+        assert_eq!(steps.len(), 2);
+        assert_eq!(
+            steps[0]["agent_name"],
+            Value::String("TechnicalAnalysisAIAgentProducer".to_string())
+        );
+        assert_eq!(
+            steps[1]["agent_name"],
+            Value::String("SummarizationAIAgentProducer".to_string())
+        );
+        assert_eq!(
+            steps[1]["wait_for"],
+            json!(["TechnicalAnalysisAIAgentProducer"])
+        );
         assert_eq!(payload["gail"]["provider"], "gail");
         assert_eq!(payload["gail"]["resolved_model"], "degraded_safety");
     }
