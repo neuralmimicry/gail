@@ -3447,7 +3447,8 @@ fn reorder_ranked_candidates_for_round_robin(
         group.extend(rest);
         return group;
     }
-    group.rotate_left(offset % group.len());
+    let group_len = group.len();
+    group.rotate_left(offset % group_len);
     let mut healthy = Vec::with_capacity(group.len());
     let mut unhealthy = Vec::new();
     for item in group {
