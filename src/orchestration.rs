@@ -64,6 +64,7 @@ struct GailServiceInner {
     trading_bridge: Option<TradingBridge>,
     _trading_bridge_handle: Option<TradingBridgeHandle>,
     load_tracker: Arc<Mutex<LoadTracker>>,
+    round_robin_cursors: Arc<Mutex<HashMap<String, usize>>>,
     interactive_pool: Arc<Semaphore>,
     solver_pool: Arc<Semaphore>,
 }
@@ -190,6 +191,14 @@ impl WorkloadClass {
     }
 }
 
+#[derive(Clone, Debug)]
+struct RoundRobinContext {
+    provider_key: String,
+    model_key: String,
+    key: String,
+    group_size: usize,
+}
+
 impl GailService {
     pub async fn new(config: GailConfig) -> Result<Self> {
         adaptive_schema::configure_persistence(config.storage.adaptive_schema_path.clone()).await;
@@ -213,6 +222,7 @@ impl GailService {
         let aarnn_bridge = AarnnMirrorClient::from_config(&config, client.clone(), &specialists);
         let nmc_telemetry = NmcTelemetryClient::from_config(&config, client.clone());
         let load_tracker = Arc::new(Mutex::new(LoadTracker::default()));
+        let round_robin_cursors = Arc::new(Mutex::new(HashMap::new()));
         let suggested_interactive_pool = suggested_pool_size(
             hardware.cpu_cores,
             config.orchestration.interactive_pool_max_in_flight,
@@ -262,6 +272,7 @@ impl GailService {
                 trading_bridge: None,
                 _trading_bridge_handle: None,
                 load_tracker: load_tracker.clone(),
+                round_robin_cursors: round_robin_cursors.clone(),
                 interactive_pool: interactive_pool.clone(),
                 solver_pool: solver_pool.clone(),
             }),
@@ -289,6 +300,7 @@ impl GailService {
                 trading_bridge,
                 _trading_bridge_handle: trading_bridge_handle,
                 load_tracker,
+                round_robin_cursors,
                 interactive_pool,
                 solver_pool,
             }),
@@ -1072,8 +1084,14 @@ impl GailService {
                     }
                 }
             }
-            let selected =
-                forced_selected.unwrap_or_else(|| select_ranked_candidates(remaining, wave_size));
+            let selected = if let Some(forced) = forced_selected {
+                forced
+            } else if selection_mode == SelectionMode::RoundRobin {
+                self.select_round_robin_candidates(remaining, wave_size, &workflow, &role)
+                    .await
+            } else {
+                select_ranked_candidates(remaining, wave_size)
+            };
             if selected.is_empty() {
                 if results.is_empty() {
                     return Err(GailError::bad_request(
@@ -2129,7 +2147,7 @@ impl GailService {
                 message: Some("local Ollama is saturated; waiting before retry".to_string()),
                 mode: Some("ollama_saturated".to_string()),
             }
-        } else if !is_ollama_candidate(&candidate)
+        } else if candidate_uses_provider_family_backoff(&candidate)
             && self
                 .inner
                 .metrics
@@ -2789,6 +2807,34 @@ impl GailService {
         ) as usize
     }
 
+    async fn select_round_robin_candidates(
+        &self,
+        ranked: Vec<RankedCandidate>,
+        max_candidates: usize,
+        workflow: &str,
+        role: &str,
+    ) -> Vec<ProviderCandidate> {
+        let Some(context) = round_robin_context(&ranked, workflow, role) else {
+            return select_ranked_candidates(ranked, max_candidates);
+        };
+        let offset = self
+            .next_round_robin_offset(context.key.as_str(), context.group_size)
+            .await;
+        let reordered = reorder_ranked_candidates_for_round_robin(ranked, &context, offset);
+        select_ranked_candidates(reordered, max_candidates)
+    }
+
+    async fn next_round_robin_offset(&self, key: &str, group_size: usize) -> usize {
+        if group_size <= 1 {
+            return 0;
+        }
+        let mut cursors = self.inner.round_robin_cursors.lock().await;
+        let cursor = cursors.entry(key.to_string()).or_insert(0);
+        let offset = *cursor % group_size;
+        *cursor = cursor.wrapping_add(1);
+        offset
+    }
+
     fn workload_pool_wait_timeout_ms(&self) -> u64 {
         env_int_any(
             &[
@@ -2863,6 +2909,7 @@ impl GailService {
         match env_value.trim().to_ascii_lowercase().as_str() {
             "fastest" => SelectionMode::Fastest,
             "best" => SelectionMode::Best,
+            "round_robin" | "roundrobin" | "rr" => SelectionMode::RoundRobin,
             _ => self.inner.config.orchestration.selection_mode.clone(),
         }
     }
@@ -3350,6 +3397,80 @@ fn select_ranked_candidates(
     ensure_local_fallback_selected(selected, local_fallback, target)
 }
 
+fn round_robin_context(
+    ranked: &[RankedCandidate],
+    workflow: &str,
+    role: &str,
+) -> Option<RoundRobinContext> {
+    let anchor = ranked
+        .iter()
+        .find(|item| item.health_ok)
+        .or_else(|| ranked.first())?;
+    let provider_key = normalize_key(anchor.candidate.provider_type.as_str(), "openai");
+    let model_key = normalize_key(anchor.candidate.configured_model.as_str(), "");
+    if provider_key.is_empty() || model_key.is_empty() {
+        return None;
+    }
+    let group_size = ranked
+        .iter()
+        .filter(|item| candidate_matches_round_robin_group(item, &provider_key, &model_key))
+        .count();
+    if group_size < 2 {
+        return None;
+    }
+    Some(RoundRobinContext {
+        provider_key: provider_key.clone(),
+        model_key: model_key.clone(),
+        key: format!("{workflow}:{role}:{provider_key}:{model_key}"),
+        group_size,
+    })
+}
+
+fn reorder_ranked_candidates_for_round_robin(
+    ranked: Vec<RankedCandidate>,
+    context: &RoundRobinContext,
+    offset: usize,
+) -> Vec<RankedCandidate> {
+    if ranked.len() < 2 || context.group_size < 2 {
+        return ranked;
+    }
+    let mut group = Vec::with_capacity(context.group_size);
+    let mut rest = Vec::with_capacity(ranked.len().saturating_sub(context.group_size));
+    for item in ranked {
+        if candidate_matches_round_robin_group(&item, &context.provider_key, &context.model_key) {
+            group.push(item);
+        } else {
+            rest.push(item);
+        }
+    }
+    if group.len() < 2 {
+        group.extend(rest);
+        return group;
+    }
+    group.rotate_left(offset % group.len());
+    let mut healthy = Vec::with_capacity(group.len());
+    let mut unhealthy = Vec::new();
+    for item in group {
+        if item.health_ok {
+            healthy.push(item);
+        } else {
+            unhealthy.push(item);
+        }
+    }
+    healthy.extend(unhealthy);
+    healthy.extend(rest);
+    healthy
+}
+
+fn candidate_matches_round_robin_group(
+    item: &RankedCandidate,
+    provider_key: &str,
+    model_key: &str,
+) -> bool {
+    normalize_key(item.candidate.provider_type.as_str(), "openai") == provider_key
+        && normalize_key(item.candidate.configured_model.as_str(), "") == model_key
+}
+
 fn suggested_pool_size(cpu_cores: usize, configured: usize, divisor: usize) -> usize {
     let derived = if divisor == 0 {
         cpu_cores
@@ -3565,8 +3686,23 @@ fn message_indicates_provider_backoff(message: &str) -> bool {
         || message_indicates_transient_provider_failure(message)
 }
 
-fn error_should_backoff_provider_family(candidate: &ProviderCandidate, message: &str) -> bool {
+fn candidate_uses_provider_family_backoff(candidate: &ProviderCandidate) -> bool {
     if is_ollama_candidate(candidate) {
+        return false;
+    }
+    !candidate_has_explicit_endpoint(candidate)
+}
+
+fn candidate_has_explicit_endpoint(candidate: &ProviderCandidate) -> bool {
+    candidate
+        .profile
+        .base_url
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn error_should_backoff_provider_family(candidate: &ProviderCandidate, message: &str) -> bool {
+    if !candidate_uses_provider_family_backoff(candidate) {
         return message_indicates_quota(message)
             || message_indicates_provider_auth_failure(message);
     }
@@ -4887,6 +5023,86 @@ Return only a JSON data instance that satisfies this schema:
                 .iter()
                 .any(|url| url == "http://192.168.1.62:18080/v1")
         );
+    }
+
+    #[test]
+    fn round_robin_reorder_rotates_equivalent_endpoints() {
+        fn ranked(base_url: &str, score: f64) -> RankedCandidate {
+            RankedCandidate {
+                score,
+                health_ok: true,
+                health_mode: None,
+                candidate: ProviderCandidate::from_profile(ProviderProfile {
+                    name: format!("llamacpp-{}", base_url.replace(':', "-")),
+                    provider_type: "openai".to_string(),
+                    model: Some("qwen3.6:35b".to_string()),
+                    api_key: Some("token".to_string()),
+                    base_url: Some(base_url.to_string()),
+                    ..ProviderProfile::default()
+                }),
+            }
+        }
+
+        let ranked_candidates = vec![
+            ranked("http://192.168.1.60:18080/v1", 5.0),
+            ranked("http://192.168.1.62:18080/v1", 4.9),
+            ranked("http://192.168.1.63:18080/v1", 4.8),
+            RankedCandidate {
+                score: 1.0,
+                health_ok: true,
+                health_mode: None,
+                candidate: ProviderCandidate::from_profile(ProviderProfile {
+                    provider_type: "ollama".to_string(),
+                    model: Some("qwen3.5:4b".to_string()),
+                    api_key: Some("token".to_string()),
+                    base_url: Some("http://ollama.internal:11434".to_string()),
+                    ..ProviderProfile::default()
+                }),
+            },
+        ];
+
+        let context = round_robin_context(&ranked_candidates, "general", "assistant")
+            .expect("round-robin context");
+        let rotated = reorder_ranked_candidates_for_round_robin(ranked_candidates, &context, 1);
+        let selected = select_ranked_candidates(rotated, 1);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].profile.base_url.as_deref(),
+            Some("http://192.168.1.62:18080/v1")
+        );
+    }
+
+    #[test]
+    fn endpoint_scoped_candidates_do_not_trigger_provider_family_backoff() {
+        let local_openai = ProviderCandidate::from_profile(ProviderProfile {
+            provider_type: "openai".to_string(),
+            model: Some("qwen3.6:35b".to_string()),
+            api_key: Some("token".to_string()),
+            base_url: Some("http://192.168.1.60:18080/v1".to_string()),
+            ..ProviderProfile::default()
+        });
+        assert!(!candidate_uses_provider_family_backoff(&local_openai));
+        assert!(!error_should_backoff_provider_family(
+            &local_openai,
+            "upstream error: error sending request",
+        ));
+        assert!(error_should_backoff_provider_family(
+            &local_openai,
+            "status 401 unauthorized",
+        ));
+
+        let shared_openai = ProviderCandidate::from_profile(ProviderProfile {
+            provider_type: "openai".to_string(),
+            model: Some("gpt-5".to_string()),
+            api_key: Some("token".to_string()),
+            base_url: None,
+            ..ProviderProfile::default()
+        });
+        assert!(candidate_uses_provider_family_backoff(&shared_openai));
+        assert!(error_should_backoff_provider_family(
+            &shared_openai,
+            "upstream error: bad gateway",
+        ));
     }
 
     #[test]

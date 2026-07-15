@@ -9,6 +9,7 @@ pub enum SelectionMode {
     Fastest,
     #[default]
     Best,
+    RoundRobin,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
