@@ -762,6 +762,7 @@ jobs:
               echo "Reusing existing libtorch seed image ${libtorch_seed_image}"
             else
               echo "Building libtorch seed image ${libtorch_seed_image}"
+              seed_iid_file="$(mktemp)"
               podman build \
                 --platform "${MATRIX_PLATFORM}" \
                 --network=host \
@@ -781,10 +782,17 @@ jobs:
                 --build-arg LIBTORCH_ARM64_XNNPACK="${libtorch_arm64_xnnpack}" \
                 --build-arg LIBTORCH_ARM64_KLEIDIAI="${libtorch_arm64_kleidiai}" \
                 --target libtorch-export \
+                --iidfile "${seed_iid_file}" \
                 -f Containerfile \
                 -t "${libtorch_seed_image}" \
                 .
-              podman push "${libtorch_seed_image}"
+              seed_image_id="$(tr -d '\n' < "${seed_iid_file}")"
+              rm -f "${seed_iid_file}"
+              if [[ -z "${seed_image_id}" ]]; then
+                echo "::error::Podman did not emit an image ID for ${libtorch_seed_image}"
+                exit 1
+              fi
+              podman push "${seed_image_id}" "docker://${libtorch_seed_image}"
             fi
           else
             echo "Using caller-provided libtorch seed image ${libtorch_seed_image}"
@@ -792,6 +800,7 @@ jobs:
 
           echo "Building ${ARCH_TAG} on ${MATRIX_PLATFORM} with BUILD_JOBS=${build_jobs}, CARGO_BUILD_JOBS=${cargo_jobs}, PYTORCH_BUILD_PARALLEL_LEVEL=${pytorch_jobs}, LIBTORCH_ACCELERATOR=${INPUT_LIBTORCH_ACCELERATOR}, LIBTORCH_SEED_IMAGE=${libtorch_seed_image}"
 
+          arch_iid_file="$(mktemp)"
           podman build \
             --platform "${MATRIX_PLATFORM}" \
             --network=host \
@@ -818,11 +827,18 @@ jobs:
             --build-arg LIBTORCH_ARM64_SVE="${arm64_sve}" \
             --build-arg LIBTORCH_ARM64_XNNPACK="${libtorch_arm64_xnnpack}" \
             --build-arg LIBTORCH_ARM64_KLEIDIAI="${libtorch_arm64_kleidiai}" \
+            --iidfile "${arch_iid_file}" \
             -f Containerfile \
             -t "${ARCH_TAG}" \
             .
 
-          podman push "${ARCH_TAG}"
+          arch_image_id="$(tr -d '\n' < "${arch_iid_file}")"
+          rm -f "${arch_iid_file}"
+          if [[ -z "${arch_image_id}" ]]; then
+            echo "::error::Podman did not emit an image ID for ${ARCH_TAG}"
+            exit 1
+          fi
+          podman push "${arch_image_id}" "docker://${ARCH_TAG}"
 
   publish-container:
     name: Publish multi-arch container manifest
