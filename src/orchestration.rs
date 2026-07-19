@@ -24,7 +24,7 @@ use crate::{
     errors::{GailError, Result, message_indicates_quota},
     hardware::{detect_hardware, log_hardware_profile},
     llm_ledger::{LlmLedger, LlmLedgerRecord},
-    metrics::{HealthBucket, LocalUsageTelemetry, MetricsStore},
+    metrics::{CandidateMetricsSummary, HealthBucket, LocalUsageTelemetry, MetricsStore},
     models::{
         AarnnMirrorDirection, AerDecodeRequest, AerDecodeResponse, AerEncodeRequest,
         AerEncodeResponse, AuthContext, CandidateInvocationSummary, CandidateSummary,
@@ -101,6 +101,28 @@ struct InvocationResult {
     latency_ms: Option<u64>,
     quality: f64,
     score: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct EndpointTelemetryRow {
+    candidate_id: String,
+    provider: Option<String>,
+    configured_model: Option<String>,
+    resolved_model: Option<String>,
+    endpoint_scope: String,
+    endpoint_host: Option<String>,
+    endpoint_port: Option<u16>,
+    endpoint_suffix: Option<String>,
+    successes: u64,
+    failures: u64,
+    total: u64,
+    success_rate: Option<f64>,
+    ewma_latency_ms: Option<f64>,
+    ewma_queue_wait_ms: Option<f64>,
+    ewma_inference_ms: Option<f64>,
+    last_status: Option<String>,
+    last_error: Option<String>,
+    updated_at: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -1664,6 +1686,8 @@ impl GailService {
         )
         .await;
         let metrics = self.inner.metrics.summary(candidate_limit.max(1)).await;
+        let endpoint_telemetry =
+            summarize_endpoint_telemetry(&self.inner.metrics.summary(256).await.candidates);
         let api_issues = api_issues::snapshot().await;
         let model_inventory = self.first_ollama_inventory().await;
         let routing_profiles_path = resolve_routing_profiles_path(None::<&std::path::Path>)
@@ -1697,6 +1721,10 @@ impl GailService {
             "aarnn_bridge": aarnn_bridge,
             "nmc_telemetry": nmc_telemetry,
             "metrics": metrics,
+            "endpoint_telemetry": {
+                "count": endpoint_telemetry.len(),
+                "candidates": endpoint_telemetry,
+            },
             "api_issues": api_issues,
             "model_inventory": model_inventory,
         })
@@ -3002,11 +3030,13 @@ impl GailService {
         }
         if expected_json
             && (prompt_requests_execution_plan(prompt_text)
-                || prompt_requests_manager_tool_call(prompt_text))
+                || prompt_requests_manager_tool_call(prompt_text)
+                || prompt_requests_signal_synthesis_output(prompt_text))
         {
-            // Multi-agent manager planning payloads (ExecutionPlan / tool-call envelopes)
-            // need a full request budget; forcing automation caps here collapses the
-            // plan to degraded no-op outputs like `{"steps":[]}`.
+            // Multi-agent planning and synthesis payloads (ExecutionPlan,
+            // ManagerToolCall, SignalSynthesisOutput) need a full request
+            // budget; forcing automation caps here collapses the response into
+            // degraded no-op envelopes.
             return base;
         }
         if !expected_json
@@ -4117,6 +4147,84 @@ fn sanitize_candidate_scope(value: &str, fallback: &str) -> String {
     }
 }
 
+fn summarize_endpoint_telemetry(
+    candidates: &[CandidateMetricsSummary],
+) -> Vec<EndpointTelemetryRow> {
+    let mut rows = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let endpoint_scope = candidate_endpoint_scope(candidate.candidate_id.as_str())?;
+            let (endpoint_host, endpoint_port) = endpoint_host_port_from_scope(endpoint_scope);
+            let endpoint_suffix = endpoint_host.as_deref().and_then(endpoint_host_suffix);
+            Some(EndpointTelemetryRow {
+                candidate_id: candidate.candidate_id.clone(),
+                provider: candidate.provider.clone(),
+                configured_model: candidate.configured_model.clone(),
+                resolved_model: candidate
+                    .resolved_model
+                    .clone()
+                    .or_else(|| candidate.model.clone()),
+                endpoint_scope: endpoint_scope.to_string(),
+                endpoint_host,
+                endpoint_port,
+                endpoint_suffix,
+                successes: candidate.successes,
+                failures: candidate.failures,
+                total: candidate.total,
+                success_rate: candidate.success_rate,
+                ewma_latency_ms: candidate.ewma_latency_ms,
+                ewma_queue_wait_ms: candidate.ewma_queue_wait_ms,
+                ewma_inference_ms: candidate.ewma_inference_ms,
+                last_status: candidate.last_status.clone(),
+                last_error: candidate.last_error.clone(),
+                updated_at: candidate.updated_at,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    rows.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.configured_model.cmp(&right.configured_model))
+            .then_with(|| left.endpoint_scope.cmp(&right.endpoint_scope))
+    });
+    rows
+}
+
+fn candidate_endpoint_scope(candidate_id: &str) -> Option<&str> {
+    candidate_id
+        .rsplit_once('@')
+        .map(|(_, scope)| scope.trim())
+        .filter(|scope| !scope.is_empty())
+}
+
+fn endpoint_host_port_from_scope(scope: &str) -> (Option<String>, Option<u16>) {
+    let segments = scope.split('_').collect::<Vec<_>>();
+    if segments.len() >= 4
+        && segments[..4]
+            .iter()
+            .all(|segment| segment.chars().all(|char| char.is_ascii_digit()))
+    {
+        let host = format!(
+            "{}.{}.{}.{}",
+            segments[0], segments[1], segments[2], segments[3]
+        );
+        let port = segments
+            .get(4)
+            .filter(|segment| segment.chars().all(|char| char.is_ascii_digit()))
+            .and_then(|segment| segment.parse::<u16>().ok());
+        return (Some(host), port);
+    }
+    (None, None)
+}
+
+fn endpoint_host_suffix(host: &str) -> Option<String> {
+    host.rsplit('.')
+        .next()
+        .filter(|octet| !octet.is_empty())
+        .map(|octet| format!(".{octet}"))
+}
+
 fn normalize_key(value: &str, fallback: &str) -> String {
     let cleaned = value.trim().to_ascii_lowercase();
     if cleaned.is_empty() {
@@ -4365,18 +4473,9 @@ fn degraded_fallback_text(
         .map(|value| value.as_str())
         .unwrap_or("all provider candidates failed");
     if expected_json {
-        let payload = if prompt_requests_manager_tool_call(prompt_text) {
-            json!({
-                "tool_name": "finish",
-                "arguments": {
-                    "status": "degraded",
-                    "decision": "hold",
-                    "action": "hold",
-                    "should_trade": false,
-                    "reason": reason,
-                }
-            })
-        } else if prompt_requests_execution_plan(prompt_text) {
+        // Prefer schema-specific fallbacks first to avoid returning manager-tool
+        // envelopes for structured payloads like SignalSynthesisOutput.
+        let payload = if prompt_requests_execution_plan(prompt_text) {
             degraded_execution_plan_payload(prompt_text)
         } else if prompt_requests_signal_synthesis_output(prompt_text) {
             json!({
@@ -4393,6 +4492,17 @@ fn degraded_fallback_text(
                 "summary": format!(
                     "Degraded fallback: providers unavailable or in adaptive backoff ({reason})."
                 )
+            })
+        } else if prompt_requests_manager_tool_call(prompt_text) {
+            json!({
+                "tool_name": "finish",
+                "arguments": {
+                    "status": "degraded",
+                    "decision": "hold",
+                    "action": "hold",
+                    "should_trade": false,
+                    "reason": reason,
+                }
             })
         } else {
             json!({
@@ -4646,9 +4756,22 @@ fn prompt_requests_execution_plan(prompt_text: &str) -> bool {
 
 fn prompt_requests_manager_tool_call(prompt_text: &str) -> bool {
     let lowered = prompt_text.to_ascii_lowercase();
-    lowered.contains("tool_name")
-        && lowered.contains("arguments")
-        && (lowered.contains("manager") || lowered.contains("tool"))
+    let has_shape = lowered.contains("tool_name") && lowered.contains("arguments");
+    let manager_markers = [
+        "managertoolcall",
+        "run_agent",
+        "run_debate",
+        "finish",
+        "agent_name",
+        "debator_agent_names",
+        "judge_agent_name",
+        "team execution manager",
+    ];
+    lowered.contains("managertoolcall")
+        || (has_shape
+            && manager_markers
+                .iter()
+                .any(|marker| lowered.contains(marker)))
 }
 
 fn prompt_requests_signal_synthesis_output(prompt_text: &str) -> bool {
@@ -4875,6 +4998,22 @@ Return only a JSON data instance that satisfies this schema:
             !object.contains_key("action"),
             "signal synthesis fallback should avoid unrelated hold/action keys"
         );
+    }
+
+    #[test]
+    fn degraded_fallback_prefers_signal_synthesis_over_manager_tool_call() {
+        let prompt = "Return only valid JSON for SignalSynthesisOutput with synthesized_signals, market_outlook, and summary. Do not return ManagerToolCall fields like tool_name and arguments.";
+        let text = degraded_fallback_text(
+            true,
+            "trading",
+            "assistant",
+            prompt,
+            &["provider unavailable".to_string()],
+        );
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        let object = value.as_object().expect("object");
+        assert!(object.contains_key("synthesized_signals"));
+        assert!(!object.contains_key("tool_name"));
     }
 
     #[test]
@@ -5231,6 +5370,74 @@ Return only a JSON data instance that satisfies this schema:
                 .starts_with("openai/qwen3-32b-centriq2400@")
         );
         assert_eq!(openai_cloud.candidate_id(), "openai/gpt-5.3-codex");
+    }
+
+    #[test]
+    fn endpoint_telemetry_summarizes_scoped_success_and_failure_counts() {
+        fn candidate_metric(
+            candidate_id: &str,
+            provider: &str,
+            model: &str,
+            successes: u64,
+            failures: u64,
+        ) -> CandidateMetricsSummary {
+            let total = successes + failures;
+            CandidateMetricsSummary {
+                candidate_id: candidate_id.to_string(),
+                provider: Some(provider.to_string()),
+                model: Some(model.to_string()),
+                configured_model: Some(model.to_string()),
+                resolved_model: Some(model.to_string()),
+                specialties: Vec::new(),
+                successes,
+                failures,
+                total,
+                success_rate: if total > 0 {
+                    Some(successes as f64 / total as f64)
+                } else {
+                    None
+                },
+                ewma_latency_ms: Some(420.0),
+                ewma_queue_wait_ms: Some(80.0),
+                ewma_inference_ms: Some(340.0),
+                ewma_tokens_estimate: None,
+                ewma_quality: 0.5,
+                last_status: Some("success".to_string()),
+                last_error: None,
+                updated_at: Some(1_789_999_999.0),
+                health_ok: Some(true),
+                health_mode: Some("runtime_completion".to_string()),
+                health_checked_at: Some(1_789_999_999.0),
+            }
+        }
+
+        let rows = summarize_endpoint_telemetry(&[
+            candidate_metric(
+                "openai/qwen3.6:35b@192_168_1_60_18080_v1",
+                "openai",
+                "qwen3.6:35b",
+                21,
+                63,
+            ),
+            candidate_metric(
+                "openai/qwen3.6:35b@192_168_1_62_18080_v1",
+                "openai",
+                "qwen3.6:35b",
+                18,
+                49,
+            ),
+            candidate_metric("openai/gpt-5.3-codex", "openai", "gpt-5.3-codex", 5, 1),
+        ]);
+
+        assert_eq!(rows.len(), 2, "unscoped candidates should be excluded");
+        assert_eq!(rows[0].endpoint_scope, "192_168_1_60_18080_v1");
+        assert_eq!(rows[0].endpoint_host.as_deref(), Some("192.168.1.60"));
+        assert_eq!(rows[0].endpoint_suffix.as_deref(), Some(".60"));
+        assert_eq!(rows[0].successes, 21);
+        assert_eq!(rows[0].failures, 63);
+        assert_eq!(rows[1].endpoint_scope, "192_168_1_62_18080_v1");
+        assert_eq!(rows[1].endpoint_host.as_deref(), Some("192.168.1.62"));
+        assert_eq!(rows[1].endpoint_suffix.as_deref(), Some(".62"));
     }
 
     #[tokio::test]

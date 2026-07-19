@@ -4166,9 +4166,78 @@ impl OctobotClient {
             }
         };
         let status = resp.status();
-        let body: Value = match resp.json().await {
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let text = resp.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<Value>(&text);
+
+        if !status.is_success() {
+            if backtest_report_is_pending_response(
+                status,
+                content_type.as_str(),
+                text.as_str(),
+                parsed.as_ref().ok(),
+            ) {
+                self.observe_success(
+                    "GET",
+                    path,
+                    "backtest report",
+                    &json!({
+                        "status": status.as_u16(),
+                        "content_type": content_type,
+                        "mode": "pending_transient",
+                        "reason": compact_error_excerpt(text.as_str(), 240),
+                    }),
+                )
+                .await;
+                return Ok(None);
+            }
+            let detail = parsed
+                .as_ref()
+                .map(Value::to_string)
+                .unwrap_or_else(|_| compact_error_excerpt(text.as_str(), 240));
+            self.observe_failure(
+                "GET",
+                path,
+                "backtest report",
+                Some(status.as_u16()),
+                detail.as_str(),
+            )
+            .await;
+            return Err(format!(
+                "OctoBot get_backtest_report failed: HTTP {}: {}",
+                status.as_u16(),
+                detail
+            ));
+        }
+
+        let body: Value = match parsed {
             Ok(body) => body,
             Err(err) => {
+                if backtest_report_is_pending_response(
+                    status,
+                    content_type.as_str(),
+                    text.as_str(),
+                    None,
+                ) {
+                    self.observe_success(
+                        "GET",
+                        path,
+                        "backtest report",
+                        &json!({
+                            "status": status.as_u16(),
+                            "content_type": content_type,
+                            "mode": "pending_non_json",
+                            "reason": compact_error_excerpt(text.as_str(), 240),
+                        }),
+                    )
+                    .await;
+                    return Ok(None);
+                }
                 let message = format!("OctoBot get_backtest_report parse failed: {err}");
                 self.observe_failure(
                     "GET",
@@ -4181,19 +4250,26 @@ impl OctobotClient {
                 return Err(message);
             }
         };
-        if !status.is_success() {
-            self.observe_failure(
+
+        if backtest_report_is_pending_response(
+            status,
+            content_type.as_str(),
+            text.as_str(),
+            Some(&body),
+        ) {
+            self.observe_success(
                 "GET",
                 path,
                 "backtest report",
-                Some(status.as_u16()),
-                &body.to_string(),
+                &json!({
+                    "status": status.as_u16(),
+                    "content_type": content_type,
+                    "mode": "pending_payload",
+                    "reason": compact_error_excerpt(text.as_str(), 240),
+                }),
             )
             .await;
-            return Err(format!(
-                "OctoBot get_backtest_report failed: HTTP {}",
-                status.as_u16()
-            ));
+            return Ok(None);
         }
         self.observe_success("GET", path, "backtest report", &body)
             .await;
@@ -4352,6 +4428,68 @@ impl OctobotClient {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn backtest_report_is_pending_response(
+    status: StatusCode,
+    content_type: &str,
+    raw_body: &str,
+    parsed_body: Option<&Value>,
+) -> bool {
+    if parsed_body
+        .and_then(Value::as_object)
+        .is_some_and(|object| object.is_empty())
+    {
+        return true;
+    }
+
+    let lowered_content_type = content_type.to_ascii_lowercase();
+    if body_has_backtest_portfolio_none_error(raw_body) {
+        return true;
+    }
+
+    if status.is_success() && response_looks_like_html(raw_body, lowered_content_type.as_str()) {
+        return true;
+    }
+
+    false
+}
+
+fn response_looks_like_html(raw_body: &str, lowered_content_type: &str) -> bool {
+    if lowered_content_type.contains("text/html") {
+        return true;
+    }
+    let trimmed = raw_body.trim_start();
+    let lowered = trimmed.to_ascii_lowercase();
+    lowered.starts_with("<!doctype html")
+        || lowered.starts_with("<html")
+        || lowered.contains("<body")
+        || lowered.contains("webinterfaceerrorhandler")
+}
+
+fn body_has_backtest_portfolio_none_error(raw_body: &str) -> bool {
+    let lowered = raw_body.to_ascii_lowercase();
+    (lowered.contains("nonetype") && lowered.contains("portfolio"))
+        || (lowered.contains("attributeerror") && lowered.contains("origin_portfolio"))
+        || (lowered.contains("webinterfaceerrorhandler") && lowered.contains("portfolio"))
+}
+
+fn compact_error_excerpt(raw_body: &str, max_chars: usize) -> String {
+    let max_chars = max_chars.max(16);
+    let mut compact = raw_body
+        .replace('\r', " ")
+        .replace('\n', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.is_empty() {
+        return "empty response body".to_string();
+    }
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    compact = compact.chars().take(max_chars).collect::<String>();
+    format!("{compact}...")
+}
 
 fn parse_backtest_report(body: Value) -> BacktestRunReport {
     let report_obj = body.get("report").unwrap_or(&body);

@@ -116,13 +116,11 @@ impl OpenAIResponseSchemaContext {
             context.push_str(&message.flattened_text());
             context.push('\n');
         }
-        let lowered = context.to_ascii_lowercase();
-        let manager_tool_call = lowered.contains("managertoolcall")
-            || (lowered.contains("tool_name")
-                && lowered.contains("arguments")
-                && (lowered.contains("agent_name") || lowered.contains("run_agent")));
         let signal_synthesis_output = prompt_requests_signal_synthesis_output(&context);
-        let structured_json = response_format_expects_json(request.response_format.as_ref());
+        let manager_tool_call =
+            prompt_requests_manager_tool_call(&context) && !signal_synthesis_output;
+        let structured_json = response_format_expects_json(request.response_format.as_ref())
+            || signal_synthesis_output;
         Self {
             manager_tool_call,
             structured_json,
@@ -2759,6 +2757,8 @@ fn degraded_chat_completion_for_upstream_error(
             "arguments": {}
         })
         .to_string()
+    } else if response_schema_context.signal_synthesis_output {
+        signal_synthesis_degraded_payload(reason.as_str()).to_string()
     } else if response_schema_context.manager_tool_call {
         json!({
             "tool_name": "finish",
@@ -2771,8 +2771,6 @@ fn degraded_chat_completion_for_upstream_error(
             }
         })
         .to_string()
-    } else if response_schema_context.signal_synthesis_output {
-        signal_synthesis_degraded_payload(reason.as_str()).to_string()
     } else if chat_request_expects_json(request) {
         json!({
             "status": "degraded",
@@ -2937,6 +2935,26 @@ fn prompt_requests_signal_synthesis_output(context: &str) -> bool {
         || (lowered.contains("synthesized_signals")
             && lowered.contains("market_outlook")
             && lowered.contains("summary"))
+}
+
+fn prompt_requests_manager_tool_call(context: &str) -> bool {
+    let lowered = context.to_ascii_lowercase();
+    let has_shape = lowered.contains("tool_name") && lowered.contains("arguments");
+    let manager_markers = [
+        "managertoolcall",
+        "run_agent",
+        "run_debate",
+        "finish",
+        "agent_name",
+        "debator_agent_names",
+        "judge_agent_name",
+        "team execution manager",
+    ];
+    lowered.contains("managertoolcall")
+        || (has_shape
+            && manager_markers
+                .iter()
+                .any(|marker| lowered.contains(marker)))
 }
 
 fn responses_request_targets_signal_synthesis_output(request: &OpenAIResponseRequest) -> bool {
@@ -4577,6 +4595,64 @@ mod tests {
         );
         assert_eq!(payload["gail"]["provider"], "gail");
         assert_eq!(payload["gail"]["resolved_model"], "degraded_safety");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_completions_saturation_signal_schema_wins_over_manager_hints() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "llama3.2"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "error": "local Ollama request queue is saturated; backing off before retrying in 14s"
+            })))
+            .mount(&server)
+            .await;
+
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "ollama/llama3.2",
+                            "base_url": server.uri(),
+                            "messages": [
+                                {
+                                    "role": "system",
+                                    "content": "Return only valid JSON for SignalSynthesisOutput with synthesized_signals, market_outlook, and summary. Do not return ManagerToolCall (tool_name, arguments)."
+                                },
+                                {
+                                    "role": "user",
+                                    "content": "Provide signal synthesis JSON now."
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+        let content = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("completion content");
+        let degraded: Value = serde_json::from_str(content).expect("degraded json payload");
+        let degraded_object = degraded.as_object().expect("degraded object");
+
+        assert!(degraded_object.contains_key("synthesized_signals"));
+        assert!(!degraded_object.contains_key("tool_name"));
     }
 
     #[tokio::test]

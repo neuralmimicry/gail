@@ -5139,6 +5139,60 @@ mod tests {
         server.verify().await;
     }
 
+    #[tokio::test]
+    async fn backtest_client_html_report_response_returns_none() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_report"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string("<!doctype html><html><body>backtesting page</body></html>"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let result = client.get_backtest_report().await;
+        assert!(
+            result.is_ok(),
+            "html backtest response should be treated as pending: {result:?}"
+        );
+        assert!(result.unwrap().is_none());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn backtest_client_none_portfolio_report_error_returns_none() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/backtesting"))
+            .and(query_param("update_type", "backtesting_report"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string(
+                        "AttributeError: 'NoneType' object has no attribute 'portfolio'",
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let result = client.get_backtest_report().await;
+        assert!(
+            result.is_ok(),
+            "known OctoBot NoneType portfolio error should be treated as pending: {result:?}"
+        );
+        assert!(result.unwrap().is_none());
+        server.verify().await;
+    }
+
     // -----------------------------------------------------------------------
     // OctoBot client: get_backtest_run_id
     // -----------------------------------------------------------------------
