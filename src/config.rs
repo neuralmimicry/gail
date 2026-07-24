@@ -279,7 +279,11 @@ impl Default for OrchestrationConfig {
             deduplicate_model_candidates: true,
             prompt_compaction_enabled: true,
             default_local_context_window_tokens: 16_384,
-            prompt_chars_per_token: 4,
+            // JSON, tool schemas, and Qwen chat templates routinely tokenize
+            // more densely than natural-language prose. Three characters per
+            // token keeps the transport-independent estimate below the real
+            // provider context limit observed in production.
+            prompt_chars_per_token: 3,
             prompt_safety_margin_tokens: 1_024,
             include_configured_candidates: true,
             health_ttl_seconds: 1800.0,
@@ -784,6 +788,13 @@ mod tests {
         assert!(config.nmc_telemetry.enabled);
         assert!(config.trainer.register_with_ollama);
         assert!(config.trading.backtesting_enabled);
+    }
+
+    #[test]
+    fn prompt_budget_default_is_conservative_for_structured_qwen_requests() {
+        let config = GailConfig::default();
+        assert_eq!(config.orchestration.prompt_chars_per_token, 3);
+        assert_eq!(config.orchestration.prompt_safety_margin_tokens, 1_024);
     }
 
     #[test]

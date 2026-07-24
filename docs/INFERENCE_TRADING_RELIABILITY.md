@@ -174,7 +174,7 @@ cross-restart deduplication record.
 | --- | ---: | --- |
 | `orchestration.prompt_compaction_enabled` | `true` | Compact oversized inputs before dispatch. |
 | `orchestration.default_local_context_window_tokens` | `16384` | Fallback context for local endpoints. |
-| `orchestration.prompt_chars_per_token` | `4` | Conservative token estimate. |
+| `orchestration.prompt_chars_per_token` | `3` | Conservative estimate for dense JSON, tool schemas, and Qwen chat prompts. |
 | `orchestration.prompt_safety_margin_tokens` | `1024` | Chat-template/tokeniser safety reserve. |
 | `providers[].context_window_tokens` | unset | Explicit per-provider/model context. |
 | `orchestration.deduplicate_model_candidates` | `true` | Avoid equivalent model work in normal waves. |

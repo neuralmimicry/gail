@@ -32,7 +32,8 @@ orchestration:
   deduplicate_model_candidates: true
   prompt_compaction_enabled: true
   default_local_context_window_tokens: 16384
-  prompt_chars_per_token: 4
+  # Structured JSON/tool prompts tokenize more densely than prose on Qwen.
+  prompt_chars_per_token: 3
   prompt_safety_margin_tokens: 1024
   include_configured_candidates: true
   health_ttl_seconds: 1800
