@@ -3633,6 +3633,15 @@ mod tests {
 
     use crate::config::{ApiTokenConfig, GailConfig, ProviderProfile, SpecialistProfile};
 
+    // These tests must prove that the one-second automation cap cancels a
+    // genuinely slow upstream request. Keep the assertion ceiling below the
+    // synthetic upstream delay, while allowing scheduler overhead on loaded
+    // ARM self-hosted runners that execute the full test suite in parallel.
+    const AUTOMATION_TIMEOUT_TEST_UPSTREAM_DELAY: std::time::Duration =
+        std::time::Duration::from_secs(15);
+    const AUTOMATION_TIMEOUT_TEST_MAX_ELAPSED: std::time::Duration =
+        std::time::Duration::from_secs(8);
+
     async fn test_service_with_config(mut config: GailConfig) -> GailService {
         crate::providers::ollama::reset_test_runtime_state().await;
         config.security.allow_unauthenticated_health = false;
@@ -5734,7 +5743,7 @@ mod tests {
             .and(path("/v1/chat/completions"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_delay(std::time::Duration::from_secs(5))
+                    .set_delay(AUTOMATION_TIMEOUT_TEST_UPSTREAM_DELAY)
                     .set_body_json(json!({
                         "id": "chatcmpl-slow",
                         "model": "moonshotai/kimi-k2-instruct-0905",
@@ -5770,7 +5779,7 @@ mod tests {
             .and(body_string_contains("Evaluate the next USDT microtrade"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_delay(std::time::Duration::from_secs(5))
+                    .set_delay(AUTOMATION_TIMEOUT_TEST_UPSTREAM_DELAY)
                     .set_body_json(json!({
                         "response": "{\"action\":\"buy\"}",
                         "prompt_eval_count": 2,
@@ -5846,7 +5855,7 @@ mod tests {
             .await
             .expect("response");
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(4),
+            started.elapsed() < AUTOMATION_TIMEOUT_TEST_MAX_ELAPSED,
             "automation fallback took {:?}",
             started.elapsed()
         );
@@ -5875,7 +5884,7 @@ mod tests {
             .and(path("/v1/chat/completions"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_delay(std::time::Duration::from_secs(5))
+                    .set_delay(AUTOMATION_TIMEOUT_TEST_UPSTREAM_DELAY)
                     .set_body_json(json!({
                         "id": "chatcmpl-slow",
                         "model": "moonshotai/kimi-k2-instruct-0905",
@@ -5911,7 +5920,7 @@ mod tests {
             .and(body_string_contains("Choose the next portfolio action."))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_delay(std::time::Duration::from_secs(5))
+                    .set_delay(AUTOMATION_TIMEOUT_TEST_UPSTREAM_DELAY)
                     .set_body_json(json!({
                         "response": "{\"action\":\"buy\"}",
                         "prompt_eval_count": 2,
@@ -5978,7 +5987,7 @@ mod tests {
             .await
             .expect("response");
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(4),
+            started.elapsed() < AUTOMATION_TIMEOUT_TEST_MAX_ELAPSED,
             "json-tag fallback took {:?}",
             started.elapsed()
         );

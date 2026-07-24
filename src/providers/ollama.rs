@@ -34,14 +34,11 @@ async fn acquire_ollama_request_permit(
     let queue_timeout = Duration::from_secs(queue_timeout_seconds);
     let semaphore = {
         let mut semaphores = OLLAMA_ENDPOINT_REQUEST_SEMAPHORES.lock().await;
-        semaphores
-            .entry(base_url.to_ascii_lowercase())
-            .or_insert_with(|| {
-                Arc::new(Semaphore::new(
-                    resolved_ollama_max_concurrent_requests() as usize
-                ))
-            })
-            .clone()
+        ollama_endpoint_request_semaphore(
+            &mut semaphores,
+            base_url,
+            resolved_ollama_max_concurrent_requests() as usize,
+        )
     };
     let started = Instant::now();
 
@@ -61,6 +58,24 @@ async fn acquire_ollama_request_permit(
         )),
     }
 }
+
+/// Return the semaphore dedicated to one normalized Ollama endpoint.
+///
+/// Keeping registry mutation in this small pure helper makes endpoint
+/// isolation directly testable without clearing the process-wide registry.
+/// Clearing shared state from a parallel test can otherwise race with live
+/// provider tests and make unrelated limiter assertions nondeterministic.
+fn ollama_endpoint_request_semaphore(
+    semaphores: &mut HashMap<String, Arc<Semaphore>>,
+    base_url: &str,
+    max_concurrent_requests: usize,
+) -> Arc<Semaphore> {
+    semaphores
+        .entry(base_url.to_ascii_lowercase())
+        .or_insert_with(|| Arc::new(Semaphore::new(max_concurrent_requests.max(1))))
+        .clone()
+}
+
 const PROVIDER_HEALTH_FALLBACK_TIMEOUT_SECONDS: u64 = 12;
 const OLLAMA_SATURATION_BACKOFF_SECONDS: u64 = 20;
 const OLLAMA_COOLDOWN_SKIP_LOG_INTERVAL_SECONDS: u64 = 5;
@@ -1895,16 +1910,16 @@ mod tests {
         assert!(message_indicates_ollama_endpoint_transport_failure(failure));
     }
 
-    #[tokio::test]
-    async fn ollama_request_limiters_are_scoped_per_endpoint() {
-        reset_test_runtime_state().await;
-        let (_qc02, _) = acquire_ollama_request_permit("http://qc02:11434", 1)
-            .await
-            .expect("qc02 permit");
-        let (_qc03, _) = acquire_ollama_request_permit("http://qc03:11434", 1)
-            .await
-            .expect("qc03 permit must not queue behind qc02");
-        assert_eq!(OLLAMA_ENDPOINT_REQUEST_SEMAPHORES.lock().await.len(), 2);
+    #[test]
+    fn ollama_request_limiters_are_scoped_per_endpoint() {
+        let mut semaphores = HashMap::new();
+        let qc02 = ollama_endpoint_request_semaphore(&mut semaphores, "http://qc02:11434", 1);
+        let qc03 = ollama_endpoint_request_semaphore(&mut semaphores, "http://qc03:11434", 1);
+        let qc02_again = ollama_endpoint_request_semaphore(&mut semaphores, "HTTP://QC02:11434", 1);
+
+        assert!(!Arc::ptr_eq(&qc02, &qc03));
+        assert!(Arc::ptr_eq(&qc02, &qc02_again));
+        assert_eq!(semaphores.len(), 2);
     }
 
     #[test]
