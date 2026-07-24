@@ -643,9 +643,11 @@ jobs:
       BUILD_VERSION: ${{ needs.version.outputs.build_version }}
       RELEASE_TAG: ${{ needs.create-version-tag.outputs.tag }}
       COMMIT_SHORT: ${{ needs.version.outputs.commit_short }}
-      GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
-      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
-      GITHUB_TOKEN: ${{ github.token }}
+      # Use GitHub's short-lived, per-run credentials. The job-level
+      # `packages: write` permission scopes this token to the release and
+      # prevents stale long-lived repository secrets from overriding it.
+      GHCR_USERNAME: ${{ github.actor }}
+      GHCR_TOKEN: ${{ github.token }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -863,9 +865,10 @@ jobs:
       BUILD_VERSION: ${{ needs.version.outputs.build_version }}
       RELEASE_TAG: ${{ needs.create-version-tag.outputs.tag }}
       COMMIT_SHORT: ${{ needs.version.outputs.commit_short }}
-      GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
-      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
-      GITHUB_TOKEN: ${{ github.token }}
+      # Keep manifest publication on the same short-lived credentials used by
+      # the architecture builders so both paths have identical permissions.
+      GHCR_USERNAME: ${{ github.actor }}
+      GHCR_TOKEN: ${{ github.token }}
     steps:
       - name: Prepare image metadata
         id: image
