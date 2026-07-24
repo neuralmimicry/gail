@@ -500,9 +500,10 @@ fn render_prometheus_metrics(snapshot: &ApiIssueRegistry) -> String {
     out.push_str("# TYPE gail_api_issue_occurrences_total counter\n");
     for issue in snapshot.issues.values() {
         let labels = format!(
-            "api=\"{}\",provider=\"{}\",category=\"{}\",severity=\"{}\",status=\"{}\"",
+            "api=\"{}\",provider=\"{}\",endpoint=\"{}\",category=\"{}\",severity=\"{}\",status=\"{}\"",
             escape_label(&issue.api),
             escape_label(issue.provider.as_deref().unwrap_or("")),
+            escape_label(&issue.endpoint),
             escape_label(&issue.category),
             escape_label(&issue.severity),
             escape_label(&issue.status),
@@ -1013,5 +1014,38 @@ mod tests {
         let rendered = render_prometheus_metrics(&registry);
         assert!(rendered.contains("gail_api_issues_active 1"));
         assert!(rendered.contains("gail_api_issue_occurrences_total"));
+    }
+
+    #[test]
+    fn prometheus_issue_series_distinguish_endpoints() {
+        let mut registry = ApiIssueRegistry::default();
+        for endpoint in ["GET /api/portfolio", "GET /api/positions"] {
+            registry.observe_failure(IssueObservation {
+                api: "octobot".to_string(),
+                provider: None,
+                endpoint: endpoint.to_string(),
+                category: "api_error".to_string(),
+                severity: "warning".to_string(),
+                summary: "OctoBot API failure".to_string(),
+                error: "bad gateway".to_string(),
+                workflow: Some("trading".to_string()),
+                role: None,
+                retry_ttl_seconds: Some(60.0),
+                context: json!({}),
+            });
+        }
+
+        let rendered = render_prometheus_metrics(&registry);
+        let occurrence_series = rendered
+            .lines()
+            .filter(|line| line.starts_with("gail_api_issue_occurrences_total{"))
+            .collect::<Vec<_>>();
+        assert_eq!(occurrence_series.len(), 2);
+        assert_ne!(occurrence_series[0], occurrence_series[1]);
+        assert!(
+            occurrence_series
+                .iter()
+                .all(|line| line.contains("endpoint=\"GET /api/"))
+        );
     }
 }

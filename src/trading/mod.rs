@@ -33,6 +33,7 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
+use futures::{StreamExt, stream};
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::oneshot;
@@ -214,8 +215,6 @@ async fn run_evaluation_loop(
     let eval_interval = Duration::from_secs(config.evaluation_interval_seconds);
     let mut tick = interval(eval_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Persist state every 5 evaluations.
-    let mut persist_counter: u32 = 0;
     // Backtest scheduling: track when we last ran a backtest.
     let backtest_engine = if config.backtesting_enabled {
         Some(BacktestEngine::new(
@@ -276,11 +275,9 @@ async fn run_evaluation_loop(
                     &decision_engine,
                     market_data_lake.as_ref(),
                 ).await;
-                persist_counter += 1;
-                if persist_counter >= 5 {
-                    state.persist(&data_path).await;
-                    persist_counter = 0;
-                }
+                // The evaluation snapshot is durable before slower maintenance
+                // cycles begin. Individual filled orders also persist eagerly.
+                state.persist(&data_path).await;
 
                 if config.token_discovery_enabled {
                     let due = now_ts() - last_discovery_ts >= config.token_discovery_interval_seconds as f64;
@@ -343,6 +340,7 @@ async fn run_evaluation_loop(
                         last_backtest_ts = now_ts();
                     }
                 }
+                state.persist(&data_path).await;
             }
             shutdown_result = &mut shutdown => {
                 match shutdown_result {
@@ -525,11 +523,19 @@ async fn run_single_evaluation(
         let s = state.0.lock().await;
         s.pending_override.is_some()
     };
-    let evaluation_targets = if market_snapshots.is_empty() {
-        vec![None]
-    } else {
-        market_snapshots.iter().map(Some).collect::<Vec<_>>()
-    };
+    let effective_trade_floor = effective_micro_trade_floor_usd(state, config).await;
+    let target_selection = choose_decision_market_candidate_with_regime(
+        &market_snapshots,
+        &consensus,
+        research_snapshot.as_ref(),
+        &portfolio,
+        effective_trade_floor,
+        &market_regime,
+    );
+    // One market-level consensus must produce at most one economic action.
+    // Applying the same advice to every exchange row leaked rationales across
+    // symbols and amplified one recommendation into many correlated orders.
+    let evaluation_targets = vec![target_selection.snapshot.as_ref()];
     let mut evaluated_decisions = Vec::new();
 
     for snapshot in evaluation_targets {
@@ -562,6 +568,17 @@ async fn run_single_evaluation(
                 action: TradeAction::Hold,
                 amount_usd: 0.0,
                 rationale: format!("Execution gated: {reason}"),
+                ..decision
+            };
+        }
+        if !decision.override_applied
+            && decision_is_actionable(&decision.action)
+            && let Some(reason) = target_selection.override_reason.as_deref()
+        {
+            decision = TradeDecision {
+                action: TradeAction::Hold,
+                amount_usd: 0.0,
+                rationale: format!("Target validation failed: {reason}"),
                 ..decision
             };
         }
@@ -619,19 +636,14 @@ async fn run_single_evaluation(
     sort_decision_candidates_for_execution(&mut actionable_decisions);
 
     let mut deduped_actionables = Vec::new();
-    let mut seen_markets = HashSet::new();
+    let mut seen_intents = HashSet::new();
+    let mut duplicate_intents_dropped = 0usize;
     for candidate in actionable_decisions {
-        let exchange = candidate.decision.exchange.trim();
-        let symbol = candidate.decision.symbol.trim();
-        if !exchange.is_empty() && !symbol.is_empty() {
-            let key = format!(
-                "{}|{}",
-                exchange.to_ascii_uppercase(),
-                symbol.to_ascii_uppercase()
-            );
-            if !seen_markets.insert(key) {
-                continue;
-            }
+        if let Some(key) = decision_batch_intent_key(&candidate.decision)
+            && !seen_intents.insert(key)
+        {
+            duplicate_intents_dropped += 1;
+            continue;
         }
         deduped_actionables.push(candidate);
     }
@@ -695,6 +707,14 @@ async fn run_single_evaluation(
                     })
                 }),
                 "execution_gate_reason": execution_gate_reason,
+                "target_selection": {
+                    "note": target_selection.note,
+                    "used_target_signal": target_selection.used_target_signal,
+                    "target_support": target_selection.target_support,
+                    "high_confidence_target": target_selection.high_confidence_target,
+                    "override_reason": target_selection.override_reason,
+                },
+                "duplicate_intents_dropped": duplicate_intents_dropped,
                 "decisions": decision_rollup,
                 "ranked_actionables": ranked_actionables,
             }),
@@ -894,6 +914,38 @@ fn decision_is_actionable(action: &TradeAction) -> bool {
     )
 }
 
+/// Batch identity is based on economic effect, not the source market row.
+/// Buys for the same pair are one intent because balance-aware routing can move
+/// all source exchanges onto the same funded account. Sells retain exchange
+/// scope so genuinely separate holdings can still be reduced independently.
+fn decision_batch_intent_key(decision: &TradeDecision) -> Option<String> {
+    let side = trade_action_side(&decision.action)?;
+    execution_intent_key(side, &decision.exchange, &decision.symbol)
+}
+
+fn trade_action_side(action: &TradeAction) -> Option<&'static str> {
+    match action {
+        TradeAction::Buy | TradeAction::StrongBuy => Some("buy"),
+        TradeAction::Sell | TradeAction::StrongSell => Some("sell"),
+        _ => None,
+    }
+}
+
+fn execution_intent_key(side: &str, exchange: &str, symbol: &str) -> Option<String> {
+    let symbol = symbol.trim().to_ascii_uppercase();
+    if symbol.is_empty() {
+        return None;
+    }
+    if side.eq_ignore_ascii_case("buy") {
+        Some(format!("BUY|{symbol}"))
+    } else if side.eq_ignore_ascii_case("sell") {
+        let exchange = exchange.trim().to_ascii_uppercase();
+        (!exchange.is_empty()).then(|| format!("SELL|{exchange}|{symbol}"))
+    } else {
+        None
+    }
+}
+
 fn sort_decision_candidates_for_execution(candidates: &mut [DecisionCandidate]) {
     candidates.sort_by(|left, right| {
         right
@@ -1023,24 +1075,20 @@ async fn run_non_portfolio_discovery_cycle(
         return;
     }
 
-    let mut evaluated = Vec::new();
-    for snapshot in &candidates {
-        let review = evaluate_symbol_candidate(
-            config,
-            state,
-            refiner,
-            fuzzy_engine,
-            advisor,
-            decision_engine,
-            &portfolio,
-            snapshot,
-            false,
-            historical_features.get(&market_feature_key(&snapshot.exchange, &snapshot.symbol)),
-            Some(&market_regime),
-        )
-        .await;
-        evaluated.push(review);
-    }
+    let mut evaluated = evaluate_symbol_candidates_parallel(
+        config,
+        state,
+        refiner,
+        fuzzy_engine,
+        advisor,
+        decision_engine,
+        &portfolio,
+        &candidates,
+        false,
+        &historical_features,
+        &market_regime,
+    )
+    .await;
     evaluated.sort_by(|left, right| {
         left.scorecard
             .composite_score
@@ -1208,24 +1256,20 @@ async fn run_portfolio_pruning_cycle(
         return;
     }
 
-    let mut evaluated = Vec::new();
-    for snapshot in &candidates {
-        let review = evaluate_symbol_candidate(
-            config,
-            state,
-            refiner,
-            fuzzy_engine,
-            advisor,
-            decision_engine,
-            &portfolio,
-            snapshot,
-            true,
-            historical_features.get(&market_feature_key(&snapshot.exchange, &snapshot.symbol)),
-            Some(&market_regime),
-        )
-        .await;
-        evaluated.push(review);
-    }
+    let mut evaluated = evaluate_symbol_candidates_parallel(
+        config,
+        state,
+        refiner,
+        fuzzy_engine,
+        advisor,
+        decision_engine,
+        &portfolio,
+        &candidates,
+        true,
+        &historical_features,
+        &market_regime,
+    )
+    .await;
     evaluated.sort_by(|left, right| {
         left.scorecard
             .composite_score
@@ -1423,6 +1467,53 @@ async fn evaluate_symbol_candidate(
         decision,
         scorecard,
     }
+}
+
+/// Evaluate discovery/pruning candidates with bounded outer parallelism.
+///
+/// A symbol evaluation performs independent Refiner and advisor I/O, making it
+/// safe to overlap. `buffer_unordered` avoids head-of-line blocking while the
+/// configured bound prevents `symbols × advisors` from becoming an unbounded
+/// request burst. Ordering is restored later by explicit score sorting.
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_symbol_candidates_parallel(
+    config: &TradingConfig,
+    state: &SharedTradingState,
+    refiner: &RefinerClient,
+    fuzzy_engine: &FuzzyEngine,
+    advisor: &TradingAdvisor,
+    decision_engine: &DecisionEngine,
+    portfolio: &OctobotPortfolio,
+    candidates: &[MarketSnapshot],
+    in_portfolio: bool,
+    historical_features: &HashMap<String, MarketHistoricalFeatures>,
+    market_regime: &MarketRegimeContagion,
+) -> Vec<EvaluatedSymbol> {
+    stream::iter(candidates.iter().cloned())
+        .map(|snapshot| {
+            let historical = historical_features
+                .get(&market_feature_key(&snapshot.exchange, &snapshot.symbol))
+                .cloned();
+            async move {
+                evaluate_symbol_candidate(
+                    config,
+                    state,
+                    refiner,
+                    fuzzy_engine,
+                    advisor,
+                    decision_engine,
+                    portfolio,
+                    &snapshot,
+                    in_portfolio,
+                    historical.as_ref(),
+                    Some(market_regime),
+                )
+                .await
+            }
+        })
+        .buffer_unordered(config.max_parallel_symbol_evaluations.max(1))
+        .collect()
+        .await
 }
 
 fn historical_features_map(
@@ -2248,6 +2339,71 @@ async fn execute_if_warranted(
         execution_exchange = rerouted_exchange;
     }
 
+    if side == "buy" {
+        let quote_asset = symbol_quote_asset(&decision.symbol).unwrap_or("quote");
+        let Some(max_buy_amount_usd) =
+            max_buy_amount_usd_from_balance(octobot, state, &execution_exchange, &decision.symbol)
+                .await
+        else {
+            warn!(
+                "trading: buy skipped — {} balance unavailable for {}/{} after portfolio refresh",
+                quote_asset, execution_exchange, decision.symbol
+            );
+            state
+                .log_warn(
+                    "execute",
+                    format!(
+                        "Buy skipped for {}/{}: {} balance unavailable after portfolio refresh",
+                        execution_exchange, decision.symbol, quote_asset
+                    ),
+                )
+                .await;
+            return;
+        };
+
+        if max_buy_amount_usd <= 0.0 {
+            warn!(
+                "trading: buy skipped — non-positive available {} balance for {}/{}",
+                quote_asset, execution_exchange, decision.symbol
+            );
+            state
+                .log_warn(
+                    "execute",
+                    format!(
+                        "Buy skipped for {}/{}: non-positive available {} balance",
+                        execution_exchange, decision.symbol, quote_asset
+                    ),
+                )
+                .await;
+            return;
+        }
+
+        if execution_amount_usd > max_buy_amount_usd + f64::EPSILON {
+            warn!(
+                "trading: capping buy amount for {} on {} from ${:.2} to ${:.2} based on available {} balance",
+                decision.symbol,
+                execution_exchange,
+                execution_amount_usd,
+                max_buy_amount_usd,
+                quote_asset
+            );
+            state
+                .log_warn(
+                    "execute",
+                    format!(
+                        "Capped buy amount for {} on {} from ${:.2} to ${:.2} based on available {} balance",
+                        decision.symbol,
+                        execution_exchange,
+                        execution_amount_usd,
+                        max_buy_amount_usd,
+                        quote_asset
+                    ),
+                )
+                .await;
+            execution_amount_usd = max_buy_amount_usd;
+        }
+    }
+
     if side == "sell" {
         let base_asset = decision
             .symbol
@@ -2395,12 +2551,38 @@ async fn execute_if_warranted(
         return;
     }
 
+    let Some(intent_key) = execution_intent_key(side, &execution_exchange, &decision.symbol) else {
+        state
+            .log_warn("execute", "Unable to derive order intent — trade skipped")
+            .await;
+        return;
+    };
+    if let Err(reason) =
+        claim_execution_intent(state, &intent_key, config, decision.override_applied).await
+    {
+        warn!(
+            intent_key = %intent_key,
+            reason = %reason,
+            "trading: duplicate/in-flight order intent skipped"
+        );
+        state
+            .log(
+                "warn",
+                "execute",
+                format!("Duplicate order intent skipped: {reason}"),
+                json!({ "intent_key": intent_key }),
+            )
+            .await;
+        return;
+    }
+
     let pair_activation = match octobot
         .ensure_trading_pair_active_for_order(&execution_exchange, &decision.symbol)
         .await
     {
         Ok(status) => status,
         Err(err) => {
+            release_execution_intent(state, &intent_key).await;
             warn!(
                 "trading: {} skipped — failed to validate OctoBot market-status activation for {}/{}: {}",
                 side, execution_exchange, decision.symbol, err
@@ -2421,6 +2603,7 @@ async fn execute_if_warranted(
     };
 
     if !pair_activation.ready {
+        release_execution_intent(state, &intent_key).await;
         warn!(
             "trading: {} skipped — OctoBot pair activation pending for {}/{}: {}",
             side, execution_exchange, decision.symbol, pair_activation.message
@@ -2472,6 +2655,7 @@ async fn execute_if_warranted(
             };
             {
                 let mut s = state.0.lock().await;
+                s.in_flight_order_intents.remove(&intent_key);
                 s.record_trade(trade);
                 s.pending_override = None; // Clear override once executed.
             }
@@ -2486,14 +2670,69 @@ async fn execute_if_warranted(
                     json!({ "order_id": order.order_id, "status": order.status }),
                 )
                 .await;
+            // Filled trades are safety-critical history. Persist immediately so
+            // a pod restart cannot erase deduplication or ROI feedback records.
+            state.persist(&PathBuf::from(&config.data_path)).await;
         }
         Err(err) => {
+            release_execution_intent(state, &intent_key).await;
             warn!("trading: {} order failed: {}", side, err);
             state
                 .log_error("execute", format!("{side} order failed: {err}"))
                 .await;
         }
     }
+}
+
+async fn claim_execution_intent(
+    state: &SharedTradingState,
+    intent_key: &str,
+    config: &TradingConfig,
+    operator_override: bool,
+) -> Result<(), String> {
+    let now = now_ts();
+    let stale_after = (config.octobot_timeout_seconds * 2.0)
+        .max(config.min_trade_interval_seconds as f64)
+        .max(60.0);
+    let mut state = state.0.lock().await;
+    state
+        .in_flight_order_intents
+        .retain(|_, claimed_at| now - *claimed_at <= stale_after);
+    if state.in_flight_order_intents.contains_key(intent_key) {
+        return Err("an equivalent order is already in flight".to_string());
+    }
+
+    if !operator_override
+        && let Some(previous) = state.recent_trades.iter().rev().find(|trade| {
+            trade_action_side(&trade.action)
+                .and_then(|side| execution_intent_key(side, &trade.exchange, &trade.symbol))
+                .as_deref()
+                == Some(intent_key)
+        })
+    {
+        let age = (now - previous.ts).max(0.0);
+        if age < config.min_trade_interval_seconds as f64 {
+            return Err(format!(
+                "equivalent order filled {:.0}s ago; {:.0}s cooldown remains",
+                age,
+                config.min_trade_interval_seconds as f64 - age,
+            ));
+        }
+    }
+
+    state
+        .in_flight_order_intents
+        .insert(intent_key.to_string(), now);
+    Ok(())
+}
+
+async fn release_execution_intent(state: &SharedTradingState, intent_key: &str) {
+    state
+        .0
+        .lock()
+        .await
+        .in_flight_order_intents
+        .remove(intent_key);
 }
 
 async fn effective_micro_trade_floor_usd(
@@ -2766,6 +3005,77 @@ async fn cached_sell_balance(
     }
 }
 
+async fn max_buy_amount_usd_from_balance(
+    octobot: &OctobotClient,
+    state: &SharedTradingState,
+    exchange: &str,
+    symbol: &str,
+) -> Option<f64> {
+    // Refresh portfolio before buy execution so quote balances are current.
+    debug!(
+        "trading: refreshing OctoBot portfolio before buy precheck for {} ({})",
+        symbol, exchange
+    );
+    if let Err(err) = octobot.refresh_portfolio().await {
+        warn!(
+            "trading: portfolio refresh request failed before buy precheck for {}/{}: {}",
+            exchange, symbol, err
+        );
+    }
+
+    match octobot.get_portfolio().await {
+        Ok(portfolio) => {
+            let max_buy = max_buy_amount_usd_for_exchange(&portfolio, exchange, symbol);
+            let mut s = state.0.lock().await;
+            s.current_portfolio = Some(portfolio);
+            max_buy
+        }
+        Err(err) => {
+            warn!(
+                "trading: portfolio refetch failed after refresh for buy precheck {}/{}: {}",
+                exchange, symbol, err
+            );
+            None
+        }
+    }
+}
+
+fn max_buy_amount_usd_for_exchange(
+    portfolio: &OctobotPortfolio,
+    exchange: &str,
+    symbol: &str,
+) -> Option<f64> {
+    let quote_asset = symbol_quote_asset(symbol)?;
+    let exchange_balances = portfolio
+        .exchange_currencies
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(exchange))
+        .map(|(_, balances)| balances)?;
+    let quote_balance = exchange_balances
+        .iter()
+        .find(|(asset, _)| asset.eq_ignore_ascii_case(quote_asset))
+        .map(|(_, balance)| balance)?;
+
+    let buyable_usd = if is_stablecoin(quote_asset) {
+        quote_balance.free.max(0.0)
+    } else {
+        match sellable_value_usd(
+            quote_balance.free,
+            quote_balance.total,
+            quote_balance.value_usd,
+            None,
+        ) {
+            Some(value) => value.max(0.0),
+            None => return None,
+        }
+    };
+    if !buyable_usd.is_finite() {
+        return None;
+    }
+
+    Some(((buyable_usd * BUY_BALANCE_USD_SAFETY_FACTOR) * 100.0).floor() / 100.0)
+}
+
 fn portfolio_balance_state(
     portfolio: &OctobotPortfolio,
     base_asset: &str,
@@ -2837,6 +3147,7 @@ fn sellable_value_usd(
 const TARGET_LOCK_CONSENSUS_CONFIDENCE_MIN: f64 = 0.70;
 const TARGET_LOCK_CONSENSUS_SIGNAL_MIN: f64 = 0.30;
 const TARGET_LOCK_SUPPORT_MIN: f64 = 0.35;
+const BUY_BALANCE_USD_SAFETY_FACTOR: f64 = 0.95;
 const SELL_BALANCE_USD_SAFETY_FACTOR: f64 = 0.99;
 const MARKET_REGIME_CONTAGION_PRICE_WEIGHT: f64 = 0.35;
 const MARKET_REGIME_CONTAGION_LEADER_COUNT_MIN: usize = 2;

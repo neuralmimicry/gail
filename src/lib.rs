@@ -13,6 +13,7 @@ pub mod mirror_worker;
 pub mod models;
 pub mod nmc_telemetry;
 pub mod orchestration;
+pub mod prompt_budget;
 pub mod providers;
 pub mod routing;
 pub mod specialists;

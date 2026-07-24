@@ -3657,6 +3657,16 @@ mod tests {
             ))
             .to_string_lossy()
             .to_string();
+        // Direct-completion tests write audit records. Keep those records out
+        // of the tracked development ledger so repeatable test runs do not
+        // mutate repository runtime data.
+        config.storage.llm_ledger_path = std::env::temp_dir()
+            .join(format!(
+                "gail-test-llm-ledger-{}.jsonl",
+                uuid::Uuid::new_v4()
+            ))
+            .to_string_lossy()
+            .to_string();
         config.storage.postgres_dsn = None;
         config.security.api_tokens.push(ApiTokenConfig {
             client_id: "test".to_string(),

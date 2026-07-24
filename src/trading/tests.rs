@@ -15,7 +15,7 @@ mod tests {
 
     use crate::trading::advisor::{AiAdvice, AiConsensus};
     use crate::trading::config::{TradingConfig, TradingConfigOverride};
-    use crate::trading::decision::DecisionEngine;
+    use crate::trading::decision::{DecisionEngine, TradeDecision};
     use crate::trading::degraded_live_execution_reason;
     use crate::trading::fuzzy::{FuzzyEngine, FuzzyInputs};
     use crate::trading::octobot::{
@@ -4179,6 +4179,158 @@ mod tests {
         )
         .expect("buy should reroute to exchange with sufficient USDT");
         assert_eq!(reroute.0, "bitget");
+    }
+
+    #[test]
+    fn buy_batch_intent_deduplicates_cross_exchange_requests() {
+        let decision = |exchange: &str, action: TradeAction| TradeDecision {
+            action,
+            exchange: exchange.to_string(),
+            symbol: "SUI/USDT".to_string(),
+            amount_usd: 20.0,
+            ..TradeDecision::hold("test")
+        };
+        let binance =
+            crate::trading::decision_batch_intent_key(&decision("binance", TradeAction::Buy));
+        let bitget =
+            crate::trading::decision_batch_intent_key(&decision("bitget", TradeAction::StrongBuy));
+        assert_eq!(binance, bitget);
+
+        let binance_sell =
+            crate::trading::decision_batch_intent_key(&decision("binance", TradeAction::Sell));
+        let bitget_sell =
+            crate::trading::decision_batch_intent_key(&decision("bitget", TradeAction::Sell));
+        assert_ne!(binance_sell, bitget_sell);
+    }
+
+    #[tokio::test]
+    async fn execution_intent_blocks_inflight_and_recent_cross_exchange_buy() {
+        let state = SharedTradingState::new(100, 50);
+        let mut config = TradingConfig::default();
+        config.min_trade_interval_seconds = 120;
+        let key = "BUY|SUI/USDT";
+
+        crate::trading::claim_execution_intent(&state, key, &config, false)
+            .await
+            .expect("first intent should claim");
+        assert!(
+            crate::trading::claim_execution_intent(&state, key, &config, false)
+                .await
+                .is_err()
+        );
+        crate::trading::release_execution_intent(&state, key).await;
+
+        {
+            let mut locked = state.0.lock().await;
+            locked.record_trade(ExecutedTrade {
+                ts: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64(),
+                exchange: "bitget".to_string(),
+                symbol: "SUI/USDT".to_string(),
+                action: TradeAction::Buy,
+                amount_usd: 20.0,
+                price: Some(1.0),
+                order_id: Some("filled-1".to_string()),
+                confidence: 0.8,
+                rationale: "test".to_string(),
+                ai_votes: json!({}),
+                fuzzy_confidence: 0.8,
+                ai_confidence: 0.8,
+            });
+        }
+        assert!(
+            crate::trading::claim_execution_intent(&state, key, &config, false)
+                .await
+                .is_err(),
+            "a recent Bitget fill must block an equivalent rerouted Binance buy"
+        );
+        crate::trading::claim_execution_intent(&state, key, &config, true)
+            .await
+            .expect("explicit operator override may repeat a recent fill");
+    }
+
+    #[test]
+    fn buy_amount_cap_uses_selected_exchange_quote_balance() {
+        let portfolio = OctobotPortfolio {
+            currencies: std::collections::HashMap::new(),
+            total_value_usd: Some(123.5),
+            exchange_currencies: std::collections::HashMap::from([(
+                "binance".to_string(),
+                std::collections::HashMap::from([(
+                    "USDT".to_string(),
+                    CurrencyBalance {
+                        free: 12.345,
+                        locked: 0.0,
+                        total: 12.345,
+                        value_usd: Some(12.345),
+                    },
+                )]),
+            )]),
+        };
+
+        let max_buy =
+            crate::trading::max_buy_amount_usd_for_exchange(&portfolio, "binance", "DOGE/USDT")
+                .expect("expected buy clamp value");
+        let expected =
+            ((12.345 * crate::trading::BUY_BALANCE_USD_SAFETY_FACTOR) * 100.0).floor() / 100.0;
+        assert!(
+            (max_buy - expected).abs() < 1e-9,
+            "expected capped buy amount to follow safety factor"
+        );
+    }
+
+    #[test]
+    fn buy_amount_cap_returns_zero_when_exchange_quote_balance_is_empty() {
+        let portfolio = OctobotPortfolio {
+            currencies: std::collections::HashMap::new(),
+            total_value_usd: Some(0.0),
+            exchange_currencies: std::collections::HashMap::from([(
+                "bitget".to_string(),
+                std::collections::HashMap::from([(
+                    "USDT".to_string(),
+                    CurrencyBalance {
+                        free: 0.0,
+                        locked: 0.0,
+                        total: 0.0,
+                        value_usd: Some(0.0),
+                    },
+                )]),
+            )]),
+        };
+
+        let max_buy =
+            crate::trading::max_buy_amount_usd_for_exchange(&portfolio, "bitget", "BTC/USDT")
+                .expect("expected zero buy clamp for zero free balance");
+        assert_eq!(max_buy, 0.0);
+    }
+
+    #[test]
+    fn buy_amount_cap_is_none_when_selected_exchange_quote_asset_missing() {
+        let portfolio = OctobotPortfolio {
+            currencies: std::collections::HashMap::new(),
+            total_value_usd: Some(42.0),
+            exchange_currencies: std::collections::HashMap::from([(
+                "kucoin".to_string(),
+                std::collections::HashMap::from([(
+                    "USDC".to_string(),
+                    CurrencyBalance {
+                        free: 42.0,
+                        locked: 0.0,
+                        total: 42.0,
+                        value_usd: Some(42.0),
+                    },
+                )]),
+            )]),
+        };
+
+        let max_buy =
+            crate::trading::max_buy_amount_usd_for_exchange(&portfolio, "kucoin", "BTC/USDT");
+        assert!(
+            max_buy.is_none(),
+            "missing per-exchange quote balance should not fabricate a buy cap"
+        );
     }
 
     #[tokio::test]

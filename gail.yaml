@@ -25,7 +25,15 @@ orchestration:
   max_parallel_candidates: 3
   interactive_pool_max_in_flight: 8
   solver_pool_max_in_flight: 4
-  workload_pool_wait_timeout_ms: 250
+  # Backpressure is bounded: callers wait briefly for global and per-host
+  # capacity rather than immediately creating a retry storm.
+  workload_pool_wait_timeout_ms: 30000
+  candidate_queue_wait_timeout_ms: 30000
+  deduplicate_model_candidates: true
+  prompt_compaction_enabled: true
+  default_local_context_window_tokens: 16384
+  prompt_chars_per_token: 4
+  prompt_safety_margin_tokens: 1024
   include_configured_candidates: true
   health_ttl_seconds: 1800
   early_success_enabled: true
@@ -96,6 +104,7 @@ providers:
     provider: ollama
     model: "${GAIL_OLLAMA_MODEL}"
     base_url: "${GAIL_OLLAMA_BASE_URL}"
+    context_window_tokens: 16384
     roles: ["general", "planner", "reviewer", "researcher", "assistant"]
     specialties: ["local", "privacy", "code", "planning", "json", "review", "research"]
     weight: 0.15
@@ -224,6 +233,9 @@ trading:
   admin_client_ids: ["pbisaacs"]
   evaluation_interval_seconds: ${GAIL_TRADING_EVAL_INTERVAL}
   max_parallel_advisors: 5
+  # Discovery/pruning evaluates symbols concurrently, while this bound keeps
+  # the nested advisor fan-out within local inference capacity.
+  max_parallel_symbol_evaluations: 2
   micro_trade_max_usd: ${GAIL_TRADING_MAX_USD}
   micro_trade_min_usd: ${GAIL_TRADING_MIN_USD}
   max_open_positions: ${GAIL_TRADING_MAX_POSITIONS}

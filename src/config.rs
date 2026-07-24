@@ -9,6 +9,8 @@ use crate::{
     trading::config::TradingConfig,
 };
 
+pub const MAX_WORKLOAD_POOL_WAIT_TIMEOUT_MS: u64 = 1_200_000;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 #[derive(Default)]
@@ -61,6 +63,20 @@ pub struct OrchestrationConfig {
     pub interactive_pool_max_in_flight: usize,
     pub solver_pool_max_in_flight: usize,
     pub workload_pool_wait_timeout_ms: u64,
+    /// Bounded backpressure wait for a provider/host resource reservation.
+    pub candidate_queue_wait_timeout_ms: u64,
+    /// Prevent equivalent provider/model work from running twice in one wave.
+    pub deduplicate_model_candidates: bool,
+    /// Compact oversized prompt histories before they reach a provider.
+    pub prompt_compaction_enabled: bool,
+    /// Context window assumed for local Ollama/OpenAI-compatible profiles
+    /// without an explicit provider-level value.
+    #[serde(alias = "default_ollama_context_window_tokens")]
+    pub default_local_context_window_tokens: usize,
+    /// Conservative tokenizer-independent estimate used for prompt budgeting.
+    pub prompt_chars_per_token: usize,
+    /// Space reserved for provider chat templates and token-estimation variance.
+    pub prompt_safety_margin_tokens: usize,
     pub include_configured_candidates: bool,
     pub health_ttl_seconds: f64,
     pub early_success_enabled: bool,
@@ -183,6 +199,9 @@ pub struct ProviderProfile {
     pub api_key: Option<String>,
     pub access_token: Option<String>,
     pub base_url: Option<String>,
+    /// Provider/model context window. `None` means provider-managed except for
+    /// Ollama, which uses the orchestration default.
+    pub context_window_tokens: Option<usize>,
     pub roles: Vec<String>,
     pub specialties: Vec<String>,
     pub weight: f64,
@@ -255,7 +274,13 @@ impl Default for OrchestrationConfig {
             max_parallel_candidates: 3,
             interactive_pool_max_in_flight: 8,
             solver_pool_max_in_flight: 4,
-            workload_pool_wait_timeout_ms: 250,
+            workload_pool_wait_timeout_ms: 30_000,
+            candidate_queue_wait_timeout_ms: 30_000,
+            deduplicate_model_candidates: true,
+            prompt_compaction_enabled: true,
+            default_local_context_window_tokens: 16_384,
+            prompt_chars_per_token: 4,
+            prompt_safety_margin_tokens: 1_024,
             include_configured_candidates: true,
             health_ttl_seconds: 1800.0,
             early_success_enabled: true,
@@ -393,6 +418,7 @@ impl Default for ProviderProfile {
             api_key: None,
             access_token: None,
             base_url: None,
+            context_window_tokens: None,
             roles: Vec::new(),
             specialties: Vec::new(),
             weight: 0.0,
@@ -491,7 +517,21 @@ impl GailConfig {
         self.orchestration.workload_pool_wait_timeout_ms = self
             .orchestration
             .workload_pool_wait_timeout_ms
-            .clamp(1, 300_000);
+            .clamp(1, MAX_WORKLOAD_POOL_WAIT_TIMEOUT_MS);
+        self.orchestration.candidate_queue_wait_timeout_ms = self
+            .orchestration
+            .candidate_queue_wait_timeout_ms
+            .clamp(1, MAX_WORKLOAD_POOL_WAIT_TIMEOUT_MS);
+        self.orchestration.default_local_context_window_tokens = self
+            .orchestration
+            .default_local_context_window_tokens
+            .clamp(1_024, 4_194_304);
+        self.orchestration.prompt_chars_per_token =
+            self.orchestration.prompt_chars_per_token.clamp(1, 16);
+        self.orchestration.prompt_safety_margin_tokens = self
+            .orchestration
+            .prompt_safety_margin_tokens
+            .clamp(0, 262_144);
         if self.orchestration.health_ttl_seconds < 30.0 {
             self.orchestration.health_ttl_seconds = 30.0;
         }
@@ -615,6 +655,9 @@ impl GailConfig {
             provider.api_key = normalize_optional_string(provider.api_key.as_deref());
             provider.access_token = normalize_optional_string(provider.access_token.as_deref());
             provider.base_url = normalize_optional_url(provider.base_url.as_deref());
+            provider.context_window_tokens = provider
+                .context_window_tokens
+                .map(|value| value.clamp(1_024, 4_194_304));
             provider.roles = provider
                 .roles
                 .iter()
@@ -730,7 +773,7 @@ fn interpolate_env(raw: &str) -> String {
 mod tests {
     use reqwest::Client;
 
-    use super::GailConfig;
+    use super::{GailConfig, MAX_WORKLOAD_POOL_WAIT_TIMEOUT_MS};
     use crate::{aarnn_bridge::AarnnMirrorClient, nmc_telemetry::NmcTelemetryClient};
 
     #[test]
@@ -756,6 +799,28 @@ mod tests {
         assert!(
             nmc_client.is_none(),
             "NMC telemetry should stay disabled at runtime when base_url is unset"
+        );
+    }
+
+    #[test]
+    fn workload_pool_wait_timeout_allows_twenty_minutes() {
+        let mut config = GailConfig::default();
+        config.orchestration.workload_pool_wait_timeout_ms = 1_200_000;
+        config.normalize().expect("config normalize");
+        assert_eq!(
+            config.orchestration.workload_pool_wait_timeout_ms,
+            1_200_000
+        );
+    }
+
+    #[test]
+    fn workload_pool_wait_timeout_clamps_to_maximum() {
+        let mut config = GailConfig::default();
+        config.orchestration.workload_pool_wait_timeout_ms = 9_999_999;
+        config.normalize().expect("config normalize");
+        assert_eq!(
+            config.orchestration.workload_pool_wait_timeout_ms,
+            MAX_WORKLOAD_POOL_WAIT_TIMEOUT_MS
         );
     }
 }

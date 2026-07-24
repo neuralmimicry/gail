@@ -33,6 +33,11 @@ pub struct TradingConfig {
     /// Maximum number of AI providers to consult in parallel per evaluation.
     pub max_parallel_advisors: usize,
 
+    /// Maximum discovery/pruning symbols evaluated concurrently. Each symbol
+    /// already fans out to advisors, so this outer bound prevents fan-out
+    /// multiplication from overwhelming provider queues.
+    pub max_parallel_symbol_evaluations: usize,
+
     /// Maximum USD value per micro-trade.
     pub micro_trade_max_usd: f64,
 
@@ -263,6 +268,7 @@ impl Default for TradingConfig {
             admin_client_ids: vec!["pbisaacs".to_string()],
             evaluation_interval_seconds: 60,
             max_parallel_advisors: 5,
+            max_parallel_symbol_evaluations: 2,
             micro_trade_max_usd: 25.0,
             micro_trade_min_usd: 1.0,
             max_open_positions: 5,
@@ -384,6 +390,7 @@ impl TradingConfig {
         self.portfolio_pruning_min_composite_score =
             self.portfolio_pruning_min_composite_score.clamp(0.0, 2.0);
         self.max_parallel_advisors = self.max_parallel_advisors.clamp(1, 20);
+        self.max_parallel_symbol_evaluations = self.max_parallel_symbol_evaluations.clamp(1, 16);
         self.max_open_positions = self.max_open_positions.clamp(1, 50);
         self.log_ring_size = self.log_ring_size.clamp(10, 10_000);
         self.trade_ring_size = self.trade_ring_size.clamp(10, 5_000);

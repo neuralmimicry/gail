@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -8,6 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tokio::{fs, sync::Mutex};
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use super::backtest::BacktestSummary;
 use super::config::TradingConfigOverride;
@@ -210,6 +211,10 @@ pub struct TradingState {
     /// Fingerprints for external OctoBot log rows already copied into Gail's log.
     #[serde(default)]
     pub observed_external_log_fingerprints: VecDeque<String>,
+    /// Economic order intent → claim timestamp. This is runtime-only: filled
+    /// trades provide the durable deduplication record after restart.
+    #[serde(skip, default)]
+    pub in_flight_order_intents: HashMap<String, f64>,
 }
 
 impl TradingState {
@@ -235,6 +240,7 @@ impl TradingState {
             backtest_auto_tune: BacktestAutoTuneState::default(),
             api_schema: AdaptiveApiSchema::default(),
             observed_external_log_fingerprints: VecDeque::with_capacity(500),
+            in_flight_order_intents: HashMap::new(),
         }
     }
 
@@ -334,14 +340,17 @@ impl TradingState {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
-pub struct SharedTradingState(pub Arc<Mutex<TradingState>>);
+pub struct SharedTradingState(pub Arc<Mutex<TradingState>>, Arc<Mutex<()>>);
 
 impl SharedTradingState {
     pub fn new(log_ring_size: usize, trade_ring_size: usize) -> Self {
-        Self(Arc::new(Mutex::new(TradingState::new(
-            log_ring_size,
-            trade_ring_size,
-        ))))
+        Self(
+            Arc::new(Mutex::new(TradingState::new(
+                log_ring_size,
+                trade_ring_size,
+            ))),
+            Arc::new(Mutex::new(())),
+        )
     }
 
     pub async fn log(
@@ -372,6 +381,9 @@ impl SharedTradingState {
 
     /// Persist state snapshot to disk asynchronously (best-effort).
     pub async fn persist(&self, path: &PathBuf) {
+        // Serialize writers so an older concurrent snapshot cannot rename over
+        // a newer fill/evaluation snapshot after finishing its disk write.
+        let _persist_guard = self.1.lock().await;
         let snapshot = {
             let state = self.0.lock().await;
             match serde_json::to_string_pretty(&*state) {
@@ -395,12 +407,24 @@ impl SharedTradingState {
             );
             return;
         }
-        if let Err(err) = fs::write(path, snapshot).await {
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("trading_state.json");
+        let temporary_path = path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+        if let Err(err) = fs::write(&temporary_path, snapshot).await {
             warn!(
                 "trading: failed to write state to {}: {}",
+                temporary_path.display(),
+                err
+            );
+        } else if let Err(err) = fs::rename(&temporary_path, path).await {
+            warn!(
+                "trading: failed to atomically replace state {}: {}",
                 path.display(),
                 err
             );
+            let _ = fs::remove_file(&temporary_path).await;
         } else {
             debug!("trading: state persisted to {}", path.display());
         }

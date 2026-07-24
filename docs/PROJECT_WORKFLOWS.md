@@ -29,8 +29,9 @@ Auth/scoping is enforced per endpoint category (`src/orchestration.rs`, `GailSer
 
 1. Candidate selection from configured providers (`src/config.rs` profiles + `src/routing.rs` tags/specialties).
 2. Per-candidate scoring and health gating (`src/metrics.rs`, `src/api_issues.rs`, `src/adaptive_schema.rs`).
-3. Parallel candidate execution and early-success arbitration.
-4. Result normalization, tracing, and response shaping back to API handlers.
+3. Provider-specific context budgeting and equivalent-model deduplication.
+4. Event-driven provider/host backpressure, parallel candidate execution, and early-success arbitration.
+5. Result normalization, tracing, and response shaping back to API handlers.
 
 Supporting flows:
 
@@ -78,12 +79,16 @@ Per evaluation cycle:
 
 1. Fetch market snapshots and portfolio/order context from OctoBot (`src/trading/octobot.rs`).
 2. Build research query from highest-scoring market candidate and gather RAG context from Refiner (`src/trading/refiner.rs`).
-3. Query AI advisors in parallel and aggregate weighted consensus (`src/trading/advisor.rs`).
+3. Rank endpoints using live health/load/latency telemetry, deduplicate equivalent models, query AI advisors in parallel, and aggregate weighted consensus (`src/trading/advisor.rs`).
 4. Produce fuzzy signal/confidence from Type-2 fuzzy system (`src/trading/fuzzy.rs`).
 5. Blend fuzzy + AI outputs and run decision risk gates (`src/trading/decision.rs`).
-6. Execute order when warranted (buy/sell), with OctoBot mode fallbacks and safety checks.
-7. Persist logs/state ring buffers (`src/trading/state.rs`) and periodic disk snapshots.
-8. Optional periodic backtest viability checks (`src/trading/backtest.rs`) (default-enabled when trading is enabled).
+6. Resolve one validated target per market-level consensus and deduplicate the final economic order intent before and after balance-aware exchange routing.
+7. Execute order when warranted (buy/sell), with OctoBot mode fallbacks and safety checks.
+8. Atomically persist every fill plus evaluation/log state (`src/trading/state.rs`).
+9. Optional periodic backtest viability checks (`src/trading/backtest.rs`) (default-enabled when trading is enabled).
+
+Detailed reliability invariants and operational checks are in
+[`INFERENCE_TRADING_RELIABILITY.md`](./INFERENCE_TRADING_RELIABILITY.md).
 
 ## 5. New Trading ROI Feedback Workflow
 

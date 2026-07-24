@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     env,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -10,7 +11,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sysinfo::{Disks, System};
-use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     adaptive_schema,
@@ -26,23 +27,36 @@ use super::{
 };
 
 async fn acquire_ollama_request_permit(
+    base_url: &str,
     total_timeout_seconds: u64,
-) -> Result<SemaphorePermit<'static>> {
+) -> Result<(OwnedSemaphorePermit, u64)> {
     let queue_timeout_seconds = resolved_ollama_queue_timeout_seconds(total_timeout_seconds);
     let queue_timeout = Duration::from_secs(queue_timeout_seconds);
+    let semaphore = {
+        let mut semaphores = OLLAMA_ENDPOINT_REQUEST_SEMAPHORES.lock().await;
+        semaphores
+            .entry(base_url.to_ascii_lowercase())
+            .or_insert_with(|| {
+                Arc::new(Semaphore::new(
+                    resolved_ollama_max_concurrent_requests() as usize
+                ))
+            })
+            .clone()
+    };
+    let started = Instant::now();
 
-    match tokio::time::timeout(queue_timeout, OLLAMA_REQUEST_SEMAPHORE.acquire()).await {
-        Ok(Ok(permit)) => Ok(permit),
+    match tokio::time::timeout(queue_timeout, semaphore.acquire_owned()).await {
+        Ok(Ok(permit)) => Ok((permit, started.elapsed().as_millis() as u64)),
         Ok(Err(_)) => Err(GailError::upstream(
             "ollama",
             None,
-            "Ollama request limiter is closed",
+            format!("Ollama request limiter is closed for endpoint {base_url}"),
         )),
         Err(_) => Err(GailError::upstream(
             "ollama",
             Some(StatusCode::TOO_MANY_REQUESTS),
             format!(
-                "local Ollama request queue is saturated after waiting {queue_timeout_seconds}s"
+                "local Ollama request queue is saturated for endpoint {base_url} after waiting {queue_timeout_seconds}s"
             ),
         )),
     }
@@ -51,8 +65,11 @@ const PROVIDER_HEALTH_FALLBACK_TIMEOUT_SECONDS: u64 = 12;
 const OLLAMA_SATURATION_BACKOFF_SECONDS: u64 = 20;
 const OLLAMA_COOLDOWN_SKIP_LOG_INTERVAL_SECONDS: u64 = 5;
 
-static OLLAMA_REQUEST_SEMAPHORE: Lazy<Semaphore> =
-    Lazy::new(|| Semaphore::new(resolved_ollama_max_concurrent_requests() as usize));
+/// Endpoint-scoped limiters protect each Ollama host independently. A single
+/// process-wide semaphore caused healthy qc02/qc03 requests to queue behind a
+/// long qc00 generation and left upgraded hardware idle.
+static OLLAMA_ENDPOINT_REQUEST_SEMAPHORES: Lazy<Mutex<HashMap<String, Arc<Semaphore>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 static OLLAMA_SATURATED_UNTIL: Lazy<Mutex<Option<Instant>>> = Lazy::new(|| Mutex::new(None));
 static OLLAMA_ENDPOINT_SATURATED_UNTIL: Lazy<Mutex<HashMap<String, Instant>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -61,6 +78,7 @@ static OLLAMA_ENDPOINT_SKIP_LOGGED_AT: Lazy<Mutex<HashMap<String, Instant>>> =
 
 #[cfg(test)]
 pub(crate) async fn reset_test_runtime_state() {
+    OLLAMA_ENDPOINT_REQUEST_SEMAPHORES.lock().await.clear();
     *OLLAMA_SATURATED_UNTIL.lock().await = None;
     OLLAMA_ENDPOINT_SATURATED_UNTIL.lock().await.clear();
     OLLAMA_ENDPOINT_SKIP_LOGGED_AT.lock().await.clear();
@@ -230,9 +248,7 @@ impl OllamaProvider {
             return Err(ollama_saturated_error(remaining));
         }
         let total_timeout_seconds = resolved_ollama_total_timeout_seconds(request.timeout_seconds);
-        let _permit = acquire_ollama_request_permit(total_timeout_seconds).await?;
         let base_urls = self.base_url_candidates(request.base_url.as_deref());
-        let queue_wait_ms = 0;
         let deadline = Instant::now() + Duration::from_secs(total_timeout_seconds);
         let mut last_error = None;
         for (index, base_url) in base_urls.iter().enumerate() {
@@ -262,14 +278,42 @@ impl OllamaProvider {
 
             let endpoints_remaining = base_urls.len().saturating_sub(index).max(1);
             let endpoint_budget = compute_ollama_endpoint_budget(remaining, endpoints_remaining);
+            let (_permit, queue_wait_ms) =
+                match acquire_ollama_request_permit(base_url, endpoint_budget.as_secs().max(1))
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let endpoint_backoff = mark_ollama_endpoint_saturated(base_url).await;
+                        tracing::warn!(
+                            base_url = %base_url,
+                            endpoint_index = index,
+                            error = %error,
+                            endpoint_backoff_seconds = endpoint_backoff.as_secs().max(1),
+                            "Ollama endpoint queue saturated; trying another endpoint"
+                        );
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
+            let inference_budget =
+                endpoint_budget.min(deadline.saturating_duration_since(Instant::now()));
+            if inference_budget.is_zero() {
+                last_error = Some(GailError::upstream(
+                    "ollama",
+                    Some(StatusCode::GATEWAY_TIMEOUT),
+                    format!("Ollama queue consumed the endpoint budget for {base_url}"),
+                ));
+                continue;
+            }
 
             let mut scoped_request = request.clone();
             scoped_request.base_url = Some(base_url.clone());
             scoped_request.timeout_seconds =
-                Some(endpoint_budget.as_secs().max(1).min(total_timeout_seconds));
+                Some(inference_budget.as_secs().max(1).min(total_timeout_seconds));
 
             let result = tokio::time::timeout(
-                endpoint_budget,
+                inference_budget,
                 self.complete_once(&scoped_request, queue_wait_ms),
             )
             .await;
@@ -277,7 +321,7 @@ impl OllamaProvider {
                 Err(_) => {
                     let message = format!(
                         "Ollama adaptive endpoint budget exhausted for endpoint {base_url} within {}s of total {}s budget",
-                        endpoint_budget.as_secs().max(1),
+                        inference_budget.as_secs().max(1),
                         total_timeout_seconds,
                     );
 
@@ -493,6 +537,19 @@ impl OllamaProvider {
                     && model != self.default_model
                 {
                     model = self.default_model.clone();
+                    continue;
+                }
+                if attempt == 0 && message_indicates_ollama_runner_crash(&message) {
+                    let restart_backoff_ms =
+                        env_int("GAIL_OLLAMA_RUNNER_RESTART_BACKOFF_MS", 750).max(50);
+                    tracing::warn!(
+                        base_url = %base_url,
+                        model = %model,
+                        restart_backoff_ms,
+                        error = %message,
+                        "Ollama runner exited; allowing it to respawn before one bounded retry"
+                    );
+                    tokio::time::sleep(Duration::from_millis(restart_backoff_ms)).await;
                     continue;
                 }
                 return Err(GailError::upstream("ollama", Some(status), message));
@@ -1509,6 +1566,14 @@ fn message_indicates_ollama_endpoint_transport_failure(message: &str) -> bool {
         || lowered.contains("connection closed")
         || lowered.contains("dns error")
         || lowered.contains("failed to lookup address information")
+        || message_indicates_ollama_runner_crash(message)
+}
+
+fn message_indicates_ollama_runner_crash(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("llama-server process no longer running")
+        || lowered.contains("runner process has terminated")
+        || lowered.contains("runner process exited")
 }
 
 fn normalize_base_url(value: &str) -> Option<String> {
@@ -1821,6 +1886,25 @@ mod tests {
         let failure =
             "error sending request for url (http://ollama/api/generate): connection reset by peer";
         assert!(message_indicates_ollama_endpoint_transport_failure(failure));
+    }
+
+    #[test]
+    fn runner_exit_is_classified_for_bounded_retry_and_endpoint_failover() {
+        let failure = "llama runner error: llama-server process no longer running";
+        assert!(message_indicates_ollama_runner_crash(failure));
+        assert!(message_indicates_ollama_endpoint_transport_failure(failure));
+    }
+
+    #[tokio::test]
+    async fn ollama_request_limiters_are_scoped_per_endpoint() {
+        reset_test_runtime_state().await;
+        let (_qc02, _) = acquire_ollama_request_permit("http://qc02:11434", 1)
+            .await
+            .expect("qc02 permit");
+        let (_qc03, _) = acquire_ollama_request_permit("http://qc03:11434", 1)
+            .await
+            .expect("qc03 permit must not queue behind qc02");
+        assert_eq!(OLLAMA_ENDPOINT_REQUEST_SEMAPHORES.lock().await.len(), 2);
     }
 
     #[test]

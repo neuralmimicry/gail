@@ -116,14 +116,14 @@ impl TradingAdvisor {
         portfolio: &OctobotPortfolio,
         max_advisors: usize,
     ) -> AiConsensus {
-        let providers = self.select_providers(max_advisors);
+        let providers = self.select_providers(max_advisors).await;
         if providers.is_empty() {
             warn!("trading: no providers available for AI advisory");
             return AiConsensus::uncertain();
         }
         let mut attempted_provider_ids = providers
             .iter()
-            .map(provider_identity)
+            .map(provider_model_identity)
             .collect::<HashSet<_>>();
 
         let prompt =
@@ -161,19 +161,29 @@ impl TradingAdvisor {
         let min_responder_target = max_advisors.clamp(1, 2);
         let mut parsed_responders = advices.iter().filter(|advice| advice.parsed_ok).count();
         if parsed_responders < min_responder_target {
-            let fallback_candidates = self.select_providers(max_advisors.max(1).saturating_add(3));
+            let fallback_candidates = self
+                .select_providers(max_advisors.max(1).saturating_add(3))
+                .await;
+            let mut fallback_join_set = JoinSet::new();
             for profile in fallback_candidates {
-                if !attempted_provider_ids.insert(provider_identity(&profile)) {
+                if !attempted_provider_ids.insert(provider_model_identity(&profile)) {
                     continue;
                 }
-                let advice = query_provider(
-                    self.service.clone(),
-                    profile,
-                    prompt.clone(),
-                    system.clone(),
-                    timeout_secs,
-                )
-                .await;
+                let service = self.service.clone();
+                let prompt = prompt.clone();
+                let system = system.clone();
+                fallback_join_set.spawn(async move {
+                    query_provider(service, profile, prompt, system, timeout_secs).await
+                });
+            }
+            while let Some(result) = fallback_join_set.join_next().await {
+                let advice = match result {
+                    Ok(advice) => advice,
+                    Err(_) => {
+                        failures += 1;
+                        continue;
+                    }
+                };
                 if !advice.parsed_ok {
                     failures += 1;
                 }
@@ -183,6 +193,7 @@ impl TradingAdvisor {
                     parsed_responders += 1;
                 }
                 if parsed_responders >= min_responder_target {
+                    fallback_join_set.abort_all();
                     break;
                 }
             }
@@ -192,57 +203,104 @@ impl TradingAdvisor {
     }
 
     /// Pick providers to consult, up to max_advisors, ordered by quality weight.
-    fn select_providers(&self, max: usize) -> Vec<ProviderProfile> {
-        select_trading_profiles(&self.service.config().providers, max)
+    async fn select_providers(&self, max: usize) -> Vec<ProviderProfile> {
+        let mut join_set = JoinSet::new();
+        for profile in self
+            .service
+            .config()
+            .providers
+            .iter()
+            .filter(|profile| provider_can_advise(profile))
+            .cloned()
+        {
+            let service = self.service.clone();
+            let advisory_score = provider_advisor_score(&profile);
+            join_set.spawn(async move {
+                let (profile, runtime_score, healthy) = service
+                    .provider_runtime_routing_score(profile, "trading", "assistant")
+                    .await;
+                (profile, advisory_score + runtime_score, healthy)
+            });
+        }
+        let mut ranked = Vec::new();
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(item) => ranked.push(item),
+                Err(error) => {
+                    debug!(error = %error, "trading: provider ranking task failed");
+                }
+            }
+        }
+        select_ranked_trading_profiles(ranked, max)
     }
 }
 
+#[cfg(test)]
 fn select_trading_profiles(profiles: &[ProviderProfile], max: usize) -> Vec<ProviderProfile> {
-    let max = max.max(1);
-    let mut ranked = profiles
+    let ranked = profiles
         .iter()
         .filter(|profile| provider_can_advise(profile))
         .cloned()
+        .map(|profile| {
+            let score = provider_advisor_score(&profile);
+            (profile, score, true)
+        })
         .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| {
-        provider_advisor_score(right)
-            .partial_cmp(&provider_advisor_score(left))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.name.cmp(&right.name))
-    });
+    select_ranked_trading_profiles(ranked, max)
+}
+
+fn select_ranked_trading_profiles(
+    mut ranked: Vec<(ProviderProfile, f64, bool)>,
+    max: usize,
+) -> Vec<ProviderProfile> {
+    let max = max.max(1);
+    ranked.sort_by(
+        |(left, left_score, left_healthy), (right, right_score, right_healthy)| {
+            right_healthy
+                .cmp(left_healthy)
+                .then_with(|| {
+                    right_score
+                        .partial_cmp(left_score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.name.cmp(&right.name))
+        },
+    );
 
     let mut selected = Vec::new();
     let mut seen_provider_types = HashSet::new();
-    for profile in &ranked {
+    let mut seen_models = HashSet::new();
+    for (profile, _, _) in &ranked {
         if selected.len() >= max {
             return selected;
         }
         let provider_type = normalize_provider_type(profile.provider_type.as_str());
-        if seen_provider_types.insert(provider_type) {
+        let model_identity = provider_model_identity(profile);
+        if !seen_models.contains(&model_identity) && seen_provider_types.insert(provider_type) {
+            seen_models.insert(model_identity);
             selected.push(profile.clone());
         }
     }
 
     let mut selected_ids = selected
         .iter()
-        .map(provider_identity)
+        .map(provider_model_identity)
         .collect::<HashSet<_>>();
-    for profile in ranked {
+    for (profile, _, _) in ranked {
         if selected.len() >= max {
             break;
         }
-        if selected_ids.insert(provider_identity(&profile)) {
+        if selected_ids.insert(provider_model_identity(&profile)) {
             selected.push(profile);
         }
     }
     selected
 }
 
-fn provider_identity(profile: &ProviderProfile) -> String {
+fn provider_model_identity(profile: &ProviderProfile) -> String {
     format!(
-        "{}:{}:{}",
+        "{}:{}",
         normalize_provider_type(profile.provider_type.as_str()),
-        profile.name.to_ascii_lowercase(),
         profile
             .model
             .clone()
@@ -1095,6 +1153,21 @@ mod tests {
             select_trading_profiles(&[claude_bridge, codex_bridge, openai_compat, native], 1);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].name, "ollama-native");
+    }
+
+    #[test]
+    fn runtime_selection_keeps_only_fastest_endpoint_for_equivalent_model() {
+        let mut qc00 = profile("qc00", "openai", 0.2);
+        qc00.model = Some("qwen3.6:35b".to_string());
+        qc00.base_url = Some("http://qc00:18080/v1".to_string());
+        let mut qc02 = qc00.clone();
+        qc02.name = "qc02".to_string();
+        qc02.base_url = Some("http://qc02:18080/v1".to_string());
+
+        let selected =
+            select_ranked_trading_profiles(vec![(qc00, 2.65, true), (qc02, 4.69, true)], 5);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "qc02");
     }
 
     #[test]
