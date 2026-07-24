@@ -643,11 +643,13 @@ jobs:
       BUILD_VERSION: ${{ needs.version.outputs.build_version }}
       RELEASE_TAG: ${{ needs.create-version-tag.outputs.tag }}
       COMMIT_SHORT: ${{ needs.version.outputs.commit_short }}
-      # Use GitHub's short-lived, per-run credentials. The job-level
-      # `packages: write` permission scopes this token to the release and
-      # prevents stale long-lived repository secrets from overriding it.
-      GHCR_USERNAME: ${{ github.actor }}
-      GHCR_TOKEN: ${{ github.token }}
+      # Prefer the explicitly managed GHCR credential because this
+      # organisation-owned package currently rejects the repository's
+      # ephemeral GITHUB_TOKEN even with `packages: write`. Keep the scoped
+      # job token as a fallback for repositories whose package permissions
+      # allow it.
+      GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -865,10 +867,10 @@ jobs:
       BUILD_VERSION: ${{ needs.version.outputs.build_version }}
       RELEASE_TAG: ${{ needs.create-version-tag.outputs.tag }}
       COMMIT_SHORT: ${{ needs.version.outputs.commit_short }}
-      # Keep manifest publication on the same short-lived credentials used by
-      # the architecture builders so both paths have identical permissions.
-      GHCR_USERNAME: ${{ github.actor }}
-      GHCR_TOKEN: ${{ github.token }}
+      # Use the same managed-package credential and scoped fallback as the
+      # architecture builders so manifest publication has identical access.
+      GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
     steps:
       - name: Prepare image metadata
         id: image
