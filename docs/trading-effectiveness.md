@@ -16,6 +16,10 @@ The objective is positive fee-adjusted ROI, not order count. A timeout, stale si
 8. Gail refreshes exchange-scoped balances. With `strict_exchange_selection: true`, OctoBot may execute only on the selected venue; it cannot silently try another exchange.
 9. Gail persists an authority-tagged intent lease before invoking a mutating endpoint. A restart observes the lease and cannot repeat an ambiguous in-flight order.
 10. A filled order creates a markout due at `markout_horizon_seconds`. The resolved directional return subtracts the same round-trip cost model and feeds later calibration.
+11. A persistent quant controller records non-overlapping paired LLM/quant
+    shadow markouts. It tunes bounded deterministic parameter arms and replaces
+    the synchronous LLM only after the configured net-USDT, activity, downside,
+    sample-count, and consecutive-confirmation guards all pass.
 
 ## Core configuration
 
@@ -32,6 +36,9 @@ The objective is positive fee-adjusted ROI, not order count. A timeout, stale si
 | `minimum_net_edge_bps` | Profit margin after modeled costs | Positive in live trading |
 | `execution_authority` | Stable owner written to durable leases | `gail` in this deployment |
 | `markout_horizon_seconds` | Fixed outcome measurement horizon | Match intended holding horizon |
+| `quant_shadow_horizon_seconds` | Paired LLM/quant comparison horizon | Keep non-overlapping and aligned with intended holding time |
+| `quant_migration_min_samples` | Paired outcomes required for promotion | Require materially more evidence than parameter tuning |
+| `quant_migration_min_outperformance_bps` | Required quant advantage after modeled costs | Positive and large enough to avoid noise-driven cutover |
 
 The pre-trade round-trip cost is `2 × (estimated_fee_bps + estimated_slippage_bps)`. `expected_move_bps` is the gross move represented by a perfect signal at perfect confidence. It is deliberately conservative and should be recalibrated from resolved markouts and realistic backtests, not increased merely to make more trades pass.
 

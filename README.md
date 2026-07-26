@@ -259,6 +259,9 @@ The trading bridge (`src/trading/`) is a self-contained module that runs a backg
 
 The live safety model, economics assumptions, tuning guidance, and deployment
 runbook are documented in [Trading effectiveness and execution safety](docs/trading-effectiveness.md).
+Persistent shadow comparison, automatic quant parameter selection, promotion
+guards, and operator log markers are documented in
+[Quant shadow migration](docs/quant-shadow-migration.md).
 
 ### Architecture
 
@@ -276,9 +279,9 @@ Gail HTTP Server
                   Every N seconds (default 60):
                   1. Fetch market snapshots + portfolio
                   2. Query Refiner for market research
-                  3. Race bounded AI advisors to deadline/quorum
-                  4. Run Type-2 fuzzy inference
-                  5. Blend fuzzy + AI signals → decision
+                  3. Resolve paired LLM/quant USDT markouts
+                  4. Use LLM primary + quant shadow, or restored quant primary
+                  5. Run Type-2 fuzzy inference and risk gates
                   6. Apply confidence + net-edge gates
                   7. Reprice, lease intent, execute exact venue
                   8. Resolve fixed-horizon outcomes; persist state
@@ -361,6 +364,7 @@ Gail evaluates decisions and has live execution enabled by default. Before any o
 - `open_positions` — latest open orders
 - `in_flight_order_intents` — durable authority-tagged idempotency leases
 - `outcome_ledger` — pending and resolved fixed-horizon fee-adjusted markouts
+- `quant_migration` — durable mode, parameter arms, paired shadow markouts, tuning state, and promotion evidence
 - `recent_trades` — `VecDeque` ring buffer (default 200 entries)
 - `activity_log` — `VecDeque` ring buffer (default 1000 entries) with level, category, message, and JSON context
 - `api_schema` — adaptive OctoBot endpoint/reference schema, semantic hints, and recent automatic adjustments
@@ -394,6 +398,7 @@ Incremental market history is persisted separately in `market_datalake_file_path
 | `src/trading/decision.rs` | `DecisionEngine` — signal blending, risk gates, trade sizing |
 | `src/trading/economics.rs` | Pure fee/slippage expected-edge gate and drift calculation |
 | `src/trading/outcomes.rs` | Fixed-horizon markout ledger and bounded live calibration |
+| `src/trading/quant.rs` | Deterministic signal engine, paired shadow ledger, parameter selection, and guarded LLM replacement |
 
 OctoBot endpoint and fallback details are documented in:
 - `docs/OCTOBOT_CONNECTIVITY.md`
@@ -478,6 +483,20 @@ trading:
   markout_horizon_seconds: 900
   markout_ledger_size: 2000
   markout_calibration_min_samples: 8
+  quant_shadow_enabled: true
+  quant_shadow_horizon_seconds: 900
+  quant_shadow_expiry_seconds: 3600
+  quant_shadow_ledger_size: 2000
+  quant_tuning_min_samples: 24
+  quant_tuning_min_actionable_samples: 6
+  quant_tuning_interval_samples: 8
+  quant_tuning_min_outperformance_bps: 5
+  quant_migration_min_samples: 96
+  quant_migration_min_actionable_samples: 16
+  quant_migration_window_samples: 240
+  quant_migration_min_outperformance_bps: 10
+  quant_migration_max_downside_regression_bps: 25
+  quant_migration_required_streak: 3
   fuzzy_weight: 0.4                      # fuzzy vs AI blend weight
   decision_roi_feedback_enabled: true
   decision_roi_feedback_lookback_trades: 120

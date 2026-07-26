@@ -22,6 +22,7 @@ pub mod economics;
 pub mod fuzzy;
 pub mod octobot;
 pub mod outcomes;
+pub mod quant;
 pub mod refiner;
 pub mod state;
 
@@ -61,6 +62,7 @@ use octobot::{
     OctobotLogEntry, OctobotPortfolio,
 };
 use outcomes::TradeMarkout;
+use quant::{QuantMode, evaluate_symbol as evaluate_quant_symbol, evaluate_universe};
 use refiner::RefinerClient;
 use state::{ExecutedTrade, ExecutionIntentClaim, SharedTradingState, TradeAction, TradingState};
 
@@ -202,6 +204,41 @@ async fn run_evaluation_loop(
     };
     let mut last_datalake_bootstrap_attempt_ts: f64 = 0.0;
 
+    // Initialise or restore the persistent shadow-to-quant controller before
+    // any advisory request can be made. The explicit markers are intentionally
+    // stable so operators and log automation can identify the active mode.
+    if config.quant_shadow_enabled {
+        let (marker, mode, parameter_id, pending, resolved) = {
+            let mut current = state.0.lock().await;
+            let newly_initialized = current.quant_migration.initialize(now_ts());
+            let marker = match (&current.quant_migration.mode, newly_initialized) {
+                (QuantMode::Primary, _) => "QUANT_PRIMARY_RESTORED",
+                (QuantMode::Shadow, true) => "QUANT_SHADOW_INITIATED",
+                (QuantMode::Shadow, false) => "QUANT_SHADOW_RESTORED",
+            };
+            let context = json!({
+                "mode": current.quant_migration.mode.as_str(),
+                "active_parameter_id": current.quant_migration.active_parameter_id,
+                "pending_evaluations": current.quant_migration.pending.len(),
+                "resolved_evaluations": current.quant_migration.resolved.len(),
+                "migration_min_samples": config.quant_migration_min_samples,
+                "migration_min_actionable_samples": config.quant_migration_min_actionable_samples,
+                "migration_min_outperformance_bps": config.quant_migration_min_outperformance_bps,
+                "migration_required_streak": config.quant_migration_required_streak,
+            });
+            current.log("info", "quant_migration", marker, context);
+            (
+                marker,
+                current.quant_migration.mode.as_str(),
+                current.quant_migration.active_parameter_id.clone(),
+                current.quant_migration.pending.len(),
+                current.quant_migration.resolved.len(),
+            )
+        };
+        info!(mode, parameter_id, pending, resolved, "{marker}");
+        state.persist(&data_path).await;
+    }
+
     // Initial OctoBot login.
     if let Err(err) = octobot.login().await {
         warn!("trading: OctoBot login failed at startup: {}", err);
@@ -296,12 +333,15 @@ async fn run_evaluation_loop(
                 run_single_evaluation(
                     &config,
                     &state,
-                    &octobot,
-                    &refiner,
-                    &fuzzy_engine,
-                    &advisor,
-                    &decision_engine,
-                    market_data_lake.as_ref(),
+                    EvaluationServices {
+                        octobot: &octobot,
+                        refiner: &refiner,
+                        fuzzy_engine: &fuzzy_engine,
+                        advisor: &advisor,
+                        decision_engine: &decision_engine,
+                        market_data_lake: market_data_lake.as_ref(),
+                        data_path: &data_path,
+                    },
                 ).await;
                 // The evaluation snapshot is durable before slower maintenance
                 // cycles begin. Individual filled orders also persist eagerly.
@@ -392,16 +432,30 @@ async fn run_evaluation_loop(
 // Single evaluation cycle
 // ---------------------------------------------------------------------------
 
+struct EvaluationServices<'a> {
+    octobot: &'a OctobotClient,
+    refiner: &'a RefinerClient,
+    fuzzy_engine: &'a FuzzyEngine,
+    advisor: &'a TradingAdvisor,
+    decision_engine: &'a DecisionEngine,
+    market_data_lake: Option<&'a MarketDataLake>,
+    data_path: &'a PathBuf,
+}
+
 async fn run_single_evaluation(
     config: &TradingConfig,
     state: &SharedTradingState,
-    octobot: &OctobotClient,
-    refiner: &RefinerClient,
-    fuzzy_engine: &FuzzyEngine,
-    advisor: &TradingAdvisor,
-    decision_engine: &DecisionEngine,
-    market_data_lake: Option<&MarketDataLake>,
+    services: EvaluationServices<'_>,
 ) {
+    let EvaluationServices {
+        octobot,
+        refiner,
+        fuzzy_engine,
+        advisor,
+        decision_engine,
+        market_data_lake,
+        data_path,
+    } = services;
     let eval_start = now_ts();
     debug!("trading: starting evaluation cycle");
     state.log_info("eval", "Starting evaluation cycle").await;
@@ -440,6 +494,11 @@ async fn run_single_evaluation(
     } else {
         HashMap::new()
     };
+    resolve_quant_evaluations(state, &market_snapshots, config, data_path).await;
+    let quant_primary = {
+        let current = state.0.lock().await;
+        config.quant_shadow_enabled && current.quant_migration.is_primary()
+    };
     let market_regime = compute_market_regime_contagion(&market_snapshots);
 
     // --- 2. Build research query ---
@@ -449,18 +508,27 @@ async fn run_single_evaluation(
 
     // Run remaining service calls in parallel so one slow dependency
     // does not serialize the whole evaluation cycle.
+    let research_future = async {
+        if quant_primary {
+            refiner::ResearchContext::empty(research_query.clone())
+        } else {
+            refiner
+                .research_with_site_hints_best_effort(
+                    &config.research_index_name,
+                    &research_query,
+                    &config.research_site_hints,
+                    config.research_top_k,
+                    config.research_max_parallel_queries,
+                )
+                .await
+        }
+    };
     let (portfolio_result, open_orders_result, exchange_info_result, log_feedback_result, research) = tokio::join!(
         octobot.get_portfolio(),
         octobot.get_open_orders(),
         octobot.get_exchange_info(),
         octobot.get_recent_logs(25),
-        refiner.research_with_site_hints_best_effort(
-            &config.research_index_name,
-            &research_query,
-            &config.research_site_hints,
-            config.research_top_k,
-            config.research_max_parallel_queries,
-        ),
+        research_future,
     );
 
     // Portfolio.
@@ -510,16 +578,38 @@ async fn run_single_evaluation(
     };
     process_octobot_feedback(config, state, octobot, logs).await;
 
-    // --- 3. Consult AI advisors in parallel ---
-    let consensus = advisor
-        .consult_all(
+    // --- 3. Select the primary advisory implementation. ---
+    // Shadow mode preserves existing LLM execution semantics. Once the
+    // persisted guard promotes quant, the synchronous network call disappears
+    // from the critical path and the same downstream risk/execution controls
+    // consume a deterministic consensus-compatible signal.
+    let quant_signal = {
+        let current = state.0.lock().await;
+        evaluate_universe(
+            &current.quant_migration,
             &market_snapshots,
             &historical_features,
-            &research,
             &portfolio,
-            config.max_parallel_advisors,
         )
-        .await;
+    };
+    let llm_consensus = if quant_primary {
+        None
+    } else {
+        Some(
+            advisor
+                .consult_all(
+                    &market_snapshots,
+                    &historical_features,
+                    &research,
+                    &portfolio,
+                    config.max_parallel_advisors,
+                )
+                .await,
+        )
+    };
+    let consensus = llm_consensus
+        .clone()
+        .unwrap_or_else(|| quant_signal.as_consensus());
 
     debug!(
         "trading: AI consensus = action={} signal={:.3} confidence={:.2} responders={}",
@@ -553,14 +643,40 @@ async fn run_single_evaluation(
         s.pending_override.is_some()
     };
     let effective_trade_floor = effective_micro_trade_floor_usd(state, config).await;
-    let target_selection = choose_decision_market_candidate_with_regime(
-        &market_snapshots,
-        &consensus,
-        research_snapshot.as_ref(),
-        &portfolio,
-        effective_trade_floor,
-        &market_regime,
-    );
+    let target_selection = if quant_primary {
+        select_quant_primary_market(
+            &market_snapshots,
+            &quant_signal,
+            &portfolio,
+            effective_trade_floor,
+        )
+    } else {
+        choose_decision_market_candidate_with_regime(
+            &market_snapshots,
+            &consensus,
+            research_snapshot.as_ref(),
+            &portfolio,
+            effective_trade_floor,
+            &market_regime,
+        )
+    };
+    record_quant_evaluation(
+        state,
+        &quant_signal,
+        quant::QuantEvaluationContext {
+            snapshots: &market_snapshots,
+            historical_features: &historical_features,
+            portfolio: &portfolio,
+            llm_consensus: llm_consensus.as_ref(),
+            llm_snapshot: target_selection.snapshot.as_ref(),
+            llm_evaluation_allowed: execution_gate_reason.is_none()
+                && target_selection.override_reason.is_none(),
+            config,
+            now: now_ts(),
+        },
+        data_path,
+    )
+    .await;
     // One market-level consensus must produce at most one economic action.
     // Applying the same advice to every exchange row leaked rationales across
     // symbols and amplified one recommendation into many correlated orders.
@@ -726,6 +842,16 @@ async fn run_single_evaluation(
                 "ai_responders": consensus.responders,
                 "ai_failures": consensus.failures,
                 "ai_vote_distribution": consensus.vote_distribution,
+                "advisory_implementation": if quant_primary { "quant_primary" } else { "llm_primary_quant_shadow" },
+                "quant_parameter_id": quant_signal.parameter_id,
+                "quant_signal": quant_signal.signal,
+                "quant_confidence": quant_signal.confidence,
+                "quant_risk_score": quant_signal.risk_score,
+                "quant_actionable": quant_signal.actionable,
+                "quant_target": if quant_signal.symbol.is_empty() { None } else { Some(json!({
+                    "exchange": quant_signal.exchange,
+                    "symbol": quant_signal.symbol,
+                })) },
                 "market_regime_signal": market_regime.signal,
                 "market_regime_confidence": market_regime.confidence,
                 "market_regime_leaders": market_regime.leaders,
@@ -767,6 +893,151 @@ async fn run_single_evaluation(
         "trading: evaluation cycle complete in {:.1}ms",
         (now_ts() - eval_start) * 1000.0
     );
+}
+
+/// Resolve due shadow observations before selecting this cycle's primary
+/// implementation. A successful migration marker is written into state and
+/// atomically persisted before quant is allowed to replace the LLM.
+async fn resolve_quant_evaluations(
+    state: &SharedTradingState,
+    snapshots: &[MarketSnapshot],
+    config: &TradingConfig,
+    data_path: &PathBuf,
+) {
+    if !config.quant_shadow_enabled {
+        return;
+    }
+    let (previous_controller, update) = {
+        let mut current = state.0.lock().await;
+        let previous = current.quant_migration.clone();
+        let update = current
+            .quant_migration
+            .resolve_due(snapshots, config, now_ts());
+        (previous, update)
+    };
+    if update.resolved == 0 && update.expired == 0 {
+        return;
+    }
+
+    {
+        let mut current = state.0.lock().await;
+        let pending = current.quant_migration.pending.len();
+        let mode = current.quant_migration.mode.as_str();
+        current.log(
+            "info",
+            "quant_migration",
+            "QUANT_SHADOW_MARKOUTS_RESOLVED",
+            json!({
+                "resolved": update.resolved,
+                "expired": update.expired,
+                "pending": pending,
+                "mode": mode,
+                "performance": update.performance,
+            }),
+        );
+        if let Some(adjustment) = update.parameter_adjustment.as_ref() {
+            current.log(
+                "info",
+                "quant_migration",
+                "QUANT_PARAMETERS_ADJUSTED",
+                json!(adjustment),
+            );
+        }
+        if let Some(migration) = update.migration.as_ref() {
+            current.log(
+                "warn",
+                "quant_migration",
+                "QUANT_REPLACED_LLM",
+                json!(migration),
+            );
+        }
+    }
+
+    if let Err(error) = state.persist_checked(data_path).await {
+        warn!(%error, "trading: failed to persist quant shadow evaluation state");
+        let mut current = state.0.lock().await;
+        current.quant_migration = previous_controller;
+        if update.migration.is_some() {
+            current.log(
+                "error",
+                "quant_migration",
+                "QUANT_MIGRATION_ABORTED_PERSISTENCE",
+                json!({ "error": error }),
+            );
+        } else {
+            current.log(
+                "error",
+                "quant_migration",
+                "QUANT_SHADOW_PERSISTENCE_FAILED",
+                json!({ "error": error, "controller_update_rolled_back": true }),
+            );
+        }
+        drop(current);
+        state.persist(data_path).await;
+        return;
+    }
+
+    if let Some(adjustment) = update.parameter_adjustment {
+        info!(
+            previous_parameter_id = adjustment.previous_parameter_id,
+            selected_parameter_id = adjustment.selected_parameter_id,
+            improvement_bps = adjustment.risk_adjusted_improvement_bps,
+            "QUANT_PARAMETERS_ADJUSTED"
+        );
+    }
+    if let Some(migration) = update.migration {
+        warn!(
+            parameter_id = migration.parameter_id,
+            samples = migration.samples,
+            actionable_samples = migration.actionable_samples,
+            outperformance_bps = migration.outperformance_bps,
+            confirmation_streak = migration.confirmation_streak,
+            "QUANT_REPLACED_LLM"
+        );
+    }
+}
+
+/// Add a paired shadow observation to the durable ledger. The LLM side is
+/// absent after migration, while quant candidate outcomes continue to tune the
+/// active deterministic parameters.
+async fn record_quant_evaluation(
+    state: &SharedTradingState,
+    quant_signal: &quant::QuantSignal,
+    context: quant::QuantEvaluationContext<'_>,
+    data_path: &PathBuf,
+) {
+    if !context.config.quant_shadow_enabled || quant_signal.symbol.is_empty() {
+        return;
+    }
+    let record = {
+        let mut current = state.0.lock().await;
+        let record = current
+            .quant_migration
+            .record_evaluation(quant_signal, context);
+        if let Some(record) = record.as_ref() {
+            let marker = if record.mode == QuantMode::Primary {
+                "QUANT_PRIMARY_EVALUATION_RECORDED"
+            } else {
+                "QUANT_SHADOW_EVALUATION_RECORDED"
+            };
+            current.log("info", "quant_migration", marker, json!(record));
+        }
+        record
+    };
+    if record.is_none() {
+        return;
+    }
+    if let Err(error) = state.persist_checked(data_path).await {
+        warn!(%error, "trading: failed to persist pending quant shadow evaluation");
+        state
+            .log(
+                "warn",
+                "quant_migration",
+                "QUANT_SHADOW_PERSISTENCE_FAILED",
+                json!({ "error": error }),
+            )
+            .await;
+    }
 }
 
 async fn run_market_datalake_bootstrap(
@@ -1432,25 +1703,38 @@ async fn evaluate_symbol_candidate(
     historical_features: Option<&MarketHistoricalFeatures>,
     market_regime: Option<&MarketRegimeContagion>,
 ) -> EvaluatedSymbol {
+    let quant_parameters = {
+        let current = state.0.lock().await;
+        (config.quant_shadow_enabled && current.quant_migration.is_primary())
+            .then(|| current.quant_migration.active_parameters().clone())
+    };
     let research_query = build_research_query(config, Some(snapshot));
-    let research = refiner
-        .research_with_site_hints_best_effort(
-            &config.research_index_name,
-            &research_query,
-            &config.research_site_hints,
-            config.research_top_k,
-            config.research_max_parallel_queries,
-        )
-        .await;
-    let consensus = advisor
-        .consult_all(
-            std::slice::from_ref(snapshot),
-            &historical_features_map(snapshot, historical_features),
-            &research,
-            portfolio,
-            config.max_parallel_advisors,
-        )
-        .await;
+    let research = if quant_parameters.is_some() {
+        refiner::ResearchContext::empty(research_query)
+    } else {
+        refiner
+            .research_with_site_hints_best_effort(
+                &config.research_index_name,
+                &research_query,
+                &config.research_site_hints,
+                config.research_top_k,
+                config.research_max_parallel_queries,
+            )
+            .await
+    };
+    let consensus = if let Some(parameters) = quant_parameters.as_ref() {
+        evaluate_quant_symbol(parameters, snapshot, historical_features).as_consensus()
+    } else {
+        advisor
+            .consult_all(
+                std::slice::from_ref(snapshot),
+                &historical_features_map(snapshot, historical_features),
+                &research,
+                portfolio,
+                config.max_parallel_advisors,
+            )
+            .await
+    };
     let fuzzy_inputs = compute_fuzzy_inputs(
         Some(snapshot),
         historical_features,
@@ -3452,6 +3736,65 @@ struct TargetSnapshotSupport {
     signed_support: f64,
     total_support: f64,
     advisors: usize,
+}
+
+/// Quant primary owns both direction and market selection. Keeping its exact
+/// venue/symbol avoids silently applying a measured strategy to the legacy
+/// momentum fallback, while retaining the existing spot-inventory floor.
+fn select_quant_primary_market(
+    snapshots: &[MarketSnapshot],
+    signal: &quant::QuantSignal,
+    portfolio: &OctobotPortfolio,
+    min_sellable_usd: f64,
+) -> DecisionMarketSelection {
+    let selected = snapshots
+        .iter()
+        .find(|snapshot| {
+            snapshot.exchange.eq_ignore_ascii_case(&signal.exchange)
+                && snapshot.symbol.eq_ignore_ascii_case(&signal.symbol)
+                && snapshot_is_usable(snapshot)
+        })
+        .cloned();
+    let Some(snapshot) = selected else {
+        let reason = format!(
+            "Quant primary target {}/{} is unavailable in the current market snapshot",
+            signal.exchange, signal.symbol
+        );
+        return DecisionMarketSelection {
+            snapshot: None,
+            note: reason.clone(),
+            override_reason: Some(reason),
+            used_target_signal: true,
+            target_support: 1.0,
+            high_confidence_target: true,
+        };
+    };
+
+    let override_reason = (signal.signal < 0.0
+        && !snapshot_sellable_above_floor(&snapshot, portfolio, min_sellable_usd))
+    .then(|| {
+        format!(
+            "Quant sell target {} is below the effective sellable inventory floor ${:.2}",
+            snapshot_label(&snapshot),
+            min_sellable_usd.max(0.01)
+        )
+    });
+    DecisionMarketSelection {
+        note: if override_reason.is_some() {
+            "Quant primary target retained for evaluation but blocked by inventory validation"
+                .to_string()
+        } else {
+            format!(
+                "Decision market locked to quant primary target {}",
+                snapshot_label(&snapshot)
+            )
+        },
+        snapshot: Some(snapshot),
+        override_reason,
+        used_target_signal: true,
+        target_support: 1.0,
+        high_confidence_target: true,
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]

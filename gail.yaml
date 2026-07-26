@@ -264,6 +264,23 @@ trading:
   markout_horizon_seconds: 900
   markout_ledger_size: 2000
   markout_calibration_min_samples: 8
+  # Persistent shadow quant controller. Paired policy observations share a
+  # timestamp/horizon, retain each policy's selected USDT venue/symbol, and
+  # include the same modeled round-trip trading costs.
+  quant_shadow_enabled: true
+  quant_shadow_horizon_seconds: 900
+  quant_shadow_expiry_seconds: 3600
+  quant_shadow_ledger_size: 2000
+  quant_tuning_min_samples: 24
+  quant_tuning_min_actionable_samples: 6
+  quant_tuning_interval_samples: 8
+  quant_tuning_min_outperformance_bps: 5
+  quant_migration_min_samples: 96
+  quant_migration_min_actionable_samples: 16
+  quant_migration_window_samples: 240
+  quant_migration_min_outperformance_bps: 10
+  quant_migration_max_downside_regression_bps: 25
+  quant_migration_required_streak: 3
   research_query_template: "cryptocurrency market sentiment {currency} {exchange} {date}"
   research_index_name: "crypto"
   research_site_hints: ["bloomberg.com", "reuters.com", "cnbc.com"]

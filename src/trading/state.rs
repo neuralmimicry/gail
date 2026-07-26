@@ -14,6 +14,7 @@ use super::backtest::BacktestSummary;
 use super::config::TradingConfigOverride;
 use super::octobot::{OctobotExchange, OctobotOrder, OctobotPortfolio};
 use super::outcomes::OutcomeLedger;
+use super::quant::QuantMigrationState;
 use crate::adaptive_schema::AdaptiveApiSchema;
 
 fn now_ts() -> f64 {
@@ -192,6 +193,11 @@ pub struct TradingStatusSnapshot {
     pub active_intent_leases: usize,
     pub pending_markouts: usize,
     pub resolved_markouts: usize,
+    pub quant_mode: String,
+    pub quant_active_parameter_id: String,
+    pub quant_pending_evaluations: usize,
+    pub quant_resolved_evaluations: usize,
+    pub quant_promotion_streak: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +240,10 @@ pub struct TradingState {
     /// Fixed-horizon, fee-adjusted outcomes used for live calibration.
     #[serde(default)]
     pub outcome_ledger: OutcomeLedger,
+    /// Durable shadow comparisons, selected quant parameters, and migration
+    /// mode. This is restored before the evaluation loop starts.
+    #[serde(default)]
+    pub quant_migration: QuantMigrationState,
 }
 
 impl TradingState {
@@ -280,6 +290,7 @@ impl TradingState {
             observed_external_log_fingerprints: VecDeque::with_capacity(500),
             in_flight_order_intents: HashMap::new(),
             outcome_ledger: OutcomeLedger::default(),
+            quant_migration: QuantMigrationState::default(),
         }
     }
 
@@ -353,6 +364,11 @@ impl TradingState {
                 .iter()
                 .filter(|item| item.resolved_at.is_some())
                 .count(),
+            quant_mode: self.quant_migration.mode.as_str().to_string(),
+            quant_active_parameter_id: self.quant_migration.active_parameter_id.clone(),
+            quant_pending_evaluations: self.quant_migration.pending.len(),
+            quant_resolved_evaluations: self.quant_migration.resolved.len(),
+            quant_promotion_streak: self.quant_migration.promotion_streak,
         }
     }
 
@@ -513,6 +529,8 @@ impl SharedTradingState {
                         restored.observed_external_log_fingerprints;
                     state.in_flight_order_intents = restored.in_flight_order_intents;
                     state.outcome_ledger = restored.outcome_ledger;
+                    state.quant_migration = restored.quant_migration;
+                    state.quant_migration.normalize();
                     state.log_info("startup", "Restored trading state from disk");
                     drop(state);
                     if let Some(snapshot) = repaired_snapshot {

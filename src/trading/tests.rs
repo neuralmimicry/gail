@@ -327,6 +327,10 @@ mod tests {
         assert_eq!(cfg.micro_trade_min_usd, 1.0);
         assert_eq!(cfg.fuzzy_confidence_threshold, 0.65);
         assert_eq!(cfg.fuzzy_weight, 0.4);
+        assert!(cfg.quant_shadow_enabled);
+        assert_eq!(cfg.quant_shadow_horizon_seconds, 900);
+        assert_eq!(cfg.quant_migration_min_samples, 96);
+        assert_eq!(cfg.quant_migration_required_streak, 3);
         assert!(cfg.decision_roi_feedback_enabled);
         assert_eq!(cfg.decision_roi_feedback_lookback_trades, 120);
         assert_eq!(cfg.decision_roi_feedback_min_samples, 8);
@@ -427,6 +431,19 @@ mod tests {
             portfolio_pruning_candidate_pool_size: 0,
             portfolio_pruning_min_composite_score: 4.0,
             max_parallel_advisors: 0, // below minimum of 1
+            quant_shadow_horizon_seconds: 0,
+            quant_shadow_expiry_seconds: 0,
+            quant_shadow_ledger_size: 1,
+            quant_tuning_min_samples: 0,
+            quant_tuning_min_actionable_samples: 999,
+            quant_tuning_interval_samples: 0,
+            quant_tuning_min_outperformance_bps: -1.0,
+            quant_migration_min_samples: 0,
+            quant_migration_min_actionable_samples: 999,
+            quant_migration_window_samples: 0,
+            quant_migration_min_outperformance_bps: -1.0,
+            quant_migration_max_downside_regression_bps: -1.0,
+            quant_migration_required_streak: 0,
             max_open_positions: 0,
             research_index_name: "   ".to_string(),
             research_site_hints: vec![
@@ -489,6 +506,19 @@ mod tests {
         assert!(cfg.portfolio_pruning_candidate_pool_size >= 1);
         assert!(cfg.portfolio_pruning_min_composite_score <= 2.0);
         assert!(cfg.max_parallel_advisors >= 1);
+        assert!(cfg.quant_shadow_horizon_seconds >= 60);
+        assert!(cfg.quant_shadow_expiry_seconds >= cfg.quant_shadow_horizon_seconds);
+        assert!(cfg.quant_shadow_ledger_size >= 100);
+        assert!(cfg.quant_tuning_min_samples >= 3);
+        assert!(cfg.quant_tuning_min_actionable_samples <= cfg.quant_tuning_min_samples);
+        assert!(cfg.quant_tuning_interval_samples >= 1);
+        assert!(cfg.quant_tuning_min_outperformance_bps >= 0.0);
+        assert!(cfg.quant_migration_min_samples >= 10);
+        assert!(cfg.quant_migration_min_actionable_samples <= cfg.quant_migration_min_samples);
+        assert!(cfg.quant_migration_window_samples >= cfg.quant_migration_min_samples);
+        assert!(cfg.quant_migration_min_outperformance_bps >= 0.0);
+        assert!(cfg.quant_migration_max_downside_regression_bps >= 0.0);
+        assert!(cfg.quant_migration_required_streak >= 1);
         assert!(cfg.max_open_positions >= 1);
         assert_eq!(cfg.research_index_name, "crypto");
         assert_eq!(cfg.research_site_hints, vec!["bloomberg.com".to_string()]);
@@ -836,6 +866,9 @@ mod tests {
         assert_eq!(snap.evaluation_count, 7);
         assert_eq!(snap.trade_count, 3);
         assert_eq!(snap.open_positions, 2);
+        assert_eq!(snap.quant_mode, "shadow");
+        assert_eq!(snap.quant_active_parameter_id, "balanced-v1");
+        assert_eq!(snap.quant_pending_evaluations, 0);
     }
 
     #[test]
@@ -904,6 +937,18 @@ mod tests {
                 },
                 100,
             );
+            s.quant_migration.mode = crate::trading::quant::QuantMode::Primary;
+            s.quant_migration.active_parameter_id = "fast-trend-v1".to_string();
+            s.quant_migration.promoted_at = Some(99_999.0);
+            s.quant_migration
+                .pending
+                .push_back(crate::trading::quant::QuantPendingEvaluation {
+                    evaluation_id: "quant-pending".to_string(),
+                    symbol: "ETH/USDT".to_string(),
+                    exchange: "kraken".to_string(),
+                    entry_price: 3_000.0,
+                    ..crate::trading::quant::QuantPendingEvaluation::default()
+                });
         }
 
         let tmp = tempfile::NamedTempFile::new().expect("temp file");
@@ -925,6 +970,14 @@ mod tests {
         assert_eq!(s.in_flight_order_intents["BUY|ETH/USDT"].authority, "gail");
         assert_eq!(s.outcome_ledger.observations.len(), 1);
         assert_eq!(s.outcome_ledger.observations[0].order_id, "test-order");
+        assert_eq!(
+            s.quant_migration.mode,
+            crate::trading::quant::QuantMode::Primary
+        );
+        assert_eq!(s.quant_migration.active_parameter_id, "fast-trend-v1");
+        assert_eq!(s.quant_migration.promoted_at, Some(99_999.0));
+        assert_eq!(s.quant_migration.pending.len(), 1);
+        assert_eq!(s.quant_migration.pending[0].evaluation_id, "quant-pending");
     }
 
     #[tokio::test]
@@ -957,6 +1010,10 @@ mod tests {
             .as_object_mut()
             .expect("legacy log object")
             .remove("context");
+        payload
+            .as_object_mut()
+            .expect("legacy state object")
+            .remove("quant_migration");
 
         let tmp = tempfile::NamedTempFile::new().expect("temp file");
         std::fs::write(
@@ -971,6 +1028,10 @@ mod tests {
         assert_eq!(s.evaluation_count, 17);
         assert_eq!(s.activity_log.front().unwrap().message, "legacy entry");
         assert!(s.activity_log.front().unwrap().context.is_null());
+        assert_eq!(
+            s.quant_migration.mode,
+            crate::trading::quant::QuantMode::Shadow
+        );
         drop(s);
 
         let repaired: serde_json::Value = serde_json::from_str(
@@ -2267,6 +2328,61 @@ mod tests {
         assert!(selection.used_target_signal);
         assert!(selection.high_confidence_target);
         assert!(selection.override_reason.is_none());
+    }
+
+    #[test]
+    fn quant_primary_market_selection_keeps_the_measured_exact_target() {
+        let snapshots = vec![
+            make_snapshot("binance", "ETH/USDT", 3_000.0, 12.0, 9_000_000.0),
+            make_snapshot("kraken", "BTC/USDT", 68_000.0, 2.0, 4_000_000.0),
+        ];
+        let signal = crate::trading::quant::QuantSignal {
+            parameter_id: "balanced-v1".to_string(),
+            exchange: "kraken".to_string(),
+            symbol: "BTC/USDT".to_string(),
+            signal: 0.55,
+            actionable: true,
+            ..crate::trading::quant::QuantSignal::default()
+        };
+
+        let selection = crate::trading::select_quant_primary_market(
+            &snapshots,
+            &signal,
+            &OctobotPortfolio::default(),
+            12.0,
+        );
+
+        let selected = selection.snapshot.expect("quant primary target");
+        assert_eq!(selected.exchange, "kraken");
+        assert_eq!(selected.symbol, "BTC/USDT");
+        assert!(selection.override_reason.is_none());
+        assert!(selection.used_target_signal);
+    }
+
+    #[test]
+    fn quant_primary_sell_target_preserves_inventory_floor() {
+        let snapshots = vec![make_snapshot(
+            "binance",
+            "ETH/USDT",
+            3_000.0,
+            -8.0,
+            9_000_000.0,
+        )];
+        let signal = crate::trading::quant::QuantSignal {
+            parameter_id: "risk-controlled-v1".to_string(),
+            exchange: "binance".to_string(),
+            symbol: "ETH/USDT".to_string(),
+            signal: -0.60,
+            actionable: true,
+            ..crate::trading::quant::QuantSignal::default()
+        };
+        let dust = make_portfolio_with_balances(&[("ETH", 0.001, 0.001, Some(3.0))], Some(3.0));
+
+        let selection =
+            crate::trading::select_quant_primary_market(&snapshots, &signal, &dust, 12.0);
+
+        assert!(selection.snapshot.is_some());
+        assert!(selection.override_reason.is_some());
     }
 
     #[test]

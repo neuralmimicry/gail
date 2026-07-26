@@ -151,6 +151,53 @@ pub struct TradingConfig {
     /// allowed to alter expected edge and position size.
     pub markout_calibration_min_samples: usize,
 
+    // -----------------------------------------------------------------------
+    // Persistent quant shadow evaluation and guarded migration
+    // -----------------------------------------------------------------------
+    /// Evaluate deterministic quant candidates beside the LLM decision path.
+    pub quant_shadow_enabled: bool,
+
+    /// Fixed USDT markout horizon for paired LLM/quant comparisons.
+    pub quant_shadow_horizon_seconds: u64,
+
+    /// Additional time allowed to observe the exact venue/symbol after a
+    /// markout becomes due before the pending comparison is discarded.
+    pub quant_shadow_expiry_seconds: u64,
+
+    /// Maximum pending and resolved quant evaluations retained in each ledger.
+    pub quant_shadow_ledger_size: usize,
+
+    /// Paired observations required before selecting a better parameter arm.
+    pub quant_tuning_min_samples: usize,
+
+    /// Actionable observations required for a parameter arm to be eligible.
+    pub quant_tuning_min_actionable_samples: usize,
+
+    /// Newly resolved observations between parameter-selection checks.
+    pub quant_tuning_interval_samples: usize,
+
+    /// Required risk-adjusted improvement before changing parameter arms.
+    pub quant_tuning_min_outperformance_bps: f64,
+
+    /// Paired non-overlapping observations required before quant can replace
+    /// the LLM as the primary advisory implementation.
+    pub quant_migration_min_samples: usize,
+
+    /// Minimum quant trades within the migration comparison window.
+    pub quant_migration_min_actionable_samples: usize,
+
+    /// Bounded rolling comparison window for both tuning and migration.
+    pub quant_migration_window_samples: usize,
+
+    /// Required mean net-USDT advantage over the LLM path.
+    pub quant_migration_min_outperformance_bps: f64,
+
+    /// Maximum allowed increase in average losing-observation magnitude.
+    pub quant_migration_max_downside_regression_bps: f64,
+
+    /// Consecutive successful checks required before the persisted cutover.
+    pub quant_migration_required_streak: usize,
+
     /// Template for Refiner research queries.
     /// Supports `{currency}`, `{exchange}`, `{date}` placeholders.
     pub research_query_template: String,
@@ -364,6 +411,20 @@ impl Default for TradingConfig {
             markout_horizon_seconds: 900,
             markout_ledger_size: 2_000,
             markout_calibration_min_samples: 8,
+            quant_shadow_enabled: true,
+            quant_shadow_horizon_seconds: 900,
+            quant_shadow_expiry_seconds: 3_600,
+            quant_shadow_ledger_size: 2_000,
+            quant_tuning_min_samples: 24,
+            quant_tuning_min_actionable_samples: 6,
+            quant_tuning_interval_samples: 8,
+            quant_tuning_min_outperformance_bps: 5.0,
+            quant_migration_min_samples: 96,
+            quant_migration_min_actionable_samples: 16,
+            quant_migration_window_samples: 240,
+            quant_migration_min_outperformance_bps: 10.0,
+            quant_migration_max_downside_regression_bps: 25.0,
+            quant_migration_required_streak: 3,
             research_query_template: "cryptocurrency market sentiment {currency} {exchange} {date}"
                 .to_string(),
             research_index_name: "crypto".to_string(),
@@ -489,6 +550,33 @@ impl TradingConfig {
         self.markout_horizon_seconds = self.markout_horizon_seconds.clamp(60, 86_400);
         self.markout_ledger_size = self.markout_ledger_size.clamp(100, 50_000);
         self.markout_calibration_min_samples = self.markout_calibration_min_samples.clamp(3, 1_000);
+        self.quant_shadow_horizon_seconds = self.quant_shadow_horizon_seconds.clamp(60, 86_400);
+        self.quant_shadow_expiry_seconds = self
+            .quant_shadow_expiry_seconds
+            .clamp(self.quant_shadow_horizon_seconds, 7 * 86_400);
+        self.quant_shadow_ledger_size = self.quant_shadow_ledger_size.clamp(100, 50_000);
+        self.quant_tuning_min_samples = self.quant_tuning_min_samples.clamp(3, 10_000);
+        self.quant_tuning_min_actionable_samples = self
+            .quant_tuning_min_actionable_samples
+            .clamp(1, self.quant_tuning_min_samples);
+        self.quant_tuning_interval_samples = self.quant_tuning_interval_samples.clamp(1, 1_000);
+        self.quant_tuning_min_outperformance_bps =
+            self.quant_tuning_min_outperformance_bps.clamp(0.0, 2_500.0);
+        self.quant_migration_min_samples = self.quant_migration_min_samples.clamp(10, 10_000);
+        self.quant_migration_min_actionable_samples = self
+            .quant_migration_min_actionable_samples
+            .clamp(1, self.quant_migration_min_samples);
+        self.quant_migration_window_samples = self.quant_migration_window_samples.clamp(
+            self.quant_migration_min_samples,
+            self.quant_shadow_ledger_size,
+        );
+        self.quant_migration_min_outperformance_bps = self
+            .quant_migration_min_outperformance_bps
+            .clamp(0.0, 2_500.0);
+        self.quant_migration_max_downside_regression_bps = self
+            .quant_migration_max_downside_regression_bps
+            .clamp(0.0, 2_500.0);
+        self.quant_migration_required_streak = self.quant_migration_required_streak.clamp(1, 100);
         self.max_open_positions = self.max_open_positions.clamp(1, 50);
         self.log_ring_size = self.log_ring_size.clamp(10, 10_000);
         self.trade_ring_size = self.trade_ring_size.clamp(10, 5_000);
