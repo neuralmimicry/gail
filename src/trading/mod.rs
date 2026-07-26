@@ -3,12 +3,13 @@
 /// Provides `TradingBridge`, a non-blocking background service that:
 ///  1. Fetches live market data from OctoBot
 ///  2. Gathers research context from Refiner
-///  3. Consults all configured AI providers in parallel (TradingAdvisor)
+///  3. Races bounded AI providers to a round deadline/quorum (TradingAdvisor)
 ///  4. Applies Type-2 fuzzy logic (FuzzyEngine)
-///  5. Blends fuzzy + AI signals and applies historical ROI feedback (DecisionEngine)
-///  6. Executes only through supported OctoBot trading/command bridges
-///  7. Logs all activity in a ring-buffer (SharedTradingState)
-///  8. Persists state to disk periodically
+///  5. Blends signals and applies fixed-horizon outcome calibration (DecisionEngine)
+///  6. Gates fee/slippage economics and immediately reprices the exact venue
+///  7. Persists an idempotency lease, then executes through OctoBot
+///  8. Resolves fee-adjusted markouts for future calibration
+///  9. Logs activity and atomically persists state (SharedTradingState)
 ///
 /// The bridge is entirely non-blocking and runs in its own tokio task.
 /// All HTTP handlers access state through `SharedTradingState` (Arc<Mutex<>>).
@@ -17,8 +18,10 @@ pub mod backtest;
 pub mod config;
 pub mod datalake;
 pub mod decision;
+pub mod economics;
 pub mod fuzzy;
 pub mod octobot;
+pub mod outcomes;
 pub mod refiner;
 pub mod state;
 
@@ -51,13 +54,15 @@ use datalake::{
     MarketDataLake, MarketDataLakeBootstrapReport, MarketHistoricalFeatures, market_feature_key,
 };
 use decision::{DecisionEngine, TradeDecision};
+use economics::adverse_reprice_drift_bps;
 use fuzzy::{FuzzyEngine, FuzzyInputs};
 use octobot::{
     MarketSnapshot, OCTOBOT_MARKET_SNAPSHOT_HARD_LIMIT, OctobotClient, OctobotExchange,
     OctobotLogEntry, OctobotPortfolio,
 };
+use outcomes::TradeMarkout;
 use refiner::RefinerClient;
-use state::{ExecutedTrade, SharedTradingState, TradeAction, TradingState};
+use state::{ExecutedTrade, ExecutionIntentClaim, SharedTradingState, TradeAction, TradingState};
 
 fn now_ts() -> f64 {
     SystemTime::now()
@@ -172,7 +177,13 @@ async fn run_evaluation_loop(
     );
     let fuzzy_engine = FuzzyEngine::new();
     let postgres_dsn = service.config().storage.postgres_dsn.clone();
-    let advisor = TradingAdvisor::new(service, config.advisor_timeout_seconds);
+    let advisor = TradingAdvisor::new(
+        service,
+        config.advisor_timeout_seconds,
+        config.advisor_round_timeout_seconds,
+        config.advisor_early_quorum,
+        config.advisory_candidate_limit,
+    );
     let decision_engine = DecisionEngine::new(config.fuzzy_weight);
     let data_path = PathBuf::from(&config.data_path);
     let market_data_lake = if config.market_datalake_enabled {
@@ -198,7 +209,24 @@ async fn run_evaluation_loop(
             .log_warn("startup", format!("OctoBot login failed: {err}"))
             .await;
     } else {
-        state.log_info("startup", "Trading bridge started").await;
+        state
+            .log(
+                "info",
+                "startup",
+                "Trading bridge started with cost-aware single-authority execution",
+                json!({
+                    "execution_authority": config.execution_authority,
+                    "strict_exchange_selection": config.strict_exchange_selection,
+                    "advisor_round_timeout_seconds": config.advisor_round_timeout_seconds,
+                    "advisor_early_quorum": config.advisor_early_quorum,
+                    "market_snapshot_ttl_seconds": config.market_snapshot_ttl_seconds,
+                    "advisory_ttl_seconds": config.advisory_ttl_seconds,
+                    "round_trip_cost_bps": 2.0 * (config.estimated_fee_bps + config.estimated_slippage_bps),
+                    "minimum_net_edge_bps": config.minimum_net_edge_bps,
+                    "markout_horizon_seconds": config.markout_horizon_seconds,
+                }),
+            )
+            .await;
     }
 
     if let Some(reason) = pending_datalake_bootstrap_reason.clone()
@@ -389,6 +417,7 @@ async fn run_single_evaluation(
             evaluation_snapshot_limit,
         )
         .await;
+    resolve_trade_markouts(state, &market_snapshots, config).await;
     let historical_features = if let Some(lake) = market_data_lake {
         let ingest_summary = lake.ingest_snapshots(&market_snapshots).await;
         if ingest_summary.file_error.is_some() || ingest_summary.postgres_error.is_some() {
@@ -1027,6 +1056,7 @@ async fn run_non_portfolio_discovery_cycle(
             config.token_discovery_snapshot_limit,
         )
         .await;
+    resolve_trade_markouts(state, &snapshots, config).await;
     let historical_features = if let Some(lake) = market_data_lake {
         let ingest_summary = lake.ingest_snapshots(&snapshots).await;
         if ingest_summary.file_error.is_some() || ingest_summary.postgres_error.is_some() {
@@ -1210,6 +1240,7 @@ async fn run_portfolio_pruning_cycle(
             config.token_discovery_snapshot_limit,
         )
         .await;
+    resolve_trade_markouts(state, &snapshots, config).await;
     let historical_features = if let Some(lake) = market_data_lake {
         let ingest_summary = lake.ingest_snapshots(&snapshots).await;
         if ingest_summary.file_error.is_some() || ingest_summary.postgres_error.is_some() {
@@ -2256,6 +2287,33 @@ fn consensus_average_risk(consensus: &advisor::AiConsensus) -> f64 {
     }
 }
 
+async fn resolve_trade_markouts(
+    state: &SharedTradingState,
+    snapshots: &[MarketSnapshot],
+    config: &TradingConfig,
+) {
+    if snapshots.is_empty() {
+        return;
+    }
+    let round_trip_cost_bps = 2.0 * (config.estimated_fee_bps + config.estimated_slippage_bps);
+    let mut state = state.0.lock().await;
+    let resolved = state
+        .outcome_ledger
+        .resolve_due(snapshots, now_ts(), round_trip_cost_bps);
+    if resolved > 0 {
+        state.log(
+            "info",
+            "outcomes",
+            format!("Resolved {resolved} fixed-horizon trade markout(s)"),
+            json!({
+                "resolved": resolved,
+                "horizon_seconds": config.markout_horizon_seconds,
+                "round_trip_cost_bps": round_trip_cost_bps,
+            }),
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Trade execution
 // ---------------------------------------------------------------------------
@@ -2268,6 +2326,7 @@ async fn execute_if_warranted(
 ) {
     let mut execution_amount_usd = decision.amount_usd;
     let mut execution_exchange = decision.exchange.clone();
+    let mut execution_reference_price = decision.reference_price;
     let min_execution_usd = effective_micro_trade_floor_usd(state, config).await;
 
     match &decision.action {
@@ -2313,7 +2372,116 @@ async fn execute_if_warranted(
         return;
     }
 
-    if side == "buy"
+    if !decision.override_applied {
+        let now = now_ts();
+        let advisory_age = (now - decision.created_at).max(0.0);
+        if advisory_age > config.advisory_ttl_seconds {
+            state
+                .log_warn(
+                    "execute",
+                    format!(
+                        "Trade skipped: advisory expired ({advisory_age:.1}s > {:.1}s)",
+                        config.advisory_ttl_seconds
+                    ),
+                )
+                .await;
+            return;
+        }
+        let Some(market_fetched_at) = decision.market_fetched_at else {
+            state
+                .log_warn("execute", "Trade skipped: decision has no market timestamp")
+                .await;
+            return;
+        };
+        let market_age = (now - market_fetched_at).max(0.0);
+        if market_age > config.market_snapshot_ttl_seconds {
+            state
+                .log_warn(
+                    "execute",
+                    format!(
+                        "Trade skipped: source market snapshot expired ({market_age:.1}s > {:.1}s)",
+                        config.market_snapshot_ttl_seconds
+                    ),
+                )
+                .await;
+            return;
+        }
+        if !decision.economics.is_worthwhile() {
+            state
+                .log_warn(
+                    "execute",
+                    format!(
+                        "Trade skipped: expected net edge {:.1}bps below {:.1}bps",
+                        decision.economics.expected_net_edge_bps,
+                        decision.economics.required_net_edge_bps
+                    ),
+                )
+                .await;
+            return;
+        }
+
+        let fresh_snapshot = match octobot
+            .get_market_snapshot(&execution_exchange, &decision.symbol)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                state
+                    .log_warn(
+                        "execute",
+                        format!("Trade skipped: immediate repricing failed: {error}"),
+                    )
+                    .await;
+                return;
+            }
+        };
+        let fresh_age = (now_ts() - fresh_snapshot.fetched_at).max(0.0);
+        if fresh_age > config.market_snapshot_ttl_seconds {
+            state
+                .log_warn(
+                    "execute",
+                    format!("Trade skipped: repricing snapshot is {fresh_age:.1}s old"),
+                )
+                .await;
+            return;
+        }
+        let Some(reference_price) = decision.reference_price else {
+            state
+                .log_warn("execute", "Trade skipped: decision has no reference price")
+                .await;
+            return;
+        };
+        let adverse_drift_bps =
+            adverse_reprice_drift_bps(side, reference_price, fresh_snapshot.price);
+        let repriced_net_edge_bps = decision.economics.expected_net_edge_bps - adverse_drift_bps;
+        if adverse_drift_bps > config.max_reprice_drift_bps
+            || repriced_net_edge_bps + f64::EPSILON < decision.economics.required_net_edge_bps
+        {
+            state
+                .log(
+                    "warn",
+                    "execute",
+                    "Trade skipped after immediate price-drift/economics check",
+                    json!({
+                        "exchange": execution_exchange,
+                        "symbol": decision.symbol,
+                        "side": side,
+                        "reference_price": reference_price,
+                        "current_price": fresh_snapshot.price,
+                        "adverse_drift_bps": adverse_drift_bps,
+                        "max_reprice_drift_bps": config.max_reprice_drift_bps,
+                        "repriced_net_edge_bps": repriced_net_edge_bps,
+                        "required_net_edge_bps": decision.economics.required_net_edge_bps,
+                    }),
+                )
+                .await;
+            return;
+        }
+        execution_reference_price = Some(fresh_snapshot.price);
+    }
+
+    if !config.strict_exchange_selection
+        && side == "buy"
         && let Some((rerouted_exchange, reason)) = maybe_reroute_execution_exchange(
             state,
             &execution_exchange,
@@ -2413,21 +2581,30 @@ async fn execute_if_warranted(
             .unwrap_or_default();
 
         if !base_asset.is_empty() {
-            match ensure_sell_balance_available(octobot, state, base_asset, &decision.symbol).await
+            match ensure_sell_balance_available(
+                octobot,
+                state,
+                &execution_exchange,
+                base_asset,
+                &decision.symbol,
+                config.strict_exchange_selection,
+            )
+            .await
             {
                 SellBalanceAvailability::Available {
                     free,
                     total,
                     value_usd,
                 } => {
-                    if let Some((rerouted_exchange, reason)) = maybe_reroute_execution_exchange(
-                        state,
-                        &execution_exchange,
-                        &decision.symbol,
-                        side,
-                        execution_amount_usd,
-                    )
-                    .await
+                    if !config.strict_exchange_selection
+                        && let Some((rerouted_exchange, reason)) = maybe_reroute_execution_exchange(
+                            state,
+                            &execution_exchange,
+                            &decision.symbol,
+                            side,
+                            execution_amount_usd,
+                        )
+                        .await
                     {
                         warn!(
                             "trading: rerouting sell execution for {} from {} to {} ({})",
@@ -2575,6 +2752,20 @@ async fn execute_if_warranted(
             .await;
         return;
     }
+    // The lease must be durable before any mutating OctoBot endpoint is called.
+    if let Err(err) = state
+        .persist_checked(&PathBuf::from(&config.data_path))
+        .await
+    {
+        release_execution_intent(state, &intent_key).await;
+        state
+            .log_error(
+                "execute",
+                format!("Trade skipped: unable to persist execution intent lease: {err}"),
+            )
+            .await;
+        return;
+    }
 
     let pair_activation = match octobot
         .ensure_trading_pair_active_for_order(&execution_exchange, &decision.symbol)
@@ -2582,7 +2773,7 @@ async fn execute_if_warranted(
     {
         Ok(status) => status,
         Err(err) => {
-            release_execution_intent(state, &intent_key).await;
+            release_and_persist_execution_intent(state, &intent_key, config).await;
             warn!(
                 "trading: {} skipped — failed to validate OctoBot market-status activation for {}/{}: {}",
                 side, execution_exchange, decision.symbol, err
@@ -2603,7 +2794,7 @@ async fn execute_if_warranted(
     };
 
     if !pair_activation.ready {
-        release_execution_intent(state, &intent_key).await;
+        release_and_persist_execution_intent(state, &intent_key, config).await;
         warn!(
             "trading: {} skipped — OctoBot pair activation pending for {}/{}: {}",
             side, execution_exchange, decision.symbol, pair_activation.message
@@ -2645,7 +2836,7 @@ async fn execute_if_warranted(
                 symbol: decision.symbol.clone(),
                 action: decision.action.clone(),
                 amount_usd: execution_amount_usd,
-                price: order.price,
+                price: order.price.or(execution_reference_price),
                 order_id: Some(order.order_id.clone()),
                 confidence: decision.confidence,
                 rationale: decision.rationale.clone(),
@@ -2657,6 +2848,24 @@ async fn execute_if_warranted(
                 let mut s = state.0.lock().await;
                 s.in_flight_order_intents.remove(&intent_key);
                 s.record_trade(trade);
+                if let Some(entry_price) = order.price.or(execution_reference_price) {
+                    s.outcome_ledger.record(
+                        TradeMarkout {
+                            order_id: order.order_id.clone(),
+                            executed_at: now_ts(),
+                            due_at: now_ts() + config.markout_horizon_seconds as f64,
+                            exchange: execution_exchange.clone(),
+                            symbol: decision.symbol.clone(),
+                            action: decision.action.clone(),
+                            amount_usd: execution_amount_usd,
+                            entry_price,
+                            providers: decision.provider_keys.clone(),
+                            regime: decision.market_regime.clone(),
+                            ..TradeMarkout::default()
+                        },
+                        config.markout_ledger_size,
+                    );
+                }
                 s.pending_override = None; // Clear override once executed.
             }
             state
@@ -2675,10 +2884,22 @@ async fn execute_if_warranted(
             state.persist(&PathBuf::from(&config.data_path)).await;
         }
         Err(err) => {
-            release_execution_intent(state, &intent_key).await;
-            warn!("trading: {} order failed: {}", side, err);
+            // A transport failure after request submission is ambiguous: the
+            // exchange may have accepted the order even though Gail never saw
+            // the acknowledgement. Retain the durable lease until expiry so
+            // the next evaluation cannot duplicate that economic intent.
+            state.persist(&PathBuf::from(&config.data_path)).await;
+            warn!(
+                "trading: {} order failed or acknowledgement was uncertain; retaining intent lease: {}",
+                side, err
+            );
             state
-                .log_error("execute", format!("{side} order failed: {err}"))
+                .log_error(
+                    "execute",
+                    format!(
+                        "{side} order failed or acknowledgement was uncertain; intent lease retained until expiry: {err}"
+                    ),
+                )
                 .await;
         }
     }
@@ -2691,38 +2912,46 @@ async fn claim_execution_intent(
     operator_override: bool,
 ) -> Result<(), String> {
     let now = now_ts();
-    let stale_after = (config.octobot_timeout_seconds * 2.0)
-        .max(config.min_trade_interval_seconds as f64)
-        .max(60.0);
-    let mut state = state.0.lock().await;
-    state
-        .in_flight_order_intents
-        .retain(|_, claimed_at| now - *claimed_at <= stale_after);
-    if state.in_flight_order_intents.contains_key(intent_key) {
-        return Err("an equivalent order is already in flight".to_string());
-    }
-
-    if !operator_override
-        && let Some(previous) = state.recent_trades.iter().rev().find(|trade| {
-            trade_action_side(&trade.action)
-                .and_then(|side| execution_intent_key(side, &trade.exchange, &trade.symbol))
-                .as_deref()
-                == Some(intent_key)
-        })
     {
-        let age = (now - previous.ts).max(0.0);
-        if age < config.min_trade_interval_seconds as f64 {
+        let mut locked = state.0.lock().await;
+        locked
+            .in_flight_order_intents
+            .retain(|_, claim| claim.expires_at > now);
+        if let Some(existing) = locked.in_flight_order_intents.get(intent_key) {
             return Err(format!(
-                "equivalent order filled {:.0}s ago; {:.0}s cooldown remains",
-                age,
-                config.min_trade_interval_seconds as f64 - age,
+                "an equivalent order is leased by authority {} for another {:.0}s",
+                existing.authority,
+                (existing.expires_at - now).max(0.0)
             ));
         }
-    }
 
-    state
-        .in_flight_order_intents
-        .insert(intent_key.to_string(), now);
+        if !operator_override
+            && let Some(previous) = locked.recent_trades.iter().rev().find(|trade| {
+                trade_action_side(&trade.action)
+                    .and_then(|side| execution_intent_key(side, &trade.exchange, &trade.symbol))
+                    .as_deref()
+                    == Some(intent_key)
+            })
+        {
+            let age = (now - previous.ts).max(0.0);
+            if age < config.min_trade_interval_seconds as f64 {
+                return Err(format!(
+                    "equivalent order filled {:.0}s ago; {:.0}s cooldown remains",
+                    age,
+                    config.min_trade_interval_seconds as f64 - age,
+                ));
+            }
+        }
+
+        locked.in_flight_order_intents.insert(
+            intent_key.to_string(),
+            ExecutionIntentClaim {
+                authority: config.execution_authority.clone(),
+                claimed_at: now,
+                expires_at: now + config.execution_lease_seconds,
+            },
+        );
+    }
     Ok(())
 }
 
@@ -2733,6 +2962,15 @@ async fn release_execution_intent(state: &SharedTradingState, intent_key: &str) 
         .await
         .in_flight_order_intents
         .remove(intent_key);
+}
+
+async fn release_and_persist_execution_intent(
+    state: &SharedTradingState,
+    intent_key: &str,
+    config: &TradingConfig,
+) {
+    release_execution_intent(state, intent_key).await;
+    state.persist(&PathBuf::from(&config.data_path)).await;
 }
 
 async fn effective_micro_trade_floor_usd(
@@ -2958,10 +3196,12 @@ fn sell_balance_is_sufficient(candidate: &ExchangeAssetBalanceCandidate, amount_
 async fn ensure_sell_balance_available(
     octobot: &OctobotClient,
     state: &SharedTradingState,
+    exchange: &str,
     base_asset: &str,
     symbol: &str,
+    strict_exchange_selection: bool,
 ) -> SellBalanceAvailability {
-    let initial = cached_sell_balance(state, base_asset).await;
+    let initial = cached_sell_balance(state, exchange, base_asset, strict_exchange_selection).await;
 
     // Always request one explicit OctoBot refresh cycle before executing a sell.
     // This keeps free balances and lock state aligned with the exchange.
@@ -2978,7 +3218,11 @@ async fn ensure_sell_balance_available(
 
     match octobot.get_portfolio().await {
         Ok(portfolio) => {
-            let availability = portfolio_balance_state(&portfolio, base_asset);
+            let availability = if strict_exchange_selection {
+                portfolio_balance_state_for_exchange(&portfolio, exchange, base_asset)
+            } else {
+                portfolio_balance_state(&portfolio, base_asset)
+            };
             let mut s = state.0.lock().await;
             s.current_portfolio = Some(portfolio);
             availability
@@ -2995,11 +3239,17 @@ async fn ensure_sell_balance_available(
 
 async fn cached_sell_balance(
     state: &SharedTradingState,
+    exchange: &str,
     base_asset: &str,
+    strict_exchange_selection: bool,
 ) -> SellBalanceAvailability {
     let s = state.0.lock().await;
     if let Some(portfolio) = s.current_portfolio.as_ref() {
-        portfolio_balance_state(portfolio, base_asset)
+        if strict_exchange_selection {
+            portfolio_balance_state_for_exchange(portfolio, exchange, base_asset)
+        } else {
+            portfolio_balance_state(portfolio, base_asset)
+        }
     } else {
         SellBalanceAvailability::Missing
     }
@@ -3086,6 +3336,39 @@ fn portfolio_balance_state(
             total: balance.total,
             value_usd: balance.value_usd,
         },
+        Some(balance) => SellBalanceAvailability::NonPositive {
+            free: balance.free,
+            total: balance.total,
+        },
+        None => SellBalanceAvailability::Missing,
+    }
+}
+
+fn portfolio_balance_state_for_exchange(
+    portfolio: &OctobotPortfolio,
+    exchange: &str,
+    base_asset: &str,
+) -> SellBalanceAvailability {
+    let Some(balances) = portfolio
+        .exchange_currencies
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(exchange))
+        .map(|(_, balances)| balances)
+    else {
+        return SellBalanceAvailability::Missing;
+    };
+    match balances
+        .iter()
+        .find(|(asset, _)| asset.eq_ignore_ascii_case(base_asset))
+        .map(|(_, balance)| balance)
+    {
+        Some(balance) if balance.free.is_finite() && balance.free > 0.0 => {
+            SellBalanceAvailability::Available {
+                free: balance.free,
+                total: balance.total,
+                value_usd: balance.value_usd,
+            }
+        }
         Some(balance) => SellBalanceAvailability::NonPositive {
             free: balance.free,
             total: balance.total,

@@ -12,6 +12,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::task::JoinSet;
+use tokio::time::{Instant, sleep_until};
 use tracing::{debug, warn};
 
 use crate::{
@@ -97,13 +98,25 @@ impl AiConsensus {
 pub struct TradingAdvisor {
     service: GailService,
     timeout: Duration,
+    round_timeout: Duration,
+    early_quorum: usize,
+    candidate_limit: usize,
 }
 
 impl TradingAdvisor {
-    pub fn new(service: GailService, advisor_timeout_seconds: f64) -> Self {
+    pub fn new(
+        service: GailService,
+        advisor_timeout_seconds: f64,
+        round_timeout_seconds: f64,
+        early_quorum: usize,
+        candidate_limit: usize,
+    ) -> Self {
         Self {
             service,
             timeout: Duration::from_secs_f64(advisor_timeout_seconds),
+            round_timeout: Duration::from_secs_f64(round_timeout_seconds),
+            early_quorum: early_quorum.max(1),
+            candidate_limit: candidate_limit.max(1),
         }
     }
 
@@ -116,7 +129,18 @@ impl TradingAdvisor {
         portfolio: &OctobotPortfolio,
         max_advisors: usize,
     ) -> AiConsensus {
-        let providers = self.select_providers(max_advisors).await;
+        let deadline = Instant::now() + self.round_timeout;
+        let providers =
+            match tokio::time::timeout_at(deadline, self.select_providers(max_advisors)).await {
+                Ok(providers) => providers,
+                Err(_) => {
+                    warn!(
+                        timeout_seconds = self.round_timeout.as_secs_f64(),
+                        "trading: advisor round expired while ranking providers"
+                    );
+                    return AiConsensus::uncertain();
+                }
+            };
         if providers.is_empty() {
             warn!("trading: no providers available for AI advisory");
             return AiConsensus::uncertain();
@@ -126,8 +150,9 @@ impl TradingAdvisor {
             .map(provider_model_identity)
             .collect::<HashSet<_>>();
 
+        let ranked_snapshots = rank_advisory_candidates(market_snapshots, self.candidate_limit);
         let prompt =
-            build_advisory_prompt(market_snapshots, historical_features, research, portfolio);
+            build_advisory_prompt(&ranked_snapshots, historical_features, research, portfolio);
         let system = advisory_system_prompt();
         let timeout_secs = self.timeout.as_secs();
 
@@ -142,28 +167,17 @@ impl TradingAdvisor {
             });
         }
 
-        let mut advices: Vec<AiAdvice> = Vec::new();
-        let mut failures = 0usize;
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(advice) => {
-                    if advice.parsed_ok {
-                        advices.push(advice);
-                    } else {
-                        failures += 1;
-                        advices.push(advice); // keep it for logs even if unparsed
-                    }
-                }
-                Err(_) => failures += 1,
-            }
-        }
-
-        let min_responder_target = max_advisors.clamp(1, 2);
+        let min_responder_target = self.early_quorum.min(max_advisors.max(1));
+        let (mut advices, mut failures, first_wave_expired) =
+            collect_advice_wave(&mut join_set, deadline, min_responder_target).await;
         let mut parsed_responders = advices.iter().filter(|advice| advice.parsed_ok).count();
-        if parsed_responders < min_responder_target {
-            let fallback_candidates = self
-                .select_providers(max_advisors.max(1).saturating_add(3))
-                .await;
+        if parsed_responders < min_responder_target && !first_wave_expired {
+            let fallback_candidates = tokio::time::timeout_at(
+                deadline,
+                self.select_providers(max_advisors.max(1).saturating_add(3)),
+            )
+            .await
+            .unwrap_or_default();
             let mut fallback_join_set = JoinSet::new();
             for profile in fallback_candidates {
                 if !attempted_provider_ids.insert(provider_model_identity(&profile)) {
@@ -176,28 +190,24 @@ impl TradingAdvisor {
                     query_provider(service, profile, prompt, system, timeout_secs).await
                 });
             }
-            while let Some(result) = fallback_join_set.join_next().await {
-                let advice = match result {
-                    Ok(advice) => advice,
-                    Err(_) => {
-                        failures += 1;
-                        continue;
-                    }
-                };
-                if !advice.parsed_ok {
-                    failures += 1;
-                }
-                let parsed_ok = advice.parsed_ok;
-                advices.push(advice);
-                if parsed_ok {
-                    parsed_responders += 1;
-                }
-                if parsed_responders >= min_responder_target {
-                    fallback_join_set.abort_all();
-                    break;
-                }
-            }
+            let remaining_quorum = min_responder_target.saturating_sub(parsed_responders);
+            let (fallback_advices, fallback_failures, _) =
+                collect_advice_wave(&mut fallback_join_set, deadline, remaining_quorum.max(1))
+                    .await;
+            failures += fallback_failures;
+            advices.extend(fallback_advices);
+            parsed_responders = advices.iter().filter(|advice| advice.parsed_ok).count();
         }
+
+        debug!(
+            responders = parsed_responders,
+            failures,
+            elapsed_ms = (self
+                .round_timeout
+                .saturating_sub(deadline.saturating_duration_since(Instant::now())))
+            .as_millis(),
+            "trading: advisor round completed"
+        );
 
         aggregate_consensus(advices, failures)
     }
@@ -233,6 +243,79 @@ impl TradingAdvisor {
         }
         select_ranked_trading_profiles(ranked, max)
     }
+}
+
+/// Retain every completed response, but never wait beyond the round deadline.
+/// A successful early quorum cancels only unfinished stragglers; deadline
+/// cancellation counts unfinished work as failures because coverage degraded.
+async fn collect_advice_wave(
+    join_set: &mut JoinSet<AiAdvice>,
+    deadline: Instant,
+    quorum: usize,
+) -> (Vec<AiAdvice>, usize, bool) {
+    let mut advices = Vec::new();
+    let mut failures = 0usize;
+    let mut expired = false;
+    while !join_set.is_empty() {
+        tokio::select! {
+            result = join_set.join_next() => {
+                let Some(result) = result else { break; };
+                match result {
+                    Ok(advice) => {
+                        if !advice.parsed_ok {
+                            failures += 1;
+                        }
+                        advices.push(advice);
+                    }
+                    Err(_) => failures += 1,
+                }
+                if advices.iter().filter(|advice| advice.parsed_ok).count() >= quorum.max(1) {
+                    join_set.abort_all();
+                    break;
+                }
+            }
+            _ = sleep_until(deadline) => {
+                failures += join_set.len();
+                join_set.abort_all();
+                expired = true;
+                break;
+            }
+        }
+    }
+    (advices, failures, expired)
+}
+
+/// Deterministic map/reduce input selection. Invalid rows are removed, exact
+/// exchange/symbol duplicates are collapsed, and the strongest liquid movers
+/// are retained with stable lexical tie-breaking.
+fn rank_advisory_candidates(snapshots: &[MarketSnapshot], limit: usize) -> Vec<MarketSnapshot> {
+    let mut ranked = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.price.is_finite() && snapshot.price > 0.0)
+        .cloned()
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        let score = |snapshot: &MarketSnapshot| {
+            let movement = snapshot.price_change_pct_24h.unwrap_or(0.0).abs().min(30.0) / 30.0;
+            let liquidity =
+                ((snapshot.volume_24h.unwrap_or(0.0) + 1.0).ln() / 20.0).clamp(0.0, 1.0);
+            movement * 0.55 + liquidity * 0.45
+        };
+        score(right)
+            .total_cmp(&score(left))
+            .then_with(|| left.exchange.cmp(&right.exchange))
+            .then_with(|| left.symbol.cmp(&right.symbol))
+    });
+    let mut seen = HashSet::new();
+    ranked.retain(|snapshot| {
+        seen.insert(format!(
+            "{}|{}",
+            snapshot.exchange.to_ascii_uppercase(),
+            snapshot.symbol.to_ascii_uppercase()
+        ))
+    });
+    ranked.truncate(limit.max(1));
+    ranked
 }
 
 #[cfg(test)]
@@ -1239,5 +1322,63 @@ mod tests {
                 .as_f64()
                 .is_some_and(|value| value <= 0.5)
         );
+    }
+
+    #[test]
+    fn advisory_candidates_are_deduplicated_ranked_and_bounded() {
+        let snapshots = vec![
+            MarketSnapshot {
+                exchange: "bitget".to_string(),
+                symbol: "ETH/USDT".to_string(),
+                price: 2_000.0,
+                price_change_pct_24h: Some(1.0),
+                volume_24h: Some(10_000.0),
+                ..MarketSnapshot::default()
+            },
+            MarketSnapshot {
+                exchange: "bitget".to_string(),
+                symbol: "ETH/USDT".to_string(),
+                price: 2_001.0,
+                price_change_pct_24h: Some(3.0),
+                volume_24h: Some(10_000_000.0),
+                ..MarketSnapshot::default()
+            },
+            MarketSnapshot {
+                exchange: "bitget".to_string(),
+                symbol: "BTC/USDT".to_string(),
+                price: 60_000.0,
+                price_change_pct_24h: Some(8.0),
+                volume_24h: Some(10_000_000.0),
+                ..MarketSnapshot::default()
+            },
+        ];
+        let ranked = rank_advisory_candidates(&snapshots, 2);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].symbol, "BTC/USDT");
+        assert_eq!(
+            ranked
+                .iter()
+                .filter(|snapshot| snapshot.symbol == "ETH/USDT")
+                .count(),
+            1
+        );
+        assert_eq!(ranked[1].price, 2_001.0);
+    }
+
+    #[tokio::test]
+    async fn advice_wave_returns_partial_quorum_without_waiting_for_straggler() {
+        let mut wave = JoinSet::new();
+        wave.spawn(async { advice("buy", 0.8, 1.0, 0.2) });
+        wave.spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            advice("sell", 0.8, 1.0, 0.2)
+        });
+        let started = Instant::now();
+        let (advices, failures, expired) =
+            collect_advice_wave(&mut wave, Instant::now() + Duration::from_secs(1), 1).await;
+        assert_eq!(advices.len(), 1);
+        assert_eq!(failures, 0);
+        assert!(!expired);
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 }

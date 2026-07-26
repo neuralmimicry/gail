@@ -104,7 +104,7 @@ Run trading tests in CI-safe mode (no libtorch / no `tch` build):
 ```bash
 scripts/test-trading-ci-safe.sh
 # equivalent:
-# cargo test --locked --lib trading::tests:: --no-default-features --features ci-trading-tests
+# cargo test --locked --lib trading:: --no-default-features --features ci-trading-tests
 ```
 
 Run the dedicated workers:
@@ -257,6 +257,9 @@ The AARNN bridge lets Gail mirror both prompt-side and response-side LLM traffic
 
 The trading bridge (`src/trading/`) is a self-contained module that runs a background tokio evaluation loop alongside all existing Gail capabilities. It is disabled by default (`trading.enabled: false`) and can be enabled without restarting or touching any other Gail functionality.
 
+The live safety model, economics assumptions, tuning guidance, and deployment
+runbook are documented in [Trading effectiveness and execution safety](docs/trading-effectiveness.md).
+
 ### Architecture
 
 ```
@@ -273,11 +276,12 @@ Gail HTTP Server
                   Every N seconds (default 60):
                   1. Fetch market snapshots + portfolio
                   2. Query Refiner for market research
-                  3. Consult all AIs in parallel (JoinSet)
+                  3. Race bounded AI advisors to deadline/quorum
                   4. Run Type-2 fuzzy inference
                   5. Blend fuzzy + AI signals → decision
-                  6. Apply risk gates → execute or hold
-                  7. Log to ring buffer; persist state
+                  6. Apply confidence + net-edge gates
+                  7. Reprice, lease intent, execute exact venue
+                  8. Resolve fixed-horizon outcomes; persist state
 ```
 
 ### Evaluation Pipeline (one cycle)
@@ -291,7 +295,7 @@ OctoBot is queried for market snapshots (price, 24 h change %, 24 h volume), por
 The highest-signal market snapshot (scored by `|Δ%| × ln(volume+1)`) is used to build a Refiner RAG query from the `research_query_template`. Gail queries the configured RAG index (`research_index_name`) and can fan out additional source-biased queries in parallel using `site:<domain>` hints (for example `bloomberg.com`) from `research_site_hints`. Refiner's `/api/rag/query` endpoint returns ranked context passages (default top 5). Gail merges the contexts, de-duplicates matches, extracts publication dates from metadata/citations/URLs where available, and prioritises the newest timestamped evidence ahead of older or undated matches before passing context to AI advisors.
 
 **Step 3 — Multi-AI advisory** (`advisor.rs`)
-`TradingAdvisor::consult_all()` fires all configured Gail provider profiles in parallel using a `tokio::task::JoinSet`. Each provider receives a structured prompt containing market data, portfolio state, and research context, and is asked to respond with:
+`TradingAdvisor::consult_all()` deterministically validates, de-duplicates, ranks, and reduces market rows before firing a bounded set of Gail provider profiles in parallel. One wall-clock round deadline covers provider ranking, the first wave, and fallbacks. Completed responses are always retained; a valid early quorum cancels stragglers, while deadline expiry records unfinished work as failed coverage. Each provider receives a compact structured prompt containing market data, portfolio state, and research context, and is asked to respond with:
 ```json
 {
   "action": "buy|sell|hold|strong_buy|strong_sell",
@@ -324,14 +328,15 @@ The fuzzy signal and AI consensus signal are blended with configurable weights (
 blended_signal     = fuzzy.signal × fuzzy_weight + ai.signal × ai_weight
 blended_confidence = fuzzy.confidence × fuzzy_weight + ai.confidence × ai_weight
 ```
-Before risk gates run, Gail optionally applies **directional ROI feedback** from recent executed trades. For the current direction (buy or sell), Gail measures whether prior decisions were directionally profitable by comparing each trade price with the next priced trade for the same symbol. Strong recent ROI performance can provide a bounded signal/confidence boost; weak performance can dampen signal/confidence to reduce repeated losing entries.
+Before risk gates run, Gail optionally applies **directional ROI feedback** from fixed-horizon markouts. Each outcome compares its fill/reference price with the exact exchange/symbol observation at `markout_horizon_seconds`, applies buy/sell direction, and subtracts modeled round-trip costs. Strong provider/symbol/regime performance can provide a bounded signal/confidence and expected-edge boost; weak performance dampens them.
 
-Three sequential risk gates are applied before a trade is placed:
+Four sequential risk gates are applied before a trade is placed:
 1. **Confidence gate**: `blended_confidence < fuzzy_confidence_threshold` → hold
-2. **Position gate**: open positions ≥ `max_open_positions` and signal is buy → hold
+2. **Position gate**: held non-cash assets ≥ `max_open_positions` and signal is buy → hold
 3. **Cooldown gate**: time since last trade < `min_trade_interval_seconds` → hold
+4. **Economics gate**: calibrated expected gross edge − round-trip fees/slippage < `minimum_net_edge_bps` → hold
 
-Trade size scales with `signal_strength × confidence` between `micro_trade_min_usd` and `micro_trade_max_usd`.
+Trade size scales with `signal_strength × confidence × net-edge strength` between `micro_trade_min_usd` and `micro_trade_max_usd`.
 
 Action thresholds on the blended signal:
 - `signal ≥ 0.65` → `strong_buy`
@@ -341,7 +346,7 @@ Action thresholds on the blended signal:
 - otherwise → `hold`
 
 **Step 6 — Execution** (`mod.rs`)
-Gail evaluates decisions and has live execution enabled by default. Execution uses resilient OctoBot endpoint orchestration in `octobot.rs`: direct `/api/orders` creation routes are preferred, with guarded `/api/user_command` fallbacks for builds that expose command bridges instead of direct order creation. For sell actions, Gail now performs a one-shot `refresh_portfolio` + portfolio refetch before skipping due to missing/non-positive base-asset balance, reducing false skips caused by stale portfolio cache.
+Gail evaluates decisions and has live execution enabled by default. Before any order it expires stale snapshots/advisories, refreshes the exact exchange/symbol price, rejects adverse drift, and rechecks expected net edge. It then refreshes exchange-scoped balances and, in strict mode, refuses venue fallback. An authority-tagged economic intent lease is atomically persisted before any mutating OctoBot endpoint. Direct `/api/orders` creation routes are preferred, with guarded endpoint-shape fallbacks only for the same explicit exchange.
 
 **Override mechanism**: if `TradingState.pending_override` is set via `POST /v1/trading/override`, the decision pipeline is bypassed and the override decision is prepared with `confidence = 1.0`. The override still requires `trading.live_execution_enabled: true` before Gail submits anything to OctoBot. The override is cleared after the attempt.
 
@@ -354,6 +359,8 @@ Gail evaluates decisions and has live execution enabled by default. Execution us
 - `last_evaluation_at` / `last_trade_at` Unix timestamps
 - `current_portfolio` — latest OctoBot portfolio snapshot
 - `open_positions` — latest open orders
+- `in_flight_order_intents` — durable authority-tagged idempotency leases
+- `outcome_ledger` — pending and resolved fixed-horizon fee-adjusted markouts
 - `recent_trades` — `VecDeque` ring buffer (default 200 entries)
 - `activity_log` — `VecDeque` ring buffer (default 1000 entries) with level, category, message, and JSON context
 - `api_schema` — adaptive OctoBot endpoint/reference schema, semantic hints, and recent automatic adjustments
@@ -362,7 +369,7 @@ Gail evaluates decisions and has live execution enabled by default. Execution us
 - `config_overrides` — runtime-mutable subset of config
 - `last_error` — most recent error string
 
-State is persisted to `data_path` (default `./data/trading_state.json`) every 5 evaluation cycles and on shutdown, and restored at startup.
+State is persisted to `data_path` (default `./data/trading_state.json`) after each evaluation, immediately after fills, before order submission when a lease is claimed, and on shutdown. It is restored at startup.
 
 Incremental market history is persisted separately in `market_datalake_file_path` (default `./data/market_datalake.jsonl`) and, when `storage.postgres_dsn` is configured, mirrored into `gail_market_snapshots` with retention pruning. Bootstrap metadata is persisted in a sidecar metadata file and optional Postgres metadata row so new-build/schema bootstrap runs only when needed. Set `GAIL_BUILD_ID` in deployment if you need deterministic build-change detection across identical package versions.
 
@@ -385,6 +392,8 @@ Incremental market history is persisted separately in `market_datalake_file_path
 | `src/trading/fuzzy.rs` | `FuzzyEngine` — Type-2 interval fuzzy logic, 25 rules, Karnik-Mendel |
 | `src/trading/advisor.rs` | `TradingAdvisor` — parallel multi-AI advisory, consensus aggregation |
 | `src/trading/decision.rs` | `DecisionEngine` — signal blending, risk gates, trade sizing |
+| `src/trading/economics.rs` | Pure fee/slippage expected-edge gate and drift calculation |
+| `src/trading/outcomes.rs` | Fixed-horizon markout ledger and bounded live calibration |
 
 OctoBot endpoint and fallback details are documented in:
 - `docs/OCTOBOT_CONNECTIVITY.md`
@@ -444,6 +453,11 @@ trading:
   admin_client_ids: ["pbisaacs"]          # write-access list
   evaluation_interval_seconds: 60         # minimum 10
   max_parallel_advisors: 5               # 1–20
+  max_parallel_symbol_evaluations: 2     # bounded map/reduce fan-out
+  advisor_timeout_seconds: 30            # per provider
+  advisor_round_timeout_seconds: 45      # entire round including fallback
+  advisor_early_quorum: 2                # parsed responses required
+  advisory_candidate_limit: 8            # deterministic top-N prompt rows
   micro_trade_max_usd: 25.0              # per-trade ceiling
   micro_trade_min_usd: 1.0               # per-trade floor
   max_open_positions: 5                  # 1–50
@@ -451,6 +465,19 @@ trading:
   target_exchanges: []                   # empty = all available
   target_currencies: []                  # empty = all available
   fuzzy_confidence_threshold: 0.65       # minimum blended confidence to trade
+  market_snapshot_ttl_seconds: 90
+  advisory_ttl_seconds: 60
+  max_reprice_drift_bps: 35
+  estimated_fee_bps: 10                 # one-way
+  estimated_slippage_bps: 12            # one-way
+  expected_move_bps: 250                # perfect signal/confidence gross move
+  minimum_net_edge_bps: 15
+  strict_exchange_selection: true
+  execution_authority: "gail"
+  execution_lease_seconds: 180
+  markout_horizon_seconds: 900
+  markout_ledger_size: 2000
+  markout_calibration_min_samples: 8
   fuzzy_weight: 0.4                      # fuzzy vs AI blend weight
   decision_roi_feedback_enabled: true
   decision_roi_feedback_lookback_trades: 120

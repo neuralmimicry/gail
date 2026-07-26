@@ -38,6 +38,20 @@ pub struct TradingConfig {
     /// multiplication from overwhelming provider queues.
     pub max_parallel_symbol_evaluations: usize,
 
+    /// Wall-clock budget for an entire advisor round, including fallbacks.
+    /// This is deliberately separate from the per-provider timeout: a slow
+    /// provider must never extend a trading decision beyond its useful life.
+    pub advisor_round_timeout_seconds: f64,
+
+    /// Parsed advisor responses required before an early, usable consensus can
+    /// be returned. Remaining stragglers are cancelled once quorum is reached.
+    pub advisor_early_quorum: usize,
+
+    /// Maximum number of deterministically ranked market rows included in one
+    /// advisory prompt. This bounds prompt size and keeps attention on the
+    /// highest-quality candidates.
+    pub advisory_candidate_limit: usize,
+
     /// Maximum USD value per micro-trade.
     pub micro_trade_max_usd: f64,
 
@@ -88,6 +102,54 @@ pub struct TradingConfig {
 
     /// Combined fuzzy+AI confidence required before placing a trade (0.0–1.0).
     pub fuzzy_confidence_threshold: f64,
+
+    // -----------------------------------------------------------------------
+    // Execution economics and freshness
+    // -----------------------------------------------------------------------
+    /// Maximum age of the market observation used to create a decision.
+    pub market_snapshot_ttl_seconds: f64,
+
+    /// Maximum wall-clock age of a completed advisory decision at execution.
+    pub advisory_ttl_seconds: f64,
+
+    /// Maximum adverse price movement between decision and order submission.
+    pub max_reprice_drift_bps: f64,
+
+    /// Estimated one-way taker fee used by the pre-trade economics gate.
+    pub estimated_fee_bps: f64,
+
+    /// Estimated one-way slippage allowance used by the economics gate.
+    pub estimated_slippage_bps: f64,
+
+    /// Gross move represented by a perfect signal/confidence observation.
+    pub expected_move_bps: f64,
+
+    /// Required expected profit after fees, slippage, and calibration.
+    pub minimum_net_edge_bps: f64,
+
+    /// Reject exchange rerouting at execution time. The decision exchange must
+    /// have a fresh, exchange-scoped balance and support the selected symbol.
+    pub strict_exchange_selection: bool,
+
+    /// Stable identifier for the only component permitted to create orders.
+    /// It is persisted with intent leases for restart-safe idempotency.
+    pub execution_authority: String,
+
+    /// Duration of a durable in-flight order intent lease.
+    pub execution_lease_seconds: f64,
+
+    // -----------------------------------------------------------------------
+    // Fixed-horizon outcome calibration
+    // -----------------------------------------------------------------------
+    /// Seconds after a fill at which fee-adjusted markout ROI is measured.
+    pub markout_horizon_seconds: u64,
+
+    /// Maximum persisted pending/resolved outcome observations.
+    pub markout_ledger_size: usize,
+
+    /// Minimum resolved samples before provider/symbol/regime calibration is
+    /// allowed to alter expected edge and position size.
+    pub markout_calibration_min_samples: usize,
 
     /// Template for Refiner research queries.
     /// Supports `{currency}`, `{exchange}`, `{date}` placeholders.
@@ -269,6 +331,9 @@ impl Default for TradingConfig {
             evaluation_interval_seconds: 60,
             max_parallel_advisors: 5,
             max_parallel_symbol_evaluations: 2,
+            advisor_round_timeout_seconds: 45.0,
+            advisor_early_quorum: 2,
+            advisory_candidate_limit: 8,
             micro_trade_max_usd: 25.0,
             micro_trade_min_usd: 1.0,
             max_open_positions: 5,
@@ -286,6 +351,19 @@ impl Default for TradingConfig {
             portfolio_pruning_candidate_pool_size: 12,
             portfolio_pruning_min_composite_score: 0.55,
             fuzzy_confidence_threshold: 0.65,
+            market_snapshot_ttl_seconds: 90.0,
+            advisory_ttl_seconds: 60.0,
+            max_reprice_drift_bps: 35.0,
+            estimated_fee_bps: 10.0,
+            estimated_slippage_bps: 12.0,
+            expected_move_bps: 250.0,
+            minimum_net_edge_bps: 15.0,
+            strict_exchange_selection: true,
+            execution_authority: "gail".to_string(),
+            execution_lease_seconds: 180.0,
+            markout_horizon_seconds: 900,
+            markout_ledger_size: 2_000,
+            markout_calibration_min_samples: 8,
             research_query_template: "cryptocurrency market sentiment {currency} {exchange} {date}"
                 .to_string(),
             research_index_name: "crypto".to_string(),
@@ -391,6 +469,26 @@ impl TradingConfig {
             self.portfolio_pruning_min_composite_score.clamp(0.0, 2.0);
         self.max_parallel_advisors = self.max_parallel_advisors.clamp(1, 20);
         self.max_parallel_symbol_evaluations = self.max_parallel_symbol_evaluations.clamp(1, 16);
+        self.advisor_round_timeout_seconds = self.advisor_round_timeout_seconds.clamp(1.0, 900.0);
+        self.advisor_early_quorum = self
+            .advisor_early_quorum
+            .clamp(1, self.max_parallel_advisors.max(1));
+        self.advisory_candidate_limit = self.advisory_candidate_limit.clamp(1, 20);
+        self.market_snapshot_ttl_seconds = self.market_snapshot_ttl_seconds.clamp(1.0, 900.0);
+        self.advisory_ttl_seconds = self.advisory_ttl_seconds.clamp(1.0, 900.0);
+        self.max_reprice_drift_bps = self.max_reprice_drift_bps.clamp(1.0, 2_500.0);
+        self.estimated_fee_bps = self.estimated_fee_bps.clamp(0.0, 500.0);
+        self.estimated_slippage_bps = self.estimated_slippage_bps.clamp(0.0, 500.0);
+        self.expected_move_bps = self.expected_move_bps.clamp(1.0, 10_000.0);
+        self.minimum_net_edge_bps = self.minimum_net_edge_bps.clamp(0.0, 2_500.0);
+        self.execution_authority = self.execution_authority.trim().to_ascii_lowercase();
+        if self.execution_authority.is_empty() {
+            self.execution_authority = "gail".to_string();
+        }
+        self.execution_lease_seconds = self.execution_lease_seconds.clamp(30.0, 3_600.0);
+        self.markout_horizon_seconds = self.markout_horizon_seconds.clamp(60, 86_400);
+        self.markout_ledger_size = self.markout_ledger_size.clamp(100, 50_000);
+        self.markout_calibration_min_samples = self.markout_calibration_min_samples.clamp(3, 1_000);
         self.max_open_positions = self.max_open_positions.clamp(1, 50);
         self.log_ring_size = self.log_ring_size.clamp(10, 10_000);
         self.trade_ring_size = self.trade_ring_size.clamp(10, 5_000);

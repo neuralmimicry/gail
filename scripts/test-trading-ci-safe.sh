@@ -10,4 +10,7 @@ REPO_ROOT=$(nm_repo_root)
 cd "$REPO_ROOT"
 
 nm_log 'running libtorch-free trading test profile'
-nm_run cargo test --locked --lib trading::tests:: --no-default-features --features ci-trading-tests
+# Run every test nested under `trading`, including unit tests colocated with
+# economics, outcomes, advisor, datalake, and execution modules. The previous
+# `trading::tests::` filter silently excluded those modular safety checks.
+nm_run cargo test --locked --lib trading:: --no-default-features --features ci-trading-tests

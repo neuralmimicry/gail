@@ -13,6 +13,7 @@ use uuid::Uuid;
 use super::backtest::BacktestSummary;
 use super::config::TradingConfigOverride;
 use super::octobot::{OctobotExchange, OctobotOrder, OctobotPortfolio};
+use super::outcomes::OutcomeLedger;
 use crate::adaptive_schema::AdaptiveApiSchema;
 
 fn now_ts() -> f64 {
@@ -114,6 +115,19 @@ pub struct ExecutedTrade {
     pub ai_confidence: f64,
 }
 
+/// Durable ownership record for an economic order intent.
+///
+/// Unlike the previous process-local timestamp map, this value is serialized
+/// before order submission. A restarted bridge therefore observes the lease
+/// and cannot immediately repeat an ambiguous or still-running order.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ExecutionIntentClaim {
+    pub authority: String,
+    pub claimed_at: f64,
+    pub expires_at: f64,
+}
+
 // ---------------------------------------------------------------------------
 // Override request
 // ---------------------------------------------------------------------------
@@ -175,6 +189,9 @@ pub struct TradingStatusSnapshot {
     pub api_schema_version: u64,
     pub api_schema_hints: usize,
     pub recent_api_adjustments: usize,
+    pub active_intent_leases: usize,
+    pub pending_markouts: usize,
+    pub resolved_markouts: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -211,13 +228,34 @@ pub struct TradingState {
     /// Fingerprints for external OctoBot log rows already copied into Gail's log.
     #[serde(default)]
     pub observed_external_log_fingerprints: VecDeque<String>,
-    /// Economic order intent → claim timestamp. This is runtime-only: filled
-    /// trades provide the durable deduplication record after restart.
-    #[serde(skip, default)]
-    pub in_flight_order_intents: HashMap<String, f64>,
+    /// Durable economic order intent leases, persisted before a mutating call.
+    #[serde(default)]
+    pub in_flight_order_intents: HashMap<String, ExecutionIntentClaim>,
+    /// Fixed-horizon, fee-adjusted outcomes used for live calibration.
+    #[serde(default)]
+    pub outcome_ledger: OutcomeLedger,
 }
 
 impl TradingState {
+    /// Count economically held, non-cash assets. Open orders are deliberately
+    /// excluded: an order is not a position, and treating the two as the same
+    /// caused both premature gating and unbounded exposure after filled orders.
+    pub fn open_position_count(&self) -> usize {
+        let Some(portfolio) = self.current_portfolio.as_ref() else {
+            return 0;
+        };
+        portfolio
+            .currencies
+            .iter()
+            .filter(|(asset, balance)| {
+                !is_cash_asset(asset)
+                    && balance.total.is_finite()
+                    && balance.total > 0.0
+                    && balance.value_usd.is_none_or(|value| value > 0.01)
+            })
+            .count()
+    }
+
     pub fn new(log_ring_size: usize, trade_ring_size: usize) -> Self {
         Self {
             paused: false,
@@ -241,6 +279,7 @@ impl TradingState {
             api_schema: AdaptiveApiSchema::default(),
             observed_external_log_fingerprints: VecDeque::with_capacity(500),
             in_flight_order_intents: HashMap::new(),
+            outcome_ledger: OutcomeLedger::default(),
         }
     }
 
@@ -289,7 +328,7 @@ impl TradingState {
             last_trade_at: self.last_trade_at,
             evaluation_count: self.evaluation_count,
             trade_count: self.trade_count,
-            open_positions: self.open_positions.len(),
+            open_positions: self.open_position_count(),
             last_error: self.last_error.clone(),
             has_pending_override: self.pending_override.is_some(),
             config_overrides_active: self.config_overrides.is_some(),
@@ -301,6 +340,19 @@ impl TradingState {
             api_schema_version: self.api_schema.version,
             api_schema_hints: self.api_schema.semantic_hints.len(),
             recent_api_adjustments: self.api_schema.recent_adjustments.len(),
+            active_intent_leases: self.in_flight_order_intents.len(),
+            pending_markouts: self
+                .outcome_ledger
+                .observations
+                .iter()
+                .filter(|item| item.resolved_at.is_none())
+                .count(),
+            resolved_markouts: self
+                .outcome_ledger
+                .observations
+                .iter()
+                .filter(|item| item.resolved_at.is_some())
+                .count(),
         }
     }
 
@@ -333,6 +385,13 @@ impl TradingState {
             .push_back(fingerprint);
         true
     }
+}
+
+fn is_cash_asset(asset: &str) -> bool {
+    matches!(
+        asset.trim().to_ascii_uppercase().as_str(),
+        "USD" | "USDT" | "USDC" | "BUSD" | "DAI" | "EUR" | "GBP"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -381,53 +440,55 @@ impl SharedTradingState {
 
     /// Persist state snapshot to disk asynchronously (best-effort).
     pub async fn persist(&self, path: &PathBuf) {
+        if let Err(err) = self.persist_checked(path).await {
+            warn!(
+                "trading: failed to persist state to {}: {err}",
+                path.display()
+            );
+        }
+    }
+
+    /// Atomically persist state and report failure to safety-critical callers.
+    ///
+    /// Most periodic snapshots are best-effort, but order execution must prove
+    /// its intent lease is durable before invoking a mutating endpoint.
+    pub async fn persist_checked(&self, path: &PathBuf) -> Result<(), String> {
         // Serialize writers so an older concurrent snapshot cannot rename over
         // a newer fill/evaluation snapshot after finishing its disk write.
         let _persist_guard = self.1.lock().await;
         let snapshot = {
             let state = self.0.lock().await;
-            match serde_json::to_string_pretty(&*state) {
-                Ok(json) => json,
-                Err(err) => {
-                    warn!(
-                        "trading: failed to serialise state for persistence: {}",
-                        err
-                    );
-                    return;
-                }
-            }
+            serde_json::to_string_pretty(&*state)
+                .map_err(|err| format!("failed to serialise state: {err}"))?
         };
-        if let Some(parent) = path.parent()
-            && let Err(err) = fs::create_dir_all(parent).await
-        {
-            warn!(
-                "trading: failed to create state dir {}: {}",
-                parent.display(),
-                err
-            );
-            return;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await.map_err(|err| {
+                format!(
+                    "failed to create state directory {}: {err}",
+                    parent.display()
+                )
+            })?;
         }
         let file_name = path
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("trading_state.json");
         let temporary_path = path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
-        if let Err(err) = fs::write(&temporary_path, snapshot).await {
-            warn!(
-                "trading: failed to write state to {}: {}",
-                temporary_path.display(),
-                err
-            );
-        } else if let Err(err) = fs::rename(&temporary_path, path).await {
-            warn!(
-                "trading: failed to atomically replace state {}: {}",
-                path.display(),
-                err
-            );
+        fs::write(&temporary_path, snapshot).await.map_err(|err| {
+            format!(
+                "failed to write temporary state {}: {err}",
+                temporary_path.display()
+            )
+        })?;
+        if let Err(err) = fs::rename(&temporary_path, path).await {
             let _ = fs::remove_file(&temporary_path).await;
-        } else {
-            debug!("trading: state persisted to {}", path.display());
+            return Err(format!(
+                "failed to atomically replace state {}: {err}",
+                path.display()
+            ));
         }
+        debug!("trading: state persisted to {}", path.display());
+        Ok(())
     }
 
     /// Restore state from disk if the file exists (best-effort, partial restore).
@@ -450,6 +511,8 @@ impl SharedTradingState {
                     state.api_schema = restored.api_schema;
                     state.observed_external_log_fingerprints =
                         restored.observed_external_log_fingerprints;
+                    state.in_flight_order_intents = restored.in_flight_order_intents;
+                    state.outcome_ledger = restored.outcome_ledger;
                     state.log_info("startup", "Restored trading state from disk");
                     drop(state);
                     if let Some(snapshot) = repaired_snapshot {

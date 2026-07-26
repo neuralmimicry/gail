@@ -237,6 +237,11 @@ trading:
   # Discovery/pruning evaluates symbols concurrently, while this bound keeps
   # the nested advisor fan-out within local inference capacity.
   max_parallel_symbol_evaluations: 2
+  # Each advisory wave is deadline-bound independently of slow provider HTTP
+  # timeouts. Return partial quorum and cancel stragglers while the signal is fresh.
+  advisor_round_timeout_seconds: 45
+  advisor_early_quorum: 2
+  advisory_candidate_limit: 8
   micro_trade_max_usd: ${GAIL_TRADING_MAX_USD}
   micro_trade_min_usd: ${GAIL_TRADING_MIN_USD}
   max_open_positions: ${GAIL_TRADING_MAX_POSITIONS}
@@ -244,6 +249,21 @@ trading:
   target_exchanges: []
   target_currencies: []
   fuzzy_confidence_threshold: ${GAIL_TRADING_CONFIDENCE_THRESHOLD}
+  # Cost-aware execution and stale-signal protection. Values are basis points
+  # (1bp = 0.01%) and model a complete enter/exit lifecycle.
+  market_snapshot_ttl_seconds: 90
+  advisory_ttl_seconds: 60
+  max_reprice_drift_bps: 35
+  estimated_fee_bps: 10
+  estimated_slippage_bps: 12
+  expected_move_bps: 250
+  minimum_net_edge_bps: 15
+  strict_exchange_selection: true
+  execution_authority: "gail"
+  execution_lease_seconds: 180
+  markout_horizon_seconds: 900
+  markout_ledger_size: 2000
+  markout_calibration_min_samples: 8
   research_query_template: "cryptocurrency market sentiment {currency} {exchange} {date}"
   research_index_name: "crypto"
   research_site_hints: ["bloomberg.com", "reuters.com", "cnbc.com"]

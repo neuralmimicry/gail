@@ -19,9 +19,12 @@ mod tests {
     use crate::trading::degraded_live_execution_reason;
     use crate::trading::fuzzy::{FuzzyEngine, FuzzyInputs};
     use crate::trading::octobot::{
-        CurrencyBalance, MarketSnapshot, OctobotExchange, OctobotOrder, OctobotPortfolio,
+        CurrencyBalance, MarketSnapshot, OctobotExchange, OctobotPortfolio,
     };
-    use crate::trading::state::{ExecutedTrade, SharedTradingState, TradeAction, TradeOverride};
+    use crate::trading::outcomes::TradeMarkout;
+    use crate::trading::state::{
+        ExecutedTrade, ExecutionIntentClaim, SharedTradingState, TradeAction, TradeOverride,
+    };
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -254,39 +257,30 @@ mod tests {
         }
     }
 
-    fn make_open_order(id: &str) -> OctobotOrder {
-        OctobotOrder {
-            id: id.to_string(),
-            exchange: "binance".to_string(),
-            symbol: "BTC/USDT".to_string(),
-            side: "buy".to_string(),
-            order_type: "limit".to_string(),
-            amount: 0.0001,
-            price: Some(50000.0),
-            status: "open".to_string(),
-            timestamp: Some(1_700_000_000.0),
-        }
-    }
-
-    fn make_executed_trade(
-        ts: f64,
+    fn record_resolved_markouts(
+        state: &mut crate::trading::state::TradingState,
         symbol: &str,
         action: TradeAction,
-        price: f64,
-    ) -> ExecutedTrade {
-        ExecutedTrade {
-            ts,
-            exchange: "binance".to_string(),
-            symbol: symbol.to_string(),
-            action,
-            amount_usd: 10.0,
-            price: Some(price),
-            order_id: Some(format!("test-{ts}")),
-            confidence: 0.75,
-            rationale: "historical test trade".to_string(),
-            ai_votes: json!({}),
-            fuzzy_confidence: 0.7,
-            ai_confidence: 0.8,
+        net_returns_bps: &[f64],
+    ) {
+        for (index, net_return_bps) in net_returns_bps.iter().copied().enumerate() {
+            state.outcome_ledger.record(
+                TradeMarkout {
+                    order_id: format!("markout-{index}"),
+                    executed_at: index as f64,
+                    due_at: index as f64,
+                    resolved_at: Some(index as f64 + 1.0),
+                    exchange: "binance".to_string(),
+                    symbol: symbol.to_string(),
+                    action: action.clone(),
+                    amount_usd: 10.0,
+                    entry_price: 100.0,
+                    observed_price: Some(100.0 * (1.0 + net_return_bps / 10_000.0)),
+                    net_directional_return_bps: Some(net_return_bps),
+                    ..TradeMarkout::default()
+                },
+                100,
+            );
         }
     }
 
@@ -813,7 +807,29 @@ mod tests {
         state.evaluation_count = 7;
         state.trade_count = 3;
         state.paused = true;
-        state.open_positions = vec![make_open_order("o1"), make_open_order("o2")];
+        state.current_portfolio = Some(OctobotPortfolio {
+            currencies: [
+                (
+                    "BTC".to_string(),
+                    CurrencyBalance {
+                        total: 0.1,
+                        value_usd: Some(5_000.0),
+                        ..CurrencyBalance::default()
+                    },
+                ),
+                (
+                    "ETH".to_string(),
+                    CurrencyBalance {
+                        total: 1.0,
+                        value_usd: Some(3_000.0),
+                        ..CurrencyBalance::default()
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..OctobotPortfolio::default()
+        });
         let snap = state.status_snapshot(true);
         assert!(snap.enabled);
         assert!(snap.paused);
@@ -866,22 +882,49 @@ mod tests {
                 fuzzy_confidence: 0.6,
                 ai_confidence: 0.9,
             });
+            s.in_flight_order_intents.insert(
+                "BUY|ETH/USDT".to_string(),
+                ExecutionIntentClaim {
+                    authority: "gail".to_string(),
+                    claimed_at: 99_999.0,
+                    expires_at: 100_179.0,
+                },
+            );
+            s.outcome_ledger.record(
+                TradeMarkout {
+                    order_id: "test-order".to_string(),
+                    executed_at: 99_999.0,
+                    due_at: 100_899.0,
+                    exchange: "kraken".to_string(),
+                    symbol: "ETH/USDT".to_string(),
+                    action: TradeAction::Buy,
+                    amount_usd: 5.0,
+                    entry_price: 3_000.0,
+                    ..TradeMarkout::default()
+                },
+                100,
+            );
         }
 
-        let tmp = PathBuf::from("/tmp/gail_trading_test_state.json");
-        state.persist(&tmp).await;
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        let tmp_path = tmp.path().to_path_buf();
+        state
+            .persist_checked(&tmp_path)
+            .await
+            .expect("state should persist atomically");
 
         // Restore into a fresh state.
         let restored = SharedTradingState::new(100, 50);
-        restored.restore(&tmp).await;
+        restored.restore(&tmp_path).await;
         let s = restored.0.lock().await;
         assert_eq!(s.evaluation_count, 42);
         assert_eq!(s.trade_count, 7);
         assert_eq!(s.recent_trades.len(), 1);
         assert_eq!(s.recent_trades[0].exchange, "kraken");
-
-        // Clean up.
-        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(s.in_flight_order_intents.len(), 1);
+        assert_eq!(s.in_flight_order_intents["BUY|ETH/USDT"].authority, "gail");
+        assert_eq!(s.outcome_ledger.observations.len(), 1);
+        assert_eq!(s.outcome_ledger.observations[0].order_id, "test-order");
     }
 
     #[tokio::test]
@@ -1420,7 +1463,7 @@ mod tests {
     }
 
     #[test]
-    fn decision_confidence_gate_relaxes_when_advisors_are_degraded_but_responding() {
+    fn decision_confidence_gate_tightens_when_advisors_are_degraded_but_responding() {
         let engine = DecisionEngine::new(0.5);
         use crate::trading::fuzzy::FuzzyDecision;
         let fuzzy = FuzzyDecision {
@@ -1450,10 +1493,8 @@ mod tests {
         };
         let snap = make_snapshot("binance", "BTC/USDT", 50000.0, 5.0, 1_000_000.0);
         let decision = engine.decide(&fuzzy, &consensus, Some(&snap), &state, &config);
-        assert!(
-            matches!(decision.action, TradeAction::Buy | TradeAction::StrongBuy),
-            "degraded advisor health should relax confidence gate enough for strong signals"
-        );
+        assert_eq!(decision.action, TradeAction::Hold);
+        assert!(decision.rationale.contains("adaptive threshold"));
     }
 
     #[test]
@@ -1504,7 +1545,29 @@ mod tests {
             max_open_positions: 2,
             ..TradingConfig::default()
         };
-        state.open_positions = vec![make_open_order("o1"), make_open_order("o2")];
+        state.current_portfolio = Some(OctobotPortfolio {
+            currencies: [
+                (
+                    "BTC".to_string(),
+                    CurrencyBalance {
+                        total: 0.1,
+                        value_usd: Some(5_000.0),
+                        ..CurrencyBalance::default()
+                    },
+                ),
+                (
+                    "ETH".to_string(),
+                    CurrencyBalance {
+                        total: 1.0,
+                        value_usd: Some(3_000.0),
+                        ..CurrencyBalance::default()
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..OctobotPortfolio::default()
+        });
         let snap = make_snapshot("binance", "BTC/USDT", 50000.0, 5.0, 2_000_000.0);
         let decision = engine.decide(&fuzzy, &consensus, Some(&snap), &state, &config);
         assert_eq!(
@@ -1759,16 +1822,12 @@ mod tests {
         };
         let snap = make_snapshot("binance", "BTC/USDT", 50_000.0, 2.0, 1_000_000.0);
         let mut state = make_default_state();
-        for trade in [
-            make_executed_trade(1.0, "BTC/USDT", TradeAction::Buy, 100.0),
-            make_executed_trade(2.0, "BTC/USDT", TradeAction::Sell, 95.0),
-            make_executed_trade(3.0, "BTC/USDT", TradeAction::Buy, 110.0),
-            make_executed_trade(4.0, "BTC/USDT", TradeAction::Sell, 104.0),
-            make_executed_trade(5.0, "BTC/USDT", TradeAction::Buy, 120.0),
-            make_executed_trade(6.0, "BTC/USDT", TradeAction::Sell, 114.0),
-        ] {
-            state.record_trade(trade);
-        }
+        record_resolved_markouts(
+            &mut state,
+            "BTC/USDT",
+            TradeAction::Buy,
+            &[-500.0, -545.0, -500.0],
+        );
 
         let disabled_config = TradingConfig {
             enabled: true,
@@ -1778,6 +1837,9 @@ mod tests {
             decision_roi_feedback_min_samples: 2,
             decision_roi_feedback_lookback_trades: 20,
             decision_roi_feedback_max_signal_adjustment: 0.25,
+            estimated_fee_bps: 0.0,
+            estimated_slippage_bps: 0.0,
+            minimum_net_edge_bps: 0.0,
             ..TradingConfig::default()
         };
         let enabled_config = TradingConfig {
@@ -1827,16 +1889,12 @@ mod tests {
         };
         let snap = make_snapshot("binance", "BTC/USDT", 50_000.0, 1.0, 1_000_000.0);
         let mut state = make_default_state();
-        for trade in [
-            make_executed_trade(1.0, "BTC/USDT", TradeAction::Buy, 100.0),
-            make_executed_trade(2.0, "BTC/USDT", TradeAction::Sell, 110.0),
-            make_executed_trade(3.0, "BTC/USDT", TradeAction::Buy, 105.0),
-            make_executed_trade(4.0, "BTC/USDT", TradeAction::Sell, 118.0),
-            make_executed_trade(5.0, "BTC/USDT", TradeAction::Buy, 115.0),
-            make_executed_trade(6.0, "BTC/USDT", TradeAction::Sell, 126.0),
-        ] {
-            state.record_trade(trade);
-        }
+        record_resolved_markouts(
+            &mut state,
+            "BTC/USDT",
+            TradeAction::Buy,
+            &[1_000.0, 1_200.0, 950.0],
+        );
 
         let disabled_config = TradingConfig {
             enabled: true,
@@ -1846,6 +1904,9 @@ mod tests {
             decision_roi_feedback_min_samples: 2,
             decision_roi_feedback_lookback_trades: 20,
             decision_roi_feedback_max_signal_adjustment: 0.25,
+            estimated_fee_bps: 0.0,
+            estimated_slippage_bps: 0.0,
+            minimum_net_edge_bps: 0.0,
             ..TradingConfig::default()
         };
         let enabled_config = TradingConfig {
@@ -1895,16 +1956,12 @@ mod tests {
         };
         let snap = make_snapshot("binance", "BTC/USDT", 50_000.0, -2.0, 1_000_000.0);
         let mut state = make_default_state();
-        for trade in [
-            make_executed_trade(1.0, "BTC/USDT", TradeAction::Sell, 100.0),
-            make_executed_trade(2.0, "BTC/USDT", TradeAction::Buy, 106.0),
-            make_executed_trade(3.0, "BTC/USDT", TradeAction::Sell, 110.0),
-            make_executed_trade(4.0, "BTC/USDT", TradeAction::Buy, 118.0),
-            make_executed_trade(5.0, "BTC/USDT", TradeAction::Sell, 120.0),
-            make_executed_trade(6.0, "BTC/USDT", TradeAction::Buy, 129.0),
-        ] {
-            state.record_trade(trade);
-        }
+        record_resolved_markouts(
+            &mut state,
+            "BTC/USDT",
+            TradeAction::Sell,
+            &[-600.0, -725.0, -750.0],
+        );
 
         let disabled_config = TradingConfig {
             enabled: true,
@@ -1914,6 +1971,9 @@ mod tests {
             decision_roi_feedback_min_samples: 2,
             decision_roi_feedback_lookback_trades: 20,
             decision_roi_feedback_max_signal_adjustment: 0.25,
+            estimated_fee_bps: 0.0,
+            estimated_slippage_bps: 0.0,
+            minimum_net_edge_bps: 0.0,
             ..TradingConfig::default()
         };
         let enabled_config = TradingConfig {
@@ -4042,8 +4102,10 @@ mod tests {
             .await;
 
         let client = OctobotClient::new(&server.uri(), None, 10.0);
-        let availability =
-            crate::trading::ensure_sell_balance_available(&client, &state, "ETH", "ETH/USDT").await;
+        let availability = crate::trading::ensure_sell_balance_available(
+            &client, &state, "binance", "ETH", "ETH/USDT", false,
+        )
+        .await;
 
         assert!(
             matches!(

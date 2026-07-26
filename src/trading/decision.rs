@@ -7,9 +7,11 @@ use tracing::debug;
 
 use super::advisor::AiConsensus;
 use super::config::TradingConfig;
+use super::economics::{TradeEconomics, estimate_trade_economics};
 use super::fuzzy::FuzzyDecision;
 use super::octobot::MarketSnapshot;
-use super::state::{ExecutedTrade, TradeAction, TradingState};
+use super::outcomes::OutcomeLedger;
+use super::state::{TradeAction, TradingState};
 
 fn now_ts() -> f64 {
     SystemTime::now()
@@ -52,6 +54,18 @@ pub struct TradeDecision {
     pub roi_feedback_win_rate: Option<f64>,
     /// Whether an operator override was applied.
     pub override_applied: bool,
+    /// Wall-clock time at which the advisory decision was materialized.
+    pub created_at: f64,
+    /// Timestamp of the market observation underlying the decision.
+    pub market_fetched_at: Option<f64>,
+    /// Price used to calculate signal economics before immediate repricing.
+    pub reference_price: Option<f64>,
+    /// Fee/slippage-aware expected edge used by gating and sizing.
+    pub economics: TradeEconomics,
+    /// Parsed provider/model identities that contributed to consensus.
+    pub provider_keys: Vec<String>,
+    /// Compact market regime label used by outcome calibration.
+    pub market_regime: String,
 }
 
 impl TradeDecision {
@@ -75,6 +89,12 @@ impl TradeDecision {
             roi_feedback_avg_directional_roi: None,
             roi_feedback_win_rate: None,
             override_applied: false,
+            created_at: now_ts(),
+            market_fetched_at: None,
+            reference_price: None,
+            economics: TradeEconomics::default(),
+            provider_keys: Vec::new(),
+            market_regime: "unknown".to_string(),
         }
     }
 }
@@ -126,7 +146,7 @@ impl DecisionEngine {
         // have been consistently poor, Gail dampens new signals/confidence.
         // If they have performed well, Gail allows a bounded boost.
         let roi_feedback = roi_feedback_adjustment(
-            &state.recent_trades,
+            &state.outcome_ledger,
             best_market.map(|market| market.symbol.as_str()),
             base_blended_signal,
             &effective_config,
@@ -184,7 +204,7 @@ impl DecisionEngine {
         }
 
         // Open position gate.
-        let open = state.open_positions.len();
+        let open = state.open_position_count();
         if open >= effective_config.max_open_positions && blended_signal > 0.0 {
             return TradeDecision {
                 action: TradeAction::Hold,
@@ -250,10 +270,63 @@ impl DecisionEngine {
             }
         };
 
+        let provider_keys = consensus
+            .advices
+            .iter()
+            .filter(|advice| advice.parsed_ok)
+            .map(|advice| {
+                advice.model.as_ref().map_or_else(
+                    || advice.provider.clone(),
+                    |model| format!("{}/{}", advice.provider, model),
+                )
+            })
+            .collect::<Vec<_>>();
+        let market_regime = market_regime_label(best_market);
+        let calibration = state.outcome_ledger.calibration_for(
+            &symbol,
+            &provider_keys,
+            &market_regime,
+            config.markout_calibration_min_samples,
+        );
+        let economics = estimate_trade_economics(
+            blended_signal.abs(),
+            blended_confidence,
+            calibration.multiplier,
+            config,
+        );
+        if !matches!(action, TradeAction::Hold) && !economics.is_worthwhile() {
+            return TradeDecision {
+                action: TradeAction::Hold,
+                exchange,
+                symbol,
+                confidence: blended_confidence,
+                rationale: format!(
+                    "Expected net edge {:.1}bps below required {:.1}bps (gross {:.1}bps, costs {:.1}bps, calibration {:.2}x)",
+                    economics.expected_net_edge_bps,
+                    economics.required_net_edge_bps,
+                    economics.expected_gross_edge_bps,
+                    economics.estimated_round_trip_cost_bps,
+                    economics.calibration_multiplier,
+                ),
+                fuzzy_signal: fuzzy.signal,
+                fuzzy_confidence: fuzzy.confidence,
+                ai_signal: consensus.signal,
+                ai_confidence: consensus.confidence,
+                blended_signal,
+                economics,
+                provider_keys,
+                market_regime,
+                market_fetched_at: best_market.map(|market| market.fetched_at),
+                reference_price: best_market.map(|market| market.price),
+                ..TradeDecision::hold("")
+            };
+        }
+
         // Size the trade.
         let amount_usd = size_trade(
             blended_signal.abs(),
             blended_confidence,
+            economics.size_multiplier(),
             effective_config.micro_trade_min_usd,
             effective_config.micro_trade_max_usd,
         );
@@ -297,6 +370,12 @@ impl DecisionEngine {
                 .map(|adjustment| adjustment.avg_directional_roi),
             roi_feedback_win_rate: roi_feedback.as_ref().map(|adjustment| adjustment.win_rate),
             override_applied: false,
+            created_at: now_ts(),
+            market_fetched_at: best_market.map(|market| market.fetched_at),
+            reference_price: best_market.map(|market| market.price),
+            economics,
+            provider_keys,
+            market_regime,
         }
     }
 
@@ -335,6 +414,12 @@ impl DecisionEngine {
             roi_feedback_avg_directional_roi: None,
             roi_feedback_win_rate: None,
             override_applied: true,
+            created_at: now_ts(),
+            market_fetched_at: None,
+            reference_price: None,
+            economics: TradeEconomics::default(),
+            provider_keys: Vec::new(),
+            market_regime: "operator_override".to_string(),
         }
     }
 }
@@ -391,23 +476,23 @@ fn adaptive_confidence_gate(
         .unwrap_or(0.5);
 
     let mut threshold = base_threshold;
-    let should_relax = responders > 0 && (failures > 0 || responders < 2);
-    if should_relax {
+    let should_tighten = responders == 0 || failures > 0 || responders < 2;
+    if should_tighten {
         let responder_depth = (responders as f64 / 3.0).clamp(0.0, 1.0);
         let degradation = ((1.0 - coverage) * 0.45
             + (1.0 - responder_depth) * 0.30
             + (1.0 - agreement) * 0.15
             + average_risk * 0.10)
             .clamp(0.0, 1.0);
-        let floor = (base_threshold * 0.68).clamp(0.42, 0.70);
-        threshold = base_threshold - (base_threshold - floor) * degradation;
-        if average_risk >= 0.80 {
-            threshold = threshold.max(base_threshold * 0.95);
+        let maximum_penalty = (1.0 - base_threshold).min(0.22);
+        threshold = base_threshold + maximum_penalty * degradation;
+        if responders == 0 {
+            threshold = 1.0;
         }
     }
 
     AdaptiveConfidenceGate {
-        threshold: threshold.clamp(0.35, 0.95),
+        threshold: threshold.clamp(base_threshold, 1.0),
         base_threshold,
         coverage,
         responders,
@@ -506,7 +591,7 @@ struct RoiFeedbackAdjustment {
 }
 
 fn roi_feedback_adjustment(
-    trades: &std::collections::VecDeque<ExecutedTrade>,
+    outcomes: &OutcomeLedger,
     preferred_symbol: Option<&str>,
     signal: f64,
     config: &EffectiveConfig,
@@ -518,11 +603,11 @@ fn roi_feedback_adjustment(
     let lookback = config.decision_roi_feedback_lookback_trades.max(2);
     let min_samples = config.decision_roi_feedback_min_samples.max(2);
     let symbol_summary = preferred_symbol.and_then(|symbol| {
-        let summary = directional_roi_summary(trades, direction, Some(symbol), lookback);
+        let summary = directional_roi_summary(outcomes, direction, Some(symbol), lookback);
         (summary.samples >= min_samples).then_some(summary)
     });
     let summary = symbol_summary
-        .unwrap_or_else(|| directional_roi_summary(trades, direction, None, lookback));
+        .unwrap_or_else(|| directional_roi_summary(outcomes, direction, None, lookback));
     if summary.samples < min_samples {
         return None;
     }
@@ -570,96 +655,52 @@ fn directional_action_for_signal(signal: f64) -> Option<DirectionalAction> {
 }
 
 fn directional_roi_summary(
-    trades: &std::collections::VecDeque<ExecutedTrade>,
+    outcomes: &OutcomeLedger,
     direction: DirectionalAction,
     symbol_filter: Option<&str>,
     lookback_trades: usize,
 ) -> DirectionalRoiSummary {
-    // Keep only priced buy/sell records, then evaluate each decision against the
-    // next priced trade on the same symbol. This approximates whether the
-    // decision direction was profitable before the next tactical adjustment.
-    let priced = trades
-        .iter()
-        .filter(|trade| {
-            trade
-                .price
-                .is_some_and(|price| price.is_finite() && price > 0.0)
-                && matches!(
-                    trade.action,
-                    TradeAction::Buy
-                        | TradeAction::StrongBuy
-                        | TradeAction::Sell
-                        | TradeAction::StrongSell
-                )
-        })
-        .collect::<Vec<_>>();
-    if priced.len() < 2 {
+    let summary = outcomes.directional_performance(
+        symbol_filter,
+        direction == DirectionalAction::Buy,
+        lookback_trades,
+    );
+    if summary.samples == 0 {
         return DirectionalRoiSummary::empty();
     }
-
-    let start = priced
-        .len()
-        .saturating_sub(lookback_trades.saturating_add(1));
-    let mut directional_rois = Vec::new();
-    for idx in start..priced.len().saturating_sub(1) {
-        let trade = priced[idx];
-        let action = match trade.action {
-            TradeAction::Buy | TradeAction::StrongBuy => DirectionalAction::Buy,
-            TradeAction::Sell | TradeAction::StrongSell => DirectionalAction::Sell,
-            _ => continue,
-        };
-        if action != direction {
-            continue;
-        }
-        if let Some(symbol) = symbol_filter
-            && !trade.symbol.eq_ignore_ascii_case(symbol)
-        {
-            continue;
-        }
-        let Some(entry_price) = trade.price else {
-            continue;
-        };
-        let Some(next_trade) = priced
-            .iter()
-            .skip(idx + 1)
-            .find(|next| next.symbol.eq_ignore_ascii_case(&trade.symbol))
-        else {
-            continue;
-        };
-        let Some(exit_price) = next_trade.price else {
-            continue;
-        };
-
-        let market_return = ((exit_price - entry_price) / entry_price).clamp(-1.0, 1.0);
-        let directional_roi = if action == DirectionalAction::Buy {
-            market_return
-        } else {
-            -market_return
-        };
-        directional_rois.push(directional_roi);
-    }
-
-    if directional_rois.is_empty() {
-        return DirectionalRoiSummary::empty();
-    }
-
-    let samples = directional_rois.len();
-    let avg_directional_roi = directional_rois.iter().sum::<f64>() / samples as f64;
-    let win_rate =
-        directional_rois.iter().filter(|roi| **roi > 0.0).count() as f64 / samples as f64;
     DirectionalRoiSummary {
-        samples,
-        avg_directional_roi,
-        win_rate,
+        samples: summary.samples,
+        avg_directional_roi: summary.average_net_return_bps / 10_000.0,
+        win_rate: summary.win_rate,
     }
 }
 
-fn size_trade(signal_strength: f64, confidence: f64, min_usd: f64, max_usd: f64) -> f64 {
-    // Trade size scales with signal strength and confidence.
-    let scale = (signal_strength * confidence).clamp(0.0, 1.0);
+fn size_trade(
+    signal_strength: f64,
+    confidence: f64,
+    edge_multiplier: f64,
+    min_usd: f64,
+    max_usd: f64,
+) -> f64 {
+    // Trade size scales with signal, confidence, and fee-adjusted expected edge.
+    let scale = (signal_strength * confidence * edge_multiplier).clamp(0.0, 1.0);
     let raw = min_usd + (max_usd - min_usd) * scale;
     // Round to 2 decimal places.
     (raw * 100.0).round() / 100.0
+}
+
+fn market_regime_label(snapshot: Option<&MarketSnapshot>) -> String {
+    let change = snapshot
+        .and_then(|market| market.price_change_pct_24h)
+        .unwrap_or(0.0);
+    match change {
+        value if value >= 3.0 => "bull_volatile",
+        value if value >= 0.5 => "bull",
+        value if value <= -3.0 => "bear_volatile",
+        value if value <= -0.5 => "bear",
+        _ => "range",
+    }
+    .to_string()
 }
 
 fn build_rationale(
