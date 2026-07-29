@@ -11,8 +11,8 @@ The objective is positive fee-adjusted ROI, not order count. A timeout, stale si
 3. Up to `max_parallel_advisors` providers race inside one `advisor_round_timeout_seconds` budget. Completed responses are retained; valid early quorum cancels stragglers. A deadline retains partial results and marks unfinished providers as failures.
 4. Fuzzy and AI signals are blended. Lower provider coverage increases the confidence requirement.
 5. Resolved fixed-horizon outcomes provide a bounded provider/symbol/regime calibration multiplier.
-6. The economics gate estimates gross edge and subtracts round-trip fee and slippage allowances. A decision below `minimum_net_edge_bps` becomes a hold. Position size also scales with net edge.
-7. Immediately before submission Gail validates advisory and snapshot age, fetches the exact exchange/symbol price, and rejects excessive adverse drift or an edge that became uneconomic.
+6. The multi-horizon economics gate estimates a conservative gross-edge lower bound and subtracts fees, live spread/depth impact and empirical fill slippage. An uncalibrated or uneconomic decision becomes a hold.
+7. Immediately before submission Gail validates advisory and snapshot age, fetches the exact exchange/symbol price, and rejects excessive adverse drift, transaction-cost regression or an edge that became uneconomic.
 8. Gail refreshes exchange-scoped balances. With `strict_exchange_selection: true`, OctoBot may execute only on the selected venue; it cannot silently try another exchange.
 9. Gail persists an authority-tagged intent lease before invoking a mutating endpoint. A restart observes the lease and cannot repeat an ambiguous in-flight order.
 10. A filled order creates a markout due at `markout_horizon_seconds`. The resolved directional return subtracts the same round-trip cost model and feeds later calibration.
@@ -20,6 +20,8 @@ The objective is positive fee-adjusted ROI, not order count. A timeout, stale si
     shadow markouts. It tunes bounded deterministic parameter arms and replaces
     the synchronous LLM only after the configured net-USDT, activity, downside,
     sample-count, and consecutive-confirmation guards all pass.
+12. Pairs and carry sleeves are evaluated concurrently in shadow and retain
+    two-leg net markouts. A recent LLM risk view may only veto or dampen quant.
 
 ## Core configuration
 
@@ -33,20 +35,20 @@ The objective is positive fee-adjusted ROI, not order count. A timeout, stale si
 | `max_reprice_drift_bps` | Maximum adverse move before submit | Less than plausible expected net edge |
 | `estimated_fee_bps` | One-way taker fee allowance | Highest applicable venue tier |
 | `estimated_slippage_bps` | One-way price-impact allowance | Raise for thin symbols or larger orders |
-| `minimum_net_edge_bps` | Profit margin after modeled costs | Positive in live trading |
+| `minimum_net_edge_bps` | Profit margin after modelled costs | Positive in live trading |
 | `execution_authority` | Stable owner written to durable leases | `gail` in this deployment |
 | `markout_horizon_seconds` | Fixed outcome measurement horizon | Match intended holding horizon |
 | `quant_shadow_horizon_seconds` | Paired LLM/quant comparison horizon | Keep non-overlapping and aligned with intended holding time |
 | `quant_migration_min_samples` | Paired outcomes required for promotion | Require materially more evidence than parameter tuning |
-| `quant_migration_min_outperformance_bps` | Required quant advantage after modeled costs | Positive and large enough to avoid noise-driven cutover |
+| `quant_migration_min_outperformance_bps` | Required quant advantage after modelled costs | Positive and large enough to avoid noise-driven cutover |
 
-The pre-trade round-trip cost is `2 × (estimated_fee_bps + estimated_slippage_bps)`. `expected_move_bps` is the gross move represented by a perfect signal at perfect confidence. It is deliberately conservative and should be recalibrated from resolved markouts and realistic backtests, not increased merely to make more trades pass.
+The static pre-trade fallback is `2 × (estimated_fee_bps + estimated_slippage_bps)`. When market or fill telemetry is available, Gail uses the more conservative executable estimate. `expected_move_bps` remains the LLM-path gross move represented by a perfect signal at perfect confidence; quant uses its calibrated multi-horizon lower bound instead.
 
 ## Outcome interpretation
 
-Markouts measure whether a recommendation direction was effective at a fixed horizon. For buys, rising price is positive; for sells, falling price is positive. Round-trip modeled costs are subtracted from both. Calibration prefers enough exact symbol/provider/regime observations, falls back to symbol observations, and finally to global resolved observations. The multiplier is bounded to prevent a small sample from dominating risk controls.
+Markouts measure whether a recommendation direction was effective at a fixed horizon. For buys, rising price is positive; for sells, falling price is positive. Round-trip modelled costs are subtracted from both. Calibration prefers enough exact symbol/provider/regime observations, falls back to symbol observations, and finally to global resolved observations. The multiplier is bounded to prevent a small sample from dominating risk controls.
 
-No implementation can guarantee improved ROI. These controls improve the conditions for ROI by eliminating fee-negative trades, stale decisions, duplicate execution, exchange ambiguity, and misleading next-trade feedback. Production evaluation should compare resolved net markout mean, median, win rate, skipped-gate reasons, fill rate, and realized exchange P&L over the same market regime.
+No implementation can guarantee improved ROI. These controls improve the conditions for ROI by eliminating fee-negative trades, stale decisions, duplicate execution, exchange ambiguity, and misleading next-trade feedback. Production evaluation should compare resolved net markout mean, median, win rate, skipped-gate reasons, fill rate, and realised exchange P&L over the same market regime. Full component and rollout details are in [Quantitative trading architecture](quantitative-trading.md).
 
 ## QA and deployment
 

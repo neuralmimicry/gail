@@ -15,6 +15,10 @@ use super::config::TradingConfigOverride;
 use super::octobot::{OctobotExchange, OctobotOrder, OctobotPortfolio};
 use super::outcomes::OutcomeLedger;
 use super::quant::QuantMigrationState;
+use super::quantitative::backtest::NativeBacktestReport;
+use super::quantitative::calibration::MultiHorizonCalibrationState;
+use super::quantitative::sleeves::{AlphaSleevesState, LlmRiskOverlayState};
+use super::quantitative::telemetry::ExecutionTelemetryState;
 use crate::adaptive_schema::AdaptiveApiSchema;
 
 fn now_ts() -> f64 {
@@ -198,6 +202,14 @@ pub struct TradingStatusSnapshot {
     pub quant_pending_evaluations: usize,
     pub quant_resolved_evaluations: usize,
     pub quant_promotion_streak: usize,
+    pub native_quant_validation_qualified: Option<bool>,
+    pub execution_telemetry_observations: usize,
+    pub alpha_sleeve_actionable_recommendations: usize,
+    pub alpha_sleeve_pending_markouts: usize,
+    pub alpha_sleeve_resolved_markouts: usize,
+    pub llm_risk_overlay_expires_at: Option<f64>,
+    pub llm_risk_overlay_score: Option<f64>,
+    pub llm_risk_overlay_veto: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +256,22 @@ pub struct TradingState {
     /// mode. This is restored before the evaluation loop starts.
     #[serde(default)]
     pub quant_migration: QuantMigrationState,
+    /// Most recent Gail-native replay result.  This is deliberately distinct
+    /// from OctoBot's strategy report.
+    #[serde(default)]
+    pub last_native_quant_backtest: Option<NativeBacktestReport>,
+    /// Persistent multi-horizon observations used by the executable-edge gate.
+    #[serde(default)]
+    pub quant_edge_calibration: MultiHorizonCalibrationState,
+    /// Observed fill slippage used to replace static execution assumptions.
+    #[serde(default)]
+    pub execution_telemetry: ExecutionTelemetryState,
+    /// Persistent observations and recommendations from diversifying sleeves.
+    #[serde(default)]
+    pub alpha_sleeves: AlphaSleevesState,
+    /// Last reliable LLM risk view. Its expiry is checked before every use.
+    #[serde(default)]
+    pub llm_risk_overlay: LlmRiskOverlayState,
 }
 
 impl TradingState {
@@ -291,6 +319,11 @@ impl TradingState {
             in_flight_order_intents: HashMap::new(),
             outcome_ledger: OutcomeLedger::default(),
             quant_migration: QuantMigrationState::default(),
+            last_native_quant_backtest: None,
+            quant_edge_calibration: MultiHorizonCalibrationState::default(),
+            execution_telemetry: ExecutionTelemetryState::default(),
+            alpha_sleeves: AlphaSleevesState::default(),
+            llm_risk_overlay: LlmRiskOverlayState::default(),
         }
     }
 
@@ -369,6 +402,25 @@ impl TradingState {
             quant_pending_evaluations: self.quant_migration.pending.len(),
             quant_resolved_evaluations: self.quant_migration.resolved.len(),
             quant_promotion_streak: self.quant_migration.promotion_streak,
+            native_quant_validation_qualified: self
+                .last_native_quant_backtest
+                .as_ref()
+                .map(|report| report.promotion_qualified),
+            execution_telemetry_observations: self.execution_telemetry.observations.len(),
+            alpha_sleeve_actionable_recommendations: self
+                .alpha_sleeves
+                .latest_recommendations
+                .iter()
+                .filter(|recommendation| recommendation.actionable)
+                .count(),
+            alpha_sleeve_pending_markouts: self.alpha_sleeves.pending.len(),
+            alpha_sleeve_resolved_markouts: self.alpha_sleeves.resolved.len(),
+            llm_risk_overlay_expires_at: self.llm_risk_overlay.expires_at,
+            llm_risk_overlay_score: self
+                .llm_risk_overlay
+                .updated_at
+                .map(|_| self.llm_risk_overlay.risk_score),
+            llm_risk_overlay_veto: self.llm_risk_overlay.veto,
         }
     }
 
@@ -531,6 +583,11 @@ impl SharedTradingState {
                     state.outcome_ledger = restored.outcome_ledger;
                     state.quant_migration = restored.quant_migration;
                     state.quant_migration.normalize();
+                    state.last_native_quant_backtest = restored.last_native_quant_backtest;
+                    state.quant_edge_calibration = restored.quant_edge_calibration;
+                    state.execution_telemetry = restored.execution_telemetry;
+                    state.alpha_sleeves = restored.alpha_sleeves;
+                    state.llm_risk_overlay = restored.llm_risk_overlay;
                     state.log_info("startup", "Restored trading state from disk");
                     drop(state);
                     if let Some(snapshot) = repaired_snapshot {

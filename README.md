@@ -331,7 +331,7 @@ The fuzzy signal and AI consensus signal are blended with configurable weights (
 blended_signal     = fuzzy.signal × fuzzy_weight + ai.signal × ai_weight
 blended_confidence = fuzzy.confidence × fuzzy_weight + ai.confidence × ai_weight
 ```
-Before risk gates run, Gail optionally applies **directional ROI feedback** from fixed-horizon markouts. Each outcome compares its fill/reference price with the exact exchange/symbol observation at `markout_horizon_seconds`, applies buy/sell direction, and subtracts modeled round-trip costs. Strong provider/symbol/regime performance can provide a bounded signal/confidence and expected-edge boost; weak performance dampens them.
+Before risk gates run, Gail optionally applies **directional ROI feedback** from fixed-horizon markouts. Each outcome compares its fill/reference price with the exact exchange/symbol observation at `markout_horizon_seconds`, applies buy/sell direction, and subtracts modelled round-trip costs. Strong provider/symbol/regime performance can provide a bounded signal/confidence and expected-edge boost; weak performance dampens them.
 
 Four sequential risk gates are applied before a trade is placed:
 1. **Confidence gate**: `blended_confidence < fuzzy_confidence_threshold` → hold
@@ -497,6 +497,47 @@ trading:
   quant_migration_min_outperformance_bps: 10
   quant_migration_max_downside_regression_bps: 25
   quant_migration_required_streak: 3
+  quantitative:
+    enabled: true
+    native_backtest_enabled: true
+    native_backtest:
+      holding_horizon_seconds: 3600
+      minimum_training_frames: 96
+      validation_frames: 48
+      embargo_frames: 4
+      minimum_validation_trades: 16
+      maximum_pbo: 0.20
+    calibration:
+      horizons_seconds: [900, 3600, 14400, 86400]
+      minimum_samples: 24
+      require_calibrated_edge: true
+    selection:
+      cash_parameter_id: "cash-v1"
+      require_native_validation_for_promotion: true
+      native_validation_max_age_seconds: 86400
+    portfolio:
+      top_k: 3
+      minimum_quote_volume_usd: 1000000
+      maximum_spread_bps: 40
+      minimum_depth_usd: 5000
+      maximum_asset_weight: 0.45
+      maximum_cluster_weight: 0.65
+    execution_telemetry:
+      enabled: true
+      minimum_empirical_samples: 8
+    alpha_sleeves:
+      enabled: true
+      pairs:
+        shadow_only: true
+        atomic_hedge_execution_supported: false
+      carry:
+        shadow_only: true
+        atomic_hedge_execution_supported: false
+    llm_risk_overlay:
+      enabled: true
+      time_to_live_seconds: 21600
+      dampening_risk_score: 0.55
+      veto_risk_score: 0.85
   fuzzy_weight: 0.4                      # fuzzy vs AI blend weight
   decision_roi_feedback_enabled: true
   decision_roi_feedback_lookback_trades: 120
@@ -539,6 +580,11 @@ trading:
   backtest_data_collection_time_frames: ["1h", "1d"]
   backtest_data_collection_cooldown_seconds: 3600
 ```
+
+The quantitative settings above are conservative operational defaults, not a
+claim of positive returns. See [Quantitative trading architecture](docs/quantitative-trading.md)
+for the data flow, validation gates, sleeve mathematics, rollout sequence and
+ROI measurement guidance.
 
 Runtime-mutable fields (via `POST /v1/trading/config`, no restart required):
 `evaluation_interval_seconds`, `micro_trade_max_usd`, `micro_trade_min_usd`, `max_open_positions`, `fuzzy_confidence_threshold`, `target_exchanges`, `target_currencies`.

@@ -15,7 +15,8 @@ quant parameter arm retain their own selected venue, USDT symbol, entry price,
 direction, and actionability, then resolve against their own exact future
 quote. This measures complete policies without incorrectly scoring an LLM BTC
 decision against an ETH interval selected by quant. An actionable direction
-pays the configured round-trip fee and slippage allowance; a hold earns zero.
+pays the conservative executable round-trip fee, spread, depth-impact and
+empirical-slippage allowance; a hold earns zero.
 Samples are created no more frequently than `quant_shadow_horizon_seconds`,
 preventing heavily overlapping returns from being counted as independent
 migration evidence.
@@ -24,11 +25,11 @@ The quant signal uses only bounded numeric inputs:
 
 - short, medium, long, and live momentum;
 - short/long volume confirmation;
-- realized volatility and drawdown attenuation;
+- realised volatility and drawdown attenuation;
 - data completeness;
 - exact USDT-quoted markets and held-inventory validation for sell signals.
 
-Five explainable parameter arms independently rank the same market universe at
+Five explainable momentum arms and an explicit cash arm independently rank the same market universe at
 every sampled timestamp. After
 `quant_tuning_min_samples`, Gail may select another arm when it has enough
 actionable observations and improves the paired risk-adjusted score by at
@@ -41,13 +42,18 @@ Migration requires all of the following over the bounded rolling window:
 
 1. At least `quant_migration_min_samples` paired non-overlapping outcomes.
 2. At least `quant_migration_min_actionable_samples` actionable quant signals.
-3. Positive mean quant return after modeled costs.
+3. Positive mean quant return after modelled costs.
 4. Mean quant outperformance of at least
    `quant_migration_min_outperformance_bps` versus the LLM.
 5. Mean quant downside no more than
    `quant_migration_max_downside_regression_bps` worse than the LLM.
 6. All conditions remain true for `quant_migration_required_streak`
    consecutive resolution checks.
+7. The selected trading arm has a current, qualifying Gail-native
+   walk-forward validation; OctoBot's own strategy backtest is not sufficient.
+
+All losing arms revert to `cash-v1`. Holds no longer dilute per-action losses,
+and cash cannot itself be promoted to primary execution.
 
 The migration record is atomically persisted before the new mode is used. If
 that write fails, Gail restores shadow mode and logs
@@ -59,6 +65,11 @@ normal, discovery, and pruning decision paths. Gail continues quant-only
 markouts so parameter selection can adapt from later outcomes. Existing
 confidence, position, economics, freshness, venue, balance, lease, and
 execution gates remain in force.
+
+The last reliable LLM round may also leave a bounded-TTL risk overlay. Quant
+primary can use this persisted value without a network call. It may dampen or
+veto quant but cannot create a trade, reverse its direction or increase its
+size. Expired overlays are ignored.
 
 ## Stable log markers
 

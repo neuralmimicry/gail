@@ -66,6 +66,12 @@ pub struct TradeDecision {
     pub provider_keys: Vec<String>,
     /// Compact market regime label used by outcome calibration.
     pub market_regime: String,
+    /// Empirically selected holding/markout horizon for quant decisions.
+    #[serde(default)]
+    pub holding_horizon_seconds: Option<u64>,
+    /// Cross-sectional risk budget applied to the configured micro-trade cap.
+    #[serde(default)]
+    pub portfolio_target_weight: Option<f64>,
 }
 
 impl TradeDecision {
@@ -95,6 +101,8 @@ impl TradeDecision {
             economics: TradeEconomics::default(),
             provider_keys: Vec::new(),
             market_regime: "unknown".to_string(),
+            holding_horizon_seconds: None,
+            portfolio_target_weight: None,
         }
     }
 }
@@ -282,18 +290,44 @@ impl DecisionEngine {
             })
             .collect::<Vec<_>>();
         let market_regime = market_regime_label(best_market);
+        let holding_horizon_seconds = consensus
+            .vote_distribution
+            .get("selected_horizon_seconds")
+            .and_then(serde_json::Value::as_u64);
+        let portfolio_target_weight = consensus
+            .vote_distribution
+            .get("rebalance_weight")
+            .and_then(serde_json::Value::as_f64)
+            .map(|weight| weight.abs().clamp(0.0, 1.0));
         let calibration = state.outcome_ledger.calibration_for(
             &symbol,
             &provider_keys,
             &market_regime,
             config.markout_calibration_min_samples,
         );
-        let economics = estimate_trade_economics(
+        let mut economics = estimate_trade_economics(
             blended_signal.abs(),
             blended_confidence,
             calibration.multiplier,
             config,
         );
+        if let (Some(net_lower_bound), Some(executable_cost)) = (
+            consensus
+                .vote_distribution
+                .get("edge_lower_bound_bps")
+                .and_then(serde_json::Value::as_f64),
+            consensus
+                .vote_distribution
+                .get("estimated_round_trip_cost_bps")
+                .and_then(serde_json::Value::as_f64),
+        ) {
+            // Quant supplies a conservative empirical net lower bound. Preserve
+            // it instead of converting confidence back into a heuristic move.
+            economics.expected_net_edge_bps = net_lower_bound;
+            economics.estimated_round_trip_cost_bps = executable_cost.max(0.0);
+            economics.expected_gross_edge_bps =
+                net_lower_bound + economics.estimated_round_trip_cost_bps;
+        }
         if !matches!(action, TradeAction::Hold) && !economics.is_worthwhile() {
             return TradeDecision {
                 action: TradeAction::Hold,
@@ -329,7 +363,7 @@ impl DecisionEngine {
             economics.size_multiplier(),
             effective_config.micro_trade_min_usd,
             effective_config.micro_trade_max_usd,
-        );
+        ) * portfolio_target_weight.unwrap_or(1.0);
 
         // Build rationale from top AI opinions and ROI feedback context.
         let rationale = build_rationale(
@@ -376,6 +410,8 @@ impl DecisionEngine {
             economics,
             provider_keys,
             market_regime,
+            holding_horizon_seconds,
+            portfolio_target_weight,
         }
     }
 
@@ -420,6 +456,8 @@ impl DecisionEngine {
             economics: TradeEconomics::default(),
             provider_keys: Vec::new(),
             market_regime: "operator_override".to_string(),
+            holding_horizon_seconds: None,
+            portfolio_target_weight: None,
         }
     }
 }

@@ -161,6 +161,28 @@ pub struct OctobotLogEntry {
 // Market data snapshot (assembled from various OctoBot API endpoints)
 // ---------------------------------------------------------------------------
 
+/// Executable market state accompanying a ticker/candle observation.
+///
+/// Every field is optional because OctoBot installations expose different API
+/// generations. Missing microstructure data causes conservative cost fallback,
+/// never an assumed zero cost.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct MarketMicrostructure {
+    pub best_bid: Option<f64>,
+    pub best_ask: Option<f64>,
+    pub bid_depth_usd: Option<f64>,
+    pub ask_depth_usd: Option<f64>,
+    pub order_flow_imbalance: Option<f64>,
+    pub trade_flow_imbalance: Option<f64>,
+    pub funding_rate: Option<f64>,
+    pub open_interest: Option<f64>,
+    pub futures_basis_bps: Option<f64>,
+    pub listing_age_days: Option<f64>,
+    pub quote_volume_24h: Option<f64>,
+    pub source_latency_ms: Option<f64>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct MarketSnapshot {
     pub exchange: String,
@@ -173,6 +195,88 @@ pub struct MarketSnapshot {
     pub high_24h: Option<f64>,
     pub low_24h: Option<f64>,
     pub fetched_at: f64,
+    #[serde(default)]
+    pub microstructure: MarketMicrostructure,
+}
+
+impl MarketSnapshot {
+    pub fn spread_bps(&self) -> Option<f64> {
+        let bid = self.microstructure.best_bid?;
+        let ask = self.microstructure.best_ask?;
+        if !bid.is_finite() || !ask.is_finite() || bid <= 0.0 || ask < bid {
+            return None;
+        }
+        let midpoint = (bid + ask) / 2.0;
+        (midpoint > 0.0).then_some((ask - bid) / midpoint * 10_000.0)
+    }
+
+    /// Conservative one-way non-fee execution cost relative to midpoint.
+    /// Depth impact follows a bounded linear participation approximation until
+    /// venue-specific fill telemetry has enough observations to supersede it.
+    pub fn projected_one_way_slippage_bps(
+        &self,
+        side: &str,
+        notional_usd: f64,
+        fallback_slippage_bps: f64,
+    ) -> f64 {
+        let half_spread = self.spread_bps().map(|spread| spread / 2.0);
+        let depth = if side.eq_ignore_ascii_case("sell") {
+            self.microstructure.bid_depth_usd
+        } else {
+            self.microstructure.ask_depth_usd
+        };
+        let depth_impact = depth
+            .filter(|depth| depth.is_finite() && *depth > 0.0)
+            .map(|depth| (notional_usd.max(0.0) / depth * 1_000.0).clamp(0.0, 2_500.0));
+        match (half_spread, depth_impact) {
+            (Some(spread), Some(impact)) => spread + impact,
+            (Some(spread), None) => spread.max(fallback_slippage_bps.max(0.0)),
+            (None, Some(impact)) => impact.max(fallback_slippage_bps.max(0.0)),
+            (None, None) => fallback_slippage_bps.max(0.0),
+        }
+    }
+
+    pub fn executable_depth_usd(&self) -> Option<f64> {
+        match (
+            self.microstructure.bid_depth_usd,
+            self.microstructure.ask_depth_usd,
+        ) {
+            (Some(bid), Some(ask)) => Some(bid.min(ask)),
+            (Some(depth), None) | (None, Some(depth)) => Some(depth),
+            (None, None) => None,
+        }
+    }
+
+    fn enrich_with(mut self, other: MarketSnapshot) -> Self {
+        if self.price <= 0.0 {
+            self.price = other.price;
+        }
+        self.price_change_pct_1h = self.price_change_pct_1h.or(other.price_change_pct_1h);
+        self.price_change_pct_24h = self.price_change_pct_24h.or(other.price_change_pct_24h);
+        self.volume_24h = self.volume_24h.or(other.volume_24h);
+        self.volume_change_pct = self.volume_change_pct.or(other.volume_change_pct);
+        self.high_24h = self.high_24h.or(other.high_24h);
+        self.low_24h = self.low_24h.or(other.low_24h);
+        macro_rules! fill_microstructure {
+            ($field:ident) => {
+                self.microstructure.$field =
+                    self.microstructure.$field.or(other.microstructure.$field);
+            };
+        }
+        fill_microstructure!(best_bid);
+        fill_microstructure!(best_ask);
+        fill_microstructure!(bid_depth_usd);
+        fill_microstructure!(ask_depth_usd);
+        fill_microstructure!(order_flow_imbalance);
+        fill_microstructure!(trade_flow_imbalance);
+        fill_microstructure!(funding_rate);
+        fill_microstructure!(open_interest);
+        fill_microstructure!(futures_basis_bps);
+        fill_microstructure!(listing_age_days);
+        fill_microstructure!(quote_volume_24h);
+        fill_microstructure!(source_latency_ms);
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1581,36 +1685,52 @@ impl OctobotClient {
         exchange: &str,
         symbol: &str,
     ) -> Result<MarketSnapshot, String> {
-        // Prefer dashboard routes in current OctoBot builds.
         let web_symbol = symbol.replace('/', "|");
-        if let Some((exchange_id, time_frame)) =
-            self.watched_symbol_context(exchange, symbol).await?
-        {
+        let legacy_path = format!("/api/market/ticker?exchange={exchange}&symbol={symbol}");
+        // Candle history and executable ticker state are independent requests.
+        // Fetching them concurrently avoids doubling per-symbol latency while
+        // still enriching dashboard prices with bid/ask and derivatives data.
+        let dashboard_future = async {
+            let Some((exchange_id, time_frame)) =
+                self.watched_symbol_context(exchange, symbol).await?
+            else {
+                return Ok::<Option<MarketSnapshot>, String>(None);
+            };
             let graph_path = format!(
                 "/dashboard/currency_price_graph_update/{exchange_id}/{web_symbol}/{time_frame}/live?display_orders=false"
             );
-            if let Some(graph) = self.get_optional_json(&graph_path, "price graph").await? {
-                if let Some(snapshot) = parse_graph_snapshot(exchange, symbol, &graph) {
-                    return Ok(snapshot);
-                }
-                if let Some(error) = graph_error_message(&graph) {
-                    debug!(
-                        "trading: dashboard graph had no usable data for {}/{}: {}",
-                        exchange, symbol, error
-                    );
-                }
+            let Some(graph) = self.get_optional_json(&graph_path, "price graph").await? else {
+                return Ok(None);
+            };
+            if let Some(snapshot) = parse_graph_snapshot(exchange, symbol, &graph) {
+                return Ok(Some(snapshot));
             }
+            if let Some(error) = graph_error_message(&graph) {
+                debug!(
+                    "trading: dashboard graph had no usable data for {}/{}: {}",
+                    exchange, symbol, error
+                );
+            }
+            Ok(None)
+        };
+        let ticker_future = async {
+            self.get_optional_json(&legacy_path, "ticker")
+                .await
+                .map(|body| body.map(|body| parse_ticker_snapshot(exchange, symbol, &body)))
+        };
+        let (dashboard_result, ticker_result) = tokio::join!(dashboard_future, ticker_future);
+        match (dashboard_result, ticker_result) {
+            (Ok(Some(dashboard)), Ok(Some(ticker))) => Ok(dashboard.enrich_with(ticker)),
+            (Ok(Some(snapshot)), Ok(None) | Err(_)) | (Ok(None) | Err(_), Ok(Some(snapshot))) => {
+                Ok(snapshot)
+            }
+            (Err(dashboard_error), Err(ticker_error)) => Err(format!(
+                "OctoBot market snapshot unavailable for {exchange}/{symbol}: dashboard={dashboard_error}; ticker={ticker_error}"
+            )),
+            _ => Err(format!(
+                "OctoBot market snapshot unavailable for {exchange}/{symbol}: no dashboard or ticker endpoint returned data"
+            )),
         }
-
-        // Legacy fallback.
-        let legacy_path = format!("/api/market/ticker?exchange={exchange}&symbol={symbol}");
-        if let Some(body) = self.get_optional_json(&legacy_path, "ticker").await? {
-            return Ok(parse_ticker_snapshot(exchange, symbol, &body));
-        }
-
-        Err(format!(
-            "OctoBot market snapshot unavailable for {exchange}/{symbol}: no dashboard or ticker endpoint returned data"
-        ))
     }
 
     /// Fetch historical dashboard candle snapshots for a symbol/time frame.
@@ -2370,27 +2490,71 @@ fn unwrap_octobot_data(body: &Value) -> &Value {
 
 fn parse_ticker_snapshot(exchange: &str, symbol: &str, body: &Value) -> MarketSnapshot {
     let now = current_unix_timestamp_f64();
+    let payload = unwrap_octobot_data(body);
+    let listing_timestamp = first_numeric(
+        payload,
+        &[
+            "listing_timestamp",
+            "listed_at",
+            "onboardDate",
+            "launch_time",
+        ],
+    )
+    .map(normalise_unix_timestamp);
+    let source_timestamp =
+        first_numeric(payload, &["timestamp", "time", "ts"]).map(normalise_unix_timestamp);
     MarketSnapshot {
         exchange: exchange.to_string(),
         symbol: symbol.to_string(),
-        price: body
-            .get("last")
-            .or_else(|| body.get("close"))
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0),
-        price_change_pct_1h: body.get("change_1h").and_then(Value::as_f64),
-        price_change_pct_24h: body
-            .get("change_24h")
-            .or_else(|| body.get("percentage"))
-            .and_then(Value::as_f64),
-        volume_24h: body
-            .get("baseVolume")
-            .or_else(|| body.get("volume"))
-            .and_then(Value::as_f64),
-        volume_change_pct: body.get("volume_change_pct").and_then(Value::as_f64),
-        high_24h: body.get("high").and_then(Value::as_f64),
-        low_24h: body.get("low").and_then(Value::as_f64),
+        price: first_numeric(payload, &["last", "close", "price"]).unwrap_or(0.0),
+        price_change_pct_1h: first_numeric(payload, &["change_1h", "percentage_1h"]),
+        price_change_pct_24h: first_numeric(payload, &["change_24h", "percentage"]),
+        volume_24h: first_numeric(payload, &["baseVolume", "volume"]),
+        volume_change_pct: first_numeric(payload, &["volume_change_pct"]),
+        high_24h: first_numeric(payload, &["high", "high_24h"]),
+        low_24h: first_numeric(payload, &["low", "low_24h"]),
         fetched_at: now,
+        microstructure: MarketMicrostructure {
+            best_bid: first_numeric(payload, &["bid", "best_bid", "bidPrice"]),
+            best_ask: first_numeric(payload, &["ask", "best_ask", "askPrice"]),
+            bid_depth_usd: first_numeric(
+                payload,
+                &["bid_depth_usd", "bidDepthUsd", "bid_notional"],
+            ),
+            ask_depth_usd: first_numeric(
+                payload,
+                &["ask_depth_usd", "askDepthUsd", "ask_notional"],
+            ),
+            order_flow_imbalance: first_numeric(
+                payload,
+                &["order_flow_imbalance", "orderFlowImbalance", "ofi"],
+            )
+            .map(|value| value.clamp(-1.0, 1.0)),
+            trade_flow_imbalance: first_numeric(
+                payload,
+                &["trade_flow_imbalance", "tradeFlowImbalance", "tfi"],
+            )
+            .map(|value| value.clamp(-1.0, 1.0)),
+            funding_rate: first_numeric(payload, &["funding_rate", "fundingRate"]),
+            open_interest: first_numeric(payload, &["open_interest", "openInterest"]),
+            futures_basis_bps: first_numeric(
+                payload,
+                &["futures_basis_bps", "basis_bps", "basisBps"],
+            ),
+            listing_age_days: first_numeric(payload, &["listing_age_days", "listingAgeDays"])
+                .or_else(|| listing_timestamp.map(|listed| ((now - listed) / 86_400.0).max(0.0))),
+            quote_volume_24h: first_numeric(
+                payload,
+                &[
+                    "quoteVolume",
+                    "quote_volume",
+                    "quote_volume_24h",
+                    "turnover",
+                ],
+            ),
+            source_latency_ms: source_timestamp
+                .map(|timestamp| (now - timestamp).max(0.0) * 1_000.0),
+        },
     }
 }
 
@@ -2426,6 +2590,7 @@ fn parse_graph_snapshot(exchange: &str, symbol: &str, body: &Value) -> Option<Ma
             .as_ref()
             .and_then(|items| items.iter().copied().reduce(f64::min)),
         fetched_at: current_unix_timestamp_f64(),
+        microstructure: MarketMicrostructure::default(),
     })
 }
 
@@ -2471,9 +2636,30 @@ fn parse_graph_history_snapshots(
             high_24h: highs.get(idx).copied(),
             low_24h: lows.get(idx).copied(),
             fetched_at,
+            microstructure: MarketMicrostructure::default(),
         });
     }
     snapshots
+}
+
+fn first_numeric(body: &Value, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|key| {
+        body.get(*key).and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_i64().map(|number| number as f64))
+                .or_else(|| value.as_u64().map(|number| number as f64))
+                .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+        })
+    })
+}
+
+fn normalise_unix_timestamp(value: f64) -> f64 {
+    if value > 10_000_000_000.0 {
+        value / 1_000.0
+    } else {
+        value
+    }
 }
 
 fn value_array(body: &Value, key: &str) -> Option<Vec<f64>> {
@@ -4788,5 +4974,78 @@ fn infer_side(value: &str) -> Option<&'static str> {
         Some("sell")
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod microstructure_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn ticker_parser_accepts_string_numbers_and_microstructure_aliases() {
+        let snapshot = parse_ticker_snapshot(
+            "binance",
+            "BTC/USDT",
+            &json!({
+                "data": {
+                    "last": "60000.5",
+                    "bidPrice": "60000.0",
+                    "askPrice": "60001.0",
+                    "bidDepthUsd": "250000",
+                    "askDepthUsd": "200000",
+                    "orderFlowImbalance": "1.4",
+                    "tradeFlowImbalance": "-0.25",
+                    "fundingRate": "0.0001",
+                    "openInterest": "50000000",
+                    "basisBps": "12.5",
+                    "listingAgeDays": "900",
+                    "quoteVolume": "1000000000",
+                    "timestamp": "1750000000000"
+                }
+            }),
+        );
+        assert_eq!(snapshot.price, 60_000.5);
+        assert_eq!(snapshot.microstructure.best_bid, Some(60_000.0));
+        assert_eq!(snapshot.microstructure.best_ask, Some(60_001.0));
+        assert_eq!(snapshot.microstructure.bid_depth_usd, Some(250_000.0));
+        assert_eq!(snapshot.microstructure.ask_depth_usd, Some(200_000.0));
+        assert_eq!(snapshot.microstructure.order_flow_imbalance, Some(1.0));
+        assert_eq!(snapshot.microstructure.trade_flow_imbalance, Some(-0.25));
+        assert_eq!(snapshot.microstructure.funding_rate, Some(0.0001));
+        assert_eq!(snapshot.microstructure.open_interest, Some(50_000_000.0));
+        assert_eq!(snapshot.microstructure.futures_basis_bps, Some(12.5));
+        assert!(snapshot.spread_bps().is_some_and(|spread| spread > 0.0));
+        assert_eq!(snapshot.executable_depth_usd(), Some(200_000.0));
+    }
+
+    #[test]
+    fn enrichment_preserves_dashboard_data_and_adds_ticker_depth() {
+        let dashboard = MarketSnapshot {
+            exchange: "binance".to_string(),
+            symbol: "ETH/USDT".to_string(),
+            price: 3_000.0,
+            price_change_pct_24h: Some(2.5),
+            fetched_at: 100.0,
+            ..MarketSnapshot::default()
+        };
+        let ticker = MarketSnapshot {
+            exchange: "binance".to_string(),
+            symbol: "ETH/USDT".to_string(),
+            price: 3_001.0,
+            microstructure: MarketMicrostructure {
+                best_bid: Some(2_999.5),
+                best_ask: Some(3_000.5),
+                bid_depth_usd: Some(100_000.0),
+                ask_depth_usd: Some(90_000.0),
+                ..MarketMicrostructure::default()
+            },
+            ..MarketSnapshot::default()
+        };
+        let enriched = dashboard.enrich_with(ticker);
+        assert_eq!(enriched.price, 3_000.0);
+        assert_eq!(enriched.price_change_pct_24h, Some(2.5));
+        assert_eq!(enriched.microstructure.best_bid, Some(2_999.5));
+        assert_eq!(enriched.executable_depth_usd(), Some(90_000.0));
     }
 }

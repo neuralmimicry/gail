@@ -6,13 +6,14 @@
 
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs::{self, OpenOptions},
@@ -22,10 +23,14 @@ use tokio::{
 use tokio_postgres::NoTls;
 use tracing::{debug, warn};
 
-use super::{config::TradingConfig, octobot::MarketSnapshot};
+use super::{
+    config::TradingConfig,
+    octobot::{MarketMicrostructure, MarketSnapshot},
+    quantitative::backtest::{NativeBacktestConfig, QuantBacktestFrame},
+};
 
 const POSTGRES_PRUNE_INTERVAL_SECONDS: f64 = 3_600.0;
-const MARKET_DATALAKE_SCHEMA_VERSION: u32 = 1;
+const MARKET_DATALAKE_SCHEMA_VERSION: u32 = 2;
 
 fn now_ts() -> f64 {
     SystemTime::now()
@@ -46,6 +51,10 @@ pub struct MarketSample {
     pub volume_24h: Option<f64>,
     pub high_24h: Option<f64>,
     pub low_24h: Option<f64>,
+    /// Point-in-time executable-market and derivatives telemetry.  Persisting
+    /// this alongside price prevents native replay from silently reverting to
+    /// static spread and slippage assumptions.
+    pub microstructure: MarketMicrostructure,
 }
 
 impl Default for MarketSample {
@@ -60,6 +69,7 @@ impl Default for MarketSample {
             volume_24h: None,
             high_24h: None,
             low_24h: None,
+            microstructure: MarketMicrostructure::default(),
         }
     }
 }
@@ -396,6 +406,34 @@ impl MarketDataLake {
         out
     }
 
+    /// Materialise look-ahead-safe frames for Gail's native quant backtester.
+    ///
+    /// The in-memory sample cache is copied while holding the asynchronous
+    /// mutex; feature construction is then moved to a blocking worker and
+    /// parallelised by symbol.  The live ingestion path is therefore never
+    /// held up by historical replay calculations.
+    pub async fn native_backtest_frames(
+        &self,
+        backtest_config: &NativeBacktestConfig,
+    ) -> Result<Vec<QuantBacktestFrame>, String> {
+        let samples_by_symbol = {
+            let state = self.state.lock().await;
+            state
+                .samples_by_symbol
+                .iter()
+                .map(|(key, samples)| (key.clone(), samples.iter().cloned().collect::<Vec<_>>()))
+                .collect::<HashMap<_, _>>()
+        };
+        let lake_config = (*self.config).clone();
+        let mut replay_config = backtest_config.clone();
+        replay_config.normalise();
+        tokio::task::spawn_blocking(move || {
+            build_native_backtest_frames(samples_by_symbol, &lake_config, &replay_config)
+        })
+        .await
+        .map_err(|error| format!("native backtest frame worker failed: {error}"))
+    }
+
     pub async fn features_for_symbol(
         &self,
         exchange: &str,
@@ -534,6 +572,91 @@ impl MarketDataLake {
     }
 }
 
+fn build_native_backtest_frames(
+    samples_by_symbol: HashMap<String, Vec<MarketSample>>,
+    lake_config: &MarketDataLakeConfig,
+    backtest_config: &NativeBacktestConfig,
+) -> Vec<QuantBacktestFrame> {
+    let mut ranked_symbols = samples_by_symbol.into_iter().collect::<Vec<_>>();
+    ranked_symbols.sort_by(|left, right| {
+        let liquidity = |samples: &[MarketSample]| {
+            samples
+                .last()
+                .and_then(|sample| sample.volume_24h.map(|volume| volume * sample.price))
+                .filter(|value| value.is_finite())
+                .unwrap_or(0.0)
+        };
+        liquidity(&right.1)
+            .partial_cmp(&liquidity(&left.1))
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    ranked_symbols.truncate(backtest_config.symbol_limit);
+
+    let interval = backtest_config.frame_interval_seconds.max(1) as i64;
+    let per_symbol = ranked_symbols
+        .par_iter()
+        .map(|(_, samples)| {
+            let mut rows = Vec::new();
+            let mut previous_interval = None;
+            for (index, sample) in samples.iter().enumerate() {
+                let interval_bucket = (sample.captured_ts / interval as f64).floor() as i64;
+                if previous_interval == Some(interval_bucket) {
+                    continue;
+                }
+                previous_interval = Some(interval_bucket);
+                let Some(features) =
+                    compute_features(&samples[..=index], sample.captured_ts, lake_config)
+                else {
+                    continue;
+                };
+                rows.push((
+                    interval_bucket,
+                    MarketSnapshot {
+                        exchange: sample.exchange.clone(),
+                        symbol: sample.symbol.clone(),
+                        price: sample.price,
+                        price_change_pct_1h: features.momentum_short_pct,
+                        price_change_pct_24h: sample.price_change_pct_24h,
+                        volume_24h: sample.volume_24h,
+                        volume_change_pct: features
+                            .volume_ratio_short_long
+                            .map(|ratio| (ratio - 1.0) * 100.0),
+                        high_24h: sample.high_24h,
+                        low_24h: sample.low_24h,
+                        fetched_at: sample.captured_ts,
+                        microstructure: sample.microstructure.clone(),
+                    },
+                    features,
+                ));
+            }
+            rows
+        })
+        .collect::<Vec<_>>();
+
+    let mut frames: BTreeMap<i64, QuantBacktestFrame> = BTreeMap::new();
+    for rows in per_symbol {
+        for (interval_bucket, snapshot, features) in rows {
+            let frame = frames
+                .entry(interval_bucket)
+                .or_insert_with(|| QuantBacktestFrame {
+                    timestamp: interval_bucket as f64 * interval as f64,
+                    ..QuantBacktestFrame::default()
+                });
+            frame.historical_features.insert(
+                market_feature_key(&snapshot.exchange, &snapshot.symbol),
+                features,
+            );
+            frame.snapshots.push(snapshot);
+        }
+    }
+    let mut frames = frames.into_values().collect::<Vec<_>>();
+    if frames.len() > backtest_config.maximum_frames {
+        frames.drain(..frames.len() - backtest_config.maximum_frames);
+    }
+    frames
+}
+
 fn sample_from_snapshot(snapshot: &MarketSnapshot, bucket_seconds: u64) -> Option<MarketSample> {
     if !snapshot.price.is_finite() || snapshot.price <= 0.0 {
         return None;
@@ -554,6 +677,7 @@ fn sample_from_snapshot(snapshot: &MarketSnapshot, bucket_seconds: u64) -> Optio
         volume_24h: snapshot.volume_24h,
         high_24h: snapshot.high_24h,
         low_24h: snapshot.low_24h,
+        microstructure: snapshot.microstructure.clone(),
     })
 }
 
@@ -834,6 +958,7 @@ async fn initialize_postgres_schema(dsn: &str) -> Result<(), String> {
                 volume_24h DOUBLE PRECISION,
                 high_24h DOUBLE PRECISION,
                 low_24h DOUBLE PRECISION,
+                microstructure JSONB NOT NULL DEFAULT '{}'::jsonb,
                 inserted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 UNIQUE (exchange, symbol, captured_bucket)
             );
@@ -841,6 +966,8 @@ async fn initialize_postgres_schema(dsn: &str) -> Result<(), String> {
                 ON gail_market_snapshots (exchange, symbol, captured_ts DESC);
             CREATE INDEX IF NOT EXISTS idx_gail_market_snapshots_ts
                 ON gail_market_snapshots (captured_ts DESC);
+            ALTER TABLE gail_market_snapshots
+                ADD COLUMN IF NOT EXISTS microstructure JSONB NOT NULL DEFAULT '{}'::jsonb;
             CREATE TABLE IF NOT EXISTS gail_market_snapshots_meta (
                 key TEXT PRIMARY KEY,
                 value JSONB NOT NULL,
@@ -871,9 +998,10 @@ async fn persist_samples_postgres(dsn: &str, samples: &[MarketSample]) -> Result
                 price_change_pct_24h,
                 volume_24h,
                 high_24h,
-                low_24h
+                low_24h,
+                microstructure
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
             ON CONFLICT (exchange, symbol, captured_bucket)
             DO UPDATE SET
                 captured_ts = EXCLUDED.captured_ts,
@@ -881,12 +1009,15 @@ async fn persist_samples_postgres(dsn: &str, samples: &[MarketSample]) -> Result
                 price_change_pct_24h = EXCLUDED.price_change_pct_24h,
                 volume_24h = EXCLUDED.volume_24h,
                 high_24h = EXCLUDED.high_24h,
-                low_24h = EXCLUDED.low_24h
+                low_24h = EXCLUDED.low_24h,
+                microstructure = EXCLUDED.microstructure
             "#,
         )
         .await
         .map_err(|error| format!("failed to prepare market datalake upsert statement: {error}"))?;
     for sample in samples {
+        let microstructure = serde_json::to_value(&sample.microstructure)
+            .map_err(|error| format!("failed to encode market microstructure: {error}"))?;
         client
             .execute(
                 &statement,
@@ -900,6 +1031,7 @@ async fn persist_samples_postgres(dsn: &str, samples: &[MarketSample]) -> Result
                     &sample.volume_24h,
                     &sample.high_24h,
                     &sample.low_24h,
+                    &microstructure,
                 ],
             )
             .await
@@ -929,7 +1061,8 @@ async fn load_samples_from_postgres(
                 price_change_pct_24h,
                 volume_24h,
                 high_24h,
-                low_24h
+                low_24h,
+                microstructure
             FROM gail_market_snapshots
             WHERE symbol = $1
               AND captured_ts >= $2
@@ -952,6 +1085,7 @@ async fn load_samples_from_postgres(
             volume_24h: row.get("volume_24h"),
             high_24h: row.get("high_24h"),
             low_24h: row.get("low_24h"),
+            microstructure: serde_json::from_value(row.get("microstructure")).unwrap_or_default(),
         })
         .filter(|sample| sample.exchange == target_exchange)
         .collect::<Vec<_>>())
@@ -1197,6 +1331,7 @@ mod tests {
                 high_24h: Some(625.0),
                 low_24h: Some(610.0),
                 fetched_at: base_ts,
+                microstructure: Default::default(),
             },
             MarketSnapshot {
                 exchange: "Binance".to_string(),
@@ -1209,6 +1344,7 @@ mod tests {
                 high_24h: Some(626.0),
                 low_24h: Some(611.0),
                 fetched_at: base_ts + 10.0,
+                microstructure: Default::default(),
             },
         ];
 
@@ -1249,6 +1385,7 @@ mod tests {
                 high_24h: Some(price + 3.0),
                 low_24h: Some(price - 3.0),
                 fetched_at: base_ts + idx as f64 * 300.0,
+                microstructure: Default::default(),
             });
         }
         let summary = lake.ingest_snapshots(&snapshots).await;

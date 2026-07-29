@@ -23,6 +23,7 @@ pub mod fuzzy;
 pub mod octobot;
 pub mod outcomes;
 pub mod quant;
+pub mod quantitative;
 pub mod refiner;
 pub mod state;
 
@@ -63,6 +64,9 @@ use octobot::{
 };
 use outcomes::TradeMarkout;
 use quant::{QuantMode, evaluate_symbol as evaluate_quant_symbol, evaluate_universe};
+use quantitative::backtest::{NativeBacktestReport, NativeQuantBacktester};
+use quantitative::sleeves::{evaluate_sleeves_async, market_key as sleeve_market_key};
+use quantitative::telemetry::reprice_net_edge;
 use refiner::RefinerClient;
 use state::{ExecutedTrade, ExecutionIntentClaim, SharedTradingState, TradeAction, TradingState};
 
@@ -382,28 +386,110 @@ async fn run_evaluation_loop(
                 }
 
                 // --- Periodic backtest ---
-                if let Some(ref engine) = backtest_engine {
+                if config.backtesting_enabled {
                     let due = now_ts() - last_backtest_ts >= config.backtest_interval_seconds as f64;
                     if due {
                         info!("trading: running periodic backtest");
                         state.log_info("backtest", "Starting periodic backtesting run").await;
-                        let summary = engine.run_with_config(&config).await;
-                        let assessment = summary.assessment.to_string();
-                        let should_pause = config.backtest_pause_on_failure
-                            && summary.assessment == backtest::ApproachAssessment::Unprofitable;
-                        {
-                            let mut s = state.0.lock().await;
-                            s.record_backtest(summary.clone());
-                            apply_backtest_auto_tuning(&config, &mut s, &summary);
-                            if should_pause {
-                                s.paused = true;
-                                s.log_warn("backtest", "Trading paused: approach assessed as unprofitable");
+                        let native_enabled = config.quantitative.enabled
+                            && config.quantitative.native_backtest_enabled;
+                        if native_enabled {
+                            if let Some(lake) = market_data_lake.as_ref() {
+                                let mut native_config = config.quantitative.native_backtest.clone();
+                                // Live fee assumptions are the single source of truth for
+                                // both execution gating and scheduled replay.
+                                native_config.fee_bps = config.estimated_fee_bps;
+                                native_config.slippage_bps = config.estimated_slippage_bps;
+                                let frames = lake.native_backtest_frames(&native_config).await;
+                                match frames {
+                                    Ok(frames) => {
+                                        let parameter_sets = {
+                                            let current = state.0.lock().await;
+                                            current.quant_migration.parameter_sets.clone()
+                                        };
+                                        match NativeQuantBacktester::new(native_config.clone())
+                                            .with_portfolio_config(config.quantitative.portfolio.clone())
+                                            .run_async(frames, parameter_sets)
+                                            .await
+                                        {
+                                            Ok(report) => {
+                                                let summary = native_backtest_summary(
+                                                    &report,
+                                                    &native_config,
+                                                );
+                                                let should_pause = {
+                                                    let mut current = state.0.lock().await;
+                                                    let quant_primary = current.quant_migration.is_primary();
+                                                    if report.promotion_qualified {
+                                                        current.quant_migration.native_validation_parameter_id =
+                                                            report.selected_parameter_id.clone();
+                                                        current.quant_migration.native_validation_at = Some(now_ts());
+                                                    } else {
+                                                        current.quant_migration.native_validation_parameter_id = None;
+                                                        current.quant_migration.native_validation_at = None;
+                                                    }
+                                                    current.last_native_quant_backtest = Some(report.clone());
+                                                    current.record_backtest(summary.clone());
+                                                    current.log(
+                                                        if report.promotion_qualified { "info" } else { "warn" },
+                                                        "native_backtest",
+                                                        "GAIL_NATIVE_QUANT_BACKTEST_COMPLETE",
+                                                        json!({
+                                                            "promotion_qualified": report.promotion_qualified,
+                                                            "selected_parameter_id": report.selected_parameter_id,
+                                                            "out_of_sample": report.out_of_sample_statistics,
+                                                            "probability_backtest_overfit": report.probability_backtest_overfit,
+                                                            "rejection_reasons": report.rejection_reasons,
+                                                        }),
+                                                    );
+                                                    let pause = config.backtest_pause_on_failure
+                                                        && quant_primary
+                                                        && !report.promotion_qualified;
+                                                    if pause {
+                                                        current.paused = true;
+                                                        current.log_warn(
+                                                            "native_backtest",
+                                                            "Trading paused: primary quant failed native validation",
+                                                        );
+                                                    }
+                                                    pause
+                                                };
+                                                if should_pause {
+                                                    warn!("trading: primary quant paused after failed native validation");
+                                                } else {
+                                                    info!(
+                                                        qualified = report.promotion_qualified,
+                                                        pbo = report.probability_backtest_overfit,
+                                                        "trading: Gail-native quant backtest complete"
+                                                    );
+                                                }
+                                            }
+                                            Err(error) => {
+                                                state.log_error("native_backtest", error).await;
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        state.log_error("native_backtest", error).await;
+                                    }
+                                }
+                            } else {
+                                state.log_warn(
+                                    "native_backtest",
+                                    "Native replay skipped because the market datalake is disabled",
+                                ).await;
                             }
-                        }
-                        if should_pause {
-                            warn!("trading: bridge paused due to unprofitable backtest result");
-                        } else {
-                            info!("trading: backtest complete — assessment={}", assessment);
+                        } else if let Some(ref engine) = backtest_engine {
+                            // Compatibility fallback for deployments that explicitly disable
+                            // Gail-native replay. OctoBot reports are never used to promote quant.
+                            let summary = engine.run_with_config(&config).await;
+                            let assessment = summary.assessment.to_string();
+                            {
+                                let mut current = state.0.lock().await;
+                                current.record_backtest(summary.clone());
+                                apply_backtest_auto_tuning(&config, &mut current, &summary);
+                            }
+                            info!("trading: OctoBot compatibility backtest complete — assessment={}", assessment);
                         }
                         last_backtest_ts = now_ts();
                     }
@@ -425,6 +511,40 @@ async fn run_evaluation_loop(
                 break;
             }
         }
+    }
+}
+
+fn native_backtest_summary(
+    report: &NativeBacktestReport,
+    config: &quantitative::backtest::NativeBacktestConfig,
+) -> backtest::BacktestSummary {
+    let assessment = if report.walk_forward_folds.is_empty() {
+        backtest::ApproachAssessment::Incomplete
+    } else if report.promotion_qualified {
+        backtest::ApproachAssessment::Viable
+    } else {
+        backtest::ApproachAssessment::Unprofitable
+    };
+    let profitability_pct = (config.initial_equity_usd > 0.0).then_some(
+        report.out_of_sample_statistics.cumulative_pnl_usd / config.initial_equity_usd * 100.0,
+    );
+    backtest::BacktestSummary {
+        run_at: now_ts(),
+        assessment,
+        profitability_pct,
+        market_avg_pct: None,
+        beats_market: None,
+        total_trades: report.out_of_sample_statistics.samples,
+        errors_count: 0,
+        symbols: Vec::new(),
+        notes: format!(
+            "Gail-native walk-forward replay; selected={:?}; pbo={:.3}; qualified={}; reasons={}",
+            report.selected_parameter_id,
+            report.probability_backtest_overfit,
+            report.promotion_qualified,
+            report.rejection_reasons.join(" | ")
+        ),
+        run_id: None,
     }
 }
 
@@ -495,6 +615,7 @@ async fn run_single_evaluation(
         HashMap::new()
     };
     resolve_quant_evaluations(state, &market_snapshots, config, data_path).await;
+    resolve_quant_edge_calibration(state, &market_snapshots, config).await;
     let quant_primary = {
         let current = state.0.lock().await;
         config.quant_shadow_enabled && current.quant_migration.is_primary()
@@ -583,29 +704,195 @@ async fn run_single_evaluation(
     // persisted guard promotes quant, the synchronous network call disappears
     // from the critical path and the same downstream risk/execution controls
     // consume a deterministic consensus-compatible signal.
-    let quant_signal = {
+    let regime_label = quantitative_regime_label(&market_regime);
+    let mut quant_signal = {
         let current = state.0.lock().await;
-        evaluate_universe(
+        let portfolio_config = if config.quantitative.enabled {
+            config.quantitative.portfolio.clone()
+        } else {
+            let mut disabled = config.quantitative.portfolio.clone();
+            disabled.enabled = false;
+            disabled
+        };
+        let mut signal = evaluate_universe(
             &current.quant_migration,
             &market_snapshots,
             &historical_features,
             &portfolio,
-        )
+            &portfolio_config,
+        );
+        let entry_side = if signal.signal < 0.0 { "sell" } else { "buy" };
+        let round_trip_cost_bps = market_snapshots
+            .iter()
+            .find(|snapshot| {
+                snapshot.exchange.eq_ignore_ascii_case(&signal.exchange)
+                    && snapshot.symbol.eq_ignore_ascii_case(&signal.symbol)
+            })
+            .map(|snapshot| {
+                current
+                    .execution_telemetry
+                    .estimate_round_trip(
+                        snapshot,
+                        entry_side,
+                        config.micro_trade_max_usd,
+                        config.estimated_fee_bps,
+                        config.estimated_slippage_bps,
+                        &config.quantitative.execution_telemetry,
+                    )
+                    .round_trip_cost_bps
+            })
+            .unwrap_or_else(|| 2.0 * (config.estimated_fee_bps + config.estimated_slippage_bps));
+        current.quant_edge_calibration.gate_signal(
+            &mut signal,
+            regime_label,
+            round_trip_cost_bps,
+            &config.quantitative.calibration,
+        );
+        signal
     };
-    let llm_consensus = if quant_primary {
-        None
-    } else {
-        Some(
-            advisor
-                .consult_all(
-                    &market_snapshots,
-                    &historical_features,
-                    &research,
-                    &portfolio,
-                    config.max_parallel_advisors,
+    // Record the undampened policy intent. The LLM overlay is a live risk
+    // control and must not censor the observations needed to calibrate the
+    // underlying quantitative forecast.
+    record_quant_edge_observations(
+        state,
+        &quant_signal,
+        &market_snapshots,
+        regime_label,
+        config,
+    )
+    .await;
+    let (alpha_sleeves_state, sleeve_costs) = {
+        let current = state.0.lock().await;
+        let costs = market_snapshots
+            .iter()
+            .map(|snapshot| {
+                let buy = current.execution_telemetry.estimate_round_trip(
+                    snapshot,
+                    "buy",
+                    config.micro_trade_max_usd,
+                    config.estimated_fee_bps,
+                    config.estimated_slippage_bps,
+                    &config.quantitative.execution_telemetry,
+                );
+                let sell = current.execution_telemetry.estimate_round_trip(
+                    snapshot,
+                    "sell",
+                    config.micro_trade_max_usd,
+                    config.estimated_fee_bps,
+                    config.estimated_slippage_bps,
+                    &config.quantitative.execution_telemetry,
+                );
+                (
+                    sleeve_market_key(&snapshot.exchange, &snapshot.symbol),
+                    buy.round_trip_cost_bps.max(sell.round_trip_cost_bps),
                 )
-                .await,
-        )
+            })
+            .collect::<HashMap<_, _>>();
+        (current.alpha_sleeves.clone(), costs)
+    };
+    let alpha_sleeves_config = if config.quantitative.enabled {
+        config.quantitative.alpha_sleeves.clone()
+    } else {
+        let mut disabled = config.quantitative.alpha_sleeves.clone();
+        disabled.enabled = false;
+        disabled
+    };
+    let sleeve_future = evaluate_sleeves_async(
+        alpha_sleeves_state,
+        market_snapshots.clone(),
+        sleeve_costs,
+        alpha_sleeves_config,
+        now_ts(),
+    );
+    let llm_future = async {
+        if quant_primary {
+            None
+        } else {
+            Some(
+                advisor
+                    .consult_all(
+                        &market_snapshots,
+                        &historical_features,
+                        &research,
+                        &portfolio,
+                        config.max_parallel_advisors,
+                    )
+                    .await,
+            )
+        }
+    };
+    let (sleeve_result, llm_consensus) = tokio::join!(sleeve_future, llm_future);
+    match sleeve_result {
+        Ok(next_state) => {
+            let actionable = next_state
+                .latest_recommendations
+                .iter()
+                .filter(|recommendation| recommendation.actionable)
+                .count();
+            let executable = next_state
+                .latest_recommendations
+                .iter()
+                .filter(|recommendation| recommendation.executable)
+                .count();
+            let mut current = state.0.lock().await;
+            current.alpha_sleeves = next_state;
+            let recommendations = current.alpha_sleeves.latest_recommendations.clone();
+            current.log(
+                "info",
+                "quant_sleeves",
+                "QUANT_ALPHA_SLEEVES_EVALUATED",
+                json!({
+                    "recommendations": recommendations.len(),
+                    "actionable": actionable,
+                    "executable": executable,
+                    "latest": recommendations,
+                }),
+            );
+        }
+        Err(error) => {
+            warn!(%error, "trading: alpha-sleeve evaluation failed");
+            state
+                .log_warn(
+                    "quant_sleeves",
+                    format!("Alpha-sleeve evaluation failed: {error}"),
+                )
+                .await;
+        }
+    }
+    let overlay_application = {
+        let mut current = state.0.lock().await;
+        let overlay_enabled = config.quantitative.enabled;
+        let refreshed = overlay_enabled
+            && llm_consensus.as_ref().is_some_and(|consensus| {
+                current.llm_risk_overlay.update_from_consensus(
+                    consensus,
+                    now_ts(),
+                    &config.quantitative.llm_risk_overlay,
+                )
+            });
+        let application = if overlay_enabled {
+            current.llm_risk_overlay.apply_to_quant(
+                &mut quant_signal,
+                now_ts(),
+                &config.quantitative.llm_risk_overlay,
+            )
+        } else {
+            Default::default()
+        };
+        if refreshed || application.active {
+            let overlay = current.llm_risk_overlay.clone();
+            current.log(
+                "info",
+                "quant_overlay",
+                "QUANT_LLM_RISK_OVERLAY_APPLIED",
+                json!({
+                    "refreshed": refreshed,
+                    "application": application,
+                    "overlay": overlay,
+                }),
+            );
+        }
+        application
     };
     let consensus = llm_consensus
         .clone()
@@ -848,6 +1135,7 @@ async fn run_single_evaluation(
                 "quant_confidence": quant_signal.confidence,
                 "quant_risk_score": quant_signal.risk_score,
                 "quant_actionable": quant_signal.actionable,
+                "llm_risk_overlay": overlay_application,
                 "quant_target": if quant_signal.symbol.is_empty() { None } else { Some(json!({
                     "exchange": quant_signal.exchange,
                     "symbol": quant_signal.symbol,
@@ -993,6 +1281,101 @@ async fn resolve_quant_evaluations(
             outperformance_bps = migration.outperformance_bps,
             confirmation_streak = migration.confirmation_streak,
             "QUANT_REPLACED_LLM"
+        );
+    }
+}
+
+/// Resolve due multi-horizon observations before the current signal is gated.
+/// This ordering allows the newest non-overlapping evidence to influence the
+/// next decision without introducing look-ahead.
+async fn resolve_quant_edge_calibration(
+    state: &SharedTradingState,
+    snapshots: &[MarketSnapshot],
+    config: &TradingConfig,
+) {
+    if !config.quantitative.enabled || !config.quantitative.calibration.enabled {
+        return;
+    }
+    let mut current = state.0.lock().await;
+    let summary = current.quant_edge_calibration.resolve_due(
+        snapshots,
+        &config.quantitative.calibration,
+        now_ts(),
+    );
+    if summary.resolved > 0 || summary.expired > 0 {
+        let pending = current.quant_edge_calibration.pending.len();
+        let resolved_total = current.quant_edge_calibration.resolved.len();
+        current.log(
+            "info",
+            "quant_calibration",
+            "QUANT_MULTI_HORIZON_OBSERVATIONS_RESOLVED",
+            json!({
+                "resolved": summary.resolved,
+                "expired": summary.expired,
+                "pending": pending,
+                "resolved_total": resolved_total,
+            }),
+        );
+    }
+}
+
+async fn record_quant_edge_observations(
+    state: &SharedTradingState,
+    signal: &quant::QuantSignal,
+    snapshots: &[MarketSnapshot],
+    regime: &str,
+    config: &TradingConfig,
+) {
+    if !config.quantitative.enabled || !config.quantitative.calibration.enabled {
+        return;
+    }
+    let snapshot = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.exchange.eq_ignore_ascii_case(&signal.exchange))
+        .filter(|snapshot| snapshot.symbol.eq_ignore_ascii_case(&signal.symbol))
+        .filter(|snapshot| snapshot.price.is_finite() && snapshot.price > 0.0)
+        .max_by(|left, right| {
+            left.fetched_at
+                .partial_cmp(&right.fetched_at)
+                .unwrap_or(Ordering::Equal)
+        });
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    let mut current = state.0.lock().await;
+    let entry_side = if signal.signal < 0.0 { "sell" } else { "buy" };
+    let round_trip_cost_bps = current
+        .execution_telemetry
+        .estimate_round_trip(
+            snapshot,
+            entry_side,
+            config.micro_trade_max_usd,
+            config.estimated_fee_bps,
+            config.estimated_slippage_bps,
+            &config.quantitative.execution_telemetry,
+        )
+        .round_trip_cost_bps;
+    let recorded = current.quant_edge_calibration.record_signal(
+        signal,
+        snapshot,
+        regime,
+        round_trip_cost_bps,
+        &config.quantitative.calibration,
+        now_ts(),
+    );
+    if recorded > 0 {
+        current.log(
+            "info",
+            "quant_calibration",
+            "QUANT_MULTI_HORIZON_OBSERVATIONS_RECORDED",
+            json!({
+                "exchange": signal.exchange,
+                "symbol": signal.symbol,
+                "raw_signal": signal.signal,
+                "regime": regime,
+                "horizons_recorded": recorded,
+                "estimated_round_trip_cost_bps": round_trip_cost_bps,
+            }),
         );
     }
 }
@@ -2611,6 +2994,7 @@ async fn execute_if_warranted(
     let mut execution_amount_usd = decision.amount_usd;
     let mut execution_exchange = decision.exchange.clone();
     let mut execution_reference_price = decision.reference_price;
+    let mut execution_round_trip_cost_bps = decision.economics.estimated_round_trip_cost_bps;
     let min_execution_usd = effective_micro_trade_floor_usd(state, config).await;
 
     match &decision.action {
@@ -2703,65 +3087,6 @@ async fn execute_if_warranted(
                 .await;
             return;
         }
-
-        let fresh_snapshot = match octobot
-            .get_market_snapshot(&execution_exchange, &decision.symbol)
-            .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                state
-                    .log_warn(
-                        "execute",
-                        format!("Trade skipped: immediate repricing failed: {error}"),
-                    )
-                    .await;
-                return;
-            }
-        };
-        let fresh_age = (now_ts() - fresh_snapshot.fetched_at).max(0.0);
-        if fresh_age > config.market_snapshot_ttl_seconds {
-            state
-                .log_warn(
-                    "execute",
-                    format!("Trade skipped: repricing snapshot is {fresh_age:.1}s old"),
-                )
-                .await;
-            return;
-        }
-        let Some(reference_price) = decision.reference_price else {
-            state
-                .log_warn("execute", "Trade skipped: decision has no reference price")
-                .await;
-            return;
-        };
-        let adverse_drift_bps =
-            adverse_reprice_drift_bps(side, reference_price, fresh_snapshot.price);
-        let repriced_net_edge_bps = decision.economics.expected_net_edge_bps - adverse_drift_bps;
-        if adverse_drift_bps > config.max_reprice_drift_bps
-            || repriced_net_edge_bps + f64::EPSILON < decision.economics.required_net_edge_bps
-        {
-            state
-                .log(
-                    "warn",
-                    "execute",
-                    "Trade skipped after immediate price-drift/economics check",
-                    json!({
-                        "exchange": execution_exchange,
-                        "symbol": decision.symbol,
-                        "side": side,
-                        "reference_price": reference_price,
-                        "current_price": fresh_snapshot.price,
-                        "adverse_drift_bps": adverse_drift_bps,
-                        "max_reprice_drift_bps": config.max_reprice_drift_bps,
-                        "repriced_net_edge_bps": repriced_net_edge_bps,
-                        "required_net_edge_bps": decision.economics.required_net_edge_bps,
-                    }),
-                )
-                .await;
-            return;
-        }
-        execution_reference_price = Some(fresh_snapshot.price);
     }
 
     if !config.strict_exchange_selection
@@ -3012,6 +3337,95 @@ async fn execute_if_warranted(
         return;
     }
 
+    // Reprice only after venue routing and balance-based amount capping. This
+    // ensures both the economics gate and subsequent fill telemetry refer to
+    // the exact venue, symbol and notional that will be submitted.
+    if !decision.override_applied {
+        let fresh_snapshot = match octobot
+            .get_market_snapshot(&execution_exchange, &decision.symbol)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                state
+                    .log_warn(
+                        "execute",
+                        format!("Trade skipped: immediate repricing failed: {error}"),
+                    )
+                    .await;
+                return;
+            }
+        };
+        let fresh_age = (now_ts() - fresh_snapshot.fetched_at).max(0.0);
+        if fresh_age > config.market_snapshot_ttl_seconds {
+            state
+                .log_warn(
+                    "execute",
+                    format!("Trade skipped: repricing snapshot is {fresh_age:.1}s old"),
+                )
+                .await;
+            return;
+        }
+        let Some(reference_price) = decision.reference_price else {
+            state
+                .log_warn("execute", "Trade skipped: decision has no reference price")
+                .await;
+            return;
+        };
+        let adverse_drift_bps =
+            adverse_reprice_drift_bps(side, reference_price, fresh_snapshot.price);
+        let fresh_cost = {
+            let current = state.0.lock().await;
+            current.execution_telemetry.estimate_round_trip(
+                &fresh_snapshot,
+                side,
+                execution_amount_usd,
+                config.estimated_fee_bps,
+                config.estimated_slippage_bps,
+                &config.quantitative.execution_telemetry,
+            )
+        };
+        execution_round_trip_cost_bps = fresh_cost.round_trip_cost_bps;
+        let repriced = reprice_net_edge(
+            decision.economics.expected_net_edge_bps,
+            decision.economics.estimated_round_trip_cost_bps,
+            fresh_cost.round_trip_cost_bps,
+            adverse_drift_bps,
+        );
+        let repriced_net_edge_bps = repriced.net_edge_bps;
+        if adverse_drift_bps > config.max_reprice_drift_bps
+            || repriced_net_edge_bps + f64::EPSILON < decision.economics.required_net_edge_bps
+        {
+            state
+                .log(
+                    "warn",
+                    "execute",
+                    "Trade skipped after immediate price-drift/economics check",
+                    json!({
+                        "exchange": execution_exchange,
+                        "symbol": decision.symbol,
+                        "side": side,
+                        "reference_price": reference_price,
+                        "current_price": fresh_snapshot.price,
+                        "adverse_drift_bps": adverse_drift_bps,
+                        "fresh_round_trip_cost_bps": fresh_cost.round_trip_cost_bps,
+                        "decision_round_trip_cost_bps": decision.economics.estimated_round_trip_cost_bps,
+                        "cost_regression_bps": repriced.cost_regression_bps,
+                        "projected_market_cost_bps": fresh_cost.projected_market_cost_bps,
+                        "empirical_market_cost_bps": fresh_cost.empirical_market_cost_bps,
+                        "empirical_samples": fresh_cost.empirical_samples,
+                        "used_cost_fallback": fresh_cost.used_fallback,
+                        "max_reprice_drift_bps": config.max_reprice_drift_bps,
+                        "repriced_net_edge_bps": repriced_net_edge_bps,
+                        "required_net_edge_bps": decision.economics.required_net_edge_bps,
+                    }),
+                )
+                .await;
+            return;
+        }
+        execution_reference_price = Some(fresh_snapshot.price);
+    }
+
     let Some(intent_key) = execution_intent_key(side, &execution_exchange, &decision.symbol) else {
         state
             .log_warn("execute", "Unable to derive order intent — trade skipped")
@@ -3110,12 +3524,13 @@ async fn execute_if_warranted(
 
     match result {
         Ok(order) => {
+            let executed_at = now_ts();
             info!(
                 "trading: {} order placed — id={} {}/{} ${:.2}",
                 side, order.order_id, execution_exchange, decision.symbol, execution_amount_usd
             );
             let trade = ExecutedTrade {
-                ts: now_ts(),
+                ts: executed_at,
                 exchange: execution_exchange.clone(),
                 symbol: decision.symbol.clone(),
                 action: decision.action.clone(),
@@ -3131,13 +3546,33 @@ async fn execute_if_warranted(
             {
                 let mut s = state.0.lock().await;
                 s.in_flight_order_intents.remove(&intent_key);
+                if let (Some(reference_price), Some(fill_price)) =
+                    (execution_reference_price, order.price)
+                {
+                    s.execution_telemetry.record_fill(
+                        executed_at,
+                        &execution_exchange,
+                        &decision.symbol,
+                        side,
+                        &order.order_id,
+                        execution_amount_usd,
+                        reference_price,
+                        fill_price,
+                        config.estimated_fee_bps,
+                        &config.quantitative.execution_telemetry,
+                    );
+                }
                 s.record_trade(trade);
                 if let Some(entry_price) = order.price.or(execution_reference_price) {
+                    let holding_horizon_seconds = decision
+                        .holding_horizon_seconds
+                        .unwrap_or(config.markout_horizon_seconds)
+                        .clamp(60, 30 * 86_400);
                     s.outcome_ledger.record(
                         TradeMarkout {
                             order_id: order.order_id.clone(),
-                            executed_at: now_ts(),
-                            due_at: now_ts() + config.markout_horizon_seconds as f64,
+                            executed_at,
+                            due_at: executed_at + holding_horizon_seconds as f64,
                             exchange: execution_exchange.clone(),
                             symbol: decision.symbol.clone(),
                             action: decision.action.clone(),
@@ -3160,7 +3595,11 @@ async fn execute_if_warranted(
                         "{side} order placed: {}/{} ${:.2} id={}",
                         execution_exchange, decision.symbol, execution_amount_usd, order.order_id
                     ),
-                    json!({ "order_id": order.order_id, "status": order.status }),
+                    json!({
+                        "order_id": order.order_id,
+                        "status": order.status,
+                        "execution_round_trip_cost_bps": execution_round_trip_cost_bps,
+                    }),
                 )
                 .await;
             // Filled trades are safety-critical history. Persist immediately so
@@ -3819,6 +4258,16 @@ impl MarketRegimeContagion {
             confidence: 0.0,
             leaders: Vec::new(),
         }
+    }
+}
+
+fn quantitative_regime_label(regime: &MarketRegimeContagion) -> &'static str {
+    if regime.confidence < 0.30 || regime.signal.abs() < 0.20 {
+        "neutral"
+    } else if regime.signal > 0.0 {
+        "bullish_trend"
+    } else {
+        "bearish_trend"
     }
 }
 

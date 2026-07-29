@@ -204,6 +204,7 @@ mod tests {
             high_24h: None,
             low_24h: None,
             fetched_at: 0.0,
+            microstructure: Default::default(),
         }
     }
 
@@ -2282,6 +2283,7 @@ mod tests {
             high_24h: None,
             low_24h: None,
             fetched_at: 0.0,
+            microstructure: Default::default(),
         };
         let score = market_score(&no_data);
         assert!(
@@ -4520,7 +4522,7 @@ mod tests {
             .and(query_param("exchange", "binance"))
             .and(query_param("symbol", "BTC/USDT"))
             .respond_with(ResponseTemplate::new(404))
-            .expect(0)
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -4661,7 +4663,7 @@ mod tests {
             .and(query_param("exchange", "bitget"))
             .and(query_param("symbol", "DOGE/USDT"))
             .respond_with(ResponseTemplate::new(404))
-            .expect(0)
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -5088,7 +5090,7 @@ mod tests {
             .and(path("/api/market/ticker"))
             .and(query_param("exchange", "binance"))
             .respond_with(ResponseTemplate::new(404))
-            .expect(0)
+            .expect(2)
             .mount(&server)
             .await;
 
@@ -5192,7 +5194,7 @@ mod tests {
             .and(path("/api/market/ticker"))
             .and(query_param("exchange", "binance"))
             .respond_with(ResponseTemplate::new(404))
-            .expect(0)
+            .expect(8)
             .mount(&server)
             .await;
 

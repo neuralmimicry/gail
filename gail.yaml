@@ -266,7 +266,7 @@ trading:
   markout_calibration_min_samples: 8
   # Persistent shadow quant controller. Paired policy observations share a
   # timestamp/horizon, retain each policy's selected USDT venue/symbol, and
-  # include the same modeled round-trip trading costs.
+  # include the same modelled round-trip trading costs.
   quant_shadow_enabled: true
   quant_shadow_horizon_seconds: 900
   quant_shadow_expiry_seconds: 3600
@@ -281,6 +281,109 @@ trading:
   quant_migration_min_outperformance_bps: 10
   quant_migration_max_downside_regression_bps: 25
   quant_migration_required_streak: 3
+  # Modular quantitative stack. CPU-heavy replay and sleeve calculations run
+  # away from Tokio I/O workers; live execution remains governed by the legacy
+  # shadow-to-primary promotion controller above.
+  quantitative:
+    enabled: true
+    native_backtest_enabled: true
+    native_backtest:
+      initial_equity_usd: 10000
+      trade_notional_usd: 25
+      holding_horizon_seconds: 3600
+      # These two values are replaced by the top-level live assumptions for
+      # scheduled replay, keeping one source of truth.
+      fee_bps: 10
+      slippage_bps: 12
+      minimum_training_frames: 96
+      validation_frames: 48
+      embargo_frames: 4
+      minimum_validation_trades: 16
+      confidence_z_score: 1.645
+      minimum_net_edge_bps: 10
+      maximum_pbo: 0.20
+      maximum_frames: 20000
+      symbol_limit: 40
+      frame_interval_seconds: 900
+    calibration:
+      enabled: true
+      horizons_seconds: [900, 3600, 14400, 86400]
+      expiry_grace_seconds: 3600
+      ledger_size: 20000
+      minimum_samples: 24
+      confidence_z_score: 1.645
+      minimum_net_edge_bps: 10
+      require_calibrated_edge: true
+    selection:
+      cash_parameter_id: "cash-v1"
+      minimum_actionable_net_edge_bps: 0
+      confidence_z_score: 1.645
+      require_native_validation_for_promotion: true
+      native_validation_max_age_seconds: 86400
+    portfolio:
+      enabled: true
+      top_k: 3
+      minimum_quote_volume_usd: 1000000
+      maximum_spread_bps: 40
+      minimum_depth_usd: 5000
+      minimum_listing_age_days: 14
+      winsor_quantile: 0.05
+      volatility_floor_pct: 0.25
+      volatility_target_pct: 2.0
+      maximum_asset_weight: 0.45
+      maximum_cluster_weight: 0.65
+      minimum_factor_score: 0.05
+      allow_illiquid_reversal: false
+      microstructure_signal_weight: 0.15
+    execution_telemetry:
+      enabled: true
+      ledger_size: 10000
+      minimum_empirical_samples: 8
+      maximum_cost_bps: 2500
+    alpha_sleeves:
+      enabled: true
+      recommendation_ledger_size: 2000
+      pairs:
+        enabled: true
+        # Remain true until the OctoBot adapter can commit or cancel both legs
+        # atomically. Research recommendations are still markout-tested.
+        shadow_only: true
+        atomic_hedge_execution_supported: false
+        pairs:
+          - id: "btc-eth"
+            first_symbol: "BTC/USDT"
+            second_symbol: "ETH/USDT"
+            exchange: ""
+        lookback_samples: 240
+        minimum_samples: 60
+        minimum_correlation: 0.60
+        entry_z_score: 2.0
+        exit_z_score: 0.50
+        minimum_net_edge_bps: 12
+        shadow_horizon_seconds: 14400
+      carry:
+        enabled: true
+        shadow_only: true
+        atomic_hedge_execution_supported: false
+        funding_interval_hours: 8
+        expected_holding_days: 30
+        minimum_abs_funding_rate: 0.0001
+        maximum_abs_funding_rate: 0.01
+        minimum_open_interest_usd: 1000000
+        maximum_abs_basis_bps: 2000
+        minimum_annualised_net_edge_bps: 150
+        maximum_leverage: 2
+        minimum_liquidation_buffer_pct: 20
+        allow_reverse_carry: false
+        shadow_horizon_seconds: 28800
+    llm_risk_overlay:
+      enabled: true
+      time_to_live_seconds: 21600
+      minimum_coverage: 0.50
+      minimum_agreement: 0.50
+      dampening_risk_score: 0.55
+      veto_risk_score: 0.85
+      minimum_multiplier: 0.25
   research_query_template: "cryptocurrency market sentiment {currency} {exchange} {date}"
   research_index_name: "crypto"
   research_site_hints: ["bloomberg.com", "reuters.com", "cnbc.com"]

@@ -18,6 +18,7 @@
 
 use std::{cmp::Ordering, collections::VecDeque};
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -27,6 +28,9 @@ use super::{
     config::TradingConfig,
     datalake::{MarketHistoricalFeatures, market_feature_key},
     octobot::{MarketSnapshot, OctobotPortfolio},
+    quantitative::portfolio::{
+        CrossSectionalAllocator, CrossSectionalConfig, CrossSectionalInput, PortfolioAllocation,
+    },
 };
 
 const QUANT_STATE_VERSION: u32 = 1;
@@ -58,6 +62,7 @@ impl QuantMode {
 #[serde(default)]
 pub struct QuantParameters {
     pub id: String,
+    pub kind: QuantParameterKind,
     pub short_momentum_weight: f64,
     pub mid_momentum_weight: f64,
     pub long_momentum_weight: f64,
@@ -71,6 +76,7 @@ impl Default for QuantParameters {
     fn default() -> Self {
         Self {
             id: "balanced-v1".to_string(),
+            kind: QuantParameterKind::Momentum,
             short_momentum_weight: 0.45,
             mid_momentum_weight: 0.30,
             long_momentum_weight: 0.15,
@@ -82,9 +88,28 @@ impl Default for QuantParameters {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuantParameterKind {
+    #[default]
+    Momentum,
+    /// Explicit no-trade benchmark. Its return is always zero.
+    Cash,
+}
+
 impl QuantParameters {
     fn normalize(&mut self) {
         self.id = self.id.trim().to_ascii_lowercase();
+        if self.kind == QuantParameterKind::Cash {
+            self.short_momentum_weight = 0.0;
+            self.mid_momentum_weight = 0.0;
+            self.long_momentum_weight = 0.0;
+            self.live_momentum_weight = 0.0;
+            self.volume_confirmation_weight = 0.0;
+            self.risk_attenuation = 0.0;
+            self.entry_threshold = 0.80;
+            return;
+        }
         self.short_momentum_weight = self.short_momentum_weight.clamp(0.0, 1.0);
         self.mid_momentum_weight = self.mid_momentum_weight.clamp(0.0, 1.0);
         self.long_momentum_weight = self.long_momentum_weight.clamp(0.0, 1.0);
@@ -115,6 +140,7 @@ fn default_parameter_sets() -> Vec<QuantParameters> {
         QuantParameters::default(),
         QuantParameters {
             id: "fast-trend-v1".to_string(),
+            kind: QuantParameterKind::Momentum,
             short_momentum_weight: 0.62,
             mid_momentum_weight: 0.20,
             long_momentum_weight: 0.08,
@@ -125,6 +151,7 @@ fn default_parameter_sets() -> Vec<QuantParameters> {
         },
         QuantParameters {
             id: "slow-trend-v1".to_string(),
+            kind: QuantParameterKind::Momentum,
             short_momentum_weight: 0.25,
             mid_momentum_weight: 0.35,
             long_momentum_weight: 0.30,
@@ -135,6 +162,7 @@ fn default_parameter_sets() -> Vec<QuantParameters> {
         },
         QuantParameters {
             id: "risk-controlled-v1".to_string(),
+            kind: QuantParameterKind::Momentum,
             short_momentum_weight: 0.40,
             mid_momentum_weight: 0.30,
             long_momentum_weight: 0.20,
@@ -145,6 +173,7 @@ fn default_parameter_sets() -> Vec<QuantParameters> {
         },
         QuantParameters {
             id: "volume-confirmed-v1".to_string(),
+            kind: QuantParameterKind::Momentum,
             short_momentum_weight: 0.50,
             mid_momentum_weight: 0.25,
             long_momentum_weight: 0.15,
@@ -152,6 +181,17 @@ fn default_parameter_sets() -> Vec<QuantParameters> {
             volume_confirmation_weight: 0.25,
             risk_attenuation: 0.60,
             entry_threshold: 0.26,
+        },
+        QuantParameters {
+            id: "cash-v1".to_string(),
+            kind: QuantParameterKind::Cash,
+            short_momentum_weight: 0.0,
+            mid_momentum_weight: 0.0,
+            long_momentum_weight: 0.0,
+            live_momentum_weight: 0.0,
+            volume_confirmation_weight: 0.0,
+            risk_attenuation: 0.0,
+            entry_threshold: 0.80,
         },
     ]
     .into_iter()
@@ -187,7 +227,19 @@ pub struct QuantSignal {
     pub signal: f64,
     pub confidence: f64,
     pub risk_score: f64,
+    /// Policy actionability before empirical cost and risk overlays.
+    pub raw_actionable: bool,
     pub actionable: bool,
+    pub selected_horizon_seconds: Option<u64>,
+    pub expected_gross_edge_bps: Option<f64>,
+    pub edge_lower_bound_bps: Option<f64>,
+    pub estimated_round_trip_cost_bps: f64,
+    pub edge_gate_reason: Option<String>,
+    /// Cross-sectional target weight; cash retains any unallocated residual.
+    pub target_weight: f64,
+    pub rebalance_weight: f64,
+    pub cross_sectional_score: f64,
+    pub portfolio_allocations: Vec<PortfolioAllocation>,
     pub rationale: String,
 }
 
@@ -232,6 +284,16 @@ impl QuantSignal {
                 "agreement": 1.0,
                 "coverage": 1.0,
                 "average_risk": self.risk_score,
+                "raw_actionable": self.raw_actionable,
+                "selected_horizon_seconds": self.selected_horizon_seconds,
+                "expected_gross_edge_bps": self.expected_gross_edge_bps,
+                "edge_lower_bound_bps": self.edge_lower_bound_bps,
+                "estimated_round_trip_cost_bps": self.estimated_round_trip_cost_bps,
+                "edge_gate_reason": self.edge_gate_reason,
+                "target_weight": self.target_weight,
+                "rebalance_weight": self.rebalance_weight,
+                "cross_sectional_score": self.cross_sectional_score,
+                "portfolio_allocations": self.portfolio_allocations,
             }),
             advices: vec![advice],
             responders: 1,
@@ -316,6 +378,9 @@ pub struct QuantMigrationState {
     pub last_shadow_recorded_at: Option<f64>,
     pub total_resolved: u64,
     pub last_tuned_resolved_count: u64,
+    /// Most recent Gail-native validation of the currently promotable arm.
+    pub native_validation_parameter_id: Option<String>,
+    pub native_validation_at: Option<f64>,
 }
 
 impl Default for QuantMigrationState {
@@ -333,6 +398,8 @@ impl Default for QuantMigrationState {
             last_shadow_recorded_at: None,
             total_resolved: 0,
             last_tuned_resolved_count: 0,
+            native_validation_parameter_id: None,
+            native_validation_at: None,
         }
     }
 }
@@ -343,6 +410,17 @@ impl QuantMigrationState {
         self.version = QUANT_STATE_VERSION;
         if self.parameter_sets.is_empty() {
             self.parameter_sets = default_parameter_sets();
+        }
+        if !self
+            .parameter_sets
+            .iter()
+            .any(|parameters| parameters.kind == QuantParameterKind::Cash)
+        {
+            self.parameter_sets.push(QuantParameters {
+                id: "cash-v1".to_string(),
+                kind: QuantParameterKind::Cash,
+                ..QuantParameters::default()
+            });
         }
         for parameters in &mut self.parameter_sets {
             parameters.normalize();
@@ -549,6 +627,7 @@ impl QuantMigrationState {
                     snapshots,
                     historical_features,
                     portfolio,
+                    &config.quantitative.portfolio,
                 );
                 let entry_price =
                     exact_market_snapshot(snapshots, &candidate.exchange, &candidate.symbol)
@@ -619,21 +698,33 @@ impl QuantMigrationState {
         {
             return None;
         }
-        let performances = self.parameter_performances(config.quant_migration_window_samples);
+        let performances = self.parameter_performances(
+            config.quant_migration_window_samples,
+            config.quantitative.selection.confidence_z_score,
+        );
         let current = performances
             .iter()
             .find(|performance| performance.parameter_id == self.active_parameter_id)?;
-        let best = performances
+        let selection = &config.quantitative.selection;
+        let cash = performances
             .iter()
+            .find(|performance| performance.parameter_id == selection.cash_parameter_id)?;
+        let best_trading_arm = performances
+            .iter()
+            .filter(|performance| performance.parameter_id != selection.cash_parameter_id)
             .filter(|performance| {
                 performance.samples >= config.quant_tuning_min_samples
                     && performance.actionable_samples >= config.quant_tuning_min_actionable_samples
+                    && performance.net_edge_lower_bound_bps
+                        > selection.minimum_actionable_net_edge_bps
             })
             .max_by(|left, right| {
                 left.risk_adjusted_score_bps
                     .partial_cmp(&right.risk_adjusted_score_bps)
                     .unwrap_or(Ordering::Equal)
-            })?;
+            });
+        // Cash wins whenever no trading arm establishes positive absolute edge.
+        let best = best_trading_arm.unwrap_or(cash);
         self.last_tuned_resolved_count = total;
         let improvement = best.risk_adjusted_score_bps - current.risk_adjusted_score_bps;
         if best.parameter_id == self.active_parameter_id
@@ -670,23 +761,58 @@ impl QuantMigrationState {
             .iter()
             .map(|item| item.active_quant_net_return_bps)
             .collect::<Vec<_>>();
+        let quant_actions = paired
+            .iter()
+            .map(|item| item.active_quant_actionable)
+            .collect::<Vec<_>>();
         let llm_values = paired
             .iter()
             .filter_map(|item| item.llm_net_return_bps)
+            .collect::<Vec<_>>();
+        let llm_actions = paired
+            .iter()
+            .map(|item| item.llm_actionable)
             .collect::<Vec<_>>();
         let actionable_samples = paired
             .iter()
             .filter(|item| item.active_quant_actionable)
             .count();
-        let quant = PerformanceSummary::from_values(&quant_values, actionable_samples);
-        let llm = PerformanceSummary::from_values(
-            &llm_values,
-            paired.iter().filter(|item| item.llm_actionable).count(),
+        let quant = PerformanceSummary::from_policy_values(
+            &quant_values,
+            &quant_actions,
+            config.quantitative.selection.confidence_z_score,
         );
-        let outperformance = quant.mean_net_return_bps - llm.mean_net_return_bps;
+        let llm = PerformanceSummary::from_policy_values(
+            &llm_values,
+            &llm_actions,
+            config.quantitative.selection.confidence_z_score,
+        );
+        let outperformance =
+            quant.opportunity_mean_net_return_bps - llm.opportunity_mean_net_return_bps;
+        let native_validation_current = !config
+            .quantitative
+            .selection
+            .require_native_validation_for_promotion
+            || (self.native_validation_parameter_id.as_deref()
+                == Some(self.active_parameter_id.as_str())
+                && self.native_validation_at.is_some_and(|validated_at| {
+                    now - validated_at
+                        <= config
+                            .quantitative
+                            .selection
+                            .native_validation_max_age_seconds as f64
+                }));
+        let active_is_cash = self.active_parameters().kind == QuantParameterKind::Cash;
         let qualified = paired.len() >= config.quant_migration_min_samples
             && actionable_samples >= config.quant_migration_min_actionable_samples
-            && quant.mean_net_return_bps > 0.0
+            && !active_is_cash
+            && native_validation_current
+            && quant.net_edge_lower_bound_bps
+                > config
+                    .quantitative
+                    .selection
+                    .minimum_actionable_net_edge_bps
+            && quant.opportunity_mean_net_return_bps > 0.0
             && outperformance >= config.quant_migration_min_outperformance_bps
             && quant.mean_downside_bps
                 <= llm.mean_downside_bps + config.quant_migration_max_downside_regression_bps;
@@ -726,27 +852,38 @@ impl QuantMigrationState {
             .iter()
             .map(|item| item.active_quant_net_return_bps)
             .collect::<Vec<_>>();
+        let quant_actions = paired
+            .iter()
+            .map(|item| item.active_quant_actionable)
+            .collect::<Vec<_>>();
         let llm_values = paired
             .iter()
             .filter_map(|item| item.llm_net_return_bps)
             .collect::<Vec<_>>();
+        let llm_actions = paired
+            .iter()
+            .map(|item| item.llm_actionable)
+            .collect::<Vec<_>>();
         QuantControllerPerformance {
             paired_samples: paired.len(),
-            quant: PerformanceSummary::from_values(
+            quant: PerformanceSummary::from_policy_values(
                 &quant_values,
-                paired
-                    .iter()
-                    .filter(|item| item.active_quant_actionable)
-                    .count(),
+                &quant_actions,
+                config.quantitative.selection.confidence_z_score,
             ),
-            llm: PerformanceSummary::from_values(
+            llm: PerformanceSummary::from_policy_values(
                 &llm_values,
-                paired.iter().filter(|item| item.llm_actionable).count(),
+                &llm_actions,
+                config.quantitative.selection.confidence_z_score,
             ),
         }
     }
 
-    fn parameter_performances(&self, window: usize) -> Vec<ParameterPerformance> {
+    fn parameter_performances(
+        &self,
+        window: usize,
+        confidence_z_score: f64,
+    ) -> Vec<ParameterPerformance> {
         self.parameter_sets
             .iter()
             .map(|parameters| {
@@ -765,19 +902,31 @@ impl QuantMigrationState {
                     .iter()
                     .map(|outcome| outcome.net_return_bps)
                     .collect::<Vec<_>>();
-                let summary = PerformanceSummary::from_values(
-                    &values,
-                    outcomes.iter().filter(|outcome| outcome.actionable).count(),
-                );
+                let actions = outcomes
+                    .iter()
+                    .map(|outcome| outcome.actionable)
+                    .collect::<Vec<_>>();
+                let summary =
+                    PerformanceSummary::from_policy_values(&values, &actions, confidence_z_score);
+                let is_cash = parameters.kind == QuantParameterKind::Cash;
                 ParameterPerformance {
                     parameter_id: parameters.id.clone(),
                     samples: summary.samples,
                     actionable_samples: summary.actionable_samples,
                     mean_net_return_bps: summary.mean_net_return_bps,
+                    opportunity_mean_net_return_bps: summary.opportunity_mean_net_return_bps,
+                    net_edge_lower_bound_bps: if is_cash {
+                        0.0
+                    } else {
+                        summary.net_edge_lower_bound_bps
+                    },
                     win_rate: summary.win_rate,
                     mean_downside_bps: summary.mean_downside_bps,
-                    risk_adjusted_score_bps: summary.mean_net_return_bps
-                        - summary.mean_downside_bps * 0.25,
+                    risk_adjusted_score_bps: if is_cash {
+                        0.0
+                    } else {
+                        summary.net_edge_lower_bound_bps - summary.mean_downside_bps * 0.25
+                    },
                 }
             })
             .collect()
@@ -789,26 +938,59 @@ pub struct PerformanceSummary {
     pub samples: usize,
     pub actionable_samples: usize,
     pub mean_net_return_bps: f64,
+    pub opportunity_mean_net_return_bps: f64,
+    pub net_edge_lower_bound_bps: f64,
     pub win_rate: f64,
     pub mean_downside_bps: f64,
 }
 
 impl PerformanceSummary {
-    fn from_values(values: &[f64], actionable_samples: usize) -> Self {
+    fn from_policy_values(values: &[f64], actionable: &[bool], confidence_z_score: f64) -> Self {
         if values.is_empty() {
             return Self::default();
         }
-        let losses = values
+        let actionable_values = values
+            .iter()
+            .zip(actionable.iter().copied())
+            .filter_map(|(value, is_actionable)| is_actionable.then_some(*value))
+            .collect::<Vec<_>>();
+        let opportunity_mean_net_return_bps = values.iter().sum::<f64>() / values.len() as f64;
+        if actionable_values.is_empty() {
+            return Self {
+                samples: values.len(),
+                opportunity_mean_net_return_bps,
+                ..Self::default()
+            };
+        }
+        let mean = actionable_values.iter().sum::<f64>() / actionable_values.len() as f64;
+        let variance = if actionable_values.len() > 1 {
+            actionable_values
+                .iter()
+                .map(|value| (value - mean).powi(2))
+                .sum::<f64>()
+                / (actionable_values.len() - 1) as f64
+        } else {
+            0.0
+        };
+        let lower_bound = mean
+            - confidence_z_score.clamp(0.0, 4.0) * variance.sqrt()
+                / (actionable_values.len() as f64).sqrt();
+        let losses = actionable_values
             .iter()
             .filter(|value| **value < 0.0)
             .map(|value| value.abs())
             .collect::<Vec<_>>();
         Self {
             samples: values.len(),
-            actionable_samples,
-            mean_net_return_bps: values.iter().sum::<f64>() / values.len() as f64,
-            win_rate: values.iter().filter(|value| **value > 0.0).count() as f64
-                / values.len() as f64,
+            actionable_samples: actionable_values.len(),
+            mean_net_return_bps: mean,
+            opportunity_mean_net_return_bps,
+            net_edge_lower_bound_bps: lower_bound,
+            win_rate: actionable_values
+                .iter()
+                .filter(|value| **value > 0.0)
+                .count() as f64
+                / actionable_values.len() as f64,
             mean_downside_bps: if losses.is_empty() {
                 0.0
             } else {
@@ -824,6 +1006,8 @@ pub struct ParameterPerformance {
     pub samples: usize,
     pub actionable_samples: usize,
     pub mean_net_return_bps: f64,
+    pub opportunity_mean_net_return_bps: f64,
+    pub net_edge_lower_bound_bps: f64,
     pub win_rate: f64,
     pub mean_downside_bps: f64,
     pub risk_adjusted_score_bps: f64,
@@ -900,41 +1084,166 @@ pub fn evaluate_universe(
     snapshots: &[MarketSnapshot],
     historical_features: &std::collections::HashMap<String, MarketHistoricalFeatures>,
     portfolio: &OctobotPortfolio,
+    cross_sectional_config: &CrossSectionalConfig,
 ) -> QuantSignal {
     evaluate_universe_for_parameters(
         state.active_parameters(),
         snapshots,
         historical_features,
         portfolio,
+        cross_sectional_config,
     )
 }
 
-fn evaluate_universe_for_parameters(
+pub(crate) fn evaluate_universe_for_parameters(
     parameters: &QuantParameters,
     snapshots: &[MarketSnapshot],
     historical_features: &std::collections::HashMap<String, MarketHistoricalFeatures>,
     portfolio: &OctobotPortfolio,
+    cross_sectional_config: &CrossSectionalConfig,
 ) -> QuantSignal {
-    snapshots
-        .iter()
+    if parameters.kind == QuantParameterKind::Cash {
+        let benchmark = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.price.is_finite() && snapshot.price > 0.0)
+            .filter(|snapshot| is_usdt_quote(&snapshot.symbol))
+            .min_by(|left, right| {
+                left.exchange
+                    .cmp(&right.exchange)
+                    .then_with(|| left.symbol.cmp(&right.symbol))
+            });
+        return benchmark.map_or_else(
+            || QuantSignal::hold("Cash arm: no usable USDT benchmark market"),
+            |snapshot| QuantSignal {
+                parameter_id: parameters.id.clone(),
+                exchange: snapshot.exchange.clone(),
+                symbol: snapshot.symbol.clone(),
+                rationale: "Explicit cash/no-trade benchmark".to_string(),
+                ..QuantSignal::default()
+            },
+        );
+    }
+    let candidates = snapshots
+        .par_iter()
         .filter(|snapshot| snapshot.price.is_finite() && snapshot.price > 0.0)
         .filter(|snapshot| is_usdt_quote(&snapshot.symbol))
         .map(|snapshot| {
             let history =
                 historical_features.get(&market_feature_key(&snapshot.exchange, &snapshot.symbol));
-            evaluate_symbol(parameters, snapshot, history)
+            let signal = evaluate_symbol(parameters, snapshot, history);
+            let inventory_eligible =
+                signal.signal >= 0.0 || portfolio_holds_symbol(portfolio, &signal.symbol);
+            let volatility_pct = history
+                .and_then(|features| features.volatility_pct)
+                .unwrap_or_else(|| range_risk(snapshot) * 8.0)
+                .abs()
+                .max(0.01);
+            let quote_volume_usd = snapshot
+                .microstructure
+                .quote_volume_24h
+                .or_else(|| snapshot.volume_24h.map(|volume| volume * snapshot.price))
+                .filter(|value| value.is_finite() && *value >= 0.0);
+            let microstructure_signal = snapshot
+                .microstructure
+                .order_flow_imbalance
+                .or(snapshot.microstructure.trade_flow_imbalance)
+                .unwrap_or(0.0)
+                .clamp(-1.0, 1.0);
+            let microstructure_weight = cross_sectional_config.microstructure_signal_weight;
+            let input = CrossSectionalInput {
+                exchange: snapshot.exchange.clone(),
+                symbol: snapshot.symbol.clone(),
+                directional_signal: (signal.signal * (1.0 - microstructure_weight)
+                    + microstructure_signal * microstructure_weight)
+                    .clamp(-1.0, 1.0),
+                confidence: signal.confidence,
+                risk_score: signal.risk_score,
+                volatility_pct,
+                quote_volume_usd,
+                spread_bps: snapshot.spread_bps(),
+                depth_usd: snapshot.executable_depth_usd(),
+                listing_age_days: snapshot.microstructure.listing_age_days,
+                inventory_eligible,
+                actionable: signal.actionable,
+                correlation_cluster: correlation_cluster(&snapshot.symbol),
+                current_weight: portfolio_symbol_weight(portfolio, &snapshot.symbol),
+            };
+            (signal, input)
         })
-        // Spot sells must be grounded in held inventory. Without this filter a
-        // bearish signal on an unheld asset could be applied to a different
-        // held fallback symbol by downstream target validation.
-        .filter(|signal| signal.signal >= 0.0 || portfolio_holds_symbol(portfolio, &signal.symbol))
-        .max_by(|left, right| {
-            quant_rank(left)
-                .partial_cmp(&quant_rank(right))
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| right.symbol.cmp(&left.symbol))
-        })
-        .unwrap_or_else(|| QuantSignal::hold("No usable USDT market for quant evaluation"))
+        .collect::<Vec<_>>();
+    let recommendation = CrossSectionalAllocator::new(cross_sectional_config.clone())
+        .allocate(candidates.iter().map(|(_, input)| input.clone()).collect());
+    let Some(selected) = recommendation.allocations.first() else {
+        return benchmark_hold_signal(
+            parameters,
+            snapshots,
+            format!(
+                "No executable cross-sectional allocation (eligible={}, excluded={})",
+                recommendation.eligible_markets, recommendation.excluded_markets
+            ),
+        );
+    };
+    let Some((mut signal, _)) = candidates.into_iter().find(|(signal, _)| {
+        signal.exchange.eq_ignore_ascii_case(&selected.exchange)
+            && signal.symbol.eq_ignore_ascii_case(&selected.symbol)
+    }) else {
+        return benchmark_hold_signal(
+            parameters,
+            snapshots,
+            "Cross-sectional allocation could not be mapped to a market".to_string(),
+        );
+    };
+    signal.target_weight = selected.target_weight;
+    signal.rebalance_weight = selected.rebalance_weight;
+    signal.cross_sectional_score = selected.factor_score;
+    signal.portfolio_allocations = recommendation.allocations;
+    signal.rationale.push_str(&format!(
+        "; cross-sectional rank=1 score={:.3} target_weight={:.3} rebalance={:.3} cash_weight={:.3}",
+        signal.cross_sectional_score,
+        signal.target_weight,
+        signal.rebalance_weight,
+        recommendation.cash_weight
+    ));
+    signal
+}
+
+fn benchmark_hold_signal(
+    parameters: &QuantParameters,
+    snapshots: &[MarketSnapshot],
+    reason: String,
+) -> QuantSignal {
+    let benchmark = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.price.is_finite() && snapshot.price > 0.0)
+        .filter(|snapshot| is_usdt_quote(&snapshot.symbol))
+        .min_by(|left, right| {
+            left.exchange
+                .cmp(&right.exchange)
+                .then_with(|| left.symbol.cmp(&right.symbol))
+        });
+    benchmark.map_or_else(
+        || QuantSignal::hold(reason.clone()),
+        |snapshot| QuantSignal {
+            parameter_id: parameters.id.clone(),
+            exchange: snapshot.exchange.clone(),
+            symbol: snapshot.symbol.clone(),
+            rationale: reason.clone(),
+            ..QuantSignal::default()
+        },
+    )
+}
+
+fn correlation_cluster(symbol: &str) -> String {
+    let base = symbol
+        .split('/')
+        .next()
+        .unwrap_or(symbol)
+        .to_ascii_uppercase();
+    if matches!(base.as_str(), "BTC" | "ETH" | "BNB" | "SOL") {
+        "large_cap".to_string()
+    } else {
+        base
+    }
 }
 
 fn portfolio_holds_symbol(portfolio: &OctobotPortfolio, symbol: &str) -> bool {
@@ -947,6 +1256,35 @@ fn portfolio_holds_symbol(portfolio: &OctobotPortfolio, symbol: &str) -> bool {
             && balance.total > 0.0
             && balance.value_usd.is_none_or(|value| value > 0.01)
     })
+}
+
+fn portfolio_symbol_weight(portfolio: &OctobotPortfolio, symbol: &str) -> f64 {
+    let Some(base) = symbol.split('/').next().map(str::trim) else {
+        return 0.0;
+    };
+    let asset_value = portfolio
+        .currencies
+        .iter()
+        .find(|(asset, _)| asset.eq_ignore_ascii_case(base))
+        .and_then(|(_, balance)| balance.value_usd)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(0.0);
+    let total_value = portfolio
+        .total_value_usd
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or_else(|| {
+            portfolio
+                .currencies
+                .values()
+                .filter_map(|balance| balance.value_usd)
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .sum()
+        });
+    if total_value <= f64::EPSILON {
+        0.0
+    } else {
+        (asset_value / total_value).clamp(0.0, 1.0)
+    }
 }
 
 pub fn evaluate_symbol(
@@ -963,11 +1301,13 @@ pub fn evaluate_symbol(
         signal: prediction.signal,
         confidence: prediction.confidence,
         risk_score: prediction.risk_score,
+        raw_actionable: prediction.actionable,
         actionable: prediction.actionable,
         rationale: format!(
             "deterministic quant {} signal={:.3} confidence={:.3} risk={:.3} history_samples={history_samples}",
             parameters.id, prediction.signal, prediction.confidence, prediction.risk_score
         ),
+        ..QuantSignal::default()
     }
 }
 
@@ -976,22 +1316,37 @@ fn prediction_for(
     history: Option<&MarketHistoricalFeatures>,
     parameters: &QuantParameters,
 ) -> QuantPrediction {
+    if parameters.kind == QuantParameterKind::Cash {
+        return QuantPrediction {
+            parameter_id: parameters.id.clone(),
+            exchange: snapshot.exchange.clone(),
+            symbol: snapshot.symbol.clone(),
+            entry_price: snapshot.price,
+            ..QuantPrediction::default()
+        };
+    }
+    let volatility_pct = history
+        .and_then(|features| features.volatility_pct)
+        .filter(|value| value.is_finite())
+        .map(f64::abs)
+        .unwrap_or(2.0)
+        .max(0.25);
     let live = snapshot
         .price_change_pct_1h
         .or(snapshot.price_change_pct_24h)
-        .map(|value| (value / 8.0).clamp(-1.0, 1.0))
+        .map(|value| volatility_normalised_return(value, volatility_pct, 2.0))
         .unwrap_or(0.0);
     let short = history
         .and_then(|features| features.momentum_short_pct)
-        .map(|value| (value / 8.0).clamp(-1.0, 1.0))
+        .map(|value| volatility_normalised_return(value, volatility_pct, 2.0))
         .unwrap_or(live);
     let mid = history
         .and_then(|features| features.momentum_mid_pct)
-        .map(|value| (value / 12.0).clamp(-1.0, 1.0))
+        .map(|value| volatility_normalised_return(value, volatility_pct, 4.0))
         .unwrap_or(live * 0.5);
     let long = history
         .and_then(|features| features.momentum_long_pct)
-        .map(|value| (value / 20.0).clamp(-1.0, 1.0))
+        .map(|value| volatility_normalised_return(value, volatility_pct, 8.0))
         .unwrap_or(0.0);
     let volume_confirmation = history
         .and_then(|features| features.volume_ratio_short_long)
@@ -1011,9 +1366,7 @@ fn prediction_for(
         momentum.signum()
     };
     let confirmed = momentum
-        + confirmation_direction
-            * volume_confirmation.max(0.0)
-            * parameters.volume_confirmation_weight;
+        + confirmation_direction * volume_confirmation * parameters.volume_confirmation_weight;
     let signal = (confirmed * (1.0 - parameters.risk_attenuation * risk_score)).clamp(-1.0, 1.0);
     let coverage = feature_coverage(history, snapshot);
     let strength = (signal.abs() / parameters.entry_threshold.max(0.01)).clamp(0.0, 1.0);
@@ -1032,6 +1385,11 @@ fn prediction_for(
         risk_score,
         actionable,
     }
+}
+
+fn volatility_normalised_return(return_pct: f64, volatility_pct: f64, horizon_scale: f64) -> f64 {
+    let denominator = (volatility_pct.abs().max(0.25) * horizon_scale.max(1.0)).max(0.25);
+    (return_pct / denominator).clamp(-1.0, 1.0)
 }
 
 fn feature_coverage(history: Option<&MarketHistoricalFeatures>, snapshot: &MarketSnapshot) -> f64 {
@@ -1063,11 +1421,6 @@ fn range_risk(snapshot: &MarketSnapshot) -> f64 {
         }
         _ => 0.5,
     }
-}
-
-fn quant_rank(signal: &QuantSignal) -> f64 {
-    let actionability = if signal.actionable { 1.0 } else { 0.25 };
-    signal.signal.abs() * signal.confidence * (1.0 - signal.risk_score * 0.5) * actionability
 }
 
 fn exact_market_snapshot<'a>(
@@ -1151,7 +1504,7 @@ mod tests {
     use super::*;
 
     fn config() -> TradingConfig {
-        TradingConfig {
+        let mut config = TradingConfig {
             quant_shadow_enabled: true,
             quant_shadow_horizon_seconds: 60,
             quant_shadow_expiry_seconds: 300,
@@ -1169,7 +1522,12 @@ mod tests {
             estimated_fee_bps: 1.0,
             estimated_slippage_bps: 1.0,
             ..TradingConfig::default()
-        }
+        };
+        config
+            .quantitative
+            .selection
+            .require_native_validation_for_promotion = false;
+        config
     }
 
     fn snapshot(price: f64, fetched_at: f64) -> MarketSnapshot {
@@ -1184,6 +1542,7 @@ mod tests {
             high_24h: Some(price * 1.03),
             low_24h: Some(price * 0.97),
             fetched_at,
+            microstructure: Default::default(),
         }
     }
 
@@ -1437,5 +1796,50 @@ mod tests {
         assert_eq!(adjustment.previous_parameter_id, active);
         assert_eq!(adjustment.selected_parameter_id, challenger);
         assert_eq!(state.active_parameter_id, challenger);
+    }
+
+    #[test]
+    fn parameter_tuning_selects_cash_when_every_trading_arm_loses() {
+        let mut state = QuantMigrationState::default();
+        let config = config();
+        let previous = state.active_parameter_id.clone();
+        for index in 0..3 {
+            state.resolved.push_back(QuantResolvedEvaluation {
+                evaluation_id: index.to_string(),
+                candidate_outcomes: state
+                    .parameter_sets
+                    .iter()
+                    .map(|parameters| QuantCandidateOutcome {
+                        parameter_id: parameters.id.clone(),
+                        actionable: parameters.kind != QuantParameterKind::Cash,
+                        net_return_bps: if parameters.kind == QuantParameterKind::Cash {
+                            0.0
+                        } else {
+                            -25.0
+                        },
+                        ..QuantCandidateOutcome::default()
+                    })
+                    .collect(),
+                ..QuantResolvedEvaluation::default()
+            });
+        }
+        state.normalize();
+        let adjustment = state.maybe_retune(&config).unwrap();
+        assert_eq!(adjustment.previous_parameter_id, previous);
+        assert_eq!(adjustment.selected_parameter_id, "cash-v1");
+        assert_eq!(state.active_parameter_id, "cash-v1");
+    }
+
+    #[test]
+    fn performance_separates_actionable_expectancy_from_hold_opportunities() {
+        let summary = PerformanceSummary::from_policy_values(
+            &[-50.0, 0.0, 0.0, 0.0],
+            &[true, false, false, false],
+            0.0,
+        );
+        assert_eq!(summary.samples, 4);
+        assert_eq!(summary.actionable_samples, 1);
+        assert_eq!(summary.mean_net_return_bps, -50.0);
+        assert_eq!(summary.opportunity_mean_net_return_bps, -12.5);
     }
 }

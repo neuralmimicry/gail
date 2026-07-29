@@ -2,6 +2,8 @@ use std::{collections::HashSet, path::Path};
 
 use serde::{Deserialize, Serialize};
 
+use super::quantitative::QuantitativeConfig;
+
 /// Configuration for the Gail crypto-trading bridge.
 ///
 /// All string fields support `${ENV_VAR}` interpolation (applied by GailConfig::load).
@@ -197,6 +199,10 @@ pub struct TradingConfig {
 
     /// Consecutive successful checks required before the persisted cutover.
     pub quant_migration_required_streak: usize,
+
+    /// Modular native replay, calibration, allocation and alpha-sleeve
+    /// settings.  This stack remains governed by the shadow migration gate.
+    pub quantitative: QuantitativeConfig,
 
     /// Template for Refiner research queries.
     /// Supports `{currency}`, `{exchange}`, `{date}` placeholders.
@@ -425,6 +431,7 @@ impl Default for TradingConfig {
             quant_migration_min_outperformance_bps: 10.0,
             quant_migration_max_downside_regression_bps: 25.0,
             quant_migration_required_streak: 3,
+            quantitative: QuantitativeConfig::default(),
             research_query_template: "cryptocurrency market sentiment {currency} {exchange} {date}"
                 .to_string(),
             research_index_name: "crypto".to_string(),
@@ -577,6 +584,7 @@ impl TradingConfig {
             .quant_migration_max_downside_regression_bps
             .clamp(0.0, 2_500.0);
         self.quant_migration_required_streak = self.quant_migration_required_streak.clamp(1, 100);
+        self.quantitative.normalise();
         self.max_open_positions = self.max_open_positions.clamp(1, 50);
         self.log_ring_size = self.log_ring_size.clamp(10, 10_000);
         self.trade_ring_size = self.trade_ring_size.clamp(10, 5_000);
