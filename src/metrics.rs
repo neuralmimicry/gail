@@ -20,7 +20,26 @@ fn now_ts() -> f64 {
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct MetricsData {
     pub candidates: HashMap<String, CandidateBucket>,
+    #[serde(default)]
+    pub ai_response_times: HashMap<String, AiResponseTimeStats>,
     pub updated_at: f64,
+}
+
+/// Unified response-time statistics for user-visible AI work.
+///
+/// Candidate metrics remain provider-specific for routing. These buckets are
+/// deliberately broader so callers can estimate work before Gail has selected
+/// a particular provider or specialist engine.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct AiResponseTimeStats {
+    pub requests: u64,
+    pub successes: u64,
+    pub failures: u64,
+    pub total_latency_ms: u64,
+    pub average_latency_ms: Option<f64>,
+    pub ewma_latency_ms: Option<f64>,
+    pub last_latency_ms: Option<u64>,
+    pub updated_at: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -100,6 +119,7 @@ pub struct MetricsSummary {
     pub healthy_candidates: usize,
     pub degraded_candidates: usize,
     pub candidates: Vec<CandidateMetricsSummary>,
+    pub ai_response_times: HashMap<String, AiResponseTimeStats>,
 }
 
 #[derive(Clone)]
@@ -123,6 +143,78 @@ impl MetricsStore {
 
     pub fn path(&self) -> String {
         self.path.to_string_lossy().to_string()
+    }
+
+    fn normalize_ai_source(source: &str) -> &'static str {
+        match source.trim().to_ascii_lowercase().as_str() {
+            "snn" | "aarnn" | "neuromorphic" => "snn",
+            "llm" | "language_model" | "language-model" => "llm",
+            _ => "all",
+        }
+    }
+
+    fn merge_ai_response_time(bucket: &mut AiResponseTimeStats, latency_ms: u64, success: bool) {
+        bucket.requests = bucket.requests.saturating_add(1);
+        if success {
+            bucket.successes = bucket.successes.saturating_add(1);
+        } else {
+            bucket.failures = bucket.failures.saturating_add(1);
+        }
+        bucket.total_latency_ms = bucket.total_latency_ms.saturating_add(latency_ms);
+        bucket.average_latency_ms =
+            Some(bucket.total_latency_ms as f64 / bucket.requests.max(1) as f64);
+        bucket.ewma_latency_ms = Some(match bucket.ewma_latency_ms {
+            Some(previous) => (previous * 0.75) + (latency_ms as f64 * 0.25),
+            None => latency_ms as f64,
+        });
+        bucket.last_latency_ms = Some(latency_ms);
+        bucket.updated_at = Some(now_ts());
+    }
+
+    /// Record one user-visible AI operation in its modality bucket and the
+    /// all-modalities bucket used for estimates before routing is known.
+    pub async fn record_ai_response_time(
+        &self,
+        source: &str,
+        latency_ms: u64,
+        success: bool,
+    ) -> Result<()> {
+        let source = Self::normalize_ai_source(source);
+        let mut data = self.inner.lock().await;
+        Self::merge_ai_response_time(
+            data.ai_response_times
+                .entry(source.to_string())
+                .or_default(),
+            latency_ms,
+            success,
+        );
+        if source != "all" {
+            Self::merge_ai_response_time(
+                data.ai_response_times.entry("all".to_string()).or_default(),
+                latency_ms,
+                success,
+            );
+        }
+        data.updated_at = now_ts();
+        let snapshot = data.clone();
+        drop(data);
+        self.save(&snapshot).await
+    }
+
+    /// Return the average observed response time for a modality, falling back
+    /// to the aggregate bucket when the modality has no samples yet.
+    pub async fn ai_response_time_estimate_ms(&self, source: &str) -> Option<u64> {
+        let source = Self::normalize_ai_source(source);
+        let data = self.inner.lock().await;
+        data.ai_response_times
+            .get(source)
+            .or_else(|| data.ai_response_times.get("all"))
+            .and_then(|stats| stats.average_latency_ms)
+            .map(|value| value.max(1.0).round() as u64)
+    }
+
+    pub async fn ai_response_time_summary(&self) -> HashMap<String, AiResponseTimeStats> {
+        self.inner.lock().await.ai_response_times.clone()
     }
 
     async fn save(&self, data: &MetricsData) -> Result<()> {
@@ -475,6 +567,7 @@ impl MetricsStore {
                 .filter(|bucket| bucket.health.ok == Some(false))
                 .count(),
             candidates: limited,
+            ai_response_times: data.ai_response_times.clone(),
         }
     }
 
@@ -500,6 +593,23 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
     out.push_str("# TYPE gail_provider_candidate_inference_ms gauge\n");
     out.push_str("# HELP gail_provider_candidate_tokens_estimate Gail provider candidate EWMA token estimate.\n");
     out.push_str("# TYPE gail_provider_candidate_tokens_estimate gauge\n");
+    out.push_str("# HELP gail_ai_response_time_average_ms Average user-visible AI response time in milliseconds.\n");
+    out.push_str("# TYPE gail_ai_response_time_average_ms gauge\n");
+    out.push_str("# HELP gail_ai_response_time_requests_total User-visible AI requests observed by modality.\n");
+    out.push_str("# TYPE gail_ai_response_time_requests_total counter\n");
+    for (source, stats) in &data.ai_response_times {
+        let labels = format!("source=\"{}\"", escape_label(source));
+        if let Some(average) = stats.average_latency_ms {
+            out.push_str(&format!(
+                "gail_ai_response_time_average_ms{{{labels}}} {:.3}\n",
+                average
+            ));
+        }
+        out.push_str(&format!(
+            "gail_ai_response_time_requests_total{{{labels}}} {}\n",
+            stats.requests
+        ));
+    }
     for (candidate_id, bucket) in &data.candidates {
         let labels = format!(
             "candidate_id=\"{}\",provider=\"{}\",model=\"{}\",health_mode=\"{}\"",
@@ -675,6 +785,35 @@ mod tests {
         let rendered = store.prometheus_metrics().await;
         assert!(rendered.contains("gail_provider_candidate_successes_total"));
         assert!(rendered.contains("candidate_id=\"ollama/llama3.2\""));
+    }
+
+    #[tokio::test]
+    async fn ai_response_time_metrics_track_modalities_and_estimates() {
+        let path = tempfile::NamedTempFile::new()
+            .expect("temp file")
+            .into_temp_path();
+        let store = MetricsStore::new(path.to_path_buf()).await.expect("store");
+        store
+            .record_ai_response_time("llm", 100, true)
+            .await
+            .expect("record llm");
+        store
+            .record_ai_response_time("snn", 300, true)
+            .await
+            .expect("record snn");
+
+        assert_eq!(store.ai_response_time_estimate_ms("llm").await, Some(100));
+        assert_eq!(store.ai_response_time_estimate_ms("snn").await, Some(300));
+        assert_eq!(store.ai_response_time_estimate_ms("all").await, Some(200));
+        let summary = store.ai_response_time_summary().await;
+        assert_eq!(summary["all"].requests, 2);
+        assert_eq!(summary["all"].average_latency_ms, Some(200.0));
+        assert!(
+            store
+                .prometheus_metrics()
+                .await
+                .contains("gail_ai_response_time_average_ms")
+        );
     }
 
     #[tokio::test]

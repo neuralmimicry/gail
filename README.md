@@ -59,6 +59,12 @@ Gail exposes the following endpoints:
 | `POST /v1/trading/override` | Inject an operator trade override |
 | `POST /v1/trading/evaluate` | Trigger an immediate evaluation cycle |
 
+Completion responses include `processing_time_estimate_ms` when Gail has prior
+observations. Gail persists unified `llm`, `snn`, and `all` response-time
+averages, and exposes the same buckets through orchestration status and
+Prometheus metrics. The estimate is captured before routing begins, so callers
+such as Refiner can show users an expected processing duration.
+
 ## What Moved From Refiner
 
 | Capability | Gail | Refiner |

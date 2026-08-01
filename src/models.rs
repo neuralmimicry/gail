@@ -266,6 +266,9 @@ pub struct CompletionResponse {
     pub provider: String,
     pub model: String,
     pub latency_ms: u64,
+    /// Average observed response time available when this request was received.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_time_estimate_ms: Option<u64>,
     pub usage: Option<TokenUsage>,
     pub trace: Option<CompletionTrace>,
     pub raw: Option<Value>,
@@ -424,6 +427,9 @@ pub struct NeuromorphicPredictResponse {
     pub input_spikes: Vec<u8>,
     pub output_spikes: Vec<u8>,
     pub aer_payload_hex: String,
+    /// Average observed SNN response time available when this request was received.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_time_estimate_ms: Option<u64>,
     pub raw: Value,
 }
 
@@ -443,6 +449,9 @@ pub struct SpecialistAnalysisResponse {
     pub combined_specialties: Vec<String>,
     pub context_blocks: Vec<String>,
     pub context: String,
+    /// Average observed SNN analysis time available when this request was received.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_time_estimate_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

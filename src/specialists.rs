@@ -277,6 +277,7 @@ impl SpecialistEngine {
             input_spikes: prediction.input_spikes,
             output_spikes: prediction.output_spikes,
             aer_payload_hex: prediction.aer_payload_hex,
+            processing_time_estimate_ms: None,
             raw: prediction.raw,
         })
     }
@@ -712,6 +713,7 @@ pub async fn analyze_specialist_engines(
             combined_specialties: Vec::new(),
             context_blocks: Vec::new(),
             context: String::new(),
+            processing_time_estimate_ms: None,
         };
     }
 
@@ -822,6 +824,7 @@ pub async fn analyze_specialist_engines(
         combined_specialties,
         context_blocks: context_blocks.clone(),
         context: context_blocks.join("\n\n"),
+        processing_time_estimate_ms: None,
     }
 }
 

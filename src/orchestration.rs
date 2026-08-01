@@ -52,6 +52,25 @@ use crate::{
 
 const PROVIDER_HEALTH_TIMEOUT_SECONDS: u64 = 4;
 
+fn completion_metric_source(response: &CompletionResponse) -> &'static str {
+    if response
+        .trace
+        .as_ref()
+        .is_some_and(|trace| trace.final_source.eq_ignore_ascii_case("aarnn"))
+    {
+        "snn"
+    } else {
+        "llm"
+    }
+}
+
+fn completion_metric_success(response: &CompletionResponse) -> bool {
+    response
+        .trace
+        .as_ref()
+        .is_none_or(|trace| !trace.final_source.eq_ignore_ascii_case("degraded_policy"))
+}
+
 #[derive(Clone)]
 pub struct GailService {
     inner: Arc<GailServiceInner>,
@@ -629,6 +648,33 @@ impl GailService {
         &self,
         request: ProviderCompletionRequest,
     ) -> Result<CompletionResponse> {
+        let processing_time_estimate_ms =
+            self.inner.metrics.ai_response_time_estimate_ms("all").await;
+        let started = Instant::now();
+        let result = self.direct_complete_inner(request).await;
+        let source = result
+            .as_ref()
+            .map(completion_metric_source)
+            .unwrap_or("llm");
+        let _ = self
+            .inner
+            .metrics
+            .record_ai_response_time(
+                source,
+                started.elapsed().as_millis() as u64,
+                result.as_ref().is_ok_and(completion_metric_success),
+            )
+            .await;
+        result.map(|mut response| {
+            response.processing_time_estimate_ms = processing_time_estimate_ms;
+            response
+        })
+    }
+
+    async fn direct_complete_inner(
+        &self,
+        request: ProviderCompletionRequest,
+    ) -> Result<CompletionResponse> {
         let mut effective_request = request.clone();
         if effective_request.workflow.is_none() {
             effective_request.workflow = Some("direct".to_string());
@@ -894,6 +940,7 @@ impl GailService {
             provider,
             model,
             latency_ms,
+            processing_time_estimate_ms: None,
             usage,
             trace,
             raw,
@@ -938,6 +985,30 @@ impl GailService {
     }
 
     pub async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+        let processing_time_estimate_ms =
+            self.inner.metrics.ai_response_time_estimate_ms("all").await;
+        let started = Instant::now();
+        let result = self.complete_inner(request).await;
+        let source = result
+            .as_ref()
+            .map(completion_metric_source)
+            .unwrap_or("llm");
+        let _ = self
+            .inner
+            .metrics
+            .record_ai_response_time(
+                source,
+                started.elapsed().as_millis() as u64,
+                result.as_ref().is_ok_and(completion_metric_success),
+            )
+            .await;
+        result.map(|mut response| {
+            response.processing_time_estimate_ms = processing_time_estimate_ms;
+            response
+        })
+    }
+
+    async fn complete_inner(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         let request_id = Uuid::new_v4().to_string();
         let workflow = normalize_key(request.workflow.as_deref().unwrap_or("general"), "general");
         let role = normalize_key(request.role.as_deref().unwrap_or("general"), "general");
@@ -1011,8 +1082,18 @@ impl GailService {
                 workflow: Some(workflow.clone()),
                 role: Some(role.clone()),
             };
+            let specialist_started = Instant::now();
             let analysis =
                 analyze_specialist_engines(&self.inner.specialists, &analyze_request).await;
+            let _ = self
+                .inner
+                .metrics
+                .record_ai_response_time(
+                    "snn",
+                    specialist_started.elapsed().as_millis() as u64,
+                    true,
+                )
+                .await;
             if analysis.relevant {
                 task_tags.insert("neuromorphic".to_string());
                 task_tags.insert("aer".to_string());
@@ -1616,6 +1697,7 @@ impl GailService {
             provider,
             model,
             latency_ms,
+            processing_time_estimate_ms: None,
             usage,
             trace: Some(trace),
             raw,
@@ -1688,6 +1770,7 @@ impl GailService {
             provider: "gail".to_string(),
             model: "degraded_safety".to_string(),
             latency_ms: 0,
+            processing_time_estimate_ms: None,
             usage: None,
             trace: Some(trace),
             raw: Some(json!({
@@ -1740,15 +1823,41 @@ impl GailService {
         &self,
         request: NeuromorphicAnalyzeRequest,
     ) -> Result<SpecialistAnalysisResponse> {
-        Ok(analyze_specialist_engines(&self.inner.specialists, &request).await)
+        let processing_time_estimate_ms =
+            self.inner.metrics.ai_response_time_estimate_ms("snn").await;
+        let started = Instant::now();
+        let mut response = analyze_specialist_engines(&self.inner.specialists, &request).await;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let _ = self
+            .inner
+            .metrics
+            .record_ai_response_time("snn", latency_ms, true)
+            .await;
+        response.processing_time_estimate_ms = processing_time_estimate_ms;
+        Ok(response)
     }
 
     pub async fn predict_neuromorphic(
         &self,
         request: NeuromorphicPredictRequest,
     ) -> Result<NeuromorphicPredictResponse> {
-        let engine = self.select_specialist(request.engine_name.as_deref())?;
-        engine.predict_request(&request).await
+        let processing_time_estimate_ms =
+            self.inner.metrics.ai_response_time_estimate_ms("snn").await;
+        let started = Instant::now();
+        let result = match self.select_specialist(request.engine_name.as_deref()) {
+            Ok(engine) => engine.predict_request(&request).await,
+            Err(error) => Err(error),
+        };
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let _ = self
+            .inner
+            .metrics
+            .record_ai_response_time("snn", latency_ms, result.is_ok())
+            .await;
+        result.map(|mut response| {
+            response.processing_time_estimate_ms = processing_time_estimate_ms;
+            response
+        })
     }
 
     pub fn encode_aer(&self, request: AerEncodeRequest) -> Result<AerEncodeResponse> {
@@ -1823,6 +1932,8 @@ impl GailService {
         )
         .await;
         let metrics = self.inner.metrics.summary(candidate_limit.max(1)).await;
+        let processing_time_estimate_ms =
+            self.inner.metrics.ai_response_time_estimate_ms("all").await;
         let endpoint_telemetry =
             summarize_endpoint_telemetry(&self.inner.metrics.summary(256).await.candidates);
         let api_issues = api_issues::snapshot().await;
@@ -1858,6 +1969,8 @@ impl GailService {
             "aarnn_bridge": aarnn_bridge,
             "nmc_telemetry": nmc_telemetry,
             "metrics": metrics,
+            "ai_response_times": self.inner.metrics.ai_response_time_summary().await,
+            "processing_time_estimate_ms": processing_time_estimate_ms,
             "endpoint_telemetry": {
                 "count": endpoint_telemetry.len(),
                 "candidates": endpoint_telemetry,

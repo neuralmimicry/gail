@@ -2720,6 +2720,9 @@ fn gail_response_body(response: &CompletionResponse) -> Value {
         "request_id": response.request_id,
         "latency_ms": response.latency_ms,
     });
+    if let Some(estimate) = response.processing_time_estimate_ms {
+        payload["processing_time_estimate_ms"] = json!(estimate);
+    }
     if let Some(trace) = response.trace.as_ref() {
         payload["trace"] = serde_json::to_value(trace).unwrap_or(Value::Null);
     }
@@ -3519,6 +3522,7 @@ fn degraded_openai_completion_response(text: String, reason: String) -> Completi
         provider: "gail".to_string(),
         model: "degraded_safety".to_string(),
         latency_ms: 0,
+        processing_time_estimate_ms: None,
         usage: None,
         trace: None,
         raw: Some(json!({
