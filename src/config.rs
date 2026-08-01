@@ -164,6 +164,8 @@ pub struct TrainerConfig {
     pub include_degraded: bool,
     pub max_attempts: u32,
     pub retry_backoff_seconds: u64,
+    pub recover_infrastructure_failures: bool,
+    pub recovery_batch_size: usize,
     pub algorithm: String,
     pub command_template: Option<String>,
     pub command_timeout_seconds: u64,
@@ -348,6 +350,8 @@ impl Default for TrainerConfig {
             include_degraded: false,
             max_attempts: 6,
             retry_backoff_seconds: 300,
+            recover_infrastructure_failures: false,
+            recovery_batch_size: 20_000,
             algorithm: "qlora_sft".to_string(),
             command_template: None,
             command_timeout_seconds: 86_400,
@@ -620,6 +624,7 @@ impl GailConfig {
             self.trainer.max_samples_per_snapshot.clamp(1, 1_000_000);
         self.trainer.max_attempts = self.trainer.max_attempts.clamp(1, 1_000);
         self.trainer.retry_backoff_seconds = self.trainer.retry_backoff_seconds.clamp(1, 604_800);
+        self.trainer.recovery_batch_size = self.trainer.recovery_batch_size.clamp(1, 100_000);
         self.trainer.algorithm = normalize_optional_string(Some(self.trainer.algorithm.as_str()))
             .unwrap_or_else(|| "qlora_sft".to_string());
         self.trainer.command_template = normalize_optional_string(

@@ -455,6 +455,7 @@ pub async fn fetch_pending_training(
             raw
         FROM gail_llm_interactions
         WHERE trained_at IS NULL
+          AND COALESCE(train_status, '') <> 'failed'
           AND (next_train_at IS NULL OR next_train_at <= now())
           AND COALESCE(response_text, '') <> ''
           AND {status_filter}
@@ -545,10 +546,7 @@ pub async fn mark_training_retry(
                     WHEN train_attempts + 1 >= $2 THEN NULL
                     ELSE now() + make_interval(secs => $4::int)
                 END,
-                trained_at = CASE
-                    WHEN train_attempts + 1 >= $2 THEN now()
-                    ELSE NULL
-                END
+                trained_at = NULL
             WHERE id = $1
             "#,
             &[
@@ -560,6 +558,73 @@ pub async fn mark_training_retry(
         )
         .await?;
     Ok(())
+}
+
+pub async fn recover_training_infrastructure_failures(
+    dsn: &str,
+    batch_size: usize,
+) -> Result<u64, tokio_postgres::Error> {
+    let client = connect_client(dsn).await?;
+    let rows = client
+        .query(
+            r#"
+            SELECT id, train_error
+            FROM gail_llm_interactions
+            WHERE train_status = 'failed'
+              AND training_snapshot IS NULL
+              AND (
+                  train_error ILIKE '%gail-qlora-sft%'
+                  OR train_error ILIKE '%failed to spawn trainer command%'
+                  OR train_error ILIKE '%Ollama API /api/create failed%'
+              )
+            ORDER BY id ASC
+            LIMIT $1
+            "#,
+            &[&(batch_size.clamp(1, 100_000) as i64)],
+        )
+        .await?;
+    let ids = rows
+        .into_iter()
+        .filter_map(|row| {
+            let id = row.get::<_, i64>("id");
+            let error = row.get::<_, Option<String>>("train_error")?;
+            is_recoverable_training_infrastructure_error(error.as_str()).then_some(id)
+        })
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let recovered = client
+        .execute(
+            r#"
+            UPDATE gail_llm_interactions
+            SET
+                train_attempts = 0,
+                train_status = 'retry',
+                train_error = NULL,
+                next_train_at = now(),
+                trained_at = NULL,
+                training_snapshot = NULL
+            WHERE id = ANY($1)
+              AND train_status = 'failed'
+              AND training_snapshot IS NULL
+            "#,
+            &[&ids],
+        )
+        .await?;
+    Ok(recovered)
+}
+
+fn is_recoverable_training_infrastructure_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    if error.contains("ollama api /api/create failed") {
+        return true;
+    }
+    let missing_executable = error.contains("not found")
+        || error.contains("no such file")
+        || error.contains("command not found");
+    missing_executable
+        && (error.contains("gail-qlora-sft") || error.contains("failed to spawn trainer command"))
 }
 
 async fn connect_client(dsn: &str) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
@@ -726,4 +791,32 @@ fn now_ts() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_recoverable_training_infrastructure_error;
+
+    #[test]
+    fn missing_trainer_binary_is_recoverable_infrastructure_failure() {
+        assert!(is_recoverable_training_infrastructure_error(
+            "/usr/bin/gail-qlora-sft: No such file or directory"
+        ));
+        assert!(is_recoverable_training_infrastructure_error(
+            "failed to spawn trainer command: No such file or directory (os error 2)"
+        ));
+        assert!(is_recoverable_training_infrastructure_error(
+            "Ollama API /api/create failed with HTTP 400"
+        ));
+    }
+
+    #[test]
+    fn model_and_data_failures_are_not_requeued_as_infrastructure_failures() {
+        assert!(!is_recoverable_training_infrastructure_error(
+            "tokenizer rejected malformed dataset row"
+        ));
+        assert!(!is_recoverable_training_infrastructure_error(
+            "CUDA out of memory while training gail-qlora-sft"
+        ));
+    }
 }

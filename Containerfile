@@ -54,6 +54,7 @@ ARG LIBTORCH_URL=
 ARG LIBTORCH_BUILD_FROM_SOURCE=auto
 ARG LIBTORCH_AMD64_BUILD_FROM_SOURCE=false
 ARG LIBTORCH_ARM64_BUILD_FROM_SOURCE=auto
+ARG LIBTORCH_ARM64_USE_PYTHON_WHEEL=true
 ARG LIBTORCH_ALLOW_CPU_FALLBACK=true
 ARG LIBTORCH_STRICT_ACCELERATOR=false
 ARG LIBTORCH_DOWNLOAD_FALLBACK_TO_SOURCE=true
@@ -163,6 +164,15 @@ RUN set -eu; \
         effective_accelerator="cpu"; \
     fi; \
     echo "libtorch configuration: arch=${norm_arch} requested=${requested_accelerator} effective=${effective_accelerator} version=${LIBTORCH_VERSION} source_build=${build_from_source}"; \
+    install_from_python_wheel="false"; \
+    if [ "${norm_arch}" = "arm64" ] \
+        && [ "${effective_accelerator}" = "cpu" ] \
+        && [ -z "${LIBTORCH_URL}" ] \
+        && [ "${LIBTORCH_BUILD_FROM_SOURCE}" != "true" ] \
+        && [ "${LIBTORCH_ARM64_USE_PYTHON_WHEEL}" = "true" ]; then \
+        install_from_python_wheel="true"; \
+        build_from_source="false"; \
+    fi; \
     reuse_cached_libtorch="false"; \
     if [ -f /opt/libtorch/lib/libtorch.so ] || [ -f /opt/libtorch/lib/libtorch_cpu.so ]; then \
         if [ -f /opt/libtorch/gail-libtorch-build.env ]; then \
@@ -183,6 +193,32 @@ RUN set -eu; \
             rm -rf /opt/libtorch; \
             mkdir -p /opt/libtorch; \
         fi; \
+    fi; \
+    if [ "${reuse_cached_libtorch}" != "true" ] && [ "${install_from_python_wheel}" = "true" ]; then \
+        echo "Installing arm64 CPU libtorch from the official PyTorch ${LIBTORCH_VERSION} wheel"; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends python3 python3-venv; \
+        python3 -m venv /tmp/libtorch-wheel-venv; \
+        if /tmp/libtorch-wheel-venv/bin/python -m pip install \
+            --no-cache-dir \
+            --disable-pip-version-check \
+            --no-deps \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --target /tmp/libtorch-wheel \
+            "torch==${LIBTORCH_VERSION}+cpu"; then \
+            test -f /tmp/libtorch-wheel/torch/lib/libtorch.so; \
+            test -f /tmp/libtorch-wheel/torch/lib/libtorch_cpu.so; \
+            cp -a /tmp/libtorch-wheel/torch/include /opt/libtorch/; \
+            cp -a /tmp/libtorch-wheel/torch/lib /opt/libtorch/; \
+            if [ -d /tmp/libtorch-wheel/torch/share ]; then \
+                cp -a /tmp/libtorch-wheel/torch/share /opt/libtorch/; \
+            fi; \
+            reuse_cached_libtorch="true"; \
+        else \
+            echo "arm64 PyTorch wheel install failed; falling back to CPU source build" >&2; \
+            build_from_source="true"; \
+        fi; \
+        rm -rf /tmp/libtorch-wheel /tmp/libtorch-wheel-venv /var/lib/apt/lists/*; \
     fi; \
     if [ "${reuse_cached_libtorch}" != "true" ]; then \
         if [ -n "${LIBTORCH_URL}" ] || [ "${build_from_source}" != "true" ]; then \
@@ -403,7 +439,12 @@ ARG CMAKE_BUILD_PARALLEL_LEVEL=auto
 ENV DEBIAN_FRONTEND=noninteractive \
     BUILD_JOBS=${BUILD_JOBS} \
     CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} \
-    CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}
+    CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL} \
+    LIBTORCH=/opt/libtorch \
+    LD_LIBRARY_PATH=/opt/libtorch/lib \
+    LIBTORCH_CXX11_ABI=1
+
+COPY --from=libtorch /opt/libtorch /opt/libtorch
 
 RUN set -eu; \
     apt-get update; \
@@ -451,6 +492,7 @@ RUN set -eu; \
         fi; \
     fi; \
     cargo build --locked --release --bin gail --no-default-features -j "${CARGO_BUILD_JOBS}"; \
+    cargo build --locked --release --bin gail-qlora-sft --features training-libtorch -j "${CARGO_BUILD_JOBS}"; \
     package_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)"; \
     if [ -z "${package_version}" ]; then \
         echo "Could not determine Gail package version from Cargo.toml" >&2; \
@@ -463,16 +505,18 @@ RUN set -eu; \
         --deb-version "${deb_version}" \
         --arch "${deb_arch}" \
         --binary target/release/gail \
+        --trainer-binary target/release/gail-qlora-sft \
         --out-dir /out
 
 FROM docker.io/library/debian:bookworm-slim
+
+COPY --from=libtorch /opt/libtorch /opt/libtorch
 
 ARG TARGETARCH
 ARG GAIL_VERSION=latest
 ARG GAIL_DEB_URL=
 ARG GAIL_RELEASE_REPOSITORY=neuralmimicry/gail
 ARG GAIL_RELEASE_BASE_URL=
-ARG GAIL_RELEASE_TOKEN=
 ARG APP_USER=gail
 ARG APP_UID=10001
 ARG APP_GID=10001
@@ -498,7 +542,9 @@ COPY --from=source-deb /out/*.deb /tmp/source-gail.deb
 COPY gail.yaml /tmp/gail-defaults/gail.yaml
 COPY config/ai-routing-profiles.json /tmp/gail-defaults/ai-routing-profiles.json
 
-RUN set -eu; \
+RUN --mount=type=secret,id=gail_release_token set -eu; \
+    GAIL_RELEASE_TOKEN="$(cat /run/secrets/gail_release_token 2>/dev/null || true)"; \
+    export GAIL_RELEASE_TOKEN; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -574,6 +620,7 @@ RUN set -eu; \
     fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends /tmp/gail.deb; \
+    test -x /usr/bin/gail-qlora-sft; \
     rm -f /tmp/gail.deb /tmp/source-gail.deb; \
     mkdir -p /app/config /app/data /app/scripts /var/lib/gail; \
     if [ -f /tmp/gail-defaults/gail.yaml ]; then \
@@ -711,7 +758,7 @@ VOLUME ["/app/config", "/app/data"]
 USER ${APP_UID}:${APP_GID}
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD sh -c 'if [ -n "${GAIL_HEALTHCHECK_TOKEN}" ]; then curl -fsS -H "Authorization: Bearer ${GAIL_HEALTHCHECK_TOKEN}" http://127.0.0.1:8080/healthz >/dev/null; else curl -fsS http://127.0.0.1:8080/healthz >/dev/null; fi || exit 1'
+  CMD sh -c 'if [ -n "${GAIL_HEALTHCHECK_TOKEN}" ]; then printf '\''header = "Authorization: Bearer %s"\n'\'' "${GAIL_HEALTHCHECK_TOKEN}" | curl -fsS -K - http://127.0.0.1:8080/healthz >/dev/null; else curl -fsS http://127.0.0.1:8080/healthz >/dev/null; fi || exit 1'
 
 ENTRYPOINT ["/usr/local/bin/gail-entrypoint.sh"]
 

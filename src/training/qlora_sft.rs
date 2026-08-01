@@ -16,7 +16,7 @@
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env,
     ffi::OsString,
     path::{Path, PathBuf},
@@ -32,7 +32,7 @@ use safetensors::{
     tensor::{Dtype, View},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tch::{CModule, Cuda, Device, Kind, Tensor, autocast, no_grad};
 use tokenizers::Tokenizer;
 use tokio::fs;
@@ -139,6 +139,57 @@ struct TrainingExecutionPlan {
     micro_batch_size: usize,
     gradient_accumulation_steps: usize,
     max_sequence_length: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DistributedContext {
+    rank: usize,
+    world_size: usize,
+    job_id: String,
+    root_output: PathBuf,
+    coordination_dir: PathBuf,
+    rank_output: PathBuf,
+    timeout_seconds: u64,
+}
+
+impl DistributedContext {
+    fn from_env(root_output: &Path, default_timeout_seconds: u64) -> anyhow::Result<Option<Self>> {
+        let world_size = parse_env("SLURM_NTASKS", 1_usize);
+        if world_size <= 1 {
+            return Ok(None);
+        }
+        let rank = parse_env("SLURM_PROCID", usize::MAX);
+        if rank >= world_size {
+            anyhow::bail!(
+                "invalid Slurm distributed rank {rank} for world size {world_size}; SLURM_PROCID and SLURM_NTASKS must be set by srun"
+            );
+        }
+        let raw_job_id = env_or("SLURM_JOB_ID", "manual");
+        let job_id = raw_job_id
+            .chars()
+            .map(|value| {
+                if value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.') {
+                    value
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let coordination_dir = root_output.join(".distributed").join(&job_id);
+        let rank_output = coordination_dir.join(format!("rank-{rank:05}"));
+        Ok(Some(Self {
+            rank,
+            world_size,
+            job_id,
+            root_output: root_output.to_path_buf(),
+            coordination_dir,
+            rank_output,
+            timeout_seconds: parse_env(
+                "GAIL_TRAIN_DISTRIBUTED_TIMEOUT_SECONDS",
+                default_timeout_seconds.max(1),
+            ),
+        }))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -377,7 +428,29 @@ async fn main() {
 }
 
 async fn async_main() -> anyhow::Result<()> {
-    let cfg = parse_args(env::args_os().skip(1))?;
+    let requested_cfg = parse_args(env::args_os().skip(1))?;
+    let distributed =
+        DistributedContext::from_env(&requested_cfg.output, requested_cfg.timeout_seconds)?;
+    let result = run_training(requested_cfg, distributed.as_ref()).await;
+    if let (Err(error), Some(distributed)) = (&result, distributed.as_ref()) {
+        let _ = fs::create_dir_all(&distributed.rank_output).await;
+        let _ = write_atomic_text(
+            &distributed.rank_output.join("FAILED"),
+            &format!("rank {}: {error}\n", distributed.rank),
+        )
+        .await;
+    }
+    result
+}
+
+async fn run_training(
+    requested_cfg: TrainingConfig,
+    distributed: Option<&DistributedContext>,
+) -> anyhow::Result<()> {
+    let mut cfg = requested_cfg.clone();
+    if let Some(distributed) = distributed {
+        cfg.output = distributed.rank_output.clone();
+    }
     if !SUPPORTED_ALGORITHMS.contains(&cfg.algorithm.as_str()) {
         anyhow::bail!(
             "unsupported algorithm '{}'; supported: {}",
@@ -391,9 +464,19 @@ async fn async_main() -> anyhow::Result<()> {
     let plan = build_execution_plan(&cfg);
     apply_cpu_thread_limits(&plan);
 
-    let texts = load_training_texts(&cfg.dataset).await?;
+    let mut texts = load_training_texts(&cfg.dataset).await?;
     if texts.is_empty() {
         anyhow::bail!("dataset is empty after message parsing");
+    }
+    if let Some(distributed) = distributed {
+        texts = shard_training_texts(texts, distributed.rank, distributed.world_size);
+        if texts.is_empty() {
+            anyhow::bail!(
+                "rank {} received no samples from a {}-rank dataset shard",
+                distributed.rank,
+                distributed.world_size
+            );
+        }
     }
 
     let rendered_dataset = cfg.output.join("dataset.rendered.jsonl");
@@ -414,7 +497,7 @@ async fn async_main() -> anyhow::Result<()> {
     let modelfile = cfg.output.join("Modelfile");
     write_modelfile(&cfg, &modelfile).await?;
 
-    let report = json!({
+    let mut report = json!({
         "algorithm_requested": cfg.algorithm,
         "algorithm_executed": run_result.executed_algorithm,
         "backend": plan.backend.as_str(),
@@ -440,10 +523,282 @@ async fn async_main() -> anyhow::Result<()> {
         "finished_ts": now_ts(),
         "runtime_seconds": started.elapsed().as_secs_f64(),
     });
+    if let Some(distributed) = distributed {
+        report["distributed"] = json!({
+            "strategy": "deterministic_sharded_federated_average",
+            "rank": distributed.rank,
+            "world_size": distributed.world_size,
+            "slurm_job_id": distributed.job_id,
+        });
+    }
 
     let report_path = cfg.output.join("training_report.json");
     fs::write(&report_path, serde_json::to_string_pretty(&report)? + "\n").await?;
-    println!("{}", serde_json::to_string(&report)?);
+    if let Some(distributed) = distributed {
+        write_atomic_text(&cfg.output.join("COMPLETE"), "complete\n").await?;
+        wait_for_distributed_ranks(distributed).await?;
+        if distributed.rank == 0 {
+            aggregate_distributed_outputs(&requested_cfg, distributed).await?;
+        }
+        wait_for_distributed_success(distributed).await?;
+        if distributed.rank == 0 {
+            let aggregate_report =
+                fs::read_to_string(distributed.root_output.join("training_report.json")).await?;
+            println!("{}", aggregate_report.trim());
+        } else {
+            println!("{}", serde_json::to_string(&report)?);
+        }
+    } else {
+        println!("{}", serde_json::to_string(&report)?);
+    }
+    Ok(())
+}
+
+fn shard_training_texts(texts: Vec<String>, rank: usize, world_size: usize) -> Vec<String> {
+    texts
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, text)| (index % world_size == rank).then_some(text))
+        .collect()
+}
+
+async fn write_atomic_text(path: &Path, body: &str) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).await?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("marker");
+    let temporary = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    fs::write(&temporary, body).await?;
+    fs::rename(&temporary, path).await?;
+    Ok(())
+}
+
+async fn wait_for_distributed_ranks(distributed: &DistributedContext) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
+    loop {
+        let mut complete = 0_usize;
+        for rank in 0..distributed.world_size {
+            let rank_dir = distributed.coordination_dir.join(format!("rank-{rank:05}"));
+            let failure = rank_dir.join("FAILED");
+            if failure.exists() {
+                let reason = fs::read_to_string(&failure)
+                    .await
+                    .unwrap_or_else(|_| "unknown rank failure".to_string());
+                anyhow::bail!("distributed training aborted: {}", reason.trim());
+            }
+            if rank_dir.join("COMPLETE").exists() {
+                complete = complete.saturating_add(1);
+            }
+        }
+        if complete == distributed.world_size {
+            return Ok(());
+        }
+        if started.elapsed().as_secs() >= distributed.timeout_seconds {
+            anyhow::bail!(
+                "timed out after {}s waiting for distributed ranks ({complete}/{})",
+                distributed.timeout_seconds,
+                distributed.world_size
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn wait_for_distributed_success(distributed: &DistributedContext) -> anyhow::Result<()> {
+    let success = distributed.root_output.join("_SUCCESS");
+    let failure = distributed.coordination_dir.join("AGGREGATION_FAILED");
+    let started = std::time::Instant::now();
+    loop {
+        if success.exists() {
+            return Ok(());
+        }
+        if failure.exists() {
+            let reason = fs::read_to_string(&failure)
+                .await
+                .unwrap_or_else(|_| "unknown aggregation failure".to_string());
+            anyhow::bail!("distributed adapter aggregation failed: {}", reason.trim());
+        }
+        if started.elapsed().as_secs() >= distributed.timeout_seconds {
+            anyhow::bail!(
+                "timed out after {}s waiting for distributed adapter aggregation",
+                distributed.timeout_seconds
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn aggregate_distributed_outputs(
+    cfg: &TrainingConfig,
+    distributed: &DistributedContext,
+) -> anyhow::Result<()> {
+    let result = aggregate_distributed_outputs_inner(cfg, distributed).await;
+    if let Err(error) = &result {
+        let _ = write_atomic_text(
+            &distributed.coordination_dir.join("AGGREGATION_FAILED"),
+            &format!("{error}\n"),
+        )
+        .await;
+    }
+    result
+}
+
+async fn aggregate_distributed_outputs_inner(
+    cfg: &TrainingConfig,
+    distributed: &DistributedContext,
+) -> anyhow::Result<()> {
+    fs::create_dir_all(&distributed.root_output).await?;
+    let adapter_dir = distributed.root_output.join("adapter");
+    fs::create_dir_all(&adapter_dir).await?;
+
+    let mut reports = Vec::with_capacity(distributed.world_size);
+    let mut sample_weights = Vec::with_capacity(distributed.world_size);
+    for rank in 0..distributed.world_size {
+        let rank_dir = distributed.coordination_dir.join(format!("rank-{rank:05}"));
+        let report: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(rank_dir.join("training_report.json")).await?,
+        )?;
+        let samples = report
+            .pointer("/metrics/samples")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("rank {rank} report has no metrics.samples"))?;
+        if samples == 0 {
+            anyhow::bail!("rank {rank} reported zero training samples");
+        }
+        reports.push(report);
+        sample_weights.push(samples);
+    }
+
+    let mut averaged = BTreeMap::<String, Tensor>::new();
+    let mut expected_shapes = BTreeMap::<String, Vec<i64>>::new();
+    let total_samples = sample_weights.iter().copied().sum::<u64>();
+    for (rank, weight) in sample_weights.iter().copied().enumerate() {
+        let adapter_path = distributed
+            .coordination_dir
+            .join(format!("rank-{rank:05}"))
+            .join("adapter/adapter_model.safetensors");
+        let tensors = Tensor::read_safetensors(&adapter_path).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to read rank {rank} adapter {}: {error}",
+                adapter_path.display()
+            )
+        })?;
+        if rank > 0 && tensors.len() != expected_shapes.len() {
+            anyhow::bail!(
+                "rank {rank} exported {} adapter tensors; expected {}",
+                tensors.len(),
+                expected_shapes.len()
+            );
+        }
+        for (name, tensor) in tensors {
+            let shape = tensor.size();
+            if rank == 0 {
+                expected_shapes.insert(name.clone(), shape.clone());
+            } else if expected_shapes.get(&name) != Some(&shape) {
+                anyhow::bail!("rank {rank} adapter tensor '{name}' has an inconsistent shape");
+            }
+            let weighted = tensor.to_kind(Kind::Double) * weight as f64;
+            if let Some(sum) = averaged.get_mut(&name) {
+                *sum = &*sum + weighted;
+            } else {
+                averaged.insert(name, weighted);
+            }
+        }
+    }
+    if averaged.is_empty() {
+        anyhow::bail!("distributed ranks exported no adapter tensors");
+    }
+    let output_tensors = averaged
+        .into_iter()
+        .map(|(name, tensor)| {
+            (
+                name,
+                (tensor / total_samples as f64)
+                    .to_kind(Kind::Float)
+                    .contiguous(),
+            )
+        })
+        .collect::<Vec<_>>();
+    Tensor::write_safetensors(
+        output_tensors
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>()
+            .as_slice(),
+        adapter_dir.join("adapter_model.safetensors"),
+    )
+    .map_err(|error| anyhow::anyhow!("failed to write averaged adapter: {error}"))?;
+
+    let rank_zero_adapter = distributed
+        .coordination_dir
+        .join("rank-00000/adapter/adapter_config.json");
+    fs::copy(rank_zero_adapter, adapter_dir.join("adapter_config.json")).await?;
+    let total_tokens = reports
+        .iter()
+        .filter_map(|report| report.pointer("/metrics/total_tokens")?.as_u64())
+        .sum::<u64>();
+    let non_padding_tokens = reports
+        .iter()
+        .filter_map(|report| report.pointer("/metrics/non_padding_tokens")?.as_u64())
+        .sum::<u64>();
+    let runtime_seconds = reports
+        .iter()
+        .filter_map(|report| report.get("runtime_seconds")?.as_f64())
+        .fold(0.0_f64, f64::max);
+    let distributed_summary = json!({
+        "strategy": "deterministic_sharded_federated_average",
+        "world_size": distributed.world_size,
+        "slurm_job_id": distributed.job_id,
+        "sample_weights": sample_weights,
+        "total_samples": total_samples,
+        "total_tokens": total_tokens,
+        "non_padding_tokens": non_padding_tokens,
+    });
+    let manifest = json!({
+        "format": "gail-distributed-lora-training-manifest",
+        "algorithm_requested": cfg.algorithm,
+        "algorithm_executed": reports.first().and_then(|report| report.get("algorithm_executed")).cloned().unwrap_or(Value::Null),
+        "base_model": cfg.base_model,
+        "adapter_model": "adapter_model.safetensors",
+        "adapter_config": "adapter_config.json",
+        "exported_adapter_tensors": output_tensors.len(),
+        "distributed": distributed_summary.clone(),
+        "rank_reports": (0..distributed.world_size).map(|rank| format!("../.distributed/{}/rank-{rank:05}/training_report.json", distributed.job_id)).collect::<Vec<_>>(),
+    });
+    fs::write(
+        adapter_dir.join("training_manifest.json"),
+        serde_json::to_string_pretty(&manifest)? + "\n",
+    )
+    .await?;
+    write_modelfile(cfg, &distributed.root_output.join("Modelfile")).await?;
+    let report = json!({
+        "algorithm_requested": cfg.algorithm,
+        "algorithm_executed": reports.first().and_then(|report| report.get("algorithm_executed")).cloned().unwrap_or(Value::Null),
+        "backend": "slurm_distributed_cpu_lora",
+        "base_model": cfg.base_model,
+        "adapter_dir": adapter_dir.to_string_lossy(),
+        "exported_adapter_tensors": output_tensors.len(),
+        "metrics": {
+            "samples": total_samples,
+            "total_tokens": total_tokens,
+            "non_padding_tokens": non_padding_tokens,
+            "runtime_seconds": runtime_seconds,
+            "aggregate_tokens_per_second": if runtime_seconds > 0.0 { total_tokens as f64 / runtime_seconds } else { 0.0 },
+        },
+        "distributed": distributed_summary,
+        "rank_reports": reports,
+        "finished_ts": now_ts(),
+    });
+    fs::write(
+        distributed.root_output.join("training_report.json"),
+        serde_json::to_string_pretty(&report)? + "\n",
+    )
+    .await?;
+    write_atomic_text(&distributed.root_output.join("_SUCCESS"), "complete\n").await?;
     Ok(())
 }
 
@@ -1539,4 +1894,26 @@ fn now_ts() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_secs_f64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shard_training_texts;
+
+    #[test]
+    fn distributed_shards_are_disjoint_and_complete() {
+        let source = (0..17).map(|value| value.to_string()).collect::<Vec<_>>();
+        let shards = (0..6)
+            .map(|rank| shard_training_texts(source.clone(), rank, 6))
+            .collect::<Vec<_>>();
+
+        assert_eq!(shards.iter().map(Vec::len).sum::<usize>(), source.len());
+        for (rank, shard) in shards.iter().enumerate() {
+            assert!(
+                shard
+                    .iter()
+                    .all(|value| { value.parse::<usize>().expect("numeric fixture") % 6 == rank })
+            );
+        }
+    }
 }

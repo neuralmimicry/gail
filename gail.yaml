@@ -213,6 +213,8 @@ trainer:
   include_degraded: false
   max_attempts: 6
   retry_backoff_seconds: 300
+  recover_infrastructure_failures: false
+  recovery_batch_size: 20000
   algorithm: "qlora_sft"
   command_template: ""
   command_timeout_seconds: 86400

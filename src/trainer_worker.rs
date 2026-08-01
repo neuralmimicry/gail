@@ -1,16 +1,18 @@
 use std::{
+    collections::HashSet,
     env,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Stdio,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{
     fs::{self, OpenOptions},
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
 };
 
@@ -31,6 +33,24 @@ pub async fn run(config: GailConfig) -> Result<()> {
         GailError::invalid_config(format!("failed to initialise LLM ledger schema: {error}"))
     })?;
     let trainer = config.trainer.clone();
+    if trainer.recover_infrastructure_failures {
+        match llm_ledger::recover_training_infrastructure_failures(
+            &dsn,
+            trainer.recovery_batch_size,
+        )
+        .await
+        {
+            Ok(recovered) => tracing::info!(
+                recovered,
+                recovery_batch_size = trainer.recovery_batch_size,
+                "requeued terminal training rows caused by missing trainer infrastructure"
+            ),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "failed to recover terminal training infrastructure rows"
+            ),
+        }
+    }
     let hardware = detect_hardware().await;
     log_hardware_profile("trainer_worker", &hardware);
     tracing::info!(
@@ -335,17 +355,34 @@ async fn run_training_pipeline(
             .await?;
     let mut training_executed = false;
     if let Some(command_line) = training_invocation {
-        let command_output = execute_training_command(
-            command_line.as_str(),
-            trainer,
-            hardware,
-            &execution_plan,
-            snapshot_id,
-            dataset_path,
-            snapshot_dir,
-        )
-        .await?;
-        pipeline_report["training_command"] = json!(command_line);
+        let command_output = if let Some(spool) = env_string("GAIL_TRAIN_SLURM_SPOOL") {
+            pipeline_report["training_backend"] = json!("slurm");
+            execute_slurm_training_request(
+                Path::new(&spool),
+                trainer,
+                snapshot_id,
+                dataset_path,
+                snapshot_dir,
+            )
+            .await?
+        } else {
+            pipeline_report["training_backend"] = json!("local");
+            execute_training_command(
+                command_line.as_str(),
+                trainer,
+                hardware,
+                &execution_plan,
+                snapshot_id,
+                dataset_path,
+                snapshot_dir,
+            )
+            .await?
+        };
+        pipeline_report["training_command"] = if env_string("GAIL_TRAIN_SLURM_SPOOL").is_some() {
+            json!("submitted through the Gail Slurm spool")
+        } else {
+            json!(command_line)
+        };
         pipeline_report["training_stdout_tail"] = json!(command_output.stdout);
         pipeline_report["training_stderr_tail"] = json!(command_output.stderr);
         pipeline_report["training_exit_code"] = json!(command_output.exit_code);
@@ -357,10 +394,42 @@ async fn run_training_pipeline(
         );
     }
     let mut snapshot_tag = format!("{}:{}", trainer.model_prefix, snapshot_id);
+    let mut registration_succeeded = false;
     if trainer.register_with_ollama && training_executed {
-        register_snapshot_with_ollama(trainer, snapshot_id, snapshot_dir).await?;
-        rotate_ollama_models(trainer).await?;
-        snapshot_tag = trainer.model_alias.clone();
+        match register_snapshot_with_ollama(trainer, snapshot_id, snapshot_dir).await {
+            Ok(registration_mode) => {
+                registration_succeeded = true;
+                snapshot_tag = trainer.model_alias.clone();
+                match registration_mode {
+                    OllamaRegistrationMode::Adapter | OllamaRegistrationMode::BaseModel => {
+                        pipeline_report["ollama_registration"] = json!("registered");
+                    }
+                    OllamaRegistrationMode::BaseModelFallback => {
+                        pipeline_report["ollama_registration"] =
+                            json!("registered_base_model_fallback");
+                        pipeline_report["ollama_adapter_registration"] =
+                            json!("retained_in_snapshot_unsupported_by_ollama");
+                    }
+                }
+                if let Err(error) = rotate_ollama_models(trainer).await {
+                    tracing::warn!(
+                        error = %error,
+                        snapshot = snapshot_id,
+                        "trained snapshot registered, but old-model rotation failed"
+                    );
+                    pipeline_report["ollama_rotation_error"] = json!(error.to_string());
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    snapshot = snapshot_id,
+                    "training completed; Ollama registration will not invalidate the snapshot"
+                );
+                pipeline_report["ollama_registration"] = json!("failed_non_fatal");
+                pipeline_report["ollama_registration_error"] = json!(error.to_string());
+            }
+        }
     } else if trainer.register_with_ollama {
         pipeline_report["ollama_registration"] =
             json!("skipped: no training command executed for this snapshot");
@@ -380,7 +449,11 @@ async fn run_training_pipeline(
             .unwrap_or(-1)
             == 0
         {
-            "trained".to_string()
+            if trainer.register_with_ollama && !registration_succeeded {
+                "trained_registration_pending".to_string()
+            } else {
+                "trained".to_string()
+            }
         } else {
             "snapshotted".to_string()
         },
@@ -392,6 +465,120 @@ struct CommandOutcome {
     stderr: String,
     exit_code: i32,
     runtime_seconds: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlurmTrainingResult {
+    exit_code: i32,
+    runtime_seconds: f64,
+    log_file: Option<String>,
+    message: Option<String>,
+}
+
+async fn execute_slurm_training_request(
+    spool: &Path,
+    trainer: &TrainerConfig,
+    snapshot_id: &str,
+    dataset_path: &Path,
+    snapshot_dir: &Path,
+) -> Result<CommandOutcome> {
+    if snapshot_id.is_empty()
+        || !snapshot_id
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_'))
+    {
+        return Err(GailError::invalid_config(format!(
+            "unsafe Slurm snapshot id: {snapshot_id}"
+        )));
+    }
+    let queue = spool.join("queue");
+    let results = spool.join("results");
+    fs::create_dir_all(&queue).await.map_err(|error| {
+        GailError::invalid_config(format!("failed to create Slurm request queue: {error}"))
+    })?;
+    fs::create_dir_all(&results).await.map_err(|error| {
+        GailError::invalid_config(format!("failed to create Slurm result directory: {error}"))
+    })?;
+    let request_path = queue.join(format!("{snapshot_id}.request"));
+    let temporary_path = queue.join(format!(".{snapshot_id}.request-{}", std::process::id()));
+    let result_path = results.join(format!("{snapshot_id}.result"));
+    let request = json!({
+        "version": 1,
+        "snapshot_id": snapshot_id,
+        "algorithm": trainer.algorithm,
+        "dataset_path": dataset_path.to_string_lossy(),
+        "snapshot_dir": snapshot_dir.to_string_lossy(),
+        "requested_at": now_ts(),
+    });
+    fs::write(
+        &temporary_path,
+        serde_json::to_string_pretty(&request).unwrap_or_else(|_| "{}".to_string()) + "\n",
+    )
+    .await
+    .map_err(|error| {
+        GailError::invalid_config(format!("failed to stage Slurm training request: {error}"))
+    })?;
+    fs::rename(&temporary_path, &request_path)
+        .await
+        .map_err(|error| {
+            GailError::invalid_config(format!("failed to publish Slurm training request: {error}"))
+        })?;
+    tracing::info!(
+        snapshot = snapshot_id,
+        request = %request_path.display(),
+        "submitted Gail training snapshot to Slurm"
+    );
+
+    let started = tokio::time::Instant::now();
+    let timeout = Duration::from_secs(trainer.command_timeout_seconds.max(1));
+    let poll_seconds = env_usize("GAIL_TRAIN_SLURM_POLL_SECONDS", 2, 1, 60) as u64;
+    loop {
+        if result_path.exists() {
+            let body = fs::read_to_string(&result_path).await.map_err(|error| {
+                GailError::invalid_config(format!("failed to read Slurm training result: {error}"))
+            })?;
+            let result: SlurmTrainingResult = serde_json::from_str(&body).map_err(|error| {
+                GailError::invalid_config(format!("invalid Slurm training result: {error}"))
+            })?;
+            let log = if let Some(log_file) = result.log_file.as_deref() {
+                if Path::new(log_file)
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+                {
+                    let candidate = spool.join(log_file);
+                    fs::read_to_string(candidate).await.unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+            let log_tail = truncate_chars(&log, 8_000);
+            let message = result.message.unwrap_or_default();
+            if result.exit_code != 0 {
+                return Err(GailError::invalid_config(format!(
+                    "Slurm training exited with status {}: {} {}",
+                    result.exit_code,
+                    message,
+                    truncate_chars(&log, 1200)
+                )));
+            }
+            return Ok(CommandOutcome {
+                stdout: log_tail,
+                stderr: message,
+                exit_code: result.exit_code,
+                runtime_seconds: result.runtime_seconds,
+            });
+        }
+        if started.elapsed() >= timeout {
+            return Err(GailError::invalid_config(format!(
+                "Slurm training timed out after {}s waiting for {}",
+                trainer.command_timeout_seconds,
+                result_path.display()
+            )));
+        }
+        tokio::time::sleep(Duration::from_secs(poll_seconds)).await;
+    }
 }
 
 async fn execute_training_command(
@@ -1096,7 +1283,7 @@ async fn register_snapshot_with_ollama(
     trainer: &TrainerConfig,
     snapshot_id: &str,
     snapshot_dir: &Path,
-) -> Result<()> {
+) -> Result<OllamaRegistrationMode> {
     let tagged_model = format!("{}:{}", trainer.model_prefix, snapshot_id);
     let modelfile_path = snapshot_dir.join("Modelfile");
     let modelfile = if modelfile_path.exists() {
@@ -1122,48 +1309,40 @@ async fn register_snapshot_with_ollama(
         &modelfile,
     );
     let parsed_modelfile = parse_modelfile(&modelfile);
-    let requires_modelfile_adapter = !parsed_modelfile.adapters.is_empty();
     let client = ollama_api_client();
-    if requires_modelfile_adapter {
-        ollama_api_post(
-            &client,
-            trainer,
-            "create",
-            &json!({
-                "model": tagged_model.as_str(),
-                "modelfile": modelfile.as_str(),
-                "stream": false
-            }),
-        )
-        .await
-        .map_err(|error| {
-            GailError::invalid_config(format!(
-                "Ollama API /api/create failed for ADAPTER Modelfile payload: {error}"
-            ))
-        })?;
-    } else if let Err(primary_error) =
-        ollama_api_post(&client, trainer, "create", &create_payload).await
-    {
-        let primary_error_text = primary_error.to_string();
-        tracing::warn!(
-            model = %tagged_model,
-            error = %primary_error_text,
-            "Ollama create via from-based payload failed; retrying with Modelfile payload"
-        );
-        if let Err(fallback_error) = ollama_api_post(
-            &client,
-            trainer,
-            "create",
-            &json!({
-                "model": tagged_model.as_str(),
-                "modelfile": modelfile.as_str(),
-                "stream": false
-            }),
-        )
-        .await
+    let mut create_payload = create_payload;
+    let mut registration_mode = OllamaRegistrationMode::BaseModel;
+    if !parsed_modelfile.adapters.is_empty() {
+        let manifest =
+            build_ollama_adapter_manifest(snapshot_dir, parsed_modelfile.adapters.as_slice())
+                .await?;
+        let adapters = upload_ollama_adapter_blobs(&client, trainer, manifest.as_slice()).await?;
+        create_payload["adapters"] = Value::Object(adapters);
+        registration_mode = OllamaRegistrationMode::Adapter;
+    }
+    if let Err(error) = ollama_api_post(&client, trainer, "create", &create_payload).await {
+        if registration_mode == OllamaRegistrationMode::Adapter
+            && ollama_adapter_is_unsupported(&error)
         {
+            tracing::warn!(
+                model = %tagged_model,
+                error = %error,
+                "Ollama cannot convert this snapshot adapter; registering a base-model-backed snapshot while retaining the trained adapter"
+            );
+            if let Some(payload) = create_payload.as_object_mut() {
+                payload.remove("adapters");
+            }
+            ollama_api_post(&client, trainer, "create", &create_payload)
+                .await
+                .map_err(|fallback_error| {
+                    GailError::invalid_config(format!(
+                        "Ollama API /api/create rejected the adapter and base-model fallback: adapter={error}; fallback={fallback_error}"
+                    ))
+                })?;
+            registration_mode = OllamaRegistrationMode::BaseModelFallback;
+        } else {
             return Err(GailError::invalid_config(format!(
-                "Ollama API /api/create failed with both payload styles: from-based={primary_error_text}; modelfile-based={fallback_error}"
+                "Ollama API /api/create failed for structured payload: {error}"
             )));
         }
     }
@@ -1177,7 +1356,293 @@ async fn register_snapshot_with_ollama(
         }),
     )
     .await?;
-    Ok(())
+    Ok(registration_mode)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OllamaRegistrationMode {
+    Adapter,
+    BaseModel,
+    BaseModelFallback,
+}
+
+fn ollama_adapter_is_unsupported(error: &GailError) -> bool {
+    let normalized = error.to_string().to_ascii_lowercase();
+    normalized.contains("unsupported architecture")
+        || normalized.contains("adapter architecture is not supported")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OllamaAdapterBlob {
+    name: String,
+    path: PathBuf,
+    digest: String,
+}
+
+async fn build_ollama_adapter_manifest(
+    snapshot_dir: &Path,
+    adapter_directives: &[String],
+) -> Result<Vec<OllamaAdapterBlob>> {
+    let snapshot_root = fs::canonicalize(snapshot_dir).await.map_err(|error| {
+        GailError::invalid_config(format!(
+            "failed to resolve training snapshot directory {}: {error}",
+            snapshot_dir.display()
+        ))
+    })?;
+    let mut manifest = Vec::new();
+    let mut names = std::collections::HashMap::<String, String>::new();
+
+    for directive in adapter_directives {
+        let relative = Path::new(directive);
+        if relative.as_os_str().is_empty()
+            || relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(GailError::invalid_config(format!(
+                "unsafe ADAPTER path in snapshot Modelfile: {directive}"
+            )));
+        }
+        let adapter_root = fs::canonicalize(snapshot_root.join(relative))
+            .await
+            .map_err(|error| {
+                GailError::invalid_config(format!(
+                    "failed to resolve ADAPTER path {directive}: {error}"
+                ))
+            })?;
+        ensure_path_beneath_snapshot(&snapshot_root, &adapter_root, directive)?;
+
+        let mut files = collect_adapter_files(&snapshot_root, &adapter_root).await?;
+        if files.is_empty() {
+            return Err(GailError::invalid_config(format!(
+                "ADAPTER path contains no regular files: {directive}"
+            )));
+        }
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        for (name, path) in files {
+            let digest = sha256_file(path.as_path()).await?;
+            if let Some(existing) = names.get(&name) {
+                if existing != &digest {
+                    return Err(GailError::invalid_config(format!(
+                        "multiple ADAPTER paths produce conflicting file name {name}"
+                    )));
+                }
+                continue;
+            }
+            names.insert(name.clone(), digest.clone());
+            manifest.push(OllamaAdapterBlob { name, path, digest });
+        }
+    }
+    manifest.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(manifest)
+}
+
+async fn collect_adapter_files(
+    snapshot_root: &Path,
+    adapter_root: &Path,
+) -> Result<Vec<(String, PathBuf)>> {
+    let metadata = fs::metadata(adapter_root).await.map_err(|error| {
+        GailError::invalid_config(format!(
+            "failed to inspect ADAPTER path {}: {error}",
+            adapter_root.display()
+        ))
+    })?;
+    if metadata.is_file() {
+        let name = adapter_root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| GailError::invalid_config("ADAPTER file has no valid UTF-8 name"))?;
+        return Ok(vec![(name.to_string(), adapter_root.to_path_buf())]);
+    }
+    if !metadata.is_dir() {
+        return Err(GailError::invalid_config(format!(
+            "ADAPTER path is not a regular file or directory: {}",
+            adapter_root.display()
+        )));
+    }
+
+    let mut files = Vec::new();
+    let mut pending = vec![(adapter_root.to_path_buf(), PathBuf::new())];
+    let mut visited = HashSet::new();
+    visited.insert(adapter_root.to_path_buf());
+    while let Some((directory, relative_directory)) = pending.pop() {
+        let mut entries = fs::read_dir(&directory).await.map_err(|error| {
+            GailError::invalid_config(format!(
+                "failed to read ADAPTER directory {}: {error}",
+                directory.display()
+            ))
+        })?;
+        while let Some(entry) = entries.next_entry().await.map_err(|error| {
+            GailError::invalid_config(format!(
+                "failed to enumerate ADAPTER directory {}: {error}",
+                directory.display()
+            ))
+        })? {
+            let relative_path = relative_directory.join(entry.file_name());
+            let resolved = fs::canonicalize(entry.path()).await.map_err(|error| {
+                GailError::invalid_config(format!(
+                    "failed to resolve ADAPTER entry {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            ensure_path_beneath_snapshot(
+                snapshot_root,
+                &resolved,
+                &relative_path.to_string_lossy(),
+            )?;
+            let entry_metadata = fs::metadata(&resolved).await.map_err(|error| {
+                GailError::invalid_config(format!(
+                    "failed to inspect ADAPTER entry {}: {error}",
+                    resolved.display()
+                ))
+            })?;
+            if entry_metadata.is_dir() {
+                if visited.insert(resolved.clone()) {
+                    pending.push((resolved, relative_path));
+                }
+            } else if entry_metadata.is_file() {
+                files.push((ollama_adapter_name(&relative_path)?, resolved));
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn ensure_path_beneath_snapshot(snapshot_root: &Path, path: &Path, label: &str) -> Result<()> {
+    if path.starts_with(snapshot_root) {
+        return Ok(());
+    }
+    Err(GailError::invalid_config(format!(
+        "ADAPTER path escapes the training snapshot: {label}"
+    )))
+}
+
+fn ollama_adapter_name(relative: &Path) -> Result<String> {
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(value) => {
+                let value = value.to_str().ok_or_else(|| {
+                    GailError::invalid_config("ADAPTER file name is not valid UTF-8")
+                })?;
+                parts.push(value);
+            }
+            _ => {
+                return Err(GailError::invalid_config(format!(
+                    "unsafe ADAPTER file name: {}",
+                    relative.display()
+                )));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(GailError::invalid_config("ADAPTER file name is empty"));
+    }
+    Ok(parts.join("/"))
+}
+
+async fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path).await.map_err(|error| {
+        GailError::invalid_config(format!(
+            "failed to open ADAPTER file {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 128 * 1024];
+    loop {
+        let read = file.read(buffer.as_mut_slice()).await.map_err(|error| {
+            GailError::invalid_config(format!(
+                "failed to hash ADAPTER file {}: {error}",
+                path.display()
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+}
+
+async fn upload_ollama_adapter_blobs(
+    client: &Client,
+    trainer: &TrainerConfig,
+    manifest: &[OllamaAdapterBlob],
+) -> Result<Map<String, Value>> {
+    let mut adapters = Map::new();
+    for blob in manifest {
+        ensure_ollama_blob(client, trainer, blob).await?;
+        adapters.insert(blob.name.clone(), json!(blob.digest));
+    }
+    Ok(adapters)
+}
+
+async fn ensure_ollama_blob(
+    client: &Client,
+    trainer: &TrainerConfig,
+    blob: &OllamaAdapterBlob,
+) -> Result<()> {
+    let base_url = ollama_base_url(trainer);
+    let url = format!("{base_url}/api/blobs/{}", blob.digest);
+    let response = client.head(&url).send().await.map_err(|error| {
+        GailError::invalid_config(format!(
+            "Ollama API request failed while checking adapter blob {}: {error}",
+            blob.name
+        ))
+    })?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    if response.status() != reqwest::StatusCode::NOT_FOUND {
+        return Err(GailError::invalid_config(format!(
+            "Ollama adapter blob check failed with HTTP {} for {}",
+            response.status().as_u16(),
+            blob.name
+        )));
+    }
+
+    let body = fs::read(&blob.path).await.map_err(|error| {
+        GailError::invalid_config(format!(
+            "failed to read ADAPTER file {}: {error}",
+            blob.path.display()
+        ))
+    })?;
+    let actual_digest = format!("sha256:{}", hex::encode(Sha256::digest(&body)));
+    if actual_digest != blob.digest {
+        return Err(GailError::invalid_config(format!(
+            "ADAPTER file changed while preparing Ollama blob: {}",
+            blob.path.display()
+        )));
+    }
+    let response = client
+        .post(&url)
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| {
+            GailError::invalid_config(format!(
+                "Ollama API request failed while uploading adapter blob {}: {error}",
+                blob.name
+            ))
+        })?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let text = response.text().await.unwrap_or_default();
+    Err(GailError::invalid_config(format!(
+        "Ollama adapter blob upload failed with HTTP {} for {}: {}",
+        status.as_u16(),
+        blob.name,
+        truncate_chars(&text, 600)
+    )))
 }
 
 async fn rotate_ollama_models(trainer: &TrainerConfig) -> Result<()> {
@@ -1666,6 +2131,100 @@ mod tests {
             json!("You are the Gail in-house continuously trained model snapshot 456.")
         );
         assert!(payload.get("parameters").is_none());
+    }
+
+    #[tokio::test]
+    async fn ollama_adapter_manifest_maps_relative_names_and_digests() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let snapshot = temporary.path().join("snapshot");
+        let adapter = snapshot.join("adapter");
+        std::fs::create_dir_all(adapter.join("nested")).expect("adapter directory");
+        std::fs::write(adapter.join("adapter_config.json"), b"{\"rank\":8}\n")
+            .expect("adapter config");
+        std::fs::write(adapter.join("nested/adapter_model.safetensors"), b"weights")
+            .expect("adapter weights");
+
+        let manifest = build_ollama_adapter_manifest(&snapshot, &["./adapter".to_string()])
+            .await
+            .expect("adapter manifest");
+        assert_eq!(manifest.len(), 2);
+        assert_eq!(manifest[0].name, "adapter_config.json");
+        assert_eq!(
+            manifest[0].digest,
+            format!("sha256:{}", hex::encode(Sha256::digest(b"{\"rank\":8}\n")))
+        );
+        assert_eq!(manifest[1].name, "nested/adapter_model.safetensors");
+        assert_eq!(
+            manifest[1].digest,
+            format!("sha256:{}", hex::encode(Sha256::digest(b"weights")))
+        );
+
+        let trainer = TrainerConfig {
+            ollama_base_model: "qwen2.5-coder:1.5b".to_string(),
+            ..TrainerConfig::default()
+        };
+        let mut payload = build_ollama_create_payload_from_modelfile(
+            &trainer,
+            "gail-inhouse:test",
+            "789",
+            "FROM qwen2.5-coder:1.5b\nADAPTER ./adapter\n",
+        );
+        payload["adapters"] = Value::Object(
+            manifest
+                .iter()
+                .map(|blob| (blob.name.clone(), json!(blob.digest)))
+                .collect(),
+        );
+        assert_eq!(payload["from"], json!("qwen2.5-coder:1.5b"));
+        assert_eq!(
+            payload["adapters"]["adapter_config.json"],
+            json!(manifest[0].digest)
+        );
+    }
+
+    #[tokio::test]
+    async fn ollama_adapter_manifest_rejects_path_traversal() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let snapshot = temporary.path().join("snapshot");
+        std::fs::create_dir_all(&snapshot).expect("snapshot directory");
+        std::fs::write(temporary.path().join("outside.safetensors"), b"outside")
+            .expect("outside file");
+
+        let error =
+            build_ollama_adapter_manifest(&snapshot, &["../outside.safetensors".to_string()])
+                .await
+                .expect_err("path traversal must fail");
+        assert!(error.to_string().contains("unsafe ADAPTER path"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ollama_adapter_manifest_rejects_symlink_escape() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let snapshot = temporary.path().join("snapshot");
+        let adapter = snapshot.join("adapter");
+        std::fs::create_dir_all(&adapter).expect("adapter directory");
+        let outside = temporary.path().join("outside.safetensors");
+        std::fs::write(&outside, b"outside").expect("outside file");
+        std::os::unix::fs::symlink(&outside, adapter.join("escaped.safetensors"))
+            .expect("adapter symlink");
+
+        let error = build_ollama_adapter_manifest(&snapshot, &["adapter".to_string()])
+            .await
+            .expect_err("symlink escape must fail");
+        assert!(error.to_string().contains("escapes the training snapshot"));
+    }
+
+    #[test]
+    fn ollama_adapter_unsupported_classifier_is_narrow() {
+        let unsupported = GailError::invalid_config(
+            "Ollama API /api/create failed with HTTP 400: unsupported architecture",
+        );
+        let transport = GailError::invalid_config(
+            "Ollama API /api/create failed with HTTP 503: service unavailable",
+        );
+        assert!(ollama_adapter_is_unsupported(&unsupported));
+        assert!(!ollama_adapter_is_unsupported(&transport));
     }
 
     #[test]

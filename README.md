@@ -221,6 +221,30 @@ Provider credentials, Gail bearer tokens, Ollama endpoints, and trading defaults
 - `orchestration.health_ttl_seconds`: cached provider-health TTL. Runtime quota health remains in backoff until this TTL expires, so later requests skip rate-limited candidates before probing them again.
 - `storage.ollama_model_store_path`: cached Ollama model inventory summary.
 
+## Distributed CPU training with Slurm
+
+Gail can hand a snapshot to an external, secret-free Slurm dispatcher through a
+shared NFS spool. The Centriq deployment starts one rank on each of
+`qc00`-`qc05`, assigns 40 CPUs to each rank (240 training CPUs total), and
+leaves six of each host's 46 CPUs available for the operating system and
+long-running services.
+
+`gail-qlora-sft` detects `SLURM_PROCID` and `SLURM_NTASKS`, deterministically
+shards the dataset by rank, and writes rank-local adapters and reports to an
+NFS coordination directory. Rank zero validates every tensor shape and creates
+one sample-count-weighted federated average, then publishes the coherent
+adapter, aggregate report, manifest, and `_SUCCESS` marker. A snapshot is not
+marked trained in Postgres until that aggregate output exists. Infrastructure
+and Ollama-registration failures remain retryable; a registration failure does
+not invalidate an otherwise successful training snapshot.
+
+The deployed TorchScript artifact must expose the real model's trainable LoRA
+parameters and an adapter mapping compatible with the serving runtime. The
+small bootstrap artifact used by deployment validation is only a pipeline
+fixture: it is not a complete Qwen 3.5 4B training graph, and CPU execution
+falls back from requested QLoRA SFT to unquantized LoRA SFT. Replace that
+artifact before treating the output as production Qwen 3.5 QLoRA training.
+
 ## AARNN Bridge
 
 Use `aarnn_bridge` when Gail should mirror every LLM input and output into an AARNN instance.
@@ -437,6 +461,8 @@ trainer:
   include_degraded: false
   max_attempts: 6
   retry_backoff_seconds: 300
+  recover_infrastructure_failures: false # bounded startup recovery for missing trainer executable failures
+  recovery_batch_size: 20000
   algorithm: "qlora_sft"
   command_template: ""                  # optional external trainer command
   command_timeout_seconds: 86400
