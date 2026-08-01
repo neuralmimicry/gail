@@ -1992,7 +1992,10 @@ mod tests {
             system: None,
             max_tokens: Some(8),
             temperature: Some(0.0),
-            timeout_seconds: Some(4),
+            // This test verifies endpoint failover, not short-timeout behavior.
+            // Leave enough headroom for loaded ARM CI runners to schedule both
+            // wiremock servers before the primary endpoint slice expires.
+            timeout_seconds: Some(30),
             reasoning_effort: None,
             request_category: None,
             workflow: None,
