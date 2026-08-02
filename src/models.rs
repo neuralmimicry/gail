@@ -327,6 +327,10 @@ pub struct AarnnMirrorStimulus {
     pub target: Option<String>,
     pub network_id: Option<String>,
     pub error: Option<String>,
+    pub output_step_index: Option<u64>,
+    #[serde(default)]
+    pub output_spike_indices: Vec<u32>,
+    pub output_aer_payload_hex: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -486,6 +490,7 @@ pub struct HealthResponse {
     pub ok: bool,
     pub service: String,
     pub version: String,
+    pub build: crate::build_info::BuildInfo,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

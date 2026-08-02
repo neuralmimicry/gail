@@ -5,6 +5,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-env-changed=GAIL_VERSION");
     println!("cargo:rerun-if-env-changed=GAIL_VERSION_MAJOR");
     println!("cargo:rerun-if-env-changed=GAIL_VERSION_MINOR");
@@ -12,6 +13,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BUILD_NUMBER");
     println!("cargo:rerun-if-env-changed=GAIL_GIT_COMMIT");
     println!("cargo:rerun-if-env-changed=GIT_COMMIT");
+    println!("cargo:rerun-if-env-changed=GAIL_SOURCE_TREE");
+    println!("cargo:rerun-if-env-changed=GAIL_SOURCE_DIRTY");
 
     if let Some(git_dir) = git_dir() {
         register_git_rerun_paths(&git_dir);
@@ -55,11 +58,21 @@ fn main() {
     let commit = env_first(&["GIT_COMMIT", "GAIL_GIT_COMMIT"])
         .or_else(|| git_output(&["rev-parse", "HEAD"]))
         .unwrap_or_else(|| "unknown".to_string());
+    let source_tree = env_first(&["GAIL_SOURCE_TREE"])
+        .or_else(|| git_output(&["rev-parse", "HEAD^{tree}"]))
+        .unwrap_or_else(|| "unknown".to_string());
+    let source_dirty = env_first(&["GAIL_SOURCE_DIRTY"]).unwrap_or_else(|| {
+        git_output(&["status", "--porcelain=v1", "--untracked-files=normal"])
+            .map(|output| (!output.is_empty()).to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    });
 
     println!("cargo:rustc-env=GAIL_BUILD_VERSION={build_version}");
     println!("cargo:rustc-env=GAIL_RELEASE_VERSION={release_version}");
     println!("cargo:rustc-env=GAIL_BUILD_NUMBER={build_number}");
     println!("cargo:rustc-env=GAIL_GIT_COMMIT={commit}");
+    println!("cargo:rustc-env=GAIL_SOURCE_TREE={source_tree}");
+    println!("cargo:rustc-env=GAIL_SOURCE_DIRTY={source_dirty}");
     println!("cargo:rustc-env=GAIL_VERSION_SOURCE={source}");
 }
 

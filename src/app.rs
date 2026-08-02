@@ -853,13 +853,15 @@ async fn trading_get_config(State(service): State<GailService>, headers: HeaderM
         None => trading_unavailable(),
         Some(bridge) => {
             let state = bridge.state.0.lock().await;
-            // Return effective config: base config + active overrides.
-            Json(json!({
+            // Return effective non-secret config. Internal config contains
+            // upstream credentials and must never be serialized directly.
+            let mut payload = json!({
                 "config": *bridge.config,
                 "overrides": state.config_overrides,
                 "enabled": bridge.is_enabled()
-            }))
-            .into_response()
+            });
+            crate::redaction::redact_sensitive_json(&mut payload);
+            Json(payload).into_response()
         }
     }
 }
@@ -3762,6 +3764,48 @@ mod tests {
             .expect("response");
         let payload = read_json(response).await;
         assert!(payload.get("api_issues").is_some());
+    }
+
+    #[tokio::test]
+    async fn trading_config_endpoint_never_serializes_upstream_credentials() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let mut config = GailConfig::default();
+        config.trading.enabled = true;
+        config.trading.octobot_base_url = upstream.uri();
+        config.trading.refiner_base_url = upstream.uri();
+        config.trading.octobot_password = Some("octobot-secret-value".to_string());
+        config.trading.refiner_api_token = Some("refiner-secret-value".to_string());
+        config.trading.data_path = std::env::temp_dir()
+            .join(format!(
+                "gail-trading-config-test-{}.json",
+                uuid::Uuid::new_v4()
+            ))
+            .to_string_lossy()
+            .to_string();
+
+        let app = build_router(test_service_with_config(config).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/trading/config")
+                    .header("authorization", "Bearer secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+        let encoded = serde_json::to_string(&payload).expect("json");
+
+        assert!(!encoded.contains("octobot-secret-value"));
+        assert!(!encoded.contains("refiner-secret-value"));
+        assert!(payload["config"].get("octobot_password").is_none());
+        assert!(payload["config"].get("refiner_api_token").is_none());
+        assert_eq!(payload["config"]["octobot_base_url"], upstream.uri());
     }
 
     #[tokio::test]

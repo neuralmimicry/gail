@@ -637,6 +637,7 @@ impl GailService {
             ok: true,
             service: "gail".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            build: crate::build_info::current(),
         }
     }
 

@@ -22,6 +22,7 @@ pub mod economics;
 pub mod fuzzy;
 pub mod octobot;
 pub mod outcomes;
+pub mod qualification;
 pub mod quant;
 pub mod quantitative;
 pub mod refiner;
@@ -63,6 +64,7 @@ use octobot::{
     OctobotLogEntry, OctobotPortfolio,
 };
 use outcomes::TradeMarkout;
+use qualification::PaperQualificationPolicy;
 use quant::{QuantMode, evaluate_symbol as evaluate_quant_symbol, evaluate_universe};
 use quantitative::backtest::{NativeBacktestReport, NativeQuantBacktester};
 use quantitative::sleeves::{evaluate_sleeves_async, market_key as sleeve_market_key};
@@ -3026,20 +3028,6 @@ async fn execute_if_warranted(
         return;
     }
 
-    if !config.live_execution_enabled {
-        info!(
-            "trading: live execution disabled — decision not sent to OctoBot exchange={} symbol={} action={:?} amount=${:.2}",
-            decision.exchange, decision.symbol, decision.action, decision.amount_usd
-        );
-        state
-            .log_warn(
-                "execute",
-                "Live execution disabled; decision was not sent to OctoBot",
-            )
-            .await;
-        return;
-    }
-
     if !decision.override_applied {
         let now = now_ts();
         let advisory_age = (now - decision.created_at).max(0.0);
@@ -3432,6 +3420,89 @@ async fn execute_if_warranted(
             .await;
         return;
     };
+    let paper_policy = PaperQualificationPolicy {
+        min_evaluations: config.paper_qualification_min_evaluations,
+        min_validated_intents: config.paper_qualification_min_validated_intents,
+        validity_seconds: config.paper_qualification_validity_seconds as f64,
+        intent_lease_seconds: config.execution_lease_seconds,
+    };
+    let build_revision = crate::build_info::revision();
+    if !config.live_execution_enabled {
+        if decision.override_applied {
+            state
+                .log_warn(
+                    "paper",
+                    "Operator overrides are not counted as paper qualification evidence",
+                )
+                .await;
+            return;
+        }
+        let (is_new, qualified, validated_intents, observed_evaluations) = {
+            let mut current = state.0.lock().await;
+            let evaluation_count = current.evaluation_count.saturating_add(1);
+            let now = now_ts();
+            let is_new = current.paper_qualification.observe_intent(
+                &build_revision,
+                &intent_key,
+                evaluation_count,
+                now,
+                paper_policy,
+            );
+            let qualified =
+                current
+                    .paper_qualification
+                    .is_qualified(&build_revision, now, paper_policy);
+            (
+                is_new,
+                qualified,
+                current.paper_qualification.validated_intents,
+                current.paper_qualification.observed_evaluations,
+            )
+        };
+        state.persist(&PathBuf::from(&config.data_path)).await;
+        state
+            .log(
+                if is_new { "info" } else { "warn" },
+                "paper",
+                if is_new {
+                    "Paper intent passed every read-only execution gate"
+                } else {
+                    "Duplicate paper intent rejected"
+                },
+                json!({
+                    "build_revision": build_revision,
+                    "intent_key": intent_key,
+                    "qualified": qualified,
+                    "validated_intents": validated_intents,
+                    "observed_evaluations": observed_evaluations,
+                }),
+            )
+            .await;
+        return;
+    }
+    if config.paper_qualification_required {
+        let qualified = {
+            let current = state.0.lock().await;
+            current
+                .paper_qualification
+                .is_qualified(&build_revision, now_ts(), paper_policy)
+        };
+        if !qualified {
+            state
+                .log(
+                    "error",
+                    "execute",
+                    "Live order blocked: current build has not passed paper qualification",
+                    json!({
+                        "build_revision": build_revision,
+                        "required_evaluations": config.paper_qualification_min_evaluations,
+                        "required_validated_intents": config.paper_qualification_min_validated_intents,
+                    }),
+                )
+                .await;
+            return;
+        }
+    }
     if let Err(reason) =
         claim_execution_intent(state, &intent_key, config, decision.override_applied).await
     {

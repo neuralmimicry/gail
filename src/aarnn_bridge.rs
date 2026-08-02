@@ -254,6 +254,9 @@ impl AarnnMirrorClient {
         if !candidate.usable {
             return false;
         }
+        if candidate.source.as_deref() != Some("network_output_decoder") {
+            return false;
+        }
         let Some(reply_text) = candidate
             .reply_text
             .as_deref()
@@ -840,22 +843,38 @@ fn resolve_transport_profile(
 }
 
 fn text_to_spikes(text: &str, sensory_size: usize) -> Vec<u8> {
-    // Lightweight deterministic text projection for mirrored stimulation.
-    // This is intentionally non-semantic and stable so repeated text produces
-    // comparable sensory activation patterns for AARNN training/replay.
+    // Fixed-density bottom-hash projection. Unlike the former set-every-hit
+    // encoder, long inputs cannot saturate the sensory layer and distinct text
+    // retains a discriminative whole-document fingerprint.
     let sensory_size = sensory_size.max(8);
     let mut spikes = vec![0u8; sensory_size];
     let compact = compact_text(text).to_ascii_lowercase();
     let bytes = compact.as_bytes();
-    let len = bytes.len().max(1);
-    for (index, byte) in bytes.iter().enumerate() {
-        let primary = ((*byte as usize) + index * 17 + len * 31) % sensory_size;
-        spikes[primary] = 1;
-        if index > 0 {
-            let previous = bytes[index - 1] as usize;
-            let secondary =
-                ((*byte as usize) * 31 + previous + index * 13 + len * 7) % sensory_size;
-            spikes[secondary] = 1;
+    if bytes.is_empty() {
+        return spikes;
+    }
+    let target = (sensory_size / 4).clamp(2, 64).min(sensory_size);
+    let mut ranked = (0..bytes.len())
+        .map(|index| {
+            let end = (index + 5).min(bytes.len());
+            let mut hash = 0xcbf29ce484222325u64;
+            for byte in &bytes[index..end] {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            hash ^= (index as u64).wrapping_mul(0x9e3779b97f4a7c15);
+            (hash, (hash as usize) % sensory_size)
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_unstable();
+    let mut active = 0usize;
+    for (_, neuron) in ranked {
+        if spikes[neuron] == 0 {
+            spikes[neuron] = 1;
+            active += 1;
+        }
+        if active >= target {
+            break;
         }
     }
     spikes
@@ -991,7 +1010,7 @@ mod tests {
                 reply_text: Some("Alternative SNN answer".to_string()),
                 confidence: Some(0.9),
                 usable: true,
-                source: Some("transport_mirror_echo".to_string()),
+                source: Some("network_output_decoder".to_string()),
                 output_spike_indices: vec![1, 2],
                 output_aer_payload_hex: Some("41455231".to_string()),
             }),
@@ -1005,13 +1024,35 @@ mod tests {
                 reply_text: Some("LLM answer".to_string()),
                 confidence: Some(0.95),
                 usable: true,
-                source: Some("transport_mirror_echo".to_string()),
+                source: Some("network_output_decoder".to_string()),
                 output_spike_indices: vec![],
                 output_aer_payload_hex: None,
             }),
             ..promoted.clone()
         };
         assert!(!client.should_promote_candidate(&duplicate, "LLM answer"));
+
+        let legacy_echo = AarnnMirrorInvocationTrace {
+            candidate: Some(AarnnMirrorCandidate {
+                reply_text: Some("Plausible but echoed answer".to_string()),
+                confidence: Some(1.0),
+                usable: true,
+                source: Some("stimulated_transport_echo".to_string()),
+                output_spike_indices: vec![1],
+                output_aer_payload_hex: None,
+            }),
+            ..promoted
+        };
+        assert!(!client.should_promote_candidate(&legacy_echo, "LLM answer"));
+    }
+
+    #[test]
+    fn long_text_projection_is_sparse_and_discriminative() {
+        let first = text_to_spikes(&"alpha beta gamma ".repeat(100), 32);
+        let second = text_to_spikes(&"delta epsilon zeta ".repeat(100), 32);
+        assert_eq!(first.iter().filter(|value| **value > 0).count(), 8);
+        assert_eq!(second.iter().filter(|value| **value > 0).count(), 8);
+        assert_ne!(first, second);
     }
 
     #[tokio::test]

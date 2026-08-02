@@ -459,7 +459,11 @@ pub async fn fetch_pending_training(
           AND (next_train_at IS NULL OR next_train_at <= now())
           AND COALESCE(response_text, '') <> ''
           AND {status_filter}
-        ORDER BY id ASC
+        -- Retries represent already-spent training work and must not be
+        -- starved by a continuous stream of new interactions.
+        ORDER BY
+            CASE WHEN train_status = 'retry' THEN 0 ELSE 1 END,
+            id ASC
         LIMIT $1
         "#
     );
@@ -512,8 +516,14 @@ pub async fn mark_training_success(
                 train_attempts = train_attempts + 1,
                 train_status = $2,
                 train_error = NULL,
-                next_train_at = NULL,
-                trained_at = now(),
+                next_train_at = CASE
+                    WHEN $2 IN ('trained', 'snapshotted') THEN NULL
+                    ELSE now()
+                END,
+                trained_at = CASE
+                    WHEN $2 IN ('trained', 'snapshotted') THEN now()
+                    ELSE NULL
+                END,
                 training_snapshot = $3
             WHERE id = ANY($1)
             "#,
@@ -521,6 +531,47 @@ pub async fn mark_training_success(
         )
         .await?;
     Ok(())
+}
+
+/// Repairs rows finalized by older workers before their serving-model
+/// registration completed.
+///
+/// `trained_at` is the terminal selector used by `fetch_pending_training`, so
+/// a registration-pending row with that timestamp set can otherwise never be
+/// retried. The bounded CTE keeps startup recovery predictable on large
+/// ledgers; subsequent restarts can continue the repair if necessary.
+pub async fn recover_incomplete_training_registrations(
+    dsn: &str,
+    batch_size: usize,
+) -> Result<u64, tokio_postgres::Error> {
+    let client = connect_client(dsn).await?;
+    client
+        .execute(
+            r#"
+            WITH recoverable AS (
+                SELECT id
+                FROM gail_llm_interactions
+                WHERE train_status = 'trained_registration_pending'
+                   OR (train_status = 'retry' AND trained_at IS NOT NULL)
+                ORDER BY id ASC
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE gail_llm_interactions AS interactions
+            SET
+                train_status = 'retry',
+                train_error = COALESCE(
+                    interactions.train_error,
+                    'serving model registration was not completed'
+                ),
+                next_train_at = now(),
+                trained_at = NULL
+            FROM recoverable
+            WHERE interactions.id = recoverable.id
+            "#,
+            &[&(batch_size.clamp(1, 100_000) as i64)],
+        )
+        .await
 }
 
 pub async fn mark_training_retry(

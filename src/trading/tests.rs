@@ -340,7 +340,10 @@ mod tests {
         assert_eq!(cfg.decision_roi_feedback_max_confidence_penalty, 0.35);
         assert_eq!(cfg.decision_roi_feedback_max_confidence_boost, 0.1);
         assert_eq!(cfg.max_open_positions, 5);
-        assert_eq!(cfg.evaluation_interval_seconds, 60);
+        assert_eq!(cfg.evaluation_interval_seconds, 900);
+        assert_eq!(cfg.advisor_timeout_seconds, 840.0);
+        assert_eq!(cfg.advisor_round_timeout_seconds, 900.0);
+        assert_eq!(cfg.advisor_early_quorum, 1);
         assert_eq!(cfg.research_index_name, "crypto");
         assert_eq!(cfg.research_site_hints, vec!["bloomberg.com".to_string()]);
         assert_eq!(cfg.research_max_parallel_queries, 3);
@@ -354,7 +357,10 @@ mod tests {
         assert_eq!(cfg.portfolio_pruning_min_holding_usd, 20.0);
         assert_eq!(cfg.portfolio_pruning_candidate_pool_size, 12);
         assert_eq!(cfg.portfolio_pruning_min_composite_score, 0.55);
-        assert!(cfg.live_execution_enabled);
+        assert!(!cfg.live_execution_enabled);
+        assert!(cfg.paper_qualification_required);
+        assert_eq!(cfg.paper_qualification_min_evaluations, 100);
+        assert_eq!(cfg.paper_qualification_min_validated_intents, 5);
         assert!(cfg.market_datalake_enabled);
         assert_eq!(cfg.market_datalake_retention_days, 365);
         assert_eq!(cfg.market_datalake_bucket_seconds, 60);
@@ -6685,6 +6691,18 @@ mod tests {
             Some("incomplete")
         );
         assert!(snapshot.last_backtest_at.is_some());
+    }
+
+    #[test]
+    fn advisor_round_deadline_preserves_provider_completion_margin() {
+        let mut config = TradingConfig {
+            advisor_timeout_seconds: 700.0,
+            advisor_round_timeout_seconds: 45.0,
+            ..TradingConfig::default()
+        };
+        config.normalize();
+        assert_eq!(config.advisor_round_timeout_seconds, 730.0);
+        assert!(config.advisor_round_timeout_seconds > config.advisor_timeout_seconds);
     }
 
     // -----------------------------------------------------------------------

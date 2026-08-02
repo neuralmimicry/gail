@@ -33,6 +33,19 @@ pub async fn run(config: GailConfig) -> Result<()> {
         GailError::invalid_config(format!("failed to initialise LLM ledger schema: {error}"))
     })?;
     let trainer = config.trainer.clone();
+    match llm_ledger::recover_incomplete_training_registrations(&dsn, trainer.recovery_batch_size)
+        .await
+    {
+        Ok(recovered) if recovered > 0 => tracing::warn!(
+            recovered,
+            "requeued rows that were previously finalized before model registration completed"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            error = %error,
+            "failed to reconcile incomplete trainer registrations"
+        ),
+    }
     if trainer.recover_infrastructure_failures {
         match llm_ledger::recover_training_infrastructure_failures(
             &dsn,
@@ -395,6 +408,7 @@ async fn run_training_pipeline(
     }
     let mut snapshot_tag = format!("{}:{}", trainer.model_prefix, snapshot_id);
     let mut registration_succeeded = false;
+    let mut registration_error = None;
     if trainer.register_with_ollama && training_executed {
         match register_snapshot_with_ollama(trainer, snapshot_id, snapshot_dir).await {
             Ok(registration_mode) => {
@@ -403,12 +417,6 @@ async fn run_training_pipeline(
                 match registration_mode {
                     OllamaRegistrationMode::Adapter | OllamaRegistrationMode::BaseModel => {
                         pipeline_report["ollama_registration"] = json!("registered");
-                    }
-                    OllamaRegistrationMode::BaseModelFallback => {
-                        pipeline_report["ollama_registration"] =
-                            json!("registered_base_model_fallback");
-                        pipeline_report["ollama_adapter_registration"] =
-                            json!("retained_in_snapshot_unsupported_by_ollama");
                     }
                 }
                 if let Err(error) = rotate_ollama_models(trainer).await {
@@ -424,10 +432,11 @@ async fn run_training_pipeline(
                 tracing::warn!(
                     error = %error,
                     snapshot = snapshot_id,
-                    "training completed; Ollama registration will not invalidate the snapshot"
+                    "training completed, but serving-model registration failed"
                 );
-                pipeline_report["ollama_registration"] = json!("failed_non_fatal");
+                pipeline_report["ollama_registration"] = json!("failed_retryable");
                 pipeline_report["ollama_registration_error"] = json!(error.to_string());
+                registration_error = Some(error.to_string());
             }
         }
     } else if trainer.register_with_ollama {
@@ -441,6 +450,11 @@ async fn run_training_pipeline(
         &pipeline_report,
     )
     .await?;
+    if let Some(error) = registration_error {
+        return Err(GailError::invalid_config(format!(
+            "trained snapshot was retained but not promoted: {error}"
+        )));
+    }
     Ok(TrainingOutcome {
         snapshot_tag,
         status: if pipeline_report
@@ -449,10 +463,10 @@ async fn run_training_pipeline(
             .unwrap_or(-1)
             == 0
         {
-            if trainer.register_with_ollama && !registration_succeeded {
-                "trained_registration_pending".to_string()
-            } else {
+            if trainer.register_with_ollama && registration_succeeded {
                 "trained".to_string()
+            } else {
+                "snapshotted".to_string()
             }
         } else {
             "snapshotted".to_string()
@@ -1309,6 +1323,7 @@ async fn register_snapshot_with_ollama(
         &modelfile,
     );
     let parsed_modelfile = parse_modelfile(&modelfile);
+    validate_registration_artifacts(trainer, &parsed_modelfile)?;
     let client = ollama_api_client();
     let mut create_payload = create_payload;
     let mut registration_mode = OllamaRegistrationMode::BaseModel;
@@ -1320,32 +1335,13 @@ async fn register_snapshot_with_ollama(
         create_payload["adapters"] = Value::Object(adapters);
         registration_mode = OllamaRegistrationMode::Adapter;
     }
-    if let Err(error) = ollama_api_post(&client, trainer, "create", &create_payload).await {
-        if registration_mode == OllamaRegistrationMode::Adapter
-            && ollama_adapter_is_unsupported(&error)
-        {
-            tracing::warn!(
-                model = %tagged_model,
-                error = %error,
-                "Ollama cannot convert this snapshot adapter; registering a base-model-backed snapshot while retaining the trained adapter"
-            );
-            if let Some(payload) = create_payload.as_object_mut() {
-                payload.remove("adapters");
-            }
-            ollama_api_post(&client, trainer, "create", &create_payload)
-                .await
-                .map_err(|fallback_error| {
-                    GailError::invalid_config(format!(
-                        "Ollama API /api/create rejected the adapter and base-model fallback: adapter={error}; fallback={fallback_error}"
-                    ))
-                })?;
-            registration_mode = OllamaRegistrationMode::BaseModelFallback;
-        } else {
-            return Err(GailError::invalid_config(format!(
-                "Ollama API /api/create failed for structured payload: {error}"
-            )));
-        }
-    }
+    ollama_api_post(&client, trainer, "create", &create_payload)
+        .await
+        .map_err(|error| {
+            GailError::invalid_config(format!(
+                "Ollama API /api/create failed for trained snapshot; the model alias was not changed: {error}"
+            ))
+        })?;
     ollama_api_post(
         &client,
         trainer,
@@ -1363,13 +1359,19 @@ async fn register_snapshot_with_ollama(
 enum OllamaRegistrationMode {
     Adapter,
     BaseModel,
-    BaseModelFallback,
 }
 
-fn ollama_adapter_is_unsupported(error: &GailError) -> bool {
-    let normalized = error.to_string().to_ascii_lowercase();
-    normalized.contains("unsupported architecture")
-        || normalized.contains("adapter architecture is not supported")
+fn validate_registration_artifacts(
+    trainer: &TrainerConfig,
+    modelfile: &ParsedModelfile,
+) -> Result<()> {
+    if trainer.algorithm.to_ascii_lowercase().contains("lora") && modelfile.adapters.is_empty() {
+        return Err(GailError::invalid_config(format!(
+            "{} training completed without an ADAPTER artifact; refusing to register an unchanged base model",
+            trainer.algorithm
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2216,15 +2218,22 @@ mod tests {
     }
 
     #[test]
-    fn ollama_adapter_unsupported_classifier_is_narrow() {
-        let unsupported = GailError::invalid_config(
-            "Ollama API /api/create failed with HTTP 400: unsupported architecture",
-        );
-        let transport = GailError::invalid_config(
-            "Ollama API /api/create failed with HTTP 503: service unavailable",
-        );
-        assert!(ollama_adapter_is_unsupported(&unsupported));
-        assert!(!ollama_adapter_is_unsupported(&transport));
+    fn lora_registration_requires_an_adapter_artifact() {
+        let trainer = TrainerConfig {
+            algorithm: "qlora_sft".to_string(),
+            ..TrainerConfig::default()
+        };
+        let missing = ParsedModelfile::default();
+        let error = validate_registration_artifacts(&trainer, &missing)
+            .expect_err("LoRA without adapter must not promote the base model");
+        assert!(error.to_string().contains("without an ADAPTER artifact"));
+
+        let with_adapter = ParsedModelfile {
+            adapters: vec!["./adapter".to_string()],
+            ..ParsedModelfile::default()
+        };
+        validate_registration_artifacts(&trainer, &with_adapter)
+            .expect("adapter-backed LoRA may be registered");
     }
 
     #[test]

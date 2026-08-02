@@ -429,6 +429,9 @@ COPY --from=libtorch /opt/libtorch /opt/libtorch
 FROM docker.io/library/rust:1-bookworm AS source-deb
 
 ARG GAIL_VERSION=latest
+ARG VCS_REF=unknown
+ARG SOURCE_TREE=unknown
+ARG SOURCE_DIRTY=unknown
 ARG LIBTORCH_VERSION=2.11.0
 ARG LIBTORCH_ACCELERATOR=cpu
 ARG LIBTORCH_URL=
@@ -437,6 +440,9 @@ ARG CARGO_BUILD_JOBS=auto
 ARG CMAKE_BUILD_PARALLEL_LEVEL=auto
 
 ENV DEBIAN_FRONTEND=noninteractive \
+    GAIL_GIT_COMMIT=${VCS_REF} \
+    GAIL_SOURCE_TREE=${SOURCE_TREE} \
+    GAIL_SOURCE_DIRTY=${SOURCE_DIRTY} \
     BUILD_JOBS=${BUILD_JOBS} \
     CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} \
     CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL} \
@@ -471,6 +477,7 @@ RUN set -eu; \
 WORKDIR /src
 
 COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
 COPY src ./src
 COPY config ./config
 COPY gail.yaml .
@@ -527,6 +534,8 @@ ARG PYTORCH_PIP_INDEX_URL=
 ARG LIBTORCH_ACCELERATOR=cpu
 ARG BUILD_VERSION=dev
 ARG VCS_REF=unknown
+ARG SOURCE_TREE=unknown
+ARG SOURCE_DIRTY=unknown
 ARG GITHUB_REPOSITORY=neuralmimicry/gail
 ARG IMAGE_CREATED=unknown
 
@@ -534,6 +543,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 LABEL org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" \
       org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.source-tree="${SOURCE_TREE}" \
+      org.opencontainers.image.source-dirty="${SOURCE_DIRTY}" \
       org.opencontainers.image.version="${BUILD_VERSION}" \
       org.opencontainers.image.created="${IMAGE_CREATED}" \
       org.opencontainers.image.description="Gail runtime image with native libtorch/tch training, Python training tooling and OpenCL runtime detection"

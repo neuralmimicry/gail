@@ -365,11 +365,20 @@ pub struct TradingConfig {
     pub backtest_pause_on_failure: bool,
 
     /// Whether Gail is allowed to call OctoBot order-placement paths.
-    ///
-    /// Gail enables live execution by default for the trading bridge rollout.
-    /// The OctoBot client still reports a clear execution error if the deployed
-    /// OctoBot surface does not expose a supported live order-placement path.
     pub live_execution_enabled: bool,
+
+    /// Require persisted paper evidence from the exact running build before
+    /// any OctoBot order-placement path can be called.
+    pub paper_qualification_required: bool,
+
+    /// Completed evaluation cycles required in the paper observation window.
+    pub paper_qualification_min_evaluations: u64,
+
+    /// Actionable intents that must pass every read-only execution gate.
+    pub paper_qualification_min_validated_intents: u64,
+
+    /// Maximum age of a completed paper qualification.
+    pub paper_qualification_validity_seconds: u64,
 }
 
 impl Default for TradingConfig {
@@ -381,11 +390,14 @@ impl Default for TradingConfig {
             refiner_base_url: String::new(),
             refiner_api_token: None,
             admin_client_ids: vec!["pbisaacs".to_string()],
-            evaluation_interval_seconds: 60,
-            max_parallel_advisors: 5,
+            evaluation_interval_seconds: 900,
+            max_parallel_advisors: 3,
             max_parallel_symbol_evaluations: 2,
-            advisor_round_timeout_seconds: 45.0,
-            advisor_early_quorum: 2,
+            // The local 35B providers have a measured steady-state EWMA near
+            // 12 minutes. Allow 25% scheduling/queue headroom and accept the
+            // first valid response from parallel independent advisors.
+            advisor_round_timeout_seconds: 900.0,
+            advisor_early_quorum: 1,
             advisory_candidate_limit: 8,
             micro_trade_max_usd: 25.0,
             micro_trade_min_usd: 1.0,
@@ -404,8 +416,8 @@ impl Default for TradingConfig {
             portfolio_pruning_candidate_pool_size: 12,
             portfolio_pruning_min_composite_score: 0.55,
             fuzzy_confidence_threshold: 0.65,
-            market_snapshot_ttl_seconds: 90.0,
-            advisory_ttl_seconds: 60.0,
+            market_snapshot_ttl_seconds: 1_200.0,
+            advisory_ttl_seconds: 120.0,
             max_reprice_drift_bps: 35.0,
             estimated_fee_bps: 10.0,
             estimated_slippage_bps: 12.0,
@@ -451,7 +463,7 @@ impl Default for TradingConfig {
             decision_roi_feedback_max_confidence_boost: 0.1,
             octobot_timeout_seconds: 10.0,
             refiner_timeout_seconds: 15.0,
-            advisor_timeout_seconds: 30.0,
+            advisor_timeout_seconds: 840.0,
             market_datalake_enabled: true,
             market_datalake_file_path: String::new(),
             market_datalake_retention_days: 365,
@@ -486,7 +498,11 @@ impl Default for TradingConfig {
             ],
             backtest_data_collection_cooldown_seconds: 900,
             backtest_pause_on_failure: false,
-            live_execution_enabled: true,
+            live_execution_enabled: false,
+            paper_qualification_required: true,
+            paper_qualification_min_evaluations: 100,
+            paper_qualification_min_validated_intents: 5,
+            paper_qualification_validity_seconds: 7 * 24 * 60 * 60,
         }
     }
 }
@@ -537,7 +553,13 @@ impl TradingConfig {
             self.portfolio_pruning_min_composite_score.clamp(0.0, 2.0);
         self.max_parallel_advisors = self.max_parallel_advisors.clamp(1, 20);
         self.max_parallel_symbol_evaluations = self.max_parallel_symbol_evaluations.clamp(1, 16);
-        self.advisor_round_timeout_seconds = self.advisor_round_timeout_seconds.clamp(1.0, 900.0);
+        self.advisor_timeout_seconds = self.advisor_timeout_seconds.clamp(5.0, 1_740.0);
+        // Provider work must finish before the outer round deadline. Ranking,
+        // parsing, and cancellation retain a bounded thirty-second margin.
+        self.advisor_round_timeout_seconds = self
+            .advisor_round_timeout_seconds
+            .clamp(5.0, 1_800.0)
+            .max((self.advisor_timeout_seconds + 30.0).min(1_800.0));
         self.advisor_early_quorum = self
             .advisor_early_quorum
             .clamp(1, self.max_parallel_advisors.max(1));
@@ -590,7 +612,6 @@ impl TradingConfig {
         self.trade_ring_size = self.trade_ring_size.clamp(10, 5_000);
         self.octobot_timeout_seconds = self.octobot_timeout_seconds.max(1.0);
         self.refiner_timeout_seconds = self.refiner_timeout_seconds.max(1.0);
-        self.advisor_timeout_seconds = self.advisor_timeout_seconds.max(5.0);
         self.market_datalake_retention_days = self.market_datalake_retention_days.clamp(7, 3650);
         self.market_datalake_bucket_seconds = self.market_datalake_bucket_seconds.clamp(10, 3_600);
         self.market_datalake_short_window_minutes =
@@ -682,6 +703,14 @@ impl TradingConfig {
         }
         self.backtest_data_collection_cooldown_seconds =
             self.backtest_data_collection_cooldown_seconds.max(60);
+        self.paper_qualification_min_evaluations =
+            self.paper_qualification_min_evaluations.clamp(1, 1_000_000);
+        self.paper_qualification_min_validated_intents = self
+            .paper_qualification_min_validated_intents
+            .clamp(1, 100_000);
+        self.paper_qualification_validity_seconds = self
+            .paper_qualification_validity_seconds
+            .clamp(300, 90 * 24 * 60 * 60);
     }
 }
 

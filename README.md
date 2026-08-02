@@ -241,8 +241,10 @@ NFS coordination directory. Rank zero validates every tensor shape and creates
 one sample-count-weighted federated average, then publishes the coherent
 adapter, aggregate report, manifest, and `_SUCCESS` marker. A snapshot is not
 marked trained in Postgres until that aggregate output exists. Infrastructure
-and Ollama-registration failures remain retryable; a registration failure does
-not invalidate an otherwise successful training snapshot.
+and Ollama-registration failures remain retryable. A LoRA/QLoRA row is marked
+`trained` only after Ollama accepts the adapter and the serving alias is copied.
+Gail never promotes an unchanged base-model fallback: rejected or unsupported
+adapters retain their snapshot artifacts and return to the bounded retry queue.
 
 The deployed TorchScript artifact must expose the real model's trainable LoRA
 parameters and an adapter mapping compatible with the serving runtime. The
@@ -488,12 +490,12 @@ trading:
   refiner_base_url: "${GAIL_TRADING_REFINER_URL}"
   refiner_api_token: "${GAIL_TRADING_REFINER_TOKEN}"
   admin_client_ids: ["pbisaacs"]          # write-access list
-  evaluation_interval_seconds: 60         # minimum 10
-  max_parallel_advisors: 5               # 1–20
+  evaluation_interval_seconds: 900        # no overlapping slow-advisor cycles
+  max_parallel_advisors: 3               # parallel first-valid-response race
   max_parallel_symbol_evaluations: 2     # bounded map/reduce fan-out
-  advisor_timeout_seconds: 30            # per provider
-  advisor_round_timeout_seconds: 45      # entire round including fallback
-  advisor_early_quorum: 2                # parsed responses required
+  advisor_timeout_seconds: 840           # measured 12m EWMA plus headroom
+  advisor_round_timeout_seconds: 900     # provider timeout + orchestration margin
+  advisor_early_quorum: 1                # first parsed response wins
   advisory_candidate_limit: 8            # deterministic top-N prompt rows
   micro_trade_max_usd: 25.0              # per-trade ceiling
   micro_trade_min_usd: 1.0               # per-trade floor
@@ -502,8 +504,8 @@ trading:
   target_exchanges: []                   # empty = all available
   target_currencies: []                  # empty = all available
   fuzzy_confidence_threshold: 0.65       # minimum blended confidence to trade
-  market_snapshot_ttl_seconds: 90
-  advisory_ttl_seconds: 60
+  market_snapshot_ttl_seconds: 1200
+  advisory_ttl_seconds: 120
   max_reprice_drift_bps: 35
   estimated_fee_bps: 10                 # one-way
   estimated_slippage_bps: 12            # one-way
@@ -578,7 +580,11 @@ trading:
   decision_roi_feedback_max_signal_adjustment: 0.2
   decision_roi_feedback_max_confidence_penalty: 0.35
   decision_roi_feedback_max_confidence_boost: 0.1
-  live_execution_enabled: true
+  live_execution_enabled: false          # paper qualification is mandatory
+  paper_qualification_required: true
+  paper_qualification_min_evaluations: 100
+  paper_qualification_min_validated_intents: 5
+  paper_qualification_validity_seconds: 604800
   research_query_template: "cryptocurrency market sentiment {currency} {exchange} {date}"
   research_index_name: "crypto"
   research_site_hints: ["bloomberg.com", "reuters.com", "cnbc.com"]
@@ -618,6 +624,10 @@ claim of positive returns. See [Quantitative trading architecture](docs/quantita
 for the data flow, validation gates, sleeve mathematics, rollout sequence and
 ROI measurement guidance.
 
+For the credential rotation, immutable-image, trainer recovery, AARNN decoder,
+and mandatory paper-to-live sequence, see
+[Secure production rollout](docs/SECURE_PRODUCTION_ROLLOUT.md).
+
 Runtime-mutable fields (via `POST /v1/trading/config`, no restart required):
 `evaluation_interval_seconds`, `micro_trade_max_usd`, `micro_trade_min_usd`, `max_open_positions`, `fuzzy_confidence_threshold`, `target_exchanges`, `target_currencies`.
 
@@ -656,8 +666,10 @@ The Ansible role (`roles/continuum_tenant_gail`) exposes the following defaults 
 | `continuum_tenant_gail_trading_refiner_url` | cluster-local Refiner | Refiner base URL |
 | `continuum_tenant_gail_trading_refiner_token` | secret file lookup | Refiner API token |
 | `continuum_tenant_gail_trading_admin_token` | env / secret file | `pbisaacs` bearer token with `trading` + `trading_admin` scopes |
-| `continuum_tenant_gail_trading_eval_interval_seconds` | `60` | Evaluation interval |
-| `continuum_tenant_gail_trading_max_parallel_advisors` | `5` | Max parallel AI advisors |
+| `continuum_tenant_gail_trading_eval_interval_seconds` | `900` | Evaluation interval aligned to slow local providers |
+| `continuum_tenant_gail_trading_max_parallel_advisors` | `3` | Parallel first-valid-response advisors |
+| `continuum_tenant_gail_trading_live_execution_enabled` | `false` | Enable external order mutation after paper qualification |
+| `continuum_tenant_gail_trading_paper_qualification_required` | `true` | Require current-build paper evidence before live orders |
 | `continuum_tenant_gail_trading_micro_trade_max_usd` | `25.0` | Per-trade ceiling (USD) |
 | `continuum_tenant_gail_trading_micro_trade_min_usd` | `1.0` | Per-trade floor (USD) |
 | `continuum_tenant_gail_trading_max_open_positions` | `5` | Max simultaneous positions |

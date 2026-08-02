@@ -14,6 +14,7 @@ use super::backtest::BacktestSummary;
 use super::config::TradingConfigOverride;
 use super::octobot::{OctobotExchange, OctobotOrder, OctobotPortfolio};
 use super::outcomes::OutcomeLedger;
+use super::qualification::PaperQualificationState;
 use super::quant::QuantMigrationState;
 use super::quantitative::backtest::NativeBacktestReport;
 use super::quantitative::calibration::MultiHorizonCalibrationState;
@@ -204,6 +205,11 @@ pub struct TradingStatusSnapshot {
     pub quant_promotion_streak: usize,
     pub native_quant_validation_qualified: Option<bool>,
     pub execution_telemetry_observations: usize,
+    pub paper_build_revision: String,
+    pub paper_observed_evaluations: u64,
+    pub paper_validated_intents: u64,
+    pub paper_duplicate_intents_rejected: u64,
+    pub paper_qualified_at: Option<f64>,
     pub alpha_sleeve_actionable_recommendations: usize,
     pub alpha_sleeve_pending_markouts: usize,
     pub alpha_sleeve_resolved_markouts: usize,
@@ -266,6 +272,10 @@ pub struct TradingState {
     /// Observed fill slippage used to replace static execution assumptions.
     #[serde(default)]
     pub execution_telemetry: ExecutionTelemetryState,
+    /// Read-only execution evidence that must qualify the current build before
+    /// external order mutation is permitted.
+    #[serde(default)]
+    pub paper_qualification: PaperQualificationState,
     /// Persistent observations and recommendations from diversifying sleeves.
     #[serde(default)]
     pub alpha_sleeves: AlphaSleevesState,
@@ -322,6 +332,7 @@ impl TradingState {
             last_native_quant_backtest: None,
             quant_edge_calibration: MultiHorizonCalibrationState::default(),
             execution_telemetry: ExecutionTelemetryState::default(),
+            paper_qualification: PaperQualificationState::default(),
             alpha_sleeves: AlphaSleevesState::default(),
             llm_risk_overlay: LlmRiskOverlayState::default(),
         }
@@ -407,6 +418,11 @@ impl TradingState {
                 .as_ref()
                 .map(|report| report.promotion_qualified),
             execution_telemetry_observations: self.execution_telemetry.observations.len(),
+            paper_build_revision: self.paper_qualification.build_revision.clone(),
+            paper_observed_evaluations: self.paper_qualification.observed_evaluations,
+            paper_validated_intents: self.paper_qualification.validated_intents,
+            paper_duplicate_intents_rejected: self.paper_qualification.duplicate_intents_rejected,
+            paper_qualified_at: self.paper_qualification.qualified_at,
             alpha_sleeve_actionable_recommendations: self
                 .alpha_sleeves
                 .latest_recommendations
@@ -586,6 +602,7 @@ impl SharedTradingState {
                     state.last_native_quant_backtest = restored.last_native_quant_backtest;
                     state.quant_edge_calibration = restored.quant_edge_calibration;
                     state.execution_telemetry = restored.execution_telemetry;
+                    state.paper_qualification = restored.paper_qualification;
                     state.alpha_sleeves = restored.alpha_sleeves;
                     state.llm_risk_overlay = restored.llm_risk_overlay;
                     state.log_info("startup", "Restored trading state from disk");

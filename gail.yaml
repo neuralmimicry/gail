@@ -235,14 +235,14 @@ trading:
   refiner_api_token: "${GAIL_TRADING_REFINER_TOKEN}"
   admin_client_ids: ["pbisaacs"]
   evaluation_interval_seconds: ${GAIL_TRADING_EVAL_INTERVAL}
-  max_parallel_advisors: 5
+  max_parallel_advisors: 3
   # Discovery/pruning evaluates symbols concurrently, while this bound keeps
   # the nested advisor fan-out within local inference capacity.
   max_parallel_symbol_evaluations: 2
   # Each advisory wave is deadline-bound independently of slow provider HTTP
   # timeouts. Return partial quorum and cancel stragglers while the signal is fresh.
-  advisor_round_timeout_seconds: 45
-  advisor_early_quorum: 2
+  advisor_round_timeout_seconds: 900
+  advisor_early_quorum: 1
   advisory_candidate_limit: 8
   micro_trade_max_usd: ${GAIL_TRADING_MAX_USD}
   micro_trade_min_usd: ${GAIL_TRADING_MIN_USD}
@@ -253,8 +253,8 @@ trading:
   fuzzy_confidence_threshold: ${GAIL_TRADING_CONFIDENCE_THRESHOLD}
   # Cost-aware execution and stale-signal protection. Values are basis points
   # (1bp = 0.01%) and model a complete enter/exit lifecycle.
-  market_snapshot_ttl_seconds: 90
-  advisory_ttl_seconds: 60
+  market_snapshot_ttl_seconds: 1200
+  advisory_ttl_seconds: 120
   max_reprice_drift_bps: 35
   estimated_fee_bps: 10
   estimated_slippage_bps: 12
@@ -402,10 +402,14 @@ trading:
   decision_roi_feedback_max_signal_adjustment: 0.2
   decision_roi_feedback_max_confidence_penalty: 0.35
   decision_roi_feedback_max_confidence_boost: 0.1
-  live_execution_enabled: true
+  live_execution_enabled: false
+  paper_qualification_required: true
+  paper_qualification_min_evaluations: 100
+  paper_qualification_min_validated_intents: 5
+  paper_qualification_validity_seconds: 604800
   octobot_timeout_seconds: 10.0
   refiner_timeout_seconds: 15.0
-  advisor_timeout_seconds: 30.0
+  advisor_timeout_seconds: 840.0
   market_datalake_enabled: true
   market_datalake_file_path: "./data/market_datalake.jsonl"
   market_datalake_retention_days: 365
