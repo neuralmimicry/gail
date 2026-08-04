@@ -688,6 +688,23 @@ jobs:
           
           echo "Podman host: ${host_arch} ${host_os}"
 
+      - name: Recover stale rootless Podman state
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # A self-hosted runner can retain Podman's rootless pause-process
+          # state across jobs. In that state `podman login` fails before it can
+          # contact GHCR and recommends this migration explicitly.
+          if podman info >/dev/null 2>&1; then
+            echo "Rootless Podman state is healthy"
+            exit 0
+          fi
+
+          echo "Resetting stale rootless Podman pause-process state"
+          podman system migrate
+          podman info >/dev/null
+
       - name: Log in to GHCR
         run: |
           set -euo pipefail
