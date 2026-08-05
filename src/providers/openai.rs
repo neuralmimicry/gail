@@ -254,6 +254,7 @@ impl OpenAIProvider {
                     .and_then(Value::as_str)
                     && reason == "max_output_tokens"
                     && attempt < 2
+                    && responses_max_output_replay_enabled(&base_url)
                 {
                     max_tokens = Some(max_tokens.unwrap_or(1024).saturating_mul(2).max(1024));
                     replay_response_id = data
@@ -851,6 +852,25 @@ fn extract_async_request_id(data: &Value) -> Option<String> {
 
 fn normalize_base_url(raw: &str) -> String {
     raw.trim().trim_end_matches('/').to_string()
+}
+
+/// Local OpenAI-compatible servers must never silently double a caller's
+/// output budget.  The replay behavior is useful for OpenAI background
+/// responses, but on llama.cpp it turns a bounded request into an unbounded
+/// generation and can leave a single GPU slot occupied for many minutes.
+fn responses_max_output_replay_enabled(base_url: &str) -> bool {
+    if !env_bool("OPENAI_RESPONSES_REPLAY_ON_MAX_OUTPUT", true) {
+        return false;
+    }
+    let lowered = normalize_base_url(base_url).to_ascii_lowercase();
+    !(lowered.starts_with("http://127.0.0.1")
+        || lowered.starts_with("http://localhost")
+        || lowered.starts_with("http://192.168.")
+        || lowered.starts_with("http://10.")
+        || lowered.starts_with("http://172.16.")
+        || lowered.starts_with("http://172.17.")
+        || lowered.starts_with("http://172.18.")
+        || lowered.starts_with("http://172."))
 }
 
 fn endpoint(base_url: &str, path: impl AsRef<str>) -> String {
