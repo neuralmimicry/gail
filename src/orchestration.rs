@@ -2065,7 +2065,6 @@ impl GailService {
         let mut join_set = JoinSet::new();
         for (index, profile) in profiles.into_iter().enumerate() {
             let client = self.inner.client.clone();
-            let metrics = self.inner.metrics.clone();
             join_set.spawn(async move {
                 let provider_type = normalize_provider_type(profile.provider_type.as_str());
                 let mut probed_health = None;
@@ -2101,21 +2100,7 @@ impl GailService {
                 } else {
                     Value::Null
                 };
-                if let Some(status) = probed_health {
-                    let candidate = ProviderCandidate::from_profile(profile.clone());
-                    let _ = metrics
-                        .record_health(
-                            &candidate.summary(None),
-                            HealthBucket {
-                                ok: Some(status.ok),
-                                mode: status.mode,
-                                checked_at: None,
-                                latency_ms: status.latency_ms,
-                                message: status.message,
-                            },
-                        )
-                        .await;
-                }
+                let metrics_probe = probed_health.map(|status| (profile.clone(), status));
                 (
                     index,
                     json!({
@@ -2140,10 +2125,12 @@ impl GailService {
                         "nmc_host": profile.nmc_host,
                         "health": health,
                     }),
+                    metrics_probe,
                 )
             });
         }
-        let mut ordered = Vec::new();
+        let mut ordered: Vec<(usize, Value, Option<(ProviderProfile, ProviderHealth)>)> =
+            Vec::new();
         while let Some(result) = join_set.join_next().await {
             match result {
                 Ok(item) => ordered.push(item),
@@ -2152,8 +2139,31 @@ impl GailService {
                 }
             }
         }
-        ordered.sort_by_key(|(index, _)| *index);
-        ordered.into_iter().map(|(_, value)| value).collect()
+        ordered.sort_by_key(|(index, _, _)| *index);
+        // Network probes run concurrently, but metrics writes must be ordered:
+        // each persistence operation snapshots the store, so concurrent writes
+        // can otherwise overwrite a just-recorded health recovery.
+        for (_, _, probe) in &ordered {
+            let Some((profile, status)) = probe else {
+                continue;
+            };
+            let candidate = ProviderCandidate::from_profile(profile.clone());
+            let _ = self
+                .inner
+                .metrics
+                .record_health(
+                    &candidate.summary(None),
+                    HealthBucket {
+                        ok: Some(status.ok),
+                        mode: status.mode.clone(),
+                        checked_at: None,
+                        latency_ms: status.latency_ms,
+                        message: status.message.clone(),
+                    },
+                )
+                .await;
+        }
+        ordered.into_iter().map(|(_, value, _)| value).collect()
     }
 
     async fn first_ollama_inventory(&self) -> Value {
