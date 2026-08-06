@@ -235,13 +235,66 @@ pub struct MetricsStore {
     inner: Arc<Mutex<MetricsData>>,
 }
 
+impl AiResponseTimeStats {
+    fn normalize_split_latency_fields(&mut self) {
+        // The split fields were introduced after the legacy aggregate file
+        // format. A zero sample count means any populated split values came
+        // from the pre-count implementation and cannot be averaged reliably.
+        if self.successful_latency_samples == 0 {
+            self.successful_latency_total_ms = 0;
+            self.successful_latency_average_ms = None;
+            self.successful_latency_min_ms = None;
+            self.successful_latency_max_ms = None;
+            self.successful_latency_ewma_ms = None;
+        }
+        if self.failed_latency_samples == 0 {
+            self.failed_latency_total_ms = 0;
+            self.failed_latency_average_ms = None;
+            self.failed_latency_min_ms = None;
+            self.failed_latency_max_ms = None;
+            self.failed_latency_ewma_ms = None;
+        }
+    }
+}
+
+impl StatsBucket {
+    fn normalize_split_latency_fields(&mut self) {
+        if self.successful_latency_samples == 0 {
+            self.successful_latency_total_ms = 0;
+            self.successful_latency_average_ms = None;
+            self.successful_latency_min_ms = None;
+            self.successful_latency_max_ms = None;
+            self.successful_latency_ewma_ms = None;
+        }
+        if self.failed_latency_samples == 0 {
+            self.failed_latency_total_ms = 0;
+            self.failed_latency_average_ms = None;
+            self.failed_latency_min_ms = None;
+            self.failed_latency_max_ms = None;
+            self.failed_latency_ewma_ms = None;
+        }
+    }
+}
+
 impl MetricsStore {
     pub async fn new(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let data = match fs::read_to_string(&path).await {
+        let mut data = match fs::read_to_string(&path).await {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
             Err(_) => MetricsData::default(),
         };
+        for stats in data.ai_response_times.values_mut() {
+            stats.normalize_split_latency_fields();
+        }
+        for stats in data.api_response_times.values_mut() {
+            stats.normalize_split_latency_fields();
+        }
+        for candidate in data.candidates.values_mut() {
+            candidate.stats.normalize_split_latency_fields();
+            for stats in candidate.roles.values_mut() {
+                stats.normalize_split_latency_fields();
+            }
+        }
         Ok(Self {
             path,
             inner: Arc::new(Mutex::new(data)),
@@ -1575,6 +1628,22 @@ mod tests {
         assert_eq!(candidate_metrics.queue_wait_average_ms, Some(4_010.0));
         assert_eq!(candidate_metrics.successes, 1);
         assert_eq!(candidate_metrics.failures, 1);
+    }
+
+    #[test]
+    fn legacy_split_latency_without_sample_counts_is_discarded() {
+        let mut stats = StatsBucket {
+            successful_latency_total_ms: 900,
+            successful_latency_average_ms: Some(225.0),
+            failed_latency_total_ms: 400,
+            failed_latency_average_ms: Some(200.0),
+            ..StatsBucket::default()
+        };
+        stats.normalize_split_latency_fields();
+        assert_eq!(stats.successful_latency_total_ms, 0);
+        assert_eq!(stats.successful_latency_average_ms, None);
+        assert_eq!(stats.failed_latency_total_ms, 0);
+        assert_eq!(stats.failed_latency_average_ms, None);
     }
 
     #[tokio::test]
