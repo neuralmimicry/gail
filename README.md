@@ -253,6 +253,14 @@ fixture: it is not a complete Qwen 3.5 4B training graph, and CPU execution
 falls back from requested QLoRA SFT to unquantized LoRA SFT. Replace that
 artifact before treating the output as production Qwen 3.5 QLoRA training.
 
+Ollama's Safetensors adapter importer does not support the Qwen3.5 hybrid
+architecture. A production Qwen3.5 adapter must therefore be converted to a
+GGUF LoRA adapter with a pinned llama.cpp converter and configured through
+`trainer.ollama_adapter_conversion_command`, or be served by a compatible
+Transformers/vLLM node. Gail refuses the incompatible Safetensors request
+before `/api/create`; it never promotes the unchanged base model as a
+training result.
+
 ## AARNN Bridge
 
 Use `aarnn_bridge` when Gail should mirror every LLM input and output into an AARNN instance.
@@ -481,6 +489,7 @@ trainer:
   register_with_ollama: true
   ollama_cli: "ollama"
   ollama_host: null
+  ollama_adapter_conversion_command: null # e.g. pinned llama.cpp convert_lora_to_gguf.py command
   output_root: "./data/training"
 
 trading:

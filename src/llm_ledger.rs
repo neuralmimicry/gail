@@ -668,6 +668,14 @@ pub async fn recover_training_infrastructure_failures(
 
 fn is_recoverable_training_infrastructure_error(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
+    // Ollama's architecture rejection is deterministic for the current
+    // artifact/runtime pair. Do not revive these rows on every worker
+    // restart; a new production adapter/export must be created first.
+    if error.contains("unsupported architecture")
+        || error.contains("cannot be registered as safetensors")
+    {
+        return false;
+    }
     if error.contains("ollama api /api/create failed") {
         return true;
     }

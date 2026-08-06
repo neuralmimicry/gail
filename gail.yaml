@@ -225,6 +225,10 @@ trainer:
   register_with_ollama: true
   ollama_cli: "ollama"
   ollama_host: "${OLLAMA_HOST}"
+  # Qwen3.5 cannot be imported by Ollama's Safetensors adapter importer.
+  # Set this to a pinned llama.cpp converter command when using Qwen3.5;
+  # placeholders: {adapter}, {output}, {base_model}, {snapshot}, {snapshot_id}.
+  ollama_adapter_conversion_command: null
   output_root: "./data/training"
 
 trading:

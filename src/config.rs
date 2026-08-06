@@ -176,6 +176,13 @@ pub struct TrainerConfig {
     pub register_with_ollama: bool,
     pub ollama_cli: String,
     pub ollama_host: Option<String>,
+    /// Optional command used to convert a PEFT/Safetensors adapter into a
+    /// serving-runtime adapter (normally a GGUF LoRA adapter).  The command
+    /// receives the placeholders `{adapter}`, `{output}`, `{base_model}`,
+    /// `{snapshot}`, and `{snapshot_id}`.  This is required for model
+    /// families which Ollama cannot import directly from Safetensors, such
+    /// as Qwen3.5.
+    pub ollama_adapter_conversion_command: Option<String>,
     pub output_root: String,
 }
 
@@ -362,6 +369,7 @@ impl Default for TrainerConfig {
             register_with_ollama: true,
             ollama_cli: "ollama".to_string(),
             ollama_host: None,
+            ollama_adapter_conversion_command: None,
             output_root: "data/training".to_string(),
         }
     }
@@ -652,6 +660,13 @@ impl GailConfig {
                 .ollama_host
                 .as_deref()
                 .or(ollama_host_env.as_deref()),
+        );
+        let adapter_conversion_env = std::env::var("GAIL_OLLAMA_ADAPTER_CONVERSION_COMMAND").ok();
+        self.trainer.ollama_adapter_conversion_command = normalize_optional_string(
+            self.trainer
+                .ollama_adapter_conversion_command
+                .as_deref()
+                .or(adapter_conversion_env.as_deref()),
         );
         self.trainer.output_root =
             normalize_optional_string(Some(self.trainer.output_root.as_str()))

@@ -151,12 +151,20 @@ pub async fn run(config: GailConfig) -> Result<()> {
             Err(error) => {
                 let error_text = error.to_string();
                 tracing::warn!(error = %error_text, "trainer worker snapshot failed");
+                // An incompatible serving artifact is deterministic. Retrying
+                // it burns the same training work every poll and obscures the
+                // actual remediation (a real model export or GGUF converter).
+                let max_attempts = if is_non_retryable_training_error(&error_text) {
+                    1
+                } else {
+                    trainer.max_attempts
+                };
                 for id in ids {
                     let _ = llm_ledger::mark_training_retry(
                         &dsn,
                         id,
                         error_text.as_str(),
-                        trainer.max_attempts,
+                        max_attempts,
                         trainer.retry_backoff_seconds,
                     )
                     .await;
@@ -165,6 +173,14 @@ pub async fn run(config: GailConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn is_non_retryable_training_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("unsupported architecture")
+        || error.contains("cannot be registered as safetensors")
+        || error.contains("synthetic bootstrap")
+        || error.contains("not a production")
 }
 
 struct TrainingOutcome {
@@ -1316,21 +1332,22 @@ async fn register_snapshot_with_ollama(
             })?;
         rendered
     };
+    let mut parsed_modelfile = parse_modelfile(&modelfile);
+    validate_registration_artifacts(trainer, &parsed_modelfile)?;
+    let adapter_directives =
+        prepare_ollama_adapter(trainer, snapshot_id, snapshot_dir, &mut parsed_modelfile).await?;
     let create_payload = build_ollama_create_payload_from_modelfile(
         trainer,
         tagged_model.as_str(),
         snapshot_id,
-        &modelfile,
+        &render_modelfile_with_adapters(&modelfile, adapter_directives.as_slice()),
     );
-    let parsed_modelfile = parse_modelfile(&modelfile);
-    validate_registration_artifacts(trainer, &parsed_modelfile)?;
     let client = ollama_api_client();
     let mut create_payload = create_payload;
     let mut registration_mode = OllamaRegistrationMode::BaseModel;
-    if !parsed_modelfile.adapters.is_empty() {
+    if !adapter_directives.is_empty() {
         let manifest =
-            build_ollama_adapter_manifest(snapshot_dir, parsed_modelfile.adapters.as_slice())
-                .await?;
+            build_ollama_adapter_manifest(snapshot_dir, adapter_directives.as_slice()).await?;
         let adapters = upload_ollama_adapter_blobs(&client, trainer, manifest.as_slice()).await?;
         create_payload["adapters"] = Value::Object(adapters);
         registration_mode = OllamaRegistrationMode::Adapter;
@@ -1353,6 +1370,190 @@ async fn register_snapshot_with_ollama(
     )
     .await?;
     Ok(registration_mode)
+}
+
+/// Prepare an adapter in the format accepted by the selected serving runtime.
+///
+/// Ollama's Safetensors adapter importer only supports a small set of dense
+/// architectures.  Qwen3.5 is a hybrid vision/linear-attention architecture;
+/// it must be supplied as a GGUF LoRA adapter (or served by a Transformers
+/// compatible node).  Keeping conversion behind an explicit command means the
+/// worker cannot silently send an incompatible Safetensors artifact and then
+/// retry the same request forever.
+async fn prepare_ollama_adapter(
+    trainer: &TrainerConfig,
+    snapshot_id: &str,
+    snapshot_dir: &Path,
+    parsed: &mut ParsedModelfile,
+) -> Result<Vec<String>> {
+    if parsed.adapters.is_empty() {
+        return Ok(Vec::new());
+    }
+    if parsed
+        .adapters
+        .iter()
+        .all(|directive| directive.to_ascii_lowercase().ends_with(".gguf"))
+    {
+        return Ok(parsed.adapters.clone());
+    }
+
+    let is_qwen35 = trainer
+        .ollama_base_model
+        .to_ascii_lowercase()
+        .replace('.', "")
+        .replace('-', "")
+        .replace('_', "")
+        .contains("qwen35");
+    if is_qwen35 && trainer.ollama_adapter_conversion_command.is_none() {
+        return Err(GailError::invalid_config(
+            "Qwen3.5 adapters cannot be registered as Safetensors with Ollama; configure trainer.ollama_adapter_conversion_command to produce a GGUF LoRA adapter or use a Transformers/vLLM Gail node",
+        ));
+    }
+    let Some(command_template) = trainer.ollama_adapter_conversion_command.as_deref() else {
+        return Ok(parsed.adapters.clone());
+    };
+    if parsed.adapters.len() != 1 {
+        return Err(GailError::invalid_config(
+            "adapter conversion currently requires exactly one ADAPTER directive",
+        ));
+    }
+    let directive = parsed.adapters[0].trim();
+    let adapter_path = resolve_snapshot_adapter_path(snapshot_dir, directive).await?;
+    let output_path = snapshot_dir.join("adapter.gguf");
+    let command = render_adapter_conversion_command(
+        command_template,
+        &adapter_path,
+        &output_path,
+        trainer.ollama_base_model.as_str(),
+        snapshot_dir,
+        snapshot_id,
+    );
+    let mut child = Command::new("bash");
+    child
+        .arg("-lc")
+        .arg(command.as_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = child.spawn().map_err(|error| {
+        GailError::invalid_config(format!(
+            "failed to start Ollama adapter conversion command: {error}"
+        ))
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        GailError::invalid_config("failed to capture adapter conversion stdout".to_string())
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        GailError::invalid_config("failed to capture adapter conversion stderr".to_string())
+    })?;
+    let stdout_task = tokio::spawn(stream_child_output("adapter_conversion.stdout", stdout));
+    let stderr_task = tokio::spawn(stream_child_output("adapter_conversion.stderr", stderr));
+    let status = match tokio::time::timeout(
+        Duration::from_secs(trainer.command_timeout_seconds.max(1)),
+        child.wait(),
+    )
+    .await
+    {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            return Err(GailError::invalid_config(format!(
+                "Ollama adapter conversion command failed to execute: {error}"
+            )));
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            return Err(GailError::invalid_config(format!(
+                "Ollama adapter conversion timed out after {}s",
+                trainer.command_timeout_seconds
+            )));
+        }
+    };
+    let stdout = stdout_task.await.unwrap_or_default();
+    let stderr = stderr_task.await.unwrap_or_default();
+    if !status.success() {
+        return Err(GailError::invalid_config(format!(
+            "Ollama adapter conversion exited with {}: {} {}",
+            status.code().unwrap_or(-1),
+            truncate_chars(&stdout, 1200),
+            truncate_chars(&stderr, 1200)
+        )));
+    }
+    let metadata = fs::metadata(&output_path).await.map_err(|error| {
+        GailError::invalid_config(format!(
+            "adapter conversion completed without output {}: {error}",
+            output_path.display()
+        ))
+    })?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(GailError::invalid_config(format!(
+            "adapter conversion produced an empty output: {}",
+            output_path.display()
+        )));
+    }
+    tracing::info!(
+        snapshot = snapshot_id,
+        adapter = %adapter_path.display(),
+        output = %output_path.display(),
+        "converted trained adapter to GGUF for Ollama registration"
+    );
+    let converted = vec!["./adapter.gguf".to_string()];
+    parsed.adapters = converted.clone();
+    Ok(converted)
+}
+
+async fn resolve_snapshot_adapter_path(snapshot_dir: &Path, directive: &str) -> Result<PathBuf> {
+    let root = fs::canonicalize(snapshot_dir).await.map_err(|error| {
+        GailError::invalid_config(format!(
+            "failed to resolve snapshot directory {}: {error}",
+            snapshot_dir.display()
+        ))
+    })?;
+    let relative = directive.strip_prefix("./").unwrap_or(directive);
+    let path = fs::canonicalize(root.join(relative))
+        .await
+        .map_err(|error| {
+            GailError::invalid_config(format!(
+                "failed to resolve ADAPTER path {directive}: {error}"
+            ))
+        })?;
+    ensure_path_beneath_snapshot(&root, &path, directive)?;
+    Ok(path)
+}
+
+fn render_adapter_conversion_command(
+    template: &str,
+    adapter: &Path,
+    output: &Path,
+    base_model: &str,
+    snapshot: &Path,
+    snapshot_id: &str,
+) -> String {
+    template
+        .replace("{adapter}", &shell_escape(&adapter.to_string_lossy()))
+        .replace("{output}", &shell_escape(&output.to_string_lossy()))
+        .replace("{base_model}", &shell_escape(base_model))
+        .replace("{snapshot}", &shell_escape(&snapshot.to_string_lossy()))
+        .replace("{snapshot_id}", &shell_escape(snapshot_id))
+}
+
+fn render_modelfile_with_adapters(modelfile: &str, adapters: &[String]) -> String {
+    let mut next_adapter = 0_usize;
+    modelfile
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.to_ascii_uppercase().starts_with("ADAPTER ") && next_adapter < adapters.len()
+            {
+                let indentation = &line[..line.len() - trimmed.len()];
+                let replacement = format!("{indentation}ADAPTER {}", adapters[next_adapter]);
+                next_adapter += 1;
+                replacement
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2234,6 +2435,55 @@ mod tests {
         };
         validate_registration_artifacts(&trainer, &with_adapter)
             .expect("adapter-backed LoRA may be registered");
+    }
+
+    #[test]
+    fn qwen35_safetensors_registration_requires_conversion() {
+        let trainer = TrainerConfig {
+            ollama_base_model: "qwen3.5:4b".to_string(),
+            ..TrainerConfig::default()
+        };
+        let mut parsed = ParsedModelfile {
+            adapters: vec!["./adapter".to_string()],
+            ..ParsedModelfile::default()
+        };
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let snapshot = temporary.path().join("snapshot");
+        std::fs::create_dir_all(snapshot.join("adapter")).expect("adapter directory");
+        std::fs::write(
+            snapshot.join("adapter/adapter_model.safetensors"),
+            b"fixture",
+        )
+        .expect("adapter weights");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let error = runtime
+            .block_on(prepare_ollama_adapter(
+                &trainer,
+                "snapshot",
+                snapshot.as_path(),
+                &mut parsed,
+            ))
+            .expect_err("Qwen3.5 Safetensors must not be sent to Ollama");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be registered as Safetensors")
+        );
+    }
+
+    #[test]
+    fn adapter_conversion_command_quotes_paths_and_replaces_placeholders() {
+        let command = render_adapter_conversion_command(
+            "convert --input {adapter} --output {output} --base {base_model} --id {snapshot_id}",
+            Path::new("/tmp/a path/adapter"),
+            Path::new("/tmp/a path/adapter.gguf"),
+            "Qwen/Qwen3.5-4B-Base",
+            Path::new("/tmp/a path"),
+            "1786023597",
+        );
+        assert!(command.contains("'/tmp/a path/adapter'"));
+        assert!(command.contains("Qwen/Qwen3.5-4B-Base"));
+        assert!(!command.contains('{'));
     }
 
     #[test]
