@@ -22,6 +22,22 @@ CONVERTER_ROOT = Path(os.environ.get("GAIL_LLAMA_CPP_CONVERTER_ROOT", "/opt/gail
 CONVERTER = CONVERTER_ROOT / "convert_lora_to_gguf.py"
 
 
+def python_converter_environment() -> dict[str, str]:
+    """Return an environment suitable for the wheel-based Python converter.
+
+    The Gail runtime exports ``LD_LIBRARY_PATH=/opt/libtorch/lib`` for the
+    native Rust/tch service.  The training/conversion venv has its own PyTorch
+    wheel, however, and loading Gail's libtorch beside that wheel can produce
+    C++ ABI mismatches (for example in ``torch/lib/libshm.so``).  Keep the
+    native process environment unchanged and remove only this inherited path
+    for the Python subprocess.
+    """
+
+    environment = os.environ.copy()
+    environment.pop("LD_LIBRARY_PATH", None)
+    return environment
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--adapter", type=Path, required=True)
@@ -99,7 +115,11 @@ def main() -> int:
         command.extend(("--base-model-id", base_model_id))
     command.append(str(adapter))
     print(f"converting LoRA snapshot {args.snapshot or adapter.name} with pinned llama.cpp", flush=True)
-    completed = subprocess.run(command, check=False)
+    completed = subprocess.run(
+        command,
+        check=False,
+        env=python_converter_environment(),
+    )
     if completed.returncode != 0:
         return completed.returncode
     with args.output.open("rb") as output:
