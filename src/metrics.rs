@@ -805,6 +805,8 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
     out.push_str("# TYPE gail_provider_candidate_health_ok gauge\n");
     out.push_str("# HELP gail_provider_candidate_latency_ms Gail provider candidate EWMA latency in milliseconds.\n");
     out.push_str("# TYPE gail_provider_candidate_latency_ms gauge\n");
+    out.push_str("# HELP gail_provider_candidate_latency_average_ms Average observed provider candidate latency in milliseconds.\n");
+    out.push_str("# TYPE gail_provider_candidate_latency_average_ms gauge\n");
     out.push_str("# HELP gail_provider_candidate_latency_min_ms Minimum observed provider candidate latency in milliseconds.\n");
     out.push_str("# TYPE gail_provider_candidate_latency_min_ms gauge\n");
     out.push_str("# HELP gail_provider_candidate_latency_max_ms Maximum observed provider candidate latency in milliseconds.\n");
@@ -910,6 +912,11 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
             out.push_str(&format!(
                 "gail_provider_candidate_latency_ms{{{labels}}} {:.3}\n",
                 latency
+            ));
+        }
+        if let Some(average) = bucket.stats.average_latency_ms {
+            out.push_str(&format!(
+                "gail_provider_candidate_latency_average_ms{{{labels}}} {average:.3}\n"
             ));
         }
         if let Some(minimum) = bucket.stats.min_latency_ms {
@@ -1085,6 +1092,7 @@ mod tests {
             .expect("record result");
         let rendered = store.prometheus_metrics().await;
         assert!(rendered.contains("gail_provider_candidate_successes_total"));
+        assert!(rendered.contains("gail_provider_candidate_latency_average_ms"));
         assert!(rendered.contains("candidate_id=\"ollama/llama3.2\""));
     }
 
