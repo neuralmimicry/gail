@@ -623,8 +623,13 @@ impl MetricsStore {
             return;
         };
         let error = error.to_ascii_lowercase();
+        // Ollama commonly reports this as `model '<name>' not found`, while
+        // other adapters use `model not found: <name>`. Treat both forms as
+        // stale once an authoritative health probe confirms the candidate.
+        let named_model_not_found = error.contains("model '") && error.contains("' not found")
+            || error.contains("model \"") && error.contains("\" not found");
         if !(error.contains("model not found")
-            || error.contains("model 'not found")
+            || named_model_not_found
             || error.contains("no such model"))
         {
             return;
@@ -1662,7 +1667,7 @@ mod tests {
                 Some(100),
                 None,
                 -1.0,
-                Some("model not found: qwen3.5:9b"),
+                Some("ollama upstream error: model 'qwen3.5:9b' not found"),
             )
             .await
             .expect("record failure");
