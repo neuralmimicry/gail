@@ -21,7 +21,9 @@ use crate::{
     errors::{GailError, Result},
     hardware::{HardwareProfile, detect_hardware, log_hardware_profile},
     llm_ledger,
-    metrics::{TrainingRunObservation, append_training_observation},
+    metrics::{
+        TrainingRunObservation, backfill_training_observations, upsert_training_observation,
+    },
 };
 
 pub async fn run(config: GailConfig) -> Result<()> {
@@ -77,6 +79,26 @@ pub async fn run(config: GailConfig) -> Result<()> {
         register_with_ollama = trainer.register_with_ollama,
         "Gail trainer worker started"
     );
+    let training_metrics_path = training_metrics_path(&trainer);
+    match backfill_training_observations(
+        training_metrics_path.clone(),
+        PathBuf::from(&trainer.output_root).join("snapshots"),
+        trainer.ollama_base_model.as_str(),
+    )
+    .await
+    {
+        Ok(backfilled) if backfilled > 0 => tracing::info!(
+            backfilled,
+            path = %training_metrics_path.display(),
+            "backfilled historical training telemetry"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            error = %error,
+            path = %training_metrics_path.display(),
+            "failed to backfill historical training telemetry"
+        ),
+    }
     let poll_interval = Duration::from_secs(trainer.poll_interval_seconds);
     loop {
         tokio::select! {
@@ -111,11 +133,27 @@ pub async fn run(config: GailConfig) -> Result<()> {
         let snapshot_dir = snapshot_root.join("snapshots").join(snapshot_id.as_str());
         if let Err(error) = write_dataset(entries.as_slice(), dataset_path.as_path()).await {
             tracing::warn!(error = %error, path = %dataset_path.display(), "trainer worker failed to build dataset snapshot");
+            let error_text = error.to_string();
+            if let Err(metrics_error) = record_training_observation(
+                &trainer,
+                &snapshot_id,
+                snapshot_dir.as_path(),
+                None,
+                Some(error_text.as_str()),
+            )
+            .await
+            {
+                tracing::warn!(
+                    error = %metrics_error,
+                    snapshot = %snapshot_id,
+                    "failed to persist dataset failure telemetry"
+                );
+            }
             for entry in entries {
                 let _ = llm_ledger::mark_training_retry(
                     &dsn,
                     entry.id,
-                    format!("dataset_write_failed: {error}").as_str(),
+                    format!("dataset_write_failed: {error_text}").as_str(),
                     trainer.max_attempts,
                     trainer.retry_backoff_seconds,
                 )
@@ -132,6 +170,7 @@ pub async fn run(config: GailConfig) -> Result<()> {
             snapshot_dir.as_path(),
         )
         .await;
+        let training_error = train_outcome.as_ref().err().map(ToString::to_string);
         if let Err(error) = record_training_observation(
             &trainer,
             &snapshot_id,
@@ -140,6 +179,7 @@ pub async fn run(config: GailConfig) -> Result<()> {
                 .as_ref()
                 .ok()
                 .map(|outcome| outcome.status.as_str()),
+            training_error.as_deref(),
         )
         .await
         {
@@ -189,115 +229,63 @@ pub async fn run(config: GailConfig) -> Result<()> {
     Ok(())
 }
 
+fn training_metrics_path(trainer: &TrainerConfig) -> PathBuf {
+    PathBuf::from(&trainer.output_root)
+        .parent()
+        .map(|path| path.join("training_metrics.json"))
+        .unwrap_or_else(|| PathBuf::from("training_metrics.json"))
+}
+
 async fn record_training_observation(
     trainer: &TrainerConfig,
     snapshot_id: &str,
     snapshot_dir: &Path,
     outcome_status: Option<&str>,
+    training_error: Option<&str>,
 ) -> Result<()> {
     let report_path = snapshot_dir.join("training_report.json");
     let report = match fs::read_to_string(&report_path).await {
-        Ok(raw) => serde_json::from_str::<Value>(&raw).map_err(|error| {
+        Ok(raw) => Some(serde_json::from_str::<Value>(&raw).map_err(|error| {
             GailError::invalid_config(format!("invalid training report: {error}"))
-        })?,
-        Err(_) => return Ok(()),
+        })?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
     };
-    let metrics = report.get("metrics").cloned().unwrap_or(Value::Null);
-    let training_exit_code = report
-        .get("training_exit_code")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let status = outcome_status.map(ToOwned::to_owned).unwrap_or_else(|| {
-        if training_exit_code == 0 {
-            "promotion_failed"
+    let status = outcome_status.unwrap_or_else(|| {
+        if training_error.is_some() {
+            if report.is_some() {
+                "promotion_failed"
+            } else {
+                "failed"
+            }
         } else {
-            "failed"
+            "completed"
         }
-        .to_string()
     });
-    let runtime_seconds = metrics
-        .get("runtime_seconds")
-        .and_then(Value::as_f64)
-        .or_else(|| {
-            report
-                .get("training_runtime_seconds")
-                .and_then(Value::as_f64)
+    let observation = report
+        .as_ref()
+        .map(|report| {
+            TrainingRunObservation::from_report(
+                snapshot_id,
+                report,
+                status,
+                trainer.ollama_base_model.as_str(),
+            )
         })
-        .unwrap_or(0.0);
-    let total_tokens = metrics
-        .get("total_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let non_padding_tokens = metrics
-        .get("non_padding_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let distributed = report.get("distributed");
-    let observation = TrainingRunObservation {
-        snapshot_id: snapshot_id.to_string(),
-        backend: report
-            .get("backend")
-            .and_then(Value::as_str)
-            .or_else(|| report.get("training_backend").and_then(Value::as_str))
-            .unwrap_or("unknown")
+        .unwrap_or_else(|| TrainingRunObservation {
+            snapshot_id: snapshot_id.to_string(),
+            backend: if env_string("GAIL_TRAIN_SLURM_SPOOL").is_some() {
+                "slurm"
+            } else {
+                "local"
+            }
             .to_string(),
-        status,
-        base_model: report
-            .get("base_model")
-            .and_then(Value::as_str)
-            .unwrap_or(trainer.ollama_base_model.as_str())
-            .to_string(),
-        slurm_job_id: distributed
-            .and_then(|value| value.get("slurm_job_id"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        nodelist: distributed
-            .and_then(|value| value.get("slurm_nodelist"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        world_size: distributed
-            .and_then(|value| value.get("world_size"))
-            .and_then(Value::as_u64),
-        samples: metrics.get("samples").and_then(Value::as_u64).unwrap_or(0),
-        total_tokens,
-        non_padding_tokens,
-        optimizer_steps: metrics
-            .get("total_optimizer_steps")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        runtime_seconds,
-        tokens_per_second: metrics
-            .get("aggregate_tokens_per_second")
-            .and_then(Value::as_f64)
-            .or_else(|| metrics.get("tokens_per_second").and_then(Value::as_f64))
-            .unwrap_or_else(|| {
-                if runtime_seconds > 0.0 {
-                    total_tokens as f64 / runtime_seconds
-                } else {
-                    0.0
-                }
-            }),
-        non_padding_tokens_per_second: metrics
-            .get("non_padding_tokens_per_second")
-            .and_then(Value::as_f64)
-            .unwrap_or_else(|| {
-                if runtime_seconds > 0.0 {
-                    non_padding_tokens as f64 / runtime_seconds
-                } else {
-                    0.0
-                }
-            }),
-        started_ts: report.get("started_ts").and_then(Value::as_f64),
-        finished_ts: report
-            .get("finished_ts")
-            .and_then(Value::as_f64)
-            .or_else(|| Some(now_ts())),
-    };
-    let metrics_path = PathBuf::from(&trainer.output_root)
-        .parent()
-        .map(|path| path.join("training_metrics.json"))
-        .unwrap_or_else(|| PathBuf::from("training_metrics.json"));
-    append_training_observation(metrics_path, observation).await
+            status: status.to_string(),
+            base_model: trainer.ollama_base_model.clone(),
+            finished_ts: Some(now_ts()),
+            ..TrainingRunObservation::default()
+        });
+    upsert_training_observation(training_metrics_path(trainer), observation).await
 }
 
 fn is_non_retryable_training_error(error: &str) -> bool {

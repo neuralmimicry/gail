@@ -1,11 +1,12 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::{fs, sync::Mutex};
 
 use crate::{errors::Result, models::CandidateSummary};
@@ -49,6 +50,103 @@ pub struct TrainingRunObservation {
     pub non_padding_tokens_per_second: f64,
     pub started_ts: Option<f64>,
     pub finished_ts: Option<f64>,
+}
+
+impl TrainingRunObservation {
+    /// Convert the stable training report contract into dashboard telemetry.
+    /// Slurm and local trainers write the same report shape, so keeping this
+    /// conversion here also makes startup backfill and live observations
+    /// consistent.
+    pub fn from_report(
+        snapshot_id: &str,
+        report: &Value,
+        status: &str,
+        default_base_model: &str,
+    ) -> Self {
+        let metrics = report.get("metrics").cloned().unwrap_or(Value::Null);
+        let distributed = report.get("distributed");
+        let runtime_seconds = metrics
+            .get("runtime_seconds")
+            .and_then(Value::as_f64)
+            .or_else(|| {
+                report
+                    .get("training_runtime_seconds")
+                    .and_then(Value::as_f64)
+            })
+            .unwrap_or(0.0);
+        let total_tokens = metrics
+            .get("total_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let non_padding_tokens = metrics
+            .get("non_padding_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let tokens_per_second = metrics
+            .get("aggregate_tokens_per_second")
+            .and_then(Value::as_f64)
+            .or_else(|| metrics.get("tokens_per_second").and_then(Value::as_f64))
+            .unwrap_or_else(|| rate(total_tokens, runtime_seconds));
+        let non_padding_tokens_per_second = metrics
+            .get("non_padding_tokens_per_second")
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| rate(non_padding_tokens, runtime_seconds));
+
+        Self {
+            snapshot_id: snapshot_id.to_string(),
+            backend: report
+                .get("backend")
+                .and_then(Value::as_str)
+                .or_else(|| report.get("training_backend").and_then(Value::as_str))
+                .unwrap_or("unknown")
+                .to_string(),
+            status: status.to_string(),
+            base_model: report
+                .get("base_model")
+                .and_then(Value::as_str)
+                .unwrap_or(default_base_model)
+                .to_string(),
+            slurm_job_id: distributed
+                .and_then(|value| value.get("slurm_job_id"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            nodelist: distributed
+                .and_then(|value| value.get("slurm_nodelist"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    distributed
+                        .and_then(|value| value.get("nodelist"))
+                        .and_then(Value::as_str)
+                })
+                .map(ToOwned::to_owned),
+            world_size: distributed
+                .and_then(|value| value.get("world_size"))
+                .and_then(Value::as_u64),
+            samples: metrics.get("samples").and_then(Value::as_u64).unwrap_or(0),
+            total_tokens,
+            non_padding_tokens,
+            optimizer_steps: metrics
+                .get("total_optimizer_steps")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            runtime_seconds,
+            tokens_per_second,
+            non_padding_tokens_per_second,
+            started_ts: report.get("started_ts").and_then(Value::as_f64),
+            finished_ts: report
+                .get("finished_ts")
+                .and_then(Value::as_f64)
+                .or_else(|| Some(now_ts())),
+        }
+    }
+}
+
+fn rate(tokens: u64, runtime_seconds: f64) -> f64 {
+    if runtime_seconds > 0.0 {
+        tokens as f64 / runtime_seconds
+    } else {
+        0.0
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -294,12 +392,32 @@ pub async fn append_training_observation(
     path: impl Into<PathBuf>,
     observation: TrainingRunObservation,
 ) -> Result<()> {
+    upsert_training_observation(path, observation).await
+}
+
+/// Persist a training observation idempotently. Retries and worker restarts
+/// must not duplicate a snapshot in Prometheus or inflate dashboard totals.
+pub async fn upsert_training_observation(
+    path: impl Into<PathBuf>,
+    observation: TrainingRunObservation,
+) -> Result<()> {
     let path = path.into();
-    let mut data = match fs::read_to_string(&path).await {
-        Ok(raw) => serde_json::from_str::<TrainingMetricsData>(&raw).unwrap_or_default(),
-        Err(_) => TrainingMetricsData::default(),
-    };
-    data.runs.push(observation);
+    let data = read_training_metrics(&path).await;
+    write_training_metrics(&path, merge_training_observations(data, [observation])).await
+}
+
+fn merge_training_observations<I>(
+    mut data: TrainingMetricsData,
+    observations: I,
+) -> TrainingMetricsData
+where
+    I: IntoIterator<Item = TrainingRunObservation>,
+{
+    for observation in observations {
+        data.runs
+            .retain(|run| run.snapshot_id != observation.snapshot_id);
+        data.runs.push(observation);
+    }
     // Bound label/cardinality growth while retaining a useful operational
     // history for dashboards and postmortems.
     const MAX_TRAINING_RUNS: usize = 512;
@@ -308,6 +426,17 @@ pub async fn append_training_observation(
         data.runs.drain(..keep_from);
     }
     data.updated_at = now_ts();
+    data
+}
+
+async fn read_training_metrics(path: &Path) -> TrainingMetricsData {
+    match fs::read_to_string(path).await {
+        Ok(raw) => serde_json::from_str::<TrainingMetricsData>(&raw).unwrap_or_default(),
+        Err(_) => TrainingMetricsData::default(),
+    }
+}
+
+async fn write_training_metrics(path: &PathBuf, data: TrainingMetricsData) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;
     }
@@ -315,6 +444,71 @@ pub async fn append_training_observation(
     fs::write(&temporary, serde_json::to_string_pretty(&data)? + "\n").await?;
     fs::rename(temporary, path).await?;
     Ok(())
+}
+
+/// Discover reports produced before the telemetry file existed. Reports are
+/// treated as completed training artifacts; promotion status is recorded by
+/// the live worker when it is known.
+pub async fn discover_training_observations(
+    snapshot_root: impl Into<PathBuf>,
+    default_base_model: &str,
+) -> Result<Vec<TrainingRunObservation>> {
+    let mut observations = Vec::new();
+    let mut entries = match fs::read_dir(snapshot_root.into()).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(observations),
+        Err(error) => return Err(error.into()),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let snapshot_id = entry.file_name().to_string_lossy().to_string();
+        let report_path = entry.path().join("training_report.json");
+        let raw = match fs::read_to_string(report_path).await {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        let report = match serde_json::from_str::<Value>(&raw) {
+            Ok(report) => report,
+            Err(_) => continue,
+        };
+        if report.get("metrics").is_none() {
+            continue;
+        }
+        observations.push(TrainingRunObservation::from_report(
+            snapshot_id.as_str(),
+            &report,
+            "historical_completed",
+            default_base_model,
+        ));
+    }
+    observations.sort_by(|left, right| {
+        left.finished_ts
+            .partial_cmp(&right.finished_ts)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(observations)
+}
+
+/// Backfill the persistent metrics file from existing training reports.
+pub async fn backfill_training_observations(
+    metrics_path: impl Into<PathBuf>,
+    snapshot_root: impl Into<PathBuf>,
+    default_base_model: &str,
+) -> Result<usize> {
+    let metrics_path = metrics_path.into();
+    let observations = discover_training_observations(snapshot_root, default_base_model).await?;
+    let count = observations.len();
+    if count > 0 {
+        let data = read_training_metrics(&metrics_path).await;
+        write_training_metrics(
+            &metrics_path,
+            merge_training_observations(data, observations),
+        )
+        .await?;
+    }
+    Ok(count)
 }
 
 impl AiResponseTimeStats {
@@ -1159,11 +1353,25 @@ impl MetricsStore {
             .parent()
             .map(|parent| parent.join("training_metrics.json"))
             .unwrap_or_else(|| PathBuf::from("training_metrics.json"));
-        let training = fs::read_to_string(training_path)
+        let persisted_training = fs::read_to_string(&training_path)
             .await
             .ok()
-            .and_then(|raw| serde_json::from_str::<TrainingMetricsData>(&raw).ok())
-            .unwrap_or_default();
+            .and_then(|raw| serde_json::from_str::<TrainingMetricsData>(&raw).ok());
+        let training = match persisted_training {
+            Some(training) if !training.runs.is_empty() => training,
+            _ => {
+                let snapshot_root = training_path
+                    .parent()
+                    .map(|parent| parent.join("training").join("snapshots"))
+                    .unwrap_or_else(|| PathBuf::from("training/snapshots"));
+                TrainingMetricsData {
+                    runs: discover_training_observations(snapshot_root, "unknown")
+                        .await
+                        .unwrap_or_default(),
+                    updated_at: now_ts(),
+                }
+            }
+        };
         let mut rendered = render_prometheus_metrics(&data);
         render_training_prometheus_metrics(&mut rendered, &training);
         rendered
@@ -1770,6 +1978,85 @@ mod tests {
         assert!(rendered.contains("gail_provider_candidate_generation_tokens_per_second{"));
         assert!(rendered.contains("gail_training_tokens_per_second{"));
         assert!(rendered.contains("status=\"promotion_failed\""));
+    }
+
+    #[test]
+    fn training_report_conversion_uses_report_fields_and_rate_fallbacks() {
+        let report = serde_json::json!({
+            "backend": "slurm_distributed_cpu_lora",
+            "base_model": "qwen3.5:4b",
+            "metrics": {
+                "samples": 7,
+                "total_tokens": 900,
+                "non_padding_tokens": 600,
+                "runtime_seconds": 3.0,
+                "total_optimizer_steps": 4
+            },
+            "distributed": {
+                "slurm_job_id": "1786023597",
+                "slurm_nodelist": "qc[00-05]",
+                "world_size": 6
+            },
+            "started_ts": 10.0,
+            "finished_ts": 13.0
+        });
+        let observation = TrainingRunObservation::from_report(
+            "1786023597",
+            &report,
+            "historical_completed",
+            "fallback-model",
+        );
+
+        assert_eq!(observation.backend, "slurm_distributed_cpu_lora");
+        assert_eq!(observation.total_tokens, 900);
+        assert_eq!(observation.tokens_per_second, 300.0);
+        assert_eq!(observation.non_padding_tokens_per_second, 200.0);
+        assert_eq!(observation.slurm_job_id.as_deref(), Some("1786023597"));
+        assert_eq!(observation.nodelist.as_deref(), Some("qc[00-05]"));
+        assert_eq!(observation.world_size, Some(6));
+    }
+
+    #[tokio::test]
+    async fn training_backfill_is_idempotent_and_replaces_stale_observations() {
+        let directory = tempfile::tempdir().expect("metrics directory");
+        let snapshot_root = directory.path().join("training/snapshots");
+        let snapshot = snapshot_root.join("snapshot-a");
+        fs::create_dir_all(&snapshot)
+            .await
+            .expect("snapshot directory");
+        fs::write(
+            snapshot.join("training_report.json"),
+            serde_json::to_string(&serde_json::json!({
+                "backend": "slurm",
+                "metrics": { "total_tokens": 100, "runtime_seconds": 2.0 }
+            }))
+            .expect("report JSON"),
+        )
+        .await
+        .expect("training report");
+
+        let metrics_path = directory.path().join("training_metrics.json");
+        let first = backfill_training_observations(&metrics_path, &snapshot_root, "fallback-model")
+            .await
+            .expect("first backfill");
+        let second =
+            backfill_training_observations(&metrics_path, &snapshot_root, "fallback-model")
+                .await
+                .expect("second backfill");
+        assert_eq!(first, 1);
+        assert_eq!(second, 1);
+
+        let mut replacement = TrainingRunObservation::default();
+        replacement.snapshot_id = "snapshot-a".to_string();
+        replacement.status = "promotion_failed".to_string();
+        replacement.total_tokens = 123;
+        upsert_training_observation(&metrics_path, replacement)
+            .await
+            .expect("replace observation");
+        let persisted = read_training_metrics(&metrics_path).await;
+        assert_eq!(persisted.runs.len(), 1);
+        assert_eq!(persisted.runs[0].status, "promotion_failed");
+        assert_eq!(persisted.runs[0].total_tokens, 123);
     }
 
     #[tokio::test]
