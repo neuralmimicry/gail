@@ -358,6 +358,7 @@ mod tests {
         assert_eq!(cfg.portfolio_pruning_candidate_pool_size, 12);
         assert_eq!(cfg.portfolio_pruning_min_composite_score, 0.55);
         assert!(!cfg.live_execution_enabled);
+        assert!(cfg.live_execution_auto_gate_enabled);
         assert!(cfg.paper_qualification_required);
         assert_eq!(cfg.paper_qualification_min_evaluations, 100);
         assert_eq!(cfg.paper_qualification_min_validated_intents, 5);
