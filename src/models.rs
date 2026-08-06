@@ -236,6 +236,9 @@ pub struct CandidateSummary {
     pub configured_model: String,
     pub resolved_model: String,
     pub source: String,
+    /// Stable serving-system identity (for example `native-qc03`).
+    #[serde(default)]
+    pub host_id: Option<String>,
     pub specialties: Vec<String>,
     pub roles: Vec<String>,
 }

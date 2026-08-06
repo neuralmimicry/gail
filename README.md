@@ -261,6 +261,17 @@ Transformers/vLLM node. Gail refuses the incompatible Safetensors request
 before `/api/create`; it never promotes the unchanged base model as a
 training result.
 
+The production image ships `gail-convert-lora-to-gguf`, backed by the pinned
+llama.cpp revision recorded in `/opt/gail-llama-converter/COMMIT`. The wrapper
+requires a genuine PEFT adapter with paired `lora_A`/`lora_B` Safetensors
+tensors, converts it with llama.cpp's architecture-aware exporter, and
+verifies the GGUF header before `/api/create`. Set `GAIL_GGUF_BASE_MODEL_ID`
+when the adapter records an Ollama tag instead of a Hugging Face model ID (the
+Ansible deployment defaults this to `Qwen/Qwen3.5-4B`). The legacy Rust
+TorchScript development fixture is not a Qwen adapter and is deliberately
+rejected; use the Python PEFT trainer or another genuine model-compatible
+exporter to produce the input adapter.
+
 ## AARNN Bridge
 
 Use `aarnn_bridge` when Gail should mirror every LLM input and output into an AARNN instance.

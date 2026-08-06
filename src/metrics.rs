@@ -27,6 +27,37 @@ pub struct MetricsData {
     pub updated_at: f64,
 }
 
+/// One completed or failed training run.  Training is written by a separate
+/// worker process, so observations live in their own append-only state file
+/// and cannot overwrite provider routing metrics.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TrainingRunObservation {
+    pub snapshot_id: String,
+    pub backend: String,
+    pub status: String,
+    pub base_model: String,
+    pub slurm_job_id: Option<String>,
+    pub nodelist: Option<String>,
+    pub world_size: Option<u64>,
+    pub samples: u64,
+    pub total_tokens: u64,
+    pub non_padding_tokens: u64,
+    pub optimizer_steps: u64,
+    pub runtime_seconds: f64,
+    pub tokens_per_second: f64,
+    pub non_padding_tokens_per_second: f64,
+    pub started_ts: Option<f64>,
+    pub finished_ts: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct TrainingMetricsData {
+    runs: Vec<TrainingRunObservation>,
+    updated_at: f64,
+}
+
 /// Unified response-time statistics for user-visible AI work.
 ///
 /// Candidate metrics remain provider-specific for routing. These buckets are
@@ -81,6 +112,8 @@ pub struct CandidateBucket {
     pub model: Option<String>,
     pub configured_model: Option<String>,
     pub resolved_model: Option<String>,
+    #[serde(default)]
+    pub host_id: Option<String>,
     pub specialties: Vec<String>,
     pub stats: StatsBucket,
     pub roles: HashMap<String, StatsBucket>,
@@ -148,6 +181,20 @@ pub struct StatsBucket {
     pub ewma_inference_ms: Option<f64>,
     pub ewma_prompt_tokens: Option<f64>,
     pub ewma_tokens_estimate: Option<f64>,
+    /// Successful generated-token throughput. Queue wait and failed requests
+    /// are intentionally excluded from this distribution.
+    #[serde(default)]
+    pub generation_tokens_per_second_samples: u64,
+    #[serde(default)]
+    pub generation_tokens_per_second_total: f64,
+    #[serde(default)]
+    pub generation_tokens_per_second_average: Option<f64>,
+    #[serde(default)]
+    pub generation_tokens_per_second_min: Option<f64>,
+    #[serde(default)]
+    pub generation_tokens_per_second_max: Option<f64>,
+    #[serde(default)]
+    pub generation_tokens_per_second_ewma: Option<f64>,
     pub ewma_quality: f64,
     pub last_status: Option<String>,
     pub last_error: Option<String>,
@@ -160,6 +207,7 @@ pub struct LocalUsageTelemetry {
     pub queue_wait_ms: Option<u64>,
     pub inference_ms: Option<u64>,
     pub total_tokens_estimate: Option<u32>,
+    pub completion_tokens_estimate: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -174,6 +222,7 @@ pub struct HealthBucket {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CandidateMetricsSummary {
     pub candidate_id: String,
+    pub host_id: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub configured_model: Option<String>,
@@ -205,6 +254,10 @@ pub struct CandidateMetricsSummary {
     pub ewma_inference_ms: Option<f64>,
     pub ewma_prompt_tokens: Option<f64>,
     pub ewma_tokens_estimate: Option<f64>,
+    pub generation_tokens_per_second_average: Option<f64>,
+    pub generation_tokens_per_second_min: Option<f64>,
+    pub generation_tokens_per_second_max: Option<f64>,
+    pub generation_tokens_per_second_ewma: Option<f64>,
     pub ewma_quality: f64,
     pub last_status: Option<String>,
     pub last_error: Option<String>,
@@ -233,6 +286,35 @@ pub struct MetricsSummary {
 pub struct MetricsStore {
     path: PathBuf,
     inner: Arc<Mutex<MetricsData>>,
+}
+
+/// Persist one Slurm/local training observation without touching the routing
+/// metrics file owned by the API process.
+pub async fn append_training_observation(
+    path: impl Into<PathBuf>,
+    observation: TrainingRunObservation,
+) -> Result<()> {
+    let path = path.into();
+    let mut data = match fs::read_to_string(&path).await {
+        Ok(raw) => serde_json::from_str::<TrainingMetricsData>(&raw).unwrap_or_default(),
+        Err(_) => TrainingMetricsData::default(),
+    };
+    data.runs.push(observation);
+    // Bound label/cardinality growth while retaining a useful operational
+    // history for dashboards and postmortems.
+    const MAX_TRAINING_RUNS: usize = 512;
+    if data.runs.len() > MAX_TRAINING_RUNS {
+        let keep_from = data.runs.len() - MAX_TRAINING_RUNS;
+        data.runs.drain(..keep_from);
+    }
+    data.updated_at = now_ts();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    fs::write(&temporary, serde_json::to_string_pretty(&data)? + "\n").await?;
+    fs::rename(temporary, path).await?;
+    Ok(())
 }
 
 impl AiResponseTimeStats {
@@ -597,6 +679,7 @@ impl MetricsStore {
         bucket.model = Some(summary.model.clone());
         bucket.configured_model = Some(summary.configured_model.clone());
         bucket.resolved_model = Some(summary.resolved_model.clone());
+        bucket.host_id = summary.host_id.clone();
         bucket.specialties = summary.specialties.clone();
         if health.ok == Some(true) {
             // A successful tags/health/completion probe proves that a prior
@@ -740,6 +823,45 @@ impl MetricsStore {
                     None => total_tokens_estimate as f64,
                 });
             }
+            // OpenAI-compatible llama.cpp nodes do not always report a
+            // provider-side inference duration. In that case latency is the
+            // effective end-to-end throughput denominator; Ollama nodes use
+            // their precise inference duration above.
+            if success
+                && let (Some(completion_tokens), Some(duration_ms)) = (
+                    telemetry.completion_tokens_estimate,
+                    telemetry.inference_ms.or(latency_ms),
+                )
+                && completion_tokens > 0
+                && duration_ms > 0
+            {
+                let tokens_per_second = completion_tokens as f64 * 1000.0 / duration_ms as f64;
+                bucket.generation_tokens_per_second_samples = bucket
+                    .generation_tokens_per_second_samples
+                    .saturating_add(1);
+                bucket.generation_tokens_per_second_total += tokens_per_second;
+                bucket.generation_tokens_per_second_average = Some(
+                    bucket.generation_tokens_per_second_total
+                        / bucket.generation_tokens_per_second_samples.max(1) as f64,
+                );
+                bucket.generation_tokens_per_second_min = Some(
+                    bucket
+                        .generation_tokens_per_second_min
+                        .map_or(tokens_per_second, |value| value.min(tokens_per_second)),
+                );
+                bucket.generation_tokens_per_second_max = Some(
+                    bucket
+                        .generation_tokens_per_second_max
+                        .map_or(tokens_per_second, |value| value.max(tokens_per_second)),
+                );
+                bucket.generation_tokens_per_second_ewma = Some(
+                    bucket
+                        .generation_tokens_per_second_ewma
+                        .map_or(tokens_per_second, |previous| {
+                            (previous * 0.75) + (tokens_per_second * 0.25)
+                        }),
+                );
+            }
         }
         bucket.ewma_quality = (bucket.ewma_quality * 0.75) + (quality * 0.25);
         bucket.last_status = Some(if success { "success" } else { "failure" }.to_string());
@@ -797,6 +919,7 @@ impl MetricsStore {
         bucket.model = Some(summary.model.clone());
         bucket.configured_model = Some(summary.configured_model.clone());
         bucket.resolved_model = Some(summary.resolved_model.clone());
+        bucket.host_id = summary.host_id.clone();
         bucket.specialties = summary.specialties.clone();
         Self::merge_stats(
             &mut bucket.stats,
@@ -926,6 +1049,7 @@ impl MetricsStore {
             .iter()
             .map(|(candidate_id, bucket)| CandidateMetricsSummary {
                 candidate_id: candidate_id.clone(),
+                host_id: bucket.host_id.clone(),
                 provider: bucket.provider.clone(),
                 model: bucket.model.clone(),
                 configured_model: bucket.configured_model.clone(),
@@ -964,6 +1088,12 @@ impl MetricsStore {
                 ewma_inference_ms: bucket.stats.ewma_inference_ms,
                 ewma_prompt_tokens: bucket.stats.ewma_prompt_tokens,
                 ewma_tokens_estimate: bucket.stats.ewma_tokens_estimate,
+                generation_tokens_per_second_average: bucket
+                    .stats
+                    .generation_tokens_per_second_average,
+                generation_tokens_per_second_min: bucket.stats.generation_tokens_per_second_min,
+                generation_tokens_per_second_max: bucket.stats.generation_tokens_per_second_max,
+                generation_tokens_per_second_ewma: bucket.stats.generation_tokens_per_second_ewma,
                 ewma_quality: bucket.stats.ewma_quality.round_to(6),
                 last_status: bucket.stats.last_status.clone(),
                 last_error: bucket.stats.last_error.clone(),
@@ -1024,7 +1154,19 @@ impl MetricsStore {
 
     pub async fn prometheus_metrics(&self) -> String {
         let data = self.inner.lock().await.clone();
-        render_prometheus_metrics(&data)
+        let training_path = self
+            .path
+            .parent()
+            .map(|parent| parent.join("training_metrics.json"))
+            .unwrap_or_else(|| PathBuf::from("training_metrics.json"));
+        let training = fs::read_to_string(training_path)
+            .await
+            .ok()
+            .and_then(|raw| serde_json::from_str::<TrainingMetricsData>(&raw).ok())
+            .unwrap_or_default();
+        let mut rendered = render_prometheus_metrics(&data);
+        render_training_prometheus_metrics(&mut rendered, &training);
+        rendered
     }
 }
 
@@ -1108,6 +1250,14 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
     out.push_str("# TYPE gail_provider_candidate_inference_ms gauge\n");
     out.push_str("# HELP gail_provider_candidate_tokens_estimate Gail provider candidate EWMA token estimate.\n");
     out.push_str("# TYPE gail_provider_candidate_tokens_estimate gauge\n");
+    out.push_str("# HELP gail_provider_candidate_generation_tokens_per_second Successful generated-token throughput by serving host.\n");
+    out.push_str("# TYPE gail_provider_candidate_generation_tokens_per_second gauge\n");
+    out.push_str("# HELP gail_provider_candidate_generation_tokens_per_second_average Average successful generated-token throughput by serving host.\n");
+    out.push_str("# TYPE gail_provider_candidate_generation_tokens_per_second_average gauge\n");
+    out.push_str("# HELP gail_provider_candidate_generation_tokens_per_second_min Minimum successful generated-token throughput by serving host.\n");
+    out.push_str("# TYPE gail_provider_candidate_generation_tokens_per_second_min gauge\n");
+    out.push_str("# HELP gail_provider_candidate_generation_tokens_per_second_max Maximum successful generated-token throughput by serving host.\n");
+    out.push_str("# TYPE gail_provider_candidate_generation_tokens_per_second_max gauge\n");
     out.push_str("# HELP gail_ai_response_time_average_ms Average user-visible AI response time in milliseconds.\n");
     out.push_str("# TYPE gail_ai_response_time_average_ms gauge\n");
     out.push_str("# HELP gail_ai_response_time_requests_total User-visible AI requests observed by modality.\n");
@@ -1187,8 +1337,9 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
     }
     for (candidate_id, bucket) in &data.candidates {
         let labels = format!(
-            "candidate_id=\"{}\",provider=\"{}\",model=\"{}\",health_mode=\"{}\"",
+            "candidate_id=\"{}\",host_id=\"{}\",provider=\"{}\",model=\"{}\",health_mode=\"{}\"",
             escape_label(candidate_id),
+            escape_label(bucket.host_id.as_deref().unwrap_or("unknown")),
             escape_label(bucket.provider.as_deref().unwrap_or("")),
             escape_label(
                 bucket
@@ -1278,6 +1429,26 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
                 "gail_provider_candidate_failure_latency_ewma_ms{{{labels}}} {ewma:.3}\n"
             ));
         }
+        if let Some(ewma) = bucket.stats.generation_tokens_per_second_ewma {
+            out.push_str(&format!(
+                "gail_provider_candidate_generation_tokens_per_second{{{labels}}} {ewma:.3}\n"
+            ));
+        }
+        if let Some(average) = bucket.stats.generation_tokens_per_second_average {
+            out.push_str(&format!(
+                "gail_provider_candidate_generation_tokens_per_second_average{{{labels}}} {average:.3}\n"
+            ));
+        }
+        if let Some(minimum) = bucket.stats.generation_tokens_per_second_min {
+            out.push_str(&format!(
+                "gail_provider_candidate_generation_tokens_per_second_min{{{labels}}} {minimum:.3}\n"
+            ));
+        }
+        if let Some(maximum) = bucket.stats.generation_tokens_per_second_max {
+            out.push_str(&format!(
+                "gail_provider_candidate_generation_tokens_per_second_max{{{labels}}} {maximum:.3}\n"
+            ));
+        }
         if let Some(queue_wait) = bucket.stats.ewma_queue_wait_ms {
             out.push_str(&format!(
                 "gail_provider_candidate_queue_wait_ms{{{labels}}} {:.3}\n",
@@ -1352,6 +1523,76 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
     out
 }
 
+fn render_training_prometheus_metrics(out: &mut String, data: &TrainingMetricsData) {
+    out.push_str(
+        "# HELP gail_training_runs_total Gail training runs observed by backend and status.\n",
+    );
+    out.push_str("# TYPE gail_training_runs_total counter\n");
+    out.push_str("# HELP gail_training_tokens_total Tokens processed by training runs.\n");
+    out.push_str("# TYPE gail_training_tokens_total counter\n");
+    out.push_str("# HELP gail_training_tokens_per_second Training throughput for each run.\n");
+    out.push_str("# TYPE gail_training_tokens_per_second gauge\n");
+    out.push_str("# HELP gail_training_runtime_seconds Training runtime for each run.\n");
+    out.push_str("# TYPE gail_training_runtime_seconds gauge\n");
+    out.push_str("# HELP gail_training_samples_total Samples processed by each training run.\n");
+    out.push_str("# TYPE gail_training_samples_total gauge\n");
+    out.push_str("# HELP gail_training_optimizer_steps_total Optimizer steps completed by each training run.\n");
+    out.push_str("# TYPE gail_training_optimizer_steps_total gauge\n");
+    out.push_str("# HELP gail_training_last_finished_timestamp_seconds Unix timestamp of the latest training observation.\n");
+    out.push_str("# TYPE gail_training_last_finished_timestamp_seconds gauge\n");
+    for run in &data.runs {
+        let labels = format!(
+            "snapshot_id=\"{}\",backend=\"{}\",status=\"{}\",model=\"{}\",slurm_job_id=\"{}\",nodelist=\"{}\"",
+            escape_label(&run.snapshot_id),
+            escape_label(&run.backend),
+            escape_label(&run.status),
+            escape_label(&run.base_model),
+            escape_label(run.slurm_job_id.as_deref().unwrap_or("")),
+            escape_label(run.nodelist.as_deref().unwrap_or("")),
+        );
+        out.push_str(&format!(
+            "gail_training_tokens_total{{{labels}}} {}\n",
+            run.total_tokens
+        ));
+        out.push_str(&format!(
+            "gail_training_tokens_per_second{{{labels}}} {:.3}\n",
+            run.tokens_per_second
+        ));
+        out.push_str(&format!(
+            "gail_training_runtime_seconds{{{labels}}} {:.3}\n",
+            run.runtime_seconds
+        ));
+        out.push_str(&format!(
+            "gail_training_samples_total{{{labels}}} {}\n",
+            run.samples
+        ));
+        out.push_str(&format!(
+            "gail_training_optimizer_steps_total{{{labels}}} {}\n",
+            run.optimizer_steps
+        ));
+        if let Some(finished) = run.finished_ts {
+            out.push_str(&format!(
+                "gail_training_last_finished_timestamp_seconds{{{labels}}} {:.3}\n",
+                finished
+            ));
+        }
+    }
+    let mut totals: HashMap<(String, String), u64> = HashMap::new();
+    for run in &data.runs {
+        *totals
+            .entry((run.backend.clone(), run.status.clone()))
+            .or_default() += 1;
+    }
+    for ((backend, status), count) in totals {
+        let labels = format!(
+            "backend=\"{}\",status=\"{}\"",
+            escape_label(&backend),
+            escape_label(&status)
+        );
+        out.push_str(&format!("gail_training_runs_total{{{labels}}} {count}\n"));
+    }
+}
+
 fn escape_label(value: &str) -> String {
     value
         .replace('\\', r"\\")
@@ -1382,6 +1623,7 @@ mod tests {
             configured_model: model.to_string(),
             resolved_model: model.to_string(),
             source: "test".to_string(),
+            host_id: Some("test-host".to_string()),
             specialties: Vec::new(),
             roles: Vec::new(),
         }
@@ -1463,6 +1705,7 @@ mod tests {
                     queue_wait_ms: Some(10),
                     inference_ms: Some(32),
                     total_tokens_estimate: Some(128),
+                    completion_tokens_estimate: Some(64),
                 }),
                 1.0,
                 None,
@@ -1473,6 +1716,60 @@ mod tests {
         assert!(rendered.contains("gail_provider_candidate_successes_total"));
         assert!(rendered.contains("gail_provider_candidate_latency_average_ms"));
         assert!(rendered.contains("candidate_id=\"ollama/llama3.2\""));
+        assert!(rendered.contains("host_id=\"test-host\""));
+        assert!(rendered.contains("gail_provider_candidate_generation_tokens_per_second"));
+    }
+
+    #[tokio::test]
+    async fn serving_throughput_and_training_observations_are_exported() {
+        let directory = tempfile::tempdir().expect("metrics directory");
+        let provider_path = directory.path().join("provider_metrics.json");
+        let store = MetricsStore::new(provider_path).await.expect("store");
+        store
+            .record_result(
+                &summary("ollama", "qwen3.5:9b"),
+                "interactive",
+                "general",
+                true,
+                Some(1_100),
+                Some(LocalUsageTelemetry {
+                    inference_ms: Some(1_000),
+                    total_tokens_estimate: Some(120),
+                    completion_tokens_estimate: Some(100),
+                    ..LocalUsageTelemetry::default()
+                }),
+                1.0,
+                None,
+            )
+            .await
+            .expect("record serving result");
+        append_training_observation(
+            directory.path().join("training_metrics.json"),
+            TrainingRunObservation {
+                snapshot_id: "1786023597".to_string(),
+                backend: "slurm".to_string(),
+                status: "promotion_failed".to_string(),
+                base_model: "qwen3.5:4b".to_string(),
+                slurm_job_id: Some("1786023597".to_string()),
+                nodelist: Some("qc[00-05]".to_string()),
+                world_size: Some(6),
+                samples: 128,
+                total_tokens: 4_000,
+                non_padding_tokens: 3_200,
+                optimizer_steps: 12,
+                runtime_seconds: 20.0,
+                tokens_per_second: 200.0,
+                non_padding_tokens_per_second: 160.0,
+                started_ts: Some(1.0),
+                finished_ts: Some(2.0),
+            },
+        )
+        .await
+        .expect("record training observation");
+        let rendered = store.prometheus_metrics().await;
+        assert!(rendered.contains("gail_provider_candidate_generation_tokens_per_second{"));
+        assert!(rendered.contains("gail_training_tokens_per_second{"));
+        assert!(rendered.contains("status=\"promotion_failed\""));
     }
 
     #[tokio::test]
@@ -1551,6 +1848,7 @@ mod tests {
                     queue_wait_ms: Some(5),
                     inference_ms: Some(110),
                     total_tokens_estimate: Some(900),
+                    completion_tokens_estimate: Some(800),
                 }),
                 1.0,
                 None,
@@ -1569,6 +1867,7 @@ mod tests {
                     queue_wait_ms: Some(850),
                     inference_ms: Some(3900),
                     total_tokens_estimate: Some(3400),
+                    completion_tokens_estimate: Some(2500),
                 }),
                 1.0,
                 None,

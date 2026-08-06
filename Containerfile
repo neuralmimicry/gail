@@ -426,6 +426,26 @@ RUN set -eu; \
 FROM scratch AS libtorch-export
 COPY --from=libtorch /opt/libtorch /opt/libtorch
 
+# The Qwen3.5 hybrid architecture is not accepted by Ollama's Safetensors
+# adapter importer.  Ship the upstream llama.cpp LoRA converter at a pinned
+# revision so trainer promotion is deterministic and does not depend on a
+# mutable host checkout or an internet connection at promotion time.
+FROM docker.io/library/debian:bookworm-slim AS llama-converter
+ARG LLAMA_CPP_COMMIT=6a32c29a746a2e44de463de647f9f6661eb5086b
+RUN set -eu; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl tar; \
+    rm -rf /var/lib/apt/lists/*; \
+    mkdir -p /opt; \
+    curl -fsSL "https://github.com/ggml-org/llama.cpp/archive/${LLAMA_CPP_COMMIT}.tar.gz" -o /tmp/llama.cpp.tar.gz; \
+    tar -xzf /tmp/llama.cpp.tar.gz -C /opt; \
+    mv "/opt/llama.cpp-${LLAMA_CPP_COMMIT}" /opt/gail-llama-converter; \
+    rm -f /tmp/llama.cpp.tar.gz; \
+    test -f /opt/gail-llama-converter/convert_lora_to_gguf.py; \
+    test -d /opt/gail-llama-converter/conversion; \
+    test -d /opt/gail-llama-converter/gguf-py; \
+    printf '%s\n' "${LLAMA_CPP_COMMIT}" > /opt/gail-llama-converter/COMMIT
+
 FROM docker.io/library/rust:1-bookworm AS source-deb
 
 ARG GAIL_VERSION=latest
@@ -518,6 +538,7 @@ RUN set -eu; \
 FROM docker.io/library/debian:bookworm-slim
 
 COPY --from=libtorch /opt/libtorch /opt/libtorch
+COPY --from=llama-converter /opt/gail-llama-converter /opt/gail-llama-converter
 
 ARG TARGETARCH
 ARG GAIL_VERSION=latest
@@ -550,6 +571,7 @@ LABEL org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" 
       org.opencontainers.image.description="Gail runtime image with native libtorch/tch training, Python training tooling and OpenCL runtime detection"
 
 COPY --from=source-deb /out/*.deb /tmp/source-gail.deb
+COPY scripts/trainer/convert_lora_to_gguf.py /usr/local/libexec/gail-convert-lora-to-gguf
 COPY gail.yaml /tmp/gail-defaults/gail.yaml
 COPY config/ai-routing-profiles.json /tmp/gail-defaults/ai-routing-profiles.json
 
@@ -632,6 +654,7 @@ RUN --mount=type=secret,id=gail_release_token set -eu; \
     apt-get update; \
     apt-get install -y --no-install-recommends /tmp/gail.deb; \
     test -x /usr/bin/gail-qlora-sft; \
+    chmod 0755 /usr/local/libexec/gail-convert-lora-to-gguf; \
     rm -f /tmp/gail.deb /tmp/source-gail.deb; \
     mkdir -p /app/config /app/data /app/scripts /var/lib/gail; \
     if [ -f /tmp/gail-defaults/gail.yaml ]; then \

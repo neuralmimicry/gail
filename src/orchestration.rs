@@ -3692,6 +3692,7 @@ impl ProviderCandidate {
             },
             resolved_model: resolved,
             source: self.source.clone(),
+            host_id: Some(candidate_host_label(self)),
             specialties: sorted_strings(self.specialties.clone()),
             roles: sorted_strings(self.roles.clone()),
         }
@@ -4562,6 +4563,16 @@ fn local_usage_telemetry(response: &ProviderInvocationResponse) -> LocalUsageTel
                     .and_then(Value::as_u64)
                     .map(|value| value as u32)
             });
+        telemetry.completion_tokens_estimate = local_usage
+            .get("completion_tokens_estimate")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32)
+            .or_else(|| {
+                local_usage
+                    .get("eval_count")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as u32)
+            });
     }
     if telemetry.total_tokens_estimate.is_none() {
         telemetry.total_tokens_estimate = response.usage.as_ref().and_then(|usage| {
@@ -4572,6 +4583,10 @@ fn local_usage_telemetry(response: &ProviderInvocationResponse) -> LocalUsageTel
                     .map(|(prompt, completion)| prompt.saturating_add(completion))
             })
         });
+    }
+    if telemetry.completion_tokens_estimate.is_none() {
+        telemetry.completion_tokens_estimate =
+            response.usage.as_ref().and_then(|usage| usage.completion);
     }
     telemetry
 }
@@ -5020,6 +5035,7 @@ fn degraded_candidate_summary(role: &str) -> CandidateSummary {
         configured_model: "degraded_safety".to_string(),
         resolved_model: "degraded_safety".to_string(),
         source: "internal_degraded_policy".to_string(),
+        host_id: Some("internal".to_string()),
         specialties: vec!["fallback".to_string(), "safety".to_string()],
         roles: vec![role.to_string()],
     }
@@ -6021,6 +6037,7 @@ Return only a JSON data instance that satisfies this schema:
             let total = successes + failures;
             CandidateMetricsSummary {
                 candidate_id: candidate_id.to_string(),
+                host_id: Some("test-host".to_string()),
                 provider: Some(provider.to_string()),
                 model: Some(model.to_string()),
                 configured_model: Some(model.to_string()),
@@ -6056,6 +6073,10 @@ Return only a JSON data instance that satisfies this schema:
                 ewma_inference_ms: Some(340.0),
                 ewma_prompt_tokens: None,
                 ewma_tokens_estimate: None,
+                generation_tokens_per_second_average: Some(20.0),
+                generation_tokens_per_second_min: Some(10.0),
+                generation_tokens_per_second_max: Some(30.0),
+                generation_tokens_per_second_ewma: Some(20.0),
                 ewma_quality: 0.5,
                 last_status: Some("success".to_string()),
                 last_error: None,
