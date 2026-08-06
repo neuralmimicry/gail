@@ -180,17 +180,9 @@ jobs:
 
           echo "Configured torch-sys to use Python PyTorch via LIBTORCH_USE_PYTORCH=1"
 
-      - name: Cache cargo registry and build output
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: verify-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            verify-${{ runner.os }}-${{ runner.arch }}-
-            verify-${{ runner.os }}-
+      # Self-hosted runners use local Cargo state. Keep the remote cache
+      # service off the critical path: a cache miss only costs build time,
+      # while a stuck cache service must not prevent validation.
 
       - name: Run canonical CI preflight
         env:
@@ -387,18 +379,8 @@ jobs:
             echo "AR_${cc_env}=$ar_path"
           } >> "$GITHUB_ENV"
 
-      - name: Cache cargo registry and build output
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: package-${{ runner.os }}-${{ runner.arch }}-${{ matrix.platform }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            package-${{ runner.os }}-${{ runner.arch }}-${{ matrix.platform }}-
-            package-${{ runner.os }}-${{ runner.arch }}-
-            package-${{ runner.os }}-
+      # Do not block release packaging on the remote cache service. A cache
+      # miss only costs build time; it must never prevent publication.
 
       - name: Build and package release artifacts
         env:
