@@ -2065,21 +2065,57 @@ impl GailService {
         let mut join_set = JoinSet::new();
         for (index, profile) in profiles.into_iter().enumerate() {
             let client = self.inner.client.clone();
+            let metrics = self.inner.metrics.clone();
             join_set.spawn(async move {
                 let provider_type = normalize_provider_type(profile.provider_type.as_str());
+                let mut probed_health = None;
                 let health = if probe_health {
                     match build_adapter(client, &profile) {
                         Ok(adapter) => {
                             match adapter.health(Some(PROVIDER_HEALTH_TIMEOUT_SECONDS)).await {
-                                Ok(status) => json!(status),
-                                Err(error) => json!({"ok": false, "message": error.to_string()}),
+                                Ok(status) => {
+                                    probed_health = Some(status.clone());
+                                    json!(status)
+                                }
+                                Err(error) => {
+                                    let status = ProviderHealth {
+                                        ok: false,
+                                        message: Some(error.to_string()),
+                                        ..ProviderHealth::default()
+                                    };
+                                    probed_health = Some(status.clone());
+                                    json!(status)
+                                }
                             }
                         }
-                        Err(error) => json!({"ok": false, "message": error.to_string()}),
+                        Err(error) => {
+                            let status = ProviderHealth {
+                                ok: false,
+                                message: Some(error.to_string()),
+                                ..ProviderHealth::default()
+                            };
+                            probed_health = Some(status.clone());
+                            json!(status)
+                        }
                     }
                 } else {
                     Value::Null
                 };
+                if let Some(status) = probed_health {
+                    let candidate = ProviderCandidate::from_profile(profile.clone());
+                    let _ = metrics
+                        .record_health(
+                            &candidate.summary(None),
+                            HealthBucket {
+                                ok: Some(status.ok),
+                                mode: status.mode,
+                                checked_at: None,
+                                latency_ms: status.latency_ms,
+                                message: status.message,
+                            },
+                        )
+                        .await;
+                }
                 (
                     index,
                     json!({
