@@ -42,6 +42,28 @@ pub struct AiResponseTimeStats {
     pub min_latency_ms: Option<u64>,
     pub max_latency_ms: Option<u64>,
     pub ewma_latency_ms: Option<f64>,
+    /// Latency distribution for successful responses only.
+    #[serde(default)]
+    pub successful_latency_total_ms: u64,
+    #[serde(default)]
+    pub successful_latency_average_ms: Option<f64>,
+    #[serde(default)]
+    pub successful_latency_min_ms: Option<u64>,
+    #[serde(default)]
+    pub successful_latency_max_ms: Option<u64>,
+    #[serde(default)]
+    pub successful_latency_ewma_ms: Option<f64>,
+    /// Latency distribution for failed responses only.
+    #[serde(default)]
+    pub failed_latency_total_ms: u64,
+    #[serde(default)]
+    pub failed_latency_average_ms: Option<f64>,
+    #[serde(default)]
+    pub failed_latency_min_ms: Option<u64>,
+    #[serde(default)]
+    pub failed_latency_max_ms: Option<u64>,
+    #[serde(default)]
+    pub failed_latency_ewma_ms: Option<f64>,
     pub last_latency_ms: Option<u64>,
     pub total_prompt_tokens: u64,
     pub average_prompt_tokens: Option<f64>,
@@ -62,15 +84,58 @@ pub struct CandidateBucket {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct StatsBucket {
+    #[serde(default)]
     pub successes: u64,
+    #[serde(default)]
     pub failures: u64,
+    #[serde(default)]
     pub total: u64,
+    /// Backward-compatible successful latency fields. New callers should use
+    /// the explicit `successful_*` fields below.
+    #[serde(default)]
     pub total_latency_ms: u64,
+    #[serde(default)]
     pub average_latency_ms: Option<f64>,
+    #[serde(default)]
     pub min_latency_ms: Option<u64>,
+    #[serde(default)]
     pub max_latency_ms: Option<u64>,
+    #[serde(default)]
     pub ewma_latency_ms: Option<f64>,
+    #[serde(default)]
+    pub successful_latency_total_ms: u64,
+    #[serde(default)]
+    pub successful_latency_average_ms: Option<f64>,
+    #[serde(default)]
+    pub successful_latency_min_ms: Option<u64>,
+    #[serde(default)]
+    pub successful_latency_max_ms: Option<u64>,
+    #[serde(default)]
+    pub successful_latency_ewma_ms: Option<f64>,
+    #[serde(default)]
+    pub failed_latency_total_ms: u64,
+    #[serde(default)]
+    pub failed_latency_average_ms: Option<f64>,
+    #[serde(default)]
+    pub failed_latency_min_ms: Option<u64>,
+    #[serde(default)]
+    pub failed_latency_max_ms: Option<u64>,
+    #[serde(default)]
+    pub failed_latency_ewma_ms: Option<f64>,
+    #[serde(default)]
+    pub stale_failures: u64,
+    #[serde(default)]
+    pub queue_wait_total_ms: u64,
+    #[serde(default)]
+    pub queue_wait_samples: u64,
+    #[serde(default)]
+    pub queue_wait_average_ms: Option<f64>,
+    #[serde(default)]
+    pub queue_wait_min_ms: Option<u64>,
+    #[serde(default)]
+    pub queue_wait_max_ms: Option<u64>,
     pub ewma_queue_wait_ms: Option<f64>,
     pub ewma_inference_ms: Option<f64>,
     pub ewma_prompt_tokens: Option<f64>,
@@ -114,6 +179,18 @@ pub struct CandidateMetricsSummary {
     pub max_latency_ms: Option<u64>,
     pub success_rate: Option<f64>,
     pub ewma_latency_ms: Option<f64>,
+    pub successful_latency_average_ms: Option<f64>,
+    pub successful_latency_min_ms: Option<u64>,
+    pub successful_latency_max_ms: Option<u64>,
+    pub successful_latency_ewma_ms: Option<f64>,
+    pub failed_latency_average_ms: Option<f64>,
+    pub failed_latency_min_ms: Option<u64>,
+    pub failed_latency_max_ms: Option<u64>,
+    pub failed_latency_ewma_ms: Option<f64>,
+    pub stale_failures: u64,
+    pub queue_wait_average_ms: Option<f64>,
+    pub queue_wait_min_ms: Option<u64>,
+    pub queue_wait_max_ms: Option<u64>,
     pub ewma_queue_wait_ms: Option<f64>,
     pub ewma_inference_ms: Option<f64>,
     pub ewma_prompt_tokens: Option<f64>,
@@ -185,6 +262,40 @@ impl MetricsStore {
         } else {
             bucket.failures = bucket.failures.saturating_add(1);
         }
+        let sample_count = if success {
+            bucket.successes
+        } else {
+            bucket.failures
+        }
+        .max(1);
+        let (total, average, minimum, maximum, ewma) = if success {
+            (
+                &mut bucket.successful_latency_total_ms,
+                &mut bucket.successful_latency_average_ms,
+                &mut bucket.successful_latency_min_ms,
+                &mut bucket.successful_latency_max_ms,
+                &mut bucket.successful_latency_ewma_ms,
+            )
+        } else {
+            (
+                &mut bucket.failed_latency_total_ms,
+                &mut bucket.failed_latency_average_ms,
+                &mut bucket.failed_latency_min_ms,
+                &mut bucket.failed_latency_max_ms,
+                &mut bucket.failed_latency_ewma_ms,
+            )
+        };
+        *total = total.saturating_add(latency_ms);
+        *average = Some(*total as f64 / sample_count as f64);
+        *minimum = Some(minimum.map_or(latency_ms, |value| value.min(latency_ms)));
+        *maximum = Some(maximum.map_or(latency_ms, |value| value.max(latency_ms)));
+        *ewma = Some(match *ewma {
+            Some(previous) => (previous * 0.75) + (latency_ms as f64 * 0.25),
+            None => latency_ms as f64,
+        });
+        // The original aggregate fields remain backward-compatible for
+        // callers that need total request latency; the explicit successful
+        // and failed fields above are used for routing and dashboards.
         bucket.total_latency_ms = bucket.total_latency_ms.saturating_add(latency_ms);
         bucket.average_latency_ms =
             Some(bucket.total_latency_ms as f64 / bucket.requests.max(1) as f64);
@@ -268,7 +379,11 @@ impl MetricsStore {
         data.ai_response_times
             .get(source)
             .or_else(|| data.ai_response_times.get("all"))
-            .and_then(|stats| stats.average_latency_ms)
+            .and_then(|stats| {
+                stats
+                    .successful_latency_average_ms
+                    .or(stats.average_latency_ms)
+            })
             .map(|value| value.max(1.0).round() as u64)
     }
 
@@ -419,6 +534,16 @@ impl MetricsStore {
         bucket.configured_model = Some(summary.configured_model.clone());
         bucket.resolved_model = Some(summary.resolved_model.clone());
         bucket.specialties = summary.specialties.clone();
+        if health.ok == Some(true) {
+            // A successful tags/health/completion probe proves that a prior
+            // model-not-found observation is no longer actionable. Preserve
+            // the historical count separately, but remove it from the live
+            // success-rate denominator and routing error state.
+            Self::decay_stale_model_failures(&mut bucket.stats);
+            for role_bucket in bucket.roles.values_mut() {
+                Self::decay_stale_model_failures(role_bucket);
+            }
+        }
         bucket.health = HealthBucket {
             checked_at: Some(now_ts()),
             ..health
@@ -427,6 +552,24 @@ impl MetricsStore {
         let snapshot = data.clone();
         drop(data);
         self.save(&snapshot).await
+    }
+
+    fn decay_stale_model_failures(bucket: &mut StatsBucket) {
+        let Some(error) = bucket.last_error.as_deref() else {
+            return;
+        };
+        let error = error.to_ascii_lowercase();
+        if !(error.contains("model not found")
+            || error.contains("model 'not found")
+            || error.contains("no such model"))
+        {
+            return;
+        }
+        bucket.stale_failures = bucket.stale_failures.saturating_add(bucket.failures);
+        bucket.failures = 0;
+        bucket.total = bucket.successes;
+        bucket.last_error = None;
+        bucket.last_status = Some("health_recovered".to_string());
     }
 
     fn merge_stats(
@@ -444,23 +587,46 @@ impl MetricsStore {
         }
         bucket.total = bucket.successes + bucket.failures;
         if let Some(latency_ms) = latency_ms {
-            bucket.total_latency_ms = bucket.total_latency_ms.saturating_add(latency_ms);
-            bucket.average_latency_ms =
-                Some(bucket.total_latency_ms as f64 / bucket.total.max(1) as f64);
-            bucket.min_latency_ms = Some(
-                bucket
-                    .min_latency_ms
-                    .map_or(latency_ms, |value| value.min(latency_ms)),
-            );
-            bucket.max_latency_ms = Some(
-                bucket
-                    .max_latency_ms
-                    .map_or(latency_ms, |value| value.max(latency_ms)),
-            );
-            bucket.ewma_latency_ms = Some(match bucket.ewma_latency_ms {
+            let sample_count = if success {
+                bucket.successes
+            } else {
+                bucket.failures
+            }
+            .max(1);
+            let (total, average, minimum, maximum, ewma) = if success {
+                (
+                    &mut bucket.successful_latency_total_ms,
+                    &mut bucket.successful_latency_average_ms,
+                    &mut bucket.successful_latency_min_ms,
+                    &mut bucket.successful_latency_max_ms,
+                    &mut bucket.successful_latency_ewma_ms,
+                )
+            } else {
+                (
+                    &mut bucket.failed_latency_total_ms,
+                    &mut bucket.failed_latency_average_ms,
+                    &mut bucket.failed_latency_min_ms,
+                    &mut bucket.failed_latency_max_ms,
+                    &mut bucket.failed_latency_ewma_ms,
+                )
+            };
+            *total = total.saturating_add(latency_ms);
+            *average = Some(*total as f64 / sample_count as f64);
+            *minimum = Some(minimum.map_or(latency_ms, |value| value.min(latency_ms)));
+            *maximum = Some(maximum.map_or(latency_ms, |value| value.max(latency_ms)));
+            *ewma = Some(match *ewma {
                 Some(previous) => (previous * 0.75) + (latency_ms as f64 * 0.25),
                 None => latency_ms as f64,
             });
+            if success {
+                // Preserve the pre-split JSON/Prometheus field names as
+                // aliases for successful completion latency.
+                bucket.total_latency_ms = bucket.successful_latency_total_ms;
+                bucket.average_latency_ms = bucket.successful_latency_average_ms;
+                bucket.min_latency_ms = bucket.successful_latency_min_ms;
+                bucket.max_latency_ms = bucket.successful_latency_max_ms;
+                bucket.ewma_latency_ms = bucket.successful_latency_ewma_ms;
+            }
         }
         if let Some(telemetry) = telemetry {
             if let Some(prompt_tokens_estimate) = telemetry.prompt_tokens_estimate {
@@ -470,6 +636,22 @@ impl MetricsStore {
                 });
             }
             if let Some(queue_wait_ms) = telemetry.queue_wait_ms {
+                bucket.queue_wait_total_ms =
+                    bucket.queue_wait_total_ms.saturating_add(queue_wait_ms);
+                bucket.queue_wait_samples = bucket.queue_wait_samples.saturating_add(1);
+                bucket.queue_wait_average_ms = Some(
+                    bucket.queue_wait_total_ms as f64 / bucket.queue_wait_samples.max(1) as f64,
+                );
+                bucket.queue_wait_min_ms = Some(
+                    bucket
+                        .queue_wait_min_ms
+                        .map_or(queue_wait_ms, |value| value.min(queue_wait_ms)),
+                );
+                bucket.queue_wait_max_ms = Some(
+                    bucket
+                        .queue_wait_max_ms
+                        .map_or(queue_wait_ms, |value| value.max(queue_wait_ms)),
+                );
                 bucket.ewma_queue_wait_ms = Some(match bucket.ewma_queue_wait_ms {
                     Some(previous) => (previous * 0.75) + (queue_wait_ms as f64 * 0.25),
                     None => queue_wait_ms as f64,
@@ -608,12 +790,12 @@ impl MetricsStore {
         }
         let success_rate = stats.successes as f64 / stats.total as f64;
         let latency_bonus = stats
-            .ewma_latency_ms
+            .successful_latency_ewma_ms
             .map(|latency| ((1500.0 - latency) / 3000.0).clamp(-0.35, 0.35))
             .unwrap_or(0.0);
         let range_penalty = stats
-            .max_latency_ms
-            .zip(stats.min_latency_ms)
+            .successful_latency_max_ms
+            .zip(stats.successful_latency_min_ms)
             .map(|(max, min)| ((max.saturating_sub(min)) as f64 / 20_000.0).clamp(0.0, 0.25))
             .unwrap_or(0.0);
         let queue_wait_penalty = stats
@@ -693,6 +875,18 @@ impl MetricsStore {
                     None
                 },
                 ewma_latency_ms: bucket.stats.ewma_latency_ms,
+                successful_latency_average_ms: bucket.stats.successful_latency_average_ms,
+                successful_latency_min_ms: bucket.stats.successful_latency_min_ms,
+                successful_latency_max_ms: bucket.stats.successful_latency_max_ms,
+                successful_latency_ewma_ms: bucket.stats.successful_latency_ewma_ms,
+                failed_latency_average_ms: bucket.stats.failed_latency_average_ms,
+                failed_latency_min_ms: bucket.stats.failed_latency_min_ms,
+                failed_latency_max_ms: bucket.stats.failed_latency_max_ms,
+                failed_latency_ewma_ms: bucket.stats.failed_latency_ewma_ms,
+                stale_failures: bucket.stats.stale_failures,
+                queue_wait_average_ms: bucket.stats.queue_wait_average_ms,
+                queue_wait_min_ms: bucket.stats.queue_wait_min_ms,
+                queue_wait_max_ms: bucket.stats.queue_wait_max_ms,
                 ewma_queue_wait_ms: bucket.stats.ewma_queue_wait_ms,
                 ewma_inference_ms: bucket.stats.ewma_inference_ms,
                 ewma_prompt_tokens: bucket.stats.ewma_prompt_tokens,
@@ -811,8 +1005,32 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
     out.push_str("# TYPE gail_provider_candidate_latency_min_ms gauge\n");
     out.push_str("# HELP gail_provider_candidate_latency_max_ms Maximum observed provider candidate latency in milliseconds.\n");
     out.push_str("# TYPE gail_provider_candidate_latency_max_ms gauge\n");
+    out.push_str("# HELP gail_provider_candidate_success_latency_average_ms Average successful provider candidate latency in milliseconds.\n");
+    out.push_str("# TYPE gail_provider_candidate_success_latency_average_ms gauge\n");
+    out.push_str("# HELP gail_provider_candidate_success_latency_min_ms Minimum successful provider candidate latency in milliseconds.\n");
+    out.push_str("# TYPE gail_provider_candidate_success_latency_min_ms gauge\n");
+    out.push_str("# HELP gail_provider_candidate_success_latency_max_ms Maximum successful provider candidate latency in milliseconds.\n");
+    out.push_str("# TYPE gail_provider_candidate_success_latency_max_ms gauge\n");
+    out.push_str("# HELP gail_provider_candidate_success_latency_ewma_ms EWMA successful provider candidate latency in milliseconds.\n");
+    out.push_str("# TYPE gail_provider_candidate_success_latency_ewma_ms gauge\n");
+    out.push_str("# HELP gail_provider_candidate_failure_latency_average_ms Average failed provider candidate latency in milliseconds.\n");
+    out.push_str("# TYPE gail_provider_candidate_failure_latency_average_ms gauge\n");
+    out.push_str("# HELP gail_provider_candidate_failure_latency_min_ms Minimum failed provider candidate latency in milliseconds.\n");
+    out.push_str("# TYPE gail_provider_candidate_failure_latency_min_ms gauge\n");
+    out.push_str("# HELP gail_provider_candidate_failure_latency_max_ms Maximum failed provider candidate latency in milliseconds.\n");
+    out.push_str("# TYPE gail_provider_candidate_failure_latency_max_ms gauge\n");
+    out.push_str("# HELP gail_provider_candidate_failure_latency_ewma_ms EWMA failed provider candidate latency in milliseconds.\n");
+    out.push_str("# TYPE gail_provider_candidate_failure_latency_ewma_ms gauge\n");
+    out.push_str("# HELP gail_provider_candidate_stale_failures_total Failed observations removed from active routing after health recovery.\n");
+    out.push_str("# TYPE gail_provider_candidate_stale_failures_total counter\n");
     out.push_str("# HELP gail_provider_candidate_queue_wait_ms Gail provider candidate EWMA local queue wait in milliseconds.\n");
     out.push_str("# TYPE gail_provider_candidate_queue_wait_ms gauge\n");
+    out.push_str("# HELP gail_provider_candidate_queue_wait_average_ms Average local queue wait in milliseconds.\n");
+    out.push_str("# TYPE gail_provider_candidate_queue_wait_average_ms gauge\n");
+    out.push_str("# HELP gail_provider_candidate_queue_wait_min_ms Minimum local queue wait in milliseconds.\n");
+    out.push_str("# TYPE gail_provider_candidate_queue_wait_min_ms gauge\n");
+    out.push_str("# HELP gail_provider_candidate_queue_wait_max_ms Maximum local queue wait in milliseconds.\n");
+    out.push_str("# TYPE gail_provider_candidate_queue_wait_max_ms gauge\n");
     out.push_str("# HELP gail_provider_candidate_inference_ms Gail provider candidate EWMA local inference duration in milliseconds.\n");
     out.push_str("# TYPE gail_provider_candidate_inference_ms gauge\n");
     out.push_str("# HELP gail_provider_candidate_tokens_estimate Gail provider candidate EWMA token estimate.\n");
@@ -825,6 +1043,10 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
     out.push_str("# TYPE gail_ai_response_time_min_ms gauge\n");
     out.push_str("# HELP gail_ai_response_time_max_ms Maximum user-visible AI response time in milliseconds.\n");
     out.push_str("# TYPE gail_ai_response_time_max_ms gauge\n");
+    out.push_str("# HELP gail_ai_response_time_success_average_ms Average successful user-visible AI response time.\n");
+    out.push_str("# TYPE gail_ai_response_time_success_average_ms gauge\n");
+    out.push_str("# HELP gail_ai_response_time_failure_average_ms Average failed user-visible AI response time.\n");
+    out.push_str("# TYPE gail_ai_response_time_failure_average_ms gauge\n");
     out.push_str("# HELP gail_api_source_response_time_average_ms Average response time by authenticated API source.\n");
     out.push_str("# TYPE gail_api_source_response_time_average_ms gauge\n");
     out.push_str("# HELP gail_api_source_response_time_min_ms Minimum response time by authenticated API source.\n");
@@ -855,6 +1077,16 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
         if let Some(maximum) = stats.max_latency_ms {
             out.push_str(&format!(
                 "gail_ai_response_time_max_ms{{{labels}}} {maximum}\n"
+            ));
+        }
+        if let Some(average) = stats.successful_latency_average_ms {
+            out.push_str(&format!(
+                "gail_ai_response_time_success_average_ms{{{labels}}} {average:.3}\n"
+            ));
+        }
+        if let Some(average) = stats.failed_latency_average_ms {
+            out.push_str(&format!(
+                "gail_ai_response_time_failure_average_ms{{{labels}}} {average:.3}\n"
             ));
         }
     }
@@ -902,6 +1134,10 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
             "gail_provider_candidate_failures_total{{{labels}}} {}\n",
             bucket.stats.failures
         ));
+        out.push_str(&format!(
+            "gail_provider_candidate_stale_failures_total{{{labels}}} {}\n",
+            bucket.stats.stale_failures
+        ));
         if let Some(ok) = bucket.health.ok {
             out.push_str(&format!(
                 "gail_provider_candidate_health_ok{{{labels}}} {}\n",
@@ -929,10 +1165,65 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
                 "gail_provider_candidate_latency_max_ms{{{labels}}} {maximum}\n"
             ));
         }
+        if let Some(average) = bucket.stats.successful_latency_average_ms {
+            out.push_str(&format!(
+                "gail_provider_candidate_success_latency_average_ms{{{labels}}} {average:.3}\n"
+            ));
+        }
+        if let Some(minimum) = bucket.stats.successful_latency_min_ms {
+            out.push_str(&format!(
+                "gail_provider_candidate_success_latency_min_ms{{{labels}}} {minimum}\n"
+            ));
+        }
+        if let Some(maximum) = bucket.stats.successful_latency_max_ms {
+            out.push_str(&format!(
+                "gail_provider_candidate_success_latency_max_ms{{{labels}}} {maximum}\n"
+            ));
+        }
+        if let Some(ewma) = bucket.stats.successful_latency_ewma_ms {
+            out.push_str(&format!(
+                "gail_provider_candidate_success_latency_ewma_ms{{{labels}}} {ewma:.3}\n"
+            ));
+        }
+        if let Some(average) = bucket.stats.failed_latency_average_ms {
+            out.push_str(&format!(
+                "gail_provider_candidate_failure_latency_average_ms{{{labels}}} {average:.3}\n"
+            ));
+        }
+        if let Some(minimum) = bucket.stats.failed_latency_min_ms {
+            out.push_str(&format!(
+                "gail_provider_candidate_failure_latency_min_ms{{{labels}}} {minimum}\n"
+            ));
+        }
+        if let Some(maximum) = bucket.stats.failed_latency_max_ms {
+            out.push_str(&format!(
+                "gail_provider_candidate_failure_latency_max_ms{{{labels}}} {maximum}\n"
+            ));
+        }
+        if let Some(ewma) = bucket.stats.failed_latency_ewma_ms {
+            out.push_str(&format!(
+                "gail_provider_candidate_failure_latency_ewma_ms{{{labels}}} {ewma:.3}\n"
+            ));
+        }
         if let Some(queue_wait) = bucket.stats.ewma_queue_wait_ms {
             out.push_str(&format!(
                 "gail_provider_candidate_queue_wait_ms{{{labels}}} {:.3}\n",
                 queue_wait
+            ));
+        }
+        if let Some(average) = bucket.stats.queue_wait_average_ms {
+            out.push_str(&format!(
+                "gail_provider_candidate_queue_wait_average_ms{{{labels}}} {average:.3}\n"
+            ));
+        }
+        if let Some(minimum) = bucket.stats.queue_wait_min_ms {
+            out.push_str(&format!(
+                "gail_provider_candidate_queue_wait_min_ms{{{labels}}} {minimum}\n"
+            ));
+        }
+        if let Some(maximum) = bucket.stats.queue_wait_max_ms {
+            out.push_str(&format!(
+                "gail_provider_candidate_queue_wait_max_ms{{{labels}}} {maximum}\n"
             ));
         }
         if let Some(inference) = bucket.stats.ewma_inference_ms {
@@ -962,6 +1253,21 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
             if let Some(maximum) = stats.max_latency_ms {
                 out.push_str(&format!(
                     "gail_provider_request_profile_latency_max_ms{{{profile_labels}}} {maximum}\n"
+                ));
+            }
+            if let Some(average) = stats.successful_latency_average_ms {
+                out.push_str(&format!(
+                    "gail_provider_request_profile_success_latency_average_ms{{{profile_labels}}} {average:.3}\n"
+                ));
+            }
+            if let Some(average) = stats.failed_latency_average_ms {
+                out.push_str(&format!(
+                    "gail_provider_request_profile_failure_latency_average_ms{{{profile_labels}}} {average:.3}\n"
+                ));
+            }
+            if let Some(average) = stats.queue_wait_average_ms {
+                out.push_str(&format!(
+                    "gail_provider_request_profile_queue_wait_average_ms{{{profile_labels}}} {average:.3}\n"
                 ));
             }
             out.push_str(&format!(
@@ -1204,5 +1510,91 @@ mod tests {
             .score_bonus(&slow.candidate_id, "project_solver", "reviewer")
             .await;
         assert!(fast_score > slow_score);
+    }
+
+    #[tokio::test]
+    async fn successful_and_failed_latency_are_kept_separate() {
+        let path = tempfile::NamedTempFile::new()
+            .expect("temp file")
+            .into_temp_path();
+        let store = MetricsStore::new(path.to_path_buf()).await.expect("store");
+        let candidate = summary("ollama", "qwen3.5:9b");
+        store
+            .record_result(
+                &candidate,
+                "project_solver",
+                "planner",
+                false,
+                Some(9_000),
+                Some(LocalUsageTelemetry {
+                    queue_wait_ms: Some(8_000),
+                    ..LocalUsageTelemetry::default()
+                }),
+                -1.0,
+                Some("model not found"),
+            )
+            .await
+            .expect("record failure");
+        store
+            .record_result(
+                &candidate,
+                "project_solver",
+                "planner",
+                true,
+                Some(200),
+                Some(LocalUsageTelemetry {
+                    queue_wait_ms: Some(20),
+                    ..LocalUsageTelemetry::default()
+                }),
+                1.0,
+                None,
+            )
+            .await
+            .expect("record success");
+
+        let candidate_metrics = &store.summary(10).await.candidates[0];
+        assert_eq!(candidate_metrics.successful_latency_average_ms, Some(200.0));
+        assert_eq!(candidate_metrics.failed_latency_average_ms, Some(9_000.0));
+        assert_eq!(candidate_metrics.queue_wait_average_ms, Some(4_010.0));
+        assert_eq!(candidate_metrics.successes, 1);
+        assert_eq!(candidate_metrics.failures, 1);
+    }
+
+    #[tokio::test]
+    async fn successful_health_probe_decays_stale_model_not_found_failures() {
+        let path = tempfile::NamedTempFile::new()
+            .expect("temp file")
+            .into_temp_path();
+        let store = MetricsStore::new(path.to_path_buf()).await.expect("store");
+        let candidate = summary("ollama", "qwen3.5:9b");
+        store
+            .record_result(
+                &candidate,
+                "project_solver",
+                "planner",
+                false,
+                Some(100),
+                None,
+                -1.0,
+                Some("model not found: qwen3.5:9b"),
+            )
+            .await
+            .expect("record failure");
+        store
+            .record_health(
+                &candidate,
+                HealthBucket {
+                    ok: Some(true),
+                    mode: Some("runtime_completion".to_string()),
+                    ..HealthBucket::default()
+                },
+            )
+            .await
+            .expect("record recovery");
+
+        let candidate_metrics = &store.summary(10).await.candidates[0];
+        assert_eq!(candidate_metrics.failures, 0);
+        assert_eq!(candidate_metrics.stale_failures, 1);
+        assert_eq!(candidate_metrics.last_error, None);
     }
 }

@@ -1410,6 +1410,8 @@ impl GailService {
                 fallback_wave = wave_index,
                 timeout_cap_seconds = ?timeout_cap,
                 candidates = %preview_labels(selected.iter().map(|item| item.label(None)).collect::<Vec<_>>(), 6),
+                candidate_ids = %preview_labels(selected.iter().map(ProviderCandidate::candidate_id).collect::<Vec<_>>(), 6),
+                candidate_hosts = %preview_labels(selected.iter().map(candidate_host_label).collect::<Vec<_>>(), 6),
                 throttled_providers = %preview_labels(sorted_strings(throttled_provider_types.iter().cloned()), 6),
                 tags = %preview_labels(task_tags.iter().cloned().collect::<Vec<_>>(), 8),
                 "dispatching Gail orchestration"
@@ -1713,6 +1715,8 @@ impl GailService {
             role = %role,
             provider = %chosen_response.provider,
             model = %chosen_response.model,
+            candidate_id = %chosen.candidate.candidate_id(),
+            candidate_host = %candidate_host_label(&chosen.candidate),
             returned_early,
             "selected Gail orchestration result"
         );
@@ -2947,7 +2951,16 @@ impl GailService {
                     score: f64::NEG_INFINITY,
                 },
             };
-            info!(candidate = %result.candidate.label(result.response.as_ref().map(|value| value.model.as_str())), status = if result.response.is_some() { "ok" } else { "error" }, latency_ms = ?result.latency_ms, quality = result.quality, error = ?result.error, "Gail candidate completed");
+            info!(
+                candidate = %result.candidate.label(result.response.as_ref().map(|value| value.model.as_str())),
+                candidate_id = %result.candidate.candidate_id(),
+                candidate_host = %candidate_host_label(&result.candidate),
+                status = if result.response.is_some() { "ok" } else { "error" },
+                latency_ms = ?result.latency_ms,
+                quality = result.quality,
+                error = ?result.error,
+                "Gail candidate completed"
+            );
             let accepts_early =
                 result.response.is_some() && result.quality >= early_success_min_quality;
             pending_candidate_ids.remove(&result.candidate.candidate_id());
@@ -3833,6 +3846,16 @@ fn looks_like_placeholder_secret(value: &str) -> bool {
     trimmed.starts_with("${")
         || (trimmed.starts_with('$') && trimmed.len() > 1)
         || (trimmed.starts_with("{{") && trimmed.ends_with("}}"))
+}
+
+fn candidate_host_label(candidate: &ProviderCandidate) -> String {
+    candidate
+        .host_group
+        .as_deref()
+        .or(candidate.nmc_host.as_deref())
+        .or_else(|| candidate.profile.base_url.as_deref())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 fn select_ranked_candidates(
@@ -5969,6 +5992,18 @@ Return only a JSON data instance that satisfies this schema:
                     None
                 },
                 ewma_latency_ms: Some(420.0),
+                successful_latency_average_ms: Some(420.0),
+                successful_latency_min_ms: Some(100),
+                successful_latency_max_ms: Some(900),
+                successful_latency_ewma_ms: Some(420.0),
+                failed_latency_average_ms: None,
+                failed_latency_min_ms: None,
+                failed_latency_max_ms: None,
+                failed_latency_ewma_ms: None,
+                stale_failures: 0,
+                queue_wait_average_ms: Some(80.0),
+                queue_wait_min_ms: Some(10),
+                queue_wait_max_ms: Some(200),
                 ewma_queue_wait_ms: Some(80.0),
                 ewma_inference_ms: Some(340.0),
                 ewma_prompt_tokens: None,

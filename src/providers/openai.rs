@@ -357,6 +357,27 @@ impl OpenAIProvider {
                 }
             } else if !status.is_success() {
                 let message = error_message(&data);
+                if status == StatusCode::NOT_FOUND
+                    && attempt == 0
+                    && completion_endpoint_fallback_enabled(&base_url)
+                {
+                    // Some llama.cpp builds expose the OpenAI model list and
+                    // legacy text-completion endpoint but omit chat routes.
+                    // Keep those native runners usable by translating the
+                    // structured conversation into a bounded prompt.
+                    return self
+                        .complete_legacy_text(
+                            &base_url,
+                            &headers,
+                            request,
+                            &model,
+                            temperature as f64,
+                            request.max_tokens,
+                            timeout,
+                            max_retries,
+                        )
+                        .await;
+                }
                 if attempt == 0
                     && is_model_not_found(status, &message)
                     && model != self.default_model
@@ -393,6 +414,85 @@ impl OpenAIProvider {
             self.provider_name.as_str(),
             None,
             "OpenAI chat retries exhausted",
+        ))
+    }
+
+    async fn complete_legacy_text(
+        &self,
+        base_url: &str,
+        headers: &HeaderMap,
+        request: &ProviderCompletionRequest,
+        model: &str,
+        temperature: f64,
+        max_tokens: Option<u32>,
+        timeout: Duration,
+        max_retries: usize,
+    ) -> Result<ProviderInvocationResponse> {
+        let url = endpoint(base_url, "completions");
+        let mut prompt = String::new();
+        if let Some(system) = request.system.as_deref() {
+            prompt.push_str("System:\n");
+            prompt.push_str(system);
+            prompt.push_str("\n\n");
+        }
+        for message in &request.messages {
+            prompt.push_str(message.role.as_str());
+            prompt.push_str(":\n");
+            prompt.push_str(message.flattened_text().as_str());
+            prompt.push_str("\n\n");
+        }
+        let mut payload = json!({
+            "model": model,
+            "prompt": prompt,
+            "temperature": temperature,
+        });
+        if let Some(max_tokens) = max_tokens {
+            payload["max_tokens"] = json!(max_tokens);
+        }
+        let started = Instant::now();
+        let response = post_json_with_retries(
+            self.provider_name.as_str(),
+            &self.client,
+            &url,
+            headers,
+            &payload,
+            timeout,
+            max_retries,
+        )
+        .await?;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let status = response.status();
+        let body = response.text().await?;
+        let data: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({"message": body}));
+        if !status.is_success() {
+            return Err(GailError::upstream(
+                self.provider_name.as_str(),
+                Some(status),
+                error_message(&data),
+            ));
+        }
+        let text = data
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if text.trim().is_empty() {
+            return Err(GailError::upstream(
+                self.provider_name.as_str(),
+                None,
+                "empty legacy completion response text",
+            ));
+        }
+        Ok(response_with_usage(
+            text,
+            data.clone(),
+            latency_ms,
+            self.provider_name.as_str(),
+            model,
+            extract_openai_usage(&data),
         ))
     }
 
@@ -879,6 +979,17 @@ fn endpoint(base_url: &str, path: impl AsRef<str>) -> String {
         normalize_base_url(base_url),
         path.as_ref().trim_start_matches('/'),
     )
+}
+
+fn completion_endpoint_fallback_enabled(base_url: &str) -> bool {
+    if !env_bool("GAIL_OPENAI_LEGACY_COMPLETIONS_FALLBACK", true) {
+        return false;
+    }
+    let lowered = base_url.to_ascii_lowercase();
+    lowered.contains("localhost")
+        || lowered.contains("127.0.0.1")
+        || lowered.contains("192.168.")
+        || lowered.contains(".svc.cluster.local")
 }
 
 fn extract_openai_response_text(data: &Value) -> String {
