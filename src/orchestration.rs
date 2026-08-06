@@ -488,7 +488,9 @@ impl GailService {
         let candidate = ProviderCandidate::from_profile(profile.clone());
         let mut tags = workflow_tags(workflow, role, "");
         tags.insert(normalize_key(workflow, "general"));
-        let ranked = self.rank_candidate(candidate, workflow, role, &tags).await;
+        let ranked = self
+            .rank_candidate(candidate, "unknown", workflow, workflow, role, None, &tags)
+            .await;
         (profile, ranked.score, ranked.health_ok)
     }
 
@@ -649,6 +651,12 @@ impl GailService {
         &self,
         request: ProviderCompletionRequest,
     ) -> Result<CompletionResponse> {
+        let api_source = request
+            .source
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let prompt_tokens_estimate =
+            estimate_request_prompt_tokens(&request.messages, request.system.as_deref());
         let processing_time_estimate_ms =
             self.inner.metrics.ai_response_time_estimate_ms("all").await;
         let started = Instant::now();
@@ -660,10 +668,21 @@ impl GailService {
         let _ = self
             .inner
             .metrics
-            .record_ai_response_time(
+            .record_ai_response_time_with_prompt(
                 source,
                 started.elapsed().as_millis() as u64,
                 result.as_ref().is_ok_and(completion_metric_success),
+                Some(prompt_tokens_estimate),
+            )
+            .await;
+        let _ = self
+            .inner
+            .metrics
+            .record_api_source_response_time(
+                api_source.as_str(),
+                started.elapsed().as_millis() as u64,
+                result.as_ref().is_ok_and(completion_metric_success),
+                Some(prompt_tokens_estimate),
             )
             .await;
         result.map(|mut response| {
@@ -986,6 +1005,12 @@ impl GailService {
     }
 
     pub async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+        let api_source = request
+            .source
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let prompt_tokens_estimate =
+            estimate_request_prompt_tokens(&request.messages, request.system.as_deref());
         let processing_time_estimate_ms =
             self.inner.metrics.ai_response_time_estimate_ms("all").await;
         let started = Instant::now();
@@ -997,10 +1022,21 @@ impl GailService {
         let _ = self
             .inner
             .metrics
-            .record_ai_response_time(
+            .record_ai_response_time_with_prompt(
                 source,
                 started.elapsed().as_millis() as u64,
                 result.as_ref().is_ok_and(completion_metric_success),
+                Some(prompt_tokens_estimate),
+            )
+            .await;
+        let _ = self
+            .inner
+            .metrics
+            .record_api_source_response_time(
+                api_source.as_str(),
+                started.elapsed().as_millis() as u64,
+                result.as_ref().is_ok_and(completion_metric_success),
+                Some(prompt_tokens_estimate),
             )
             .await;
         result.map(|mut response| {
@@ -1011,6 +1047,7 @@ impl GailService {
 
     async fn complete_inner(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         let request_id = Uuid::new_v4().to_string();
+        let api_source = normalize_key(request.source.as_deref().unwrap_or("unknown"), "unknown");
         let workflow = normalize_key(request.workflow.as_deref().unwrap_or("general"), "general");
         let role = normalize_key(request.role.as_deref().unwrap_or("general"), "general");
         let workload_class = classify_workload(workflow.as_str(), role.as_str());
@@ -1055,12 +1092,15 @@ impl GailService {
             role: Some(role.clone()),
             min_model_size_b: model_floor_b,
             strict_no_downgrade: Some(strict_no_downgrade),
+            source: request.source.clone(),
+            request_profile: request.request_profile.clone(),
         };
 
         let prompt_text = flatten_prompt_text(
             &provider_request.messages,
             provider_request.system.as_deref(),
         );
+        let prompt_tokens_estimate = estimate_prompt_tokens(&prompt_text);
         let mut task_tags = workflow_tags(&workflow, &role, &prompt_text);
         if let Some(category) = request
             .request_category
@@ -1074,6 +1114,13 @@ impl GailService {
                 }
             }
         }
+        let request_profile = derive_request_profile(
+            request.request_profile.as_deref(),
+            &workflow,
+            &role,
+            request.request_category.as_deref(),
+            &task_tags,
+        );
         let mut specialist_meta = None;
         if !self.inner.specialists.is_empty()
             && (task_tags.contains("neuromorphic") || self.always_route_specialists())
@@ -1167,12 +1214,23 @@ impl GailService {
         let mut rank_join_set = JoinSet::new();
         for candidate in candidates.drain(..) {
             let service = self.clone();
+            let api_source_clone = api_source.clone();
+            let request_profile_clone = request_profile.clone();
             let workflow_clone = workflow.clone();
             let role_clone = role.clone();
+            let request_category_clone = request.request_category.clone();
             let task_tags_clone = task_tags.clone();
             rank_join_set.spawn(async move {
                 service
-                    .rank_candidate(candidate, &workflow_clone, &role_clone, &task_tags_clone)
+                    .rank_candidate(
+                        candidate,
+                        &api_source_clone,
+                        &request_profile_clone,
+                        &workflow_clone,
+                        &role_clone,
+                        request_category_clone.as_deref(),
+                        &task_tags_clone,
+                    )
                     .await
             });
         }
@@ -1424,16 +1482,27 @@ impl GailService {
                 let metrics_bonus = self
                     .inner
                     .metrics
-                    .score_bonus(candidate_summary.candidate_id.as_str(), &workflow, &role)
-                    .await;
-                result.score = result.quality - latency_penalty.min(1.25) + metrics_bonus;
-                let telemetry = local_usage_telemetry(response);
-                self.inner
-                    .metrics
-                    .record_result(
-                        &candidate_summary,
+                    .score_bonus_for_context(
+                        candidate_summary.candidate_id.as_str(),
+                        &api_source,
+                        &request_profile,
                         &workflow,
                         &role,
+                        request.request_category.as_deref(),
+                    )
+                    .await;
+                result.score = result.quality - latency_penalty.min(1.25) + metrics_bonus;
+                let mut telemetry = local_usage_telemetry(response);
+                telemetry.prompt_tokens_estimate = Some(prompt_tokens_estimate);
+                self.inner
+                    .metrics
+                    .record_result_with_context(
+                        &candidate_summary,
+                        &api_source,
+                        &request_profile,
+                        &workflow,
+                        &role,
+                        request.request_category.as_deref(),
                         true,
                         Some(response.latency_ms),
                         Some(telemetry),
@@ -1469,13 +1538,19 @@ impl GailService {
                     .unwrap_or_else(|| "runtime_error".to_string());
                 self.inner
                     .metrics
-                    .record_result(
+                    .record_result_with_context(
                         &candidate_summary,
+                        &api_source,
+                        &request_profile,
                         &workflow,
                         &role,
+                        request.request_category.as_deref(),
                         false,
                         result.latency_ms,
-                        None,
+                        Some(LocalUsageTelemetry {
+                            prompt_tokens_estimate: Some(prompt_tokens_estimate),
+                            ..LocalUsageTelemetry::default()
+                        }),
                         -1.0,
                         result.error.as_deref(),
                     )
@@ -2395,8 +2470,11 @@ impl GailService {
     async fn rank_candidate(
         &self,
         candidate: ProviderCandidate,
+        source: &str,
+        request_profile: &str,
         workflow: &str,
         role: &str,
+        request_category: Option<&str>,
         task_tags: &HashSet<String>,
     ) -> RankedCandidate {
         let candidate_id = candidate.candidate_id();
@@ -2488,8 +2566,22 @@ impl GailService {
         let metrics_bonus = self
             .inner
             .metrics
-            .score_bonus(candidate_id.as_str(), workflow, role)
+            .score_bonus_for_context(
+                candidate_id.as_str(),
+                source,
+                request_profile,
+                workflow,
+                role,
+                request_category,
+            )
             .await;
+        // Prefer the largest configured model when candidates are otherwise
+        // comparable. Persistent source/profile latency and queue metrics are
+        // deliberately allowed to outweigh this bonus when the large model
+        // is busy or too slow for this workload.
+        let model_size_bonus = parse_model_size_billions(candidate.configured_model.as_str())
+            .map(|size| (size.ln_1p() / 3.6).clamp(0.0, 1.0) * 0.65)
+            .unwrap_or(0.0);
         RankedCandidate {
             health_ok,
             health_mode,
@@ -2500,6 +2592,7 @@ impl GailService {
                 + health_score
                 + preferred_score
                 + metrics_bonus
+                + model_size_bonus
                 - usage_penalty
                 - resource_penalty
                 - hard_limit_penalty
@@ -4491,6 +4584,57 @@ fn flatten_prompt_text(messages: &[crate::models::ChatMessage], system: Option<&
     parts.join("\n")
 }
 
+fn estimate_prompt_tokens(text: &str) -> u32 {
+    ((text.chars().count() as u32).saturating_add(3) / 4).max(1)
+}
+
+fn estimate_request_prompt_tokens(
+    messages: &[crate::models::ChatMessage],
+    system: Option<&str>,
+) -> u32 {
+    estimate_prompt_tokens(flatten_prompt_text(messages, system).as_str())
+}
+
+fn derive_request_profile(
+    explicit: Option<&str>,
+    workflow: &str,
+    role: &str,
+    request_category: Option<&str>,
+    task_tags: &HashSet<String>,
+) -> String {
+    if let Some(value) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
+        return normalize_key(value, "general");
+    }
+    if let Some(value) = request_category
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return normalize_key(value, "general");
+    }
+    for candidate in [
+        "project_solver",
+        "coding",
+        "code",
+        "research",
+        "trading",
+        "market",
+        "json",
+        "planning",
+        "review",
+    ] {
+        if task_tags.contains(candidate) {
+            return candidate.to_string();
+        }
+    }
+    if !workflow.eq_ignore_ascii_case("general") {
+        normalize_key(workflow, "general")
+    } else if !role.eq_ignore_ascii_case("general") {
+        normalize_key(role, "general")
+    } else {
+        "general".to_string()
+    }
+}
+
 fn candidate_scope_from_base_url(base_url: &str) -> Option<String> {
     let trimmed = base_url.trim();
     if trimmed.is_empty() {
@@ -5816,6 +5960,9 @@ Return only a JSON data instance that satisfies this schema:
                 successes,
                 failures,
                 total,
+                average_latency_ms: Some(420.0),
+                min_latency_ms: Some(100),
+                max_latency_ms: Some(900),
                 success_rate: if total > 0 {
                     Some(successes as f64 / total as f64)
                 } else {
@@ -5824,6 +5971,7 @@ Return only a JSON data instance that satisfies this schema:
                 ewma_latency_ms: Some(420.0),
                 ewma_queue_wait_ms: Some(80.0),
                 ewma_inference_ms: Some(340.0),
+                ewma_prompt_tokens: None,
                 ewma_tokens_estimate: None,
                 ewma_quality: 0.5,
                 last_status: Some("success".to_string()),
@@ -5832,6 +5980,7 @@ Return only a JSON data instance that satisfies this schema:
                 health_ok: Some(true),
                 health_mode: Some("runtime_completion".to_string()),
                 health_checked_at: Some(1_789_999_999.0),
+                routing_profiles: std::collections::HashMap::new(),
             }
         }
 
@@ -6117,6 +6266,8 @@ Return only a JSON data instance that satisfies this schema:
             timeout_seconds: None,
             reasoning_effort: None,
             request_category: None,
+            source: None,
+            request_profile: None,
         };
         assert!(should_include_configured_candidates(false, &request, true));
     }
@@ -6145,6 +6296,8 @@ Return only a JSON data instance that satisfies this schema:
             timeout_seconds: None,
             reasoning_effort: None,
             request_category: None,
+            source: None,
+            request_profile: None,
         };
         assert!(!should_include_configured_candidates(false, &request, true));
         assert!(should_include_configured_candidates(false, &request, false));

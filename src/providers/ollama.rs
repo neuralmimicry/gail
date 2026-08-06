@@ -2002,6 +2002,8 @@ mod tests {
             role: None,
             min_model_size_b: None,
             strict_no_downgrade: None,
+            source: None,
+            request_profile: None,
         };
 
         let response = provider
@@ -2061,6 +2063,8 @@ mod tests {
             role: None,
             min_model_size_b: Some(1.5),
             strict_no_downgrade: None,
+            source: None,
+            request_profile: None,
         };
 
         let error = provider
@@ -2122,6 +2126,8 @@ mod tests {
             role: None,
             min_model_size_b: None,
             strict_no_downgrade: Some(true),
+            source: None,
+            request_profile: None,
         };
 
         let response = provider
@@ -2181,6 +2187,8 @@ mod tests {
             role: None,
             min_model_size_b: None,
             strict_no_downgrade: Some(true),
+            source: None,
+            request_profile: None,
         };
 
         let response = provider
@@ -2239,6 +2247,8 @@ mod tests {
             role: None,
             min_model_size_b: None,
             strict_no_downgrade: None,
+            source: None,
+            request_profile: None,
         };
 
         let error = provider
@@ -2301,6 +2311,8 @@ mod tests {
             role: None,
             min_model_size_b: None,
             strict_no_downgrade: None,
+            source: None,
+            request_profile: None,
         };
 
         let error = provider

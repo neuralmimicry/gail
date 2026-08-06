@@ -177,6 +177,8 @@ pub fn provider_request_from_profile(
         role: request.role.clone(),
         min_model_size_b: request.min_model_size_b,
         strict_no_downgrade: request.strict_no_downgrade,
+        source: request.source.clone(),
+        request_profile: request.request_profile.clone(),
     }
 }
 
@@ -665,6 +667,8 @@ pub fn build_internal_request(
         role: None,
         min_model_size_b: None,
         strict_no_downgrade: None,
+        source: None,
+        request_profile: None,
     }
 }
 

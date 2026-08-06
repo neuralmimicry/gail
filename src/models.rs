@@ -121,6 +121,13 @@ pub struct ProviderCompletionRequest {
     pub role: Option<String>,
     pub min_model_size_b: Option<f64>,
     pub strict_no_downgrade: Option<bool>,
+    /// Authenticated API source, such as `refiner`, `continuum`, or `tracey`.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Optional caller-supplied workload profile (for example `research` or
+    /// `project_solver`). Gail derives one from workflow/tags when omitted.
+    #[serde(default)]
+    pub request_profile: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -147,6 +154,10 @@ pub struct CompletionRequest {
     pub timeout_seconds: Option<u64>,
     pub reasoning_effort: Option<String>,
     pub request_category: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub request_profile: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -578,6 +578,8 @@ async fn query_provider(
         role: Some("assistant".to_string()),
         min_model_size_b: None,
         strict_no_downgrade: None,
+        source: Some("gail_trading".to_string()),
+        request_profile: Some("trading".to_string()),
     };
 
     let weight = profile.weight;

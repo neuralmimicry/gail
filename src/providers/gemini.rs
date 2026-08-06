@@ -196,6 +196,8 @@ impl GeminiProvider {
             role: None,
             min_model_size_b: None,
             strict_no_downgrade: None,
+            source: None,
+            request_profile: None,
         };
         self.complete(&request).await
     }

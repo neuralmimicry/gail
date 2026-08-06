@@ -22,6 +22,8 @@ pub struct MetricsData {
     pub candidates: HashMap<String, CandidateBucket>,
     #[serde(default)]
     pub ai_response_times: HashMap<String, AiResponseTimeStats>,
+    #[serde(default)]
+    pub api_response_times: HashMap<String, AiResponseTimeStats>,
     pub updated_at: f64,
 }
 
@@ -37,8 +39,13 @@ pub struct AiResponseTimeStats {
     pub failures: u64,
     pub total_latency_ms: u64,
     pub average_latency_ms: Option<f64>,
+    pub min_latency_ms: Option<u64>,
+    pub max_latency_ms: Option<u64>,
     pub ewma_latency_ms: Option<f64>,
     pub last_latency_ms: Option<u64>,
+    pub total_prompt_tokens: u64,
+    pub average_prompt_tokens: Option<f64>,
+    pub ewma_prompt_tokens: Option<f64>,
     pub updated_at: Option<f64>,
 }
 
@@ -59,9 +66,14 @@ pub struct StatsBucket {
     pub successes: u64,
     pub failures: u64,
     pub total: u64,
+    pub total_latency_ms: u64,
+    pub average_latency_ms: Option<f64>,
+    pub min_latency_ms: Option<u64>,
+    pub max_latency_ms: Option<u64>,
     pub ewma_latency_ms: Option<f64>,
     pub ewma_queue_wait_ms: Option<f64>,
     pub ewma_inference_ms: Option<f64>,
+    pub ewma_prompt_tokens: Option<f64>,
     pub ewma_tokens_estimate: Option<f64>,
     pub ewma_quality: f64,
     pub last_status: Option<String>,
@@ -71,6 +83,7 @@ pub struct StatsBucket {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct LocalUsageTelemetry {
+    pub prompt_tokens_estimate: Option<u32>,
     pub queue_wait_ms: Option<u64>,
     pub inference_ms: Option<u64>,
     pub total_tokens_estimate: Option<u32>,
@@ -96,10 +109,14 @@ pub struct CandidateMetricsSummary {
     pub successes: u64,
     pub failures: u64,
     pub total: u64,
+    pub average_latency_ms: Option<f64>,
+    pub min_latency_ms: Option<u64>,
+    pub max_latency_ms: Option<u64>,
     pub success_rate: Option<f64>,
     pub ewma_latency_ms: Option<f64>,
     pub ewma_queue_wait_ms: Option<f64>,
     pub ewma_inference_ms: Option<f64>,
+    pub ewma_prompt_tokens: Option<f64>,
     pub ewma_tokens_estimate: Option<f64>,
     pub ewma_quality: f64,
     pub last_status: Option<String>,
@@ -108,6 +125,8 @@ pub struct CandidateMetricsSummary {
     pub health_ok: Option<bool>,
     pub health_mode: Option<String>,
     pub health_checked_at: Option<f64>,
+    /// Persistent source/profile-specific observations used by the ranker.
+    pub routing_profiles: HashMap<String, StatsBucket>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -120,6 +139,7 @@ pub struct MetricsSummary {
     pub degraded_candidates: usize,
     pub candidates: Vec<CandidateMetricsSummary>,
     pub ai_response_times: HashMap<String, AiResponseTimeStats>,
+    pub api_response_times: HashMap<String, AiResponseTimeStats>,
 }
 
 #[derive(Clone)]
@@ -153,7 +173,12 @@ impl MetricsStore {
         }
     }
 
-    fn merge_ai_response_time(bucket: &mut AiResponseTimeStats, latency_ms: u64, success: bool) {
+    fn merge_ai_response_time(
+        bucket: &mut AiResponseTimeStats,
+        latency_ms: u64,
+        success: bool,
+        prompt_tokens_estimate: Option<u32>,
+    ) {
         bucket.requests = bucket.requests.saturating_add(1);
         if success {
             bucket.successes = bucket.successes.saturating_add(1);
@@ -163,10 +188,31 @@ impl MetricsStore {
         bucket.total_latency_ms = bucket.total_latency_ms.saturating_add(latency_ms);
         bucket.average_latency_ms =
             Some(bucket.total_latency_ms as f64 / bucket.requests.max(1) as f64);
+        bucket.min_latency_ms = Some(
+            bucket
+                .min_latency_ms
+                .map_or(latency_ms, |value| value.min(latency_ms)),
+        );
+        bucket.max_latency_ms = Some(
+            bucket
+                .max_latency_ms
+                .map_or(latency_ms, |value| value.max(latency_ms)),
+        );
         bucket.ewma_latency_ms = Some(match bucket.ewma_latency_ms {
             Some(previous) => (previous * 0.75) + (latency_ms as f64 * 0.25),
             None => latency_ms as f64,
         });
+        if let Some(prompt_tokens) = prompt_tokens_estimate {
+            bucket.total_prompt_tokens = bucket
+                .total_prompt_tokens
+                .saturating_add(prompt_tokens as u64);
+            bucket.average_prompt_tokens =
+                Some(bucket.total_prompt_tokens as f64 / bucket.requests.max(1) as f64);
+            bucket.ewma_prompt_tokens = Some(match bucket.ewma_prompt_tokens {
+                Some(previous) => (previous * 0.75) + (prompt_tokens as f64 * 0.25),
+                None => prompt_tokens as f64,
+            });
+        }
         bucket.last_latency_ms = Some(latency_ms);
         bucket.updated_at = Some(now_ts());
     }
@@ -179,6 +225,17 @@ impl MetricsStore {
         latency_ms: u64,
         success: bool,
     ) -> Result<()> {
+        self.record_ai_response_time_with_prompt(source, latency_ms, success, None)
+            .await
+    }
+
+    pub async fn record_ai_response_time_with_prompt(
+        &self,
+        source: &str,
+        latency_ms: u64,
+        success: bool,
+        prompt_tokens_estimate: Option<u32>,
+    ) -> Result<()> {
         let source = Self::normalize_ai_source(source);
         let mut data = self.inner.lock().await;
         Self::merge_ai_response_time(
@@ -187,12 +244,14 @@ impl MetricsStore {
                 .or_default(),
             latency_ms,
             success,
+            prompt_tokens_estimate,
         );
         if source != "all" {
             Self::merge_ai_response_time(
                 data.ai_response_times.entry("all".to_string()).or_default(),
                 latency_ms,
                 success,
+                prompt_tokens_estimate,
             );
         }
         data.updated_at = now_ts();
@@ -215,6 +274,43 @@ impl MetricsStore {
 
     pub async fn ai_response_time_summary(&self) -> HashMap<String, AiResponseTimeStats> {
         self.inner.lock().await.ai_response_times.clone()
+    }
+
+    pub async fn record_api_source_response_time(
+        &self,
+        source: &str,
+        latency_ms: u64,
+        success: bool,
+        prompt_tokens_estimate: Option<u32>,
+    ) -> Result<()> {
+        let source = source
+            .trim()
+            .to_ascii_lowercase()
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let source = if source.is_empty() {
+            "unknown".to_string()
+        } else {
+            source
+        };
+        let mut data = self.inner.lock().await;
+        Self::merge_ai_response_time(
+            data.api_response_times.entry(source).or_default(),
+            latency_ms,
+            success,
+            prompt_tokens_estimate,
+        );
+        data.updated_at = now_ts();
+        let snapshot = data.clone();
+        drop(data);
+        self.save(&snapshot).await
     }
 
     async fn save(&self, data: &MetricsData) -> Result<()> {
@@ -348,12 +444,31 @@ impl MetricsStore {
         }
         bucket.total = bucket.successes + bucket.failures;
         if let Some(latency_ms) = latency_ms {
+            bucket.total_latency_ms = bucket.total_latency_ms.saturating_add(latency_ms);
+            bucket.average_latency_ms =
+                Some(bucket.total_latency_ms as f64 / bucket.total.max(1) as f64);
+            bucket.min_latency_ms = Some(
+                bucket
+                    .min_latency_ms
+                    .map_or(latency_ms, |value| value.min(latency_ms)),
+            );
+            bucket.max_latency_ms = Some(
+                bucket
+                    .max_latency_ms
+                    .map_or(latency_ms, |value| value.max(latency_ms)),
+            );
             bucket.ewma_latency_ms = Some(match bucket.ewma_latency_ms {
                 Some(previous) => (previous * 0.75) + (latency_ms as f64 * 0.25),
                 None => latency_ms as f64,
             });
         }
         if let Some(telemetry) = telemetry {
+            if let Some(prompt_tokens_estimate) = telemetry.prompt_tokens_estimate {
+                bucket.ewma_prompt_tokens = Some(match bucket.ewma_prompt_tokens {
+                    Some(previous) => (previous * 0.75) + (prompt_tokens_estimate as f64 * 0.25),
+                    None => prompt_tokens_estimate as f64,
+                });
+            }
             if let Some(queue_wait_ms) = telemetry.queue_wait_ms {
                 bucket.ewma_queue_wait_ms = Some(match bucket.ewma_queue_wait_ms {
                     Some(previous) => (previous * 0.75) + (queue_wait_ms as f64 * 0.25),
@@ -390,6 +505,36 @@ impl MetricsStore {
         quality: f64,
         error: Option<&str>,
     ) -> Result<()> {
+        self.record_result_with_context(
+            summary,
+            "unknown",
+            "unclassified",
+            workflow,
+            role,
+            None,
+            success,
+            latency_ms,
+            telemetry,
+            quality,
+            error,
+        )
+        .await
+    }
+
+    pub async fn record_result_with_context(
+        &self,
+        summary: &CandidateSummary,
+        source: &str,
+        request_profile: &str,
+        workflow: &str,
+        role: &str,
+        request_category: Option<&str>,
+        success: bool,
+        latency_ms: Option<u64>,
+        telemetry: Option<LocalUsageTelemetry>,
+        quality: f64,
+        error: Option<&str>,
+    ) -> Result<()> {
         let mut data = self.inner.lock().await;
         let bucket = data
             .candidates
@@ -408,7 +553,8 @@ impl MetricsStore {
             quality,
             error,
         );
-        let role_key = format!("{workflow}:{role}");
+        let role_key =
+            routing_profile_key(source, request_profile, workflow, role, request_category);
         let role_bucket = bucket.roles.entry(role_key).or_default();
         Self::merge_stats(
             role_bucket,
@@ -425,12 +571,38 @@ impl MetricsStore {
     }
 
     pub async fn score_bonus(&self, candidate_id: &str, workflow: &str, role: &str) -> f64 {
+        self.score_bonus_for_context(
+            candidate_id,
+            "unknown",
+            "unclassified",
+            workflow,
+            role,
+            None,
+        )
+        .await
+    }
+
+    pub async fn score_bonus_for_context(
+        &self,
+        candidate_id: &str,
+        source: &str,
+        request_profile: &str,
+        workflow: &str,
+        role: &str,
+        request_category: Option<&str>,
+    ) -> f64 {
         let data = self.inner.lock().await;
         let Some(bucket) = data.candidates.get(candidate_id) else {
             return 0.0;
         };
-        let role_key = format!("{workflow}:{role}");
-        let stats = bucket.roles.get(&role_key).unwrap_or(&bucket.stats);
+        let role_key =
+            routing_profile_key(source, request_profile, workflow, role, request_category);
+        let legacy_key = format!("{workflow}:{role}");
+        let stats = bucket
+            .roles
+            .get(&role_key)
+            .or_else(|| bucket.roles.get(&legacy_key))
+            .unwrap_or(&bucket.stats);
         if stats.total == 0 {
             return 0.0;
         }
@@ -438,6 +610,11 @@ impl MetricsStore {
         let latency_bonus = stats
             .ewma_latency_ms
             .map(|latency| ((1500.0 - latency) / 3000.0).clamp(-0.35, 0.35))
+            .unwrap_or(0.0);
+        let range_penalty = stats
+            .max_latency_ms
+            .zip(stats.min_latency_ms)
+            .map(|(max, min)| ((max.saturating_sub(min)) as f64 / 20_000.0).clamp(0.0, 0.25))
             .unwrap_or(0.0);
         let queue_wait_penalty = stats
             .ewma_queue_wait_ms
@@ -454,7 +631,8 @@ impl MetricsStore {
         ((success_rate - 0.5) + stats.ewma_quality + latency_bonus
             - queue_wait_penalty
             - inference_penalty
-            - token_pressure_penalty)
+            - token_pressure_penalty
+            - range_penalty)
             .round_to(6)
     }
 
@@ -506,6 +684,9 @@ impl MetricsStore {
                 successes: bucket.stats.successes,
                 failures: bucket.stats.failures,
                 total: bucket.stats.total,
+                average_latency_ms: bucket.stats.average_latency_ms,
+                min_latency_ms: bucket.stats.min_latency_ms,
+                max_latency_ms: bucket.stats.max_latency_ms,
                 success_rate: if bucket.stats.total > 0 {
                     Some((bucket.stats.successes as f64 / bucket.stats.total as f64).round_to(6))
                 } else {
@@ -514,6 +695,7 @@ impl MetricsStore {
                 ewma_latency_ms: bucket.stats.ewma_latency_ms,
                 ewma_queue_wait_ms: bucket.stats.ewma_queue_wait_ms,
                 ewma_inference_ms: bucket.stats.ewma_inference_ms,
+                ewma_prompt_tokens: bucket.stats.ewma_prompt_tokens,
                 ewma_tokens_estimate: bucket.stats.ewma_tokens_estimate,
                 ewma_quality: bucket.stats.ewma_quality.round_to(6),
                 last_status: bucket.stats.last_status.clone(),
@@ -522,6 +704,7 @@ impl MetricsStore {
                 health_ok: bucket.health.ok,
                 health_mode: bucket.health.mode.clone(),
                 health_checked_at: bucket.health.checked_at,
+                routing_profiles: bucket.roles.clone(),
             })
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
@@ -568,6 +751,7 @@ impl MetricsStore {
                 .count(),
             candidates: limited,
             ai_response_times: data.ai_response_times.clone(),
+            api_response_times: data.api_response_times.clone(),
         }
     }
 
@@ -575,6 +759,40 @@ impl MetricsStore {
         let data = self.inner.lock().await.clone();
         render_prometheus_metrics(&data)
     }
+}
+
+fn routing_profile_key(
+    source: &str,
+    request_profile: &str,
+    workflow: &str,
+    role: &str,
+    request_category: Option<&str>,
+) -> String {
+    fn clean(value: &str) -> String {
+        value
+            .trim()
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                    ch.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('_')
+            .chars()
+            .take(96)
+            .collect()
+    }
+    format!(
+        "source={};profile={};workflow={};role={};category={}",
+        clean(source),
+        clean(request_profile),
+        clean(workflow),
+        clean(role),
+        clean(request_category.unwrap_or("")),
+    )
 }
 
 fn render_prometheus_metrics(data: &MetricsData) -> String {
@@ -587,6 +805,10 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
     out.push_str("# TYPE gail_provider_candidate_health_ok gauge\n");
     out.push_str("# HELP gail_provider_candidate_latency_ms Gail provider candidate EWMA latency in milliseconds.\n");
     out.push_str("# TYPE gail_provider_candidate_latency_ms gauge\n");
+    out.push_str("# HELP gail_provider_candidate_latency_min_ms Minimum observed provider candidate latency in milliseconds.\n");
+    out.push_str("# TYPE gail_provider_candidate_latency_min_ms gauge\n");
+    out.push_str("# HELP gail_provider_candidate_latency_max_ms Maximum observed provider candidate latency in milliseconds.\n");
+    out.push_str("# TYPE gail_provider_candidate_latency_max_ms gauge\n");
     out.push_str("# HELP gail_provider_candidate_queue_wait_ms Gail provider candidate EWMA local queue wait in milliseconds.\n");
     out.push_str("# TYPE gail_provider_candidate_queue_wait_ms gauge\n");
     out.push_str("# HELP gail_provider_candidate_inference_ms Gail provider candidate EWMA local inference duration in milliseconds.\n");
@@ -597,6 +819,20 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
     out.push_str("# TYPE gail_ai_response_time_average_ms gauge\n");
     out.push_str("# HELP gail_ai_response_time_requests_total User-visible AI requests observed by modality.\n");
     out.push_str("# TYPE gail_ai_response_time_requests_total counter\n");
+    out.push_str("# HELP gail_ai_response_time_min_ms Minimum user-visible AI response time in milliseconds.\n");
+    out.push_str("# TYPE gail_ai_response_time_min_ms gauge\n");
+    out.push_str("# HELP gail_ai_response_time_max_ms Maximum user-visible AI response time in milliseconds.\n");
+    out.push_str("# TYPE gail_ai_response_time_max_ms gauge\n");
+    out.push_str("# HELP gail_api_source_response_time_average_ms Average response time by authenticated API source.\n");
+    out.push_str("# TYPE gail_api_source_response_time_average_ms gauge\n");
+    out.push_str("# HELP gail_api_source_response_time_min_ms Minimum response time by authenticated API source.\n");
+    out.push_str("# TYPE gail_api_source_response_time_min_ms gauge\n");
+    out.push_str("# HELP gail_api_source_response_time_max_ms Maximum response time by authenticated API source.\n");
+    out.push_str("# TYPE gail_api_source_response_time_max_ms gauge\n");
+    out.push_str(
+        "# HELP gail_api_source_requests_total Requests observed by authenticated API source.\n",
+    );
+    out.push_str("# TYPE gail_api_source_requests_total counter\n");
     for (source, stats) in &data.ai_response_times {
         let labels = format!("source=\"{}\"", escape_label(source));
         if let Some(average) = stats.average_latency_ms {
@@ -607,6 +843,38 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
         }
         out.push_str(&format!(
             "gail_ai_response_time_requests_total{{{labels}}} {}\n",
+            stats.requests
+        ));
+        if let Some(minimum) = stats.min_latency_ms {
+            out.push_str(&format!(
+                "gail_ai_response_time_min_ms{{{labels}}} {minimum}\n"
+            ));
+        }
+        if let Some(maximum) = stats.max_latency_ms {
+            out.push_str(&format!(
+                "gail_ai_response_time_max_ms{{{labels}}} {maximum}\n"
+            ));
+        }
+    }
+    for (source, stats) in &data.api_response_times {
+        let labels = format!("source=\"{}\"", escape_label(source));
+        if let Some(average) = stats.average_latency_ms {
+            out.push_str(&format!(
+                "gail_api_source_response_time_average_ms{{{labels}}} {average:.3}\n"
+            ));
+        }
+        if let Some(minimum) = stats.min_latency_ms {
+            out.push_str(&format!(
+                "gail_api_source_response_time_min_ms{{{labels}}} {minimum}\n"
+            ));
+        }
+        if let Some(maximum) = stats.max_latency_ms {
+            out.push_str(&format!(
+                "gail_api_source_response_time_max_ms{{{labels}}} {maximum}\n"
+            ));
+        }
+        out.push_str(&format!(
+            "gail_api_source_requests_total{{{labels}}} {}\n",
             stats.requests
         ));
     }
@@ -644,6 +912,16 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
                 latency
             ));
         }
+        if let Some(minimum) = bucket.stats.min_latency_ms {
+            out.push_str(&format!(
+                "gail_provider_candidate_latency_min_ms{{{labels}}} {minimum}\n"
+            ));
+        }
+        if let Some(maximum) = bucket.stats.max_latency_ms {
+            out.push_str(&format!(
+                "gail_provider_candidate_latency_max_ms{{{labels}}} {maximum}\n"
+            ));
+        }
         if let Some(queue_wait) = bucket.stats.ewma_queue_wait_ms {
             out.push_str(&format!(
                 "gail_provider_candidate_queue_wait_ms{{{labels}}} {:.3}\n",
@@ -660,6 +938,28 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
             out.push_str(&format!(
                 "gail_provider_candidate_tokens_estimate{{{labels}}} {:.3}\n",
                 tokens
+            ));
+        }
+        for (profile, stats) in &bucket.roles {
+            let profile_labels = format!("{labels},request_profile=\"{}\"", escape_label(profile));
+            if let Some(average) = stats.average_latency_ms {
+                out.push_str(&format!(
+                    "gail_provider_request_profile_latency_average_ms{{{profile_labels}}} {average:.3}\n"
+                ));
+            }
+            if let Some(minimum) = stats.min_latency_ms {
+                out.push_str(&format!(
+                    "gail_provider_request_profile_latency_min_ms{{{profile_labels}}} {minimum}\n"
+                ));
+            }
+            if let Some(maximum) = stats.max_latency_ms {
+                out.push_str(&format!(
+                    "gail_provider_request_profile_latency_max_ms{{{profile_labels}}} {maximum}\n"
+                ));
+            }
+            out.push_str(&format!(
+                "gail_provider_request_profile_requests_total{{{profile_labels}}} {}\n",
+                stats.total
             ));
         }
     }
@@ -773,6 +1073,7 @@ mod tests {
                 true,
                 Some(42),
                 Some(LocalUsageTelemetry {
+                    prompt_tokens_estimate: None,
                     queue_wait_ms: Some(10),
                     inference_ms: Some(32),
                     total_tokens_estimate: Some(128),
@@ -859,6 +1160,7 @@ mod tests {
                 true,
                 Some(120),
                 Some(LocalUsageTelemetry {
+                    prompt_tokens_estimate: None,
                     queue_wait_ms: Some(5),
                     inference_ms: Some(110),
                     total_tokens_estimate: Some(900),
@@ -876,6 +1178,7 @@ mod tests {
                 true,
                 Some(1800),
                 Some(LocalUsageTelemetry {
+                    prompt_tokens_estimate: None,
                     queue_wait_ms: Some(850),
                     inference_ms: Some(3900),
                     total_tokens_estimate: Some(3400),

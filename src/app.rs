@@ -224,14 +224,15 @@ async fn openai_chat_completions(
     headers: HeaderMap,
     Json(request): Json<OpenAIChatCompletionRequest>,
 ) -> Response {
-    if let Err(error) = service.authorize(&headers, "llm") {
-        return openai_error_response(error);
-    }
+    let auth = match service.authorize(&headers, "llm") {
+        Ok(auth) => auth,
+        Err(error) => return openai_error_response(error),
+    };
     let stream_response = request.stream.unwrap_or(false);
     let tool_context = OpenAIToolContext::from_tools(request.tools.as_ref());
     let response_schema_context = OpenAIResponseSchemaContext::from_chat_request(&request);
     let request_for_fallback = request.clone();
-    match dispatch_openai_chat_completion(&service, request).await {
+    match dispatch_openai_chat_completion(&service, request, auth.client_id.as_deref()).await {
         Ok((public_model, mut response)) => {
             if tool_context.is_none()
                 && let Some(normalized) =
@@ -280,13 +281,14 @@ async fn openai_responses(
     headers: HeaderMap,
     Json(request): Json<OpenAIResponseRequest>,
 ) -> Response {
-    if let Err(error) = service.authorize(&headers, "llm") {
-        return openai_error_response(error);
-    }
+    let auth = match service.authorize(&headers, "llm") {
+        Ok(auth) => auth,
+        Err(error) => return openai_error_response(error),
+    };
     let stream_response = request.stream.unwrap_or(false);
     let request_for_fallback = request.clone();
     let response_schema_context = OpenAIResponseSchemaContext::from_response_request(&request);
-    match dispatch_openai_responses(&service, request).await {
+    match dispatch_openai_responses(&service, request, auth.client_id.as_deref()).await {
         Ok((public_model, mut response)) => {
             if let Some(normalized) =
                 response_schema_context.normalize_response_text(response.text.as_str())
@@ -463,18 +465,20 @@ async fn openai_audio_transcriptions(
 async fn complete(
     State(service): State<GailService>,
     headers: HeaderMap,
-    Json(request): Json<CompletionRequest>,
+    Json(mut request): Json<CompletionRequest>,
 ) -> Result<Json<CompletionResponse>> {
-    let _ = service.authorize(&headers, "llm")?;
+    let auth = service.authorize(&headers, "llm")?;
+    request.source = auth.client_id;
     Ok(Json(service.complete(request).await?))
 }
 
 async fn direct_complete(
     State(service): State<GailService>,
     headers: HeaderMap,
-    Json(request): Json<ProviderCompletionRequest>,
+    Json(mut request): Json<ProviderCompletionRequest>,
 ) -> Result<Json<CompletionResponse>> {
-    let _ = service.authorize(&headers, "llm")?;
+    let auth = service.authorize(&headers, "llm")?;
+    request.source = auth.client_id;
     Ok(Json(service.direct_complete(request).await?))
 }
 
@@ -1075,6 +1079,7 @@ async fn trading_run_backtest(
 async fn dispatch_openai_chat_completion(
     service: &GailService,
     request: OpenAIChatCompletionRequest,
+    source: Option<&str>,
 ) -> Result<(String, CompletionResponse)> {
     let explicit_request_provider_override = explicit_request_has_provider_override(
         request.api_key.as_deref(),
@@ -1116,6 +1121,8 @@ async fn dispatch_openai_chat_completion(
         request.api_key.clone(),
         request.access_token.clone(),
         request.base_url.clone(),
+        source.map(str::to_string),
+        request.metadata.as_ref().and_then(metadata_request_profile),
     );
     let response = match route {
         OpenAIResolvedRoute::Orchestrated { .. } => service.complete(completion_request).await?,
@@ -1140,6 +1147,8 @@ async fn dispatch_openai_chat_completion(
                 request.api_key,
                 request.access_token,
                 request.base_url,
+                source.map(str::to_string),
+                request.metadata.as_ref().and_then(metadata_request_profile),
             );
             service.direct_complete(direct_request).await?
         }
@@ -1151,6 +1160,7 @@ async fn dispatch_openai_chat_completion(
 async fn dispatch_openai_responses(
     service: &GailService,
     request: OpenAIResponseRequest,
+    source: Option<&str>,
 ) -> Result<(String, CompletionResponse)> {
     let explicit_request_provider_override = explicit_request_has_provider_override(
         request.api_key.as_deref(),
@@ -1191,6 +1201,8 @@ async fn dispatch_openai_responses(
         request.api_key.clone(),
         request.access_token.clone(),
         request.base_url.clone(),
+        source.map(str::to_string),
+        request.metadata.as_ref().and_then(metadata_request_profile),
     );
     let response = match route {
         OpenAIResolvedRoute::Orchestrated { .. } => service.complete(completion_request).await?,
@@ -1215,6 +1227,8 @@ async fn dispatch_openai_responses(
                 request.api_key,
                 request.access_token,
                 request.base_url,
+                source.map(str::to_string),
+                request.metadata.as_ref().and_then(metadata_request_profile),
             );
             service.direct_complete(direct_request).await?
         }
@@ -1239,6 +1253,8 @@ fn build_direct_provider_request(
     api_key: Option<String>,
     access_token: Option<String>,
     base_url: Option<String>,
+    source: Option<String>,
+    request_profile: Option<String>,
 ) -> ProviderCompletionRequest {
     ProviderCompletionRequest {
         provider,
@@ -1258,6 +1274,8 @@ fn build_direct_provider_request(
         role,
         min_model_size_b: None,
         strict_no_downgrade: None,
+        source,
+        request_profile,
     }
 }
 
@@ -1293,6 +1311,8 @@ fn build_completion_request(
     api_key: Option<String>,
     access_token: Option<String>,
     base_url: Option<String>,
+    source: Option<String>,
+    request_profile: Option<String>,
 ) -> CompletionRequest {
     match route {
         OpenAIResolvedRoute::Orchestrated { .. } => CompletionRequest {
@@ -1317,6 +1337,8 @@ fn build_completion_request(
             timeout_seconds: None,
             reasoning_effort,
             request_category,
+            source,
+            request_profile,
         },
         OpenAIResolvedRoute::Explicit {
             provider,
@@ -1367,9 +1389,20 @@ fn build_completion_request(
                 timeout_seconds: None,
                 reasoning_effort,
                 request_category,
+                source,
+                request_profile,
             }
         }
     }
+}
+
+fn metadata_request_profile(metadata: &Value) -> Option<String> {
+    ["request_profile", "profile", "request_type", "kind"]
+        .iter()
+        .find_map(|key| metadata.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn resolve_openai_route(
