@@ -367,6 +367,12 @@ pub struct TradingConfig {
     /// Whether Gail is allowed to call OctoBot order-placement paths.
     pub live_execution_enabled: bool,
 
+    /// When enabled, Gail promotes paper execution to live execution only
+    /// after the current build has passed paper-intent and profitability
+    /// gates. A failed/expired gate always falls back to paper or hold-only
+    /// behavior; it never enables live orders by configuration accident.
+    pub live_execution_auto_gate_enabled: bool,
+
     /// Require persisted paper evidence from the exact running build before
     /// any OctoBot order-placement path can be called.
     pub paper_qualification_required: bool,
@@ -499,6 +505,7 @@ impl Default for TradingConfig {
             backtest_data_collection_cooldown_seconds: 900,
             backtest_pause_on_failure: false,
             live_execution_enabled: false,
+            live_execution_auto_gate_enabled: true,
             paper_qualification_required: true,
             paper_qualification_min_evaluations: 100,
             paper_qualification_min_validated_intents: 5,

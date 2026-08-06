@@ -62,6 +62,10 @@ pub struct OrchestrationConfig {
     pub max_parallel_candidates: usize,
     pub interactive_pool_max_in_flight: usize,
     pub solver_pool_max_in_flight: usize,
+    /// Reserved capacity for latency-sensitive trading advisories.  Trading
+    /// requests use this pool instead of competing with interactive chat or
+    /// long-running solver/research requests.
+    pub trading_pool_max_in_flight: usize,
     pub workload_pool_wait_timeout_ms: u64,
     /// Bounded backpressure wait for a provider/host resource reservation.
     pub candidate_queue_wait_timeout_ms: u64,
@@ -283,6 +287,7 @@ impl Default for OrchestrationConfig {
             max_parallel_candidates: 3,
             interactive_pool_max_in_flight: 8,
             solver_pool_max_in_flight: 4,
+            trading_pool_max_in_flight: 3,
             workload_pool_wait_timeout_ms: 30_000,
             candidate_queue_wait_timeout_ms: 30_000,
             deduplicate_model_candidates: true,
@@ -530,6 +535,8 @@ impl GailConfig {
             .clamp(1, 4096);
         self.orchestration.solver_pool_max_in_flight =
             self.orchestration.solver_pool_max_in_flight.clamp(1, 4096);
+        self.orchestration.trading_pool_max_in_flight =
+            self.orchestration.trading_pool_max_in_flight.clamp(1, 4096);
         self.orchestration.workload_pool_wait_timeout_ms = self
             .orchestration
             .workload_pool_wait_timeout_ms

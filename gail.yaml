@@ -25,6 +25,7 @@ orchestration:
   max_parallel_candidates: 3
   interactive_pool_max_in_flight: 8
   solver_pool_max_in_flight: 4
+  trading_pool_max_in_flight: 3
   # Backpressure is bounded: callers wait briefly for global and per-host
   # capacity rather than immediately creating a retry storm.
   workload_pool_wait_timeout_ms: 30000

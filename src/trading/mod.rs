@@ -3427,7 +3427,30 @@ async fn execute_if_warranted(
         intent_lease_seconds: config.execution_lease_seconds,
     };
     let build_revision = crate::build_info::revision();
-    if !config.live_execution_enabled {
+    let paper_qualified = {
+        let current = state.0.lock().await;
+        current
+            .paper_qualification
+            .is_qualified(&build_revision, now_ts(), paper_policy)
+    };
+    let profitability_qualified = {
+        let current = state.0.lock().await;
+        if !config.backtesting_enabled {
+            true
+        } else {
+            current.last_backtest.as_ref().is_some_and(|summary| {
+                matches!(summary.assessment, backtest::ApproachAssessment::Viable)
+                    && summary.profitability_pct.is_some_and(|value| {
+                        value.is_finite() && value >= config.backtest_profitability_threshold
+                    })
+            })
+        }
+    };
+    let auto_live_ready =
+        config.live_execution_auto_gate_enabled && paper_qualified && profitability_qualified;
+    let effective_live_execution = config.live_execution_enabled || auto_live_ready;
+
+    if !effective_live_execution {
         if decision.override_applied {
             state
                 .log_warn(
@@ -3480,14 +3503,22 @@ async fn execute_if_warranted(
             .await;
         return;
     }
+    if auto_live_ready && !config.live_execution_enabled {
+        state
+            .log(
+                "info",
+                "execute",
+                "LIVE_EXECUTION_AUTO_ENABLED",
+                json!({
+                    "paper_qualified": paper_qualified,
+                    "profitability_qualified": profitability_qualified,
+                    "backtest_profitability_threshold": config.backtest_profitability_threshold,
+                }),
+            )
+            .await;
+    }
     if config.paper_qualification_required {
-        let qualified = {
-            let current = state.0.lock().await;
-            current
-                .paper_qualification
-                .is_qualified(&build_revision, now_ts(), paper_policy)
-        };
-        if !qualified {
+        if !paper_qualified {
             state
                 .log(
                     "error",
@@ -3502,6 +3533,19 @@ async fn execute_if_warranted(
                 .await;
             return;
         }
+    }
+    if config.backtesting_enabled && !profitability_qualified {
+        state
+            .log(
+                "warn",
+                "execute",
+                "Live order blocked: latest backtest has not met profitability gate",
+                json!({
+                    "required_profitability_pct": config.backtest_profitability_threshold,
+                }),
+            )
+            .await;
+        return;
     }
     if let Err(reason) =
         claim_execution_intent(state, &intent_key, config, decision.override_applied).await

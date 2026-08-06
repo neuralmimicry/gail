@@ -91,6 +91,7 @@ struct GailServiceInner {
     round_robin_cursors: Arc<Mutex<HashMap<String, usize>>>,
     interactive_pool: Arc<Semaphore>,
     solver_pool: Arc<Semaphore>,
+    trading_pool: Arc<Semaphore>,
 }
 
 #[derive(Clone, Debug)]
@@ -226,6 +227,7 @@ impl Drop for LoadReservationGuard {
 enum WorkloadClass {
     Interactive,
     Solver,
+    Trading,
 }
 
 impl WorkloadClass {
@@ -233,6 +235,7 @@ impl WorkloadClass {
         match self {
             Self::Interactive => "interactive",
             Self::Solver => "solver",
+            Self::Trading => "trading",
         }
     }
 }
@@ -300,9 +303,17 @@ impl GailService {
             )
             .max(1) as usize,
         ));
+        let trading_pool = Arc::new(Semaphore::new(
+            env_int_any(
+                &["GAIL_TRADING_POOL_MAX_IN_FLIGHT"],
+                config.orchestration.trading_pool_max_in_flight as u64,
+            )
+            .max(1) as usize,
+        ));
         tracing::info!(
             interactive_pool_size = interactive_pool.available_permits(),
             solver_pool_size = solver_pool.available_permits(),
+            trading_pool_size = trading_pool.available_permits(),
             "configured workload pool capacities"
         );
 
@@ -323,6 +334,7 @@ impl GailService {
                 round_robin_cursors: round_robin_cursors.clone(),
                 interactive_pool: interactive_pool.clone(),
                 solver_pool: solver_pool.clone(),
+                trading_pool: trading_pool.clone(),
             }),
         };
 
@@ -352,6 +364,7 @@ impl GailService {
                 round_robin_cursors,
                 interactive_pool,
                 solver_pool,
+                trading_pool,
             }),
         })
     }
@@ -702,8 +715,12 @@ impl GailService {
         if effective_request.role.is_none() {
             effective_request.role = Some("assistant".to_string());
         }
+        let workload_class = classify_workload(
+            effective_request.workflow.as_deref().unwrap_or("direct"),
+            effective_request.role.as_deref().unwrap_or("assistant"),
+        );
         if effective_request.min_model_size_b.is_none() {
-            effective_request.min_model_size_b = self.model_floor_b(WorkloadClass::Interactive);
+            effective_request.min_model_size_b = self.model_floor_b(workload_class);
         }
         if effective_request.strict_no_downgrade.is_none() {
             effective_request.strict_no_downgrade = Some(self.strict_no_downgrade());
@@ -720,10 +737,7 @@ impl GailService {
             effective_request.system.as_deref(),
         );
         let candidate = ProviderCandidate::from_profile(profile.clone());
-        let workload_permit = match self
-            .acquire_workload_permit(WorkloadClass::Interactive)
-            .await
-        {
+        let workload_permit = match self.acquire_workload_permit(workload_class).await {
             Some(permit) => permit,
             None => {
                 return Err(GailError::upstream(
@@ -2037,6 +2051,7 @@ impl GailService {
             "max_parallel_candidates": self.max_parallel_candidates(),
             "interactive_pool_max_in_flight": self.inner.config.orchestration.interactive_pool_max_in_flight,
             "solver_pool_max_in_flight": self.inner.config.orchestration.solver_pool_max_in_flight,
+            "trading_pool_max_in_flight": self.inner.config.orchestration.trading_pool_max_in_flight,
             "workload_pool_wait_timeout_ms": self.workload_pool_wait_timeout_ms(),
             "health_ttl_seconds": self.health_ttl_seconds(),
             "interactive_model_floor_b": self.model_floor_b(WorkloadClass::Interactive),
@@ -3347,6 +3362,7 @@ impl GailService {
         let configured = match workload_class {
             WorkloadClass::Interactive => self.inner.config.orchestration.interactive_model_floor_b,
             WorkloadClass::Solver => self.inner.config.orchestration.solver_model_floor_b,
+            WorkloadClass::Trading => self.inner.config.orchestration.interactive_model_floor_b,
         };
         let env_floor = match workload_class {
             WorkloadClass::Interactive => env_float_any(
@@ -3363,6 +3379,7 @@ impl GailService {
                 ],
                 configured,
             ),
+            WorkloadClass::Trading => env_float_any(&["GAIL_TRADING_MODEL_FLOOR_B"], configured),
         };
         let floor = env_floor.max(0.0);
         if floor > 0.0 { Some(floor) } else { None }
@@ -3380,6 +3397,7 @@ impl GailService {
         let semaphore = match class {
             WorkloadClass::Interactive => self.inner.interactive_pool.clone(),
             WorkloadClass::Solver => self.inner.solver_pool.clone(),
+            WorkloadClass::Trading => self.inner.trading_pool.clone(),
         };
         match tokio::time::timeout(wait_timeout, semaphore.acquire_owned()).await {
             Ok(Ok(permit)) => Some(permit),
@@ -5402,6 +5420,14 @@ fn prompt_requests_signal_synthesis_output(prompt_text: &str) -> bool {
 }
 
 fn classify_workload(workflow: &str, role: &str) -> WorkloadClass {
+    let workflow_lower = workflow.to_ascii_lowercase();
+    let role_lower = role.to_ascii_lowercase();
+    if workflow_lower.contains("trading")
+        || workflow_lower.contains("advisory")
+        || role_lower == "trading"
+    {
+        return WorkloadClass::Trading;
+    }
     if is_interactive_workflow(workflow, role) {
         return WorkloadClass::Interactive;
     }
@@ -6343,6 +6369,14 @@ Return only a JSON data instance that satisfies this schema:
         assert_eq!(
             classify_workload("direct", "assistant"),
             WorkloadClass::Interactive
+        );
+        assert_eq!(
+            classify_workload("trading", "assistant"),
+            WorkloadClass::Trading
+        );
+        assert_eq!(
+            classify_workload("direct", "trading"),
+            WorkloadClass::Trading
         );
     }
 
