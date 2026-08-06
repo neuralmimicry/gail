@@ -715,9 +715,13 @@ impl GailService {
         if effective_request.role.is_none() {
             effective_request.role = Some("assistant".to_string());
         }
-        let workload_class = classify_workload(
+        let workload_class = classify_workload_with_context(
             effective_request.workflow.as_deref().unwrap_or("direct"),
             effective_request.role.as_deref().unwrap_or("assistant"),
+            effective_request.request_category.as_deref(),
+            effective_request.request_profile.as_deref(),
+            effective_request.source.as_deref(),
+            None,
         );
         if effective_request.min_model_size_b.is_none() {
             effective_request.min_model_size_b = self.model_floor_b(workload_class);
@@ -744,7 +748,8 @@ impl GailService {
                     "gail",
                     Some(StatusCode::SERVICE_UNAVAILABLE),
                     format!(
-                        "interactive workload pool is saturated; retry after {}ms",
+                        "{} workload pool is saturated; retry after {}ms",
+                        workload_class.label(),
                         self.workload_pool_wait_timeout_ms()
                     ),
                 ));
@@ -1064,7 +1069,14 @@ impl GailService {
         let api_source = normalize_key(request.source.as_deref().unwrap_or("unknown"), "unknown");
         let workflow = normalize_key(request.workflow.as_deref().unwrap_or("general"), "general");
         let role = normalize_key(request.role.as_deref().unwrap_or("general"), "general");
-        let workload_class = classify_workload(workflow.as_str(), role.as_str());
+        let workload_class = classify_workload_with_context(
+            workflow.as_str(),
+            role.as_str(),
+            request.request_category.as_deref(),
+            request.request_profile.as_deref(),
+            request.source.as_deref(),
+            None,
+        );
         let model_floor_b = self.model_floor_b(workload_class);
         let strict_no_downgrade = self.strict_no_downgrade();
         let selection_mode = request
@@ -5420,12 +5432,45 @@ fn prompt_requests_signal_synthesis_output(prompt_text: &str) -> bool {
 }
 
 fn classify_workload(workflow: &str, role: &str) -> WorkloadClass {
+    classify_workload_with_context(workflow, role, None, None, None, None)
+}
+
+/// Classify a request before acquiring a global permit.  OctoBot's
+/// OpenAI-compatible path can use a generic `direct`/`assistant` route while
+/// still carrying a trading category or trading-shaped prompt.  Looking only
+/// at workflow and role incorrectly puts those calls in the interactive pool,
+/// allowing long planner/research work to starve trading advisories.
+fn classify_workload_with_context(
+    workflow: &str,
+    role: &str,
+    request_category: Option<&str>,
+    request_profile: Option<&str>,
+    source: Option<&str>,
+    prompt_text: Option<&str>,
+) -> WorkloadClass {
     let workflow_lower = workflow.to_ascii_lowercase();
     let role_lower = role.to_ascii_lowercase();
-    if workflow_lower.contains("trading")
-        || workflow_lower.contains("advisory")
-        || role_lower == "trading"
-    {
+    let category_lower = request_category.unwrap_or_default().to_ascii_lowercase();
+    let profile_lower = request_profile.unwrap_or_default().to_ascii_lowercase();
+    let source_lower = source.unwrap_or_default().to_ascii_lowercase();
+    let prompt_lower = prompt_text.unwrap_or_default().to_ascii_lowercase();
+    let trading_markers = [
+        "trading",
+        "advisory",
+        "buy/hold/sell",
+        "buy_hold_sell",
+        "target_symbol",
+        "market data",
+        "octobot",
+    ];
+    if trading_markers.iter().any(|marker| {
+        workflow_lower.contains(marker)
+            || role_lower.contains(marker)
+            || category_lower.contains(marker)
+            || profile_lower.contains(marker)
+            || source_lower.contains(marker)
+            || prompt_lower.contains(marker)
+    }) {
         return WorkloadClass::Trading;
     }
     if is_interactive_workflow(workflow, role) {
@@ -6376,6 +6421,32 @@ Return only a JSON data instance that satisfies this schema:
         );
         assert_eq!(
             classify_workload("direct", "trading"),
+            WorkloadClass::Trading
+        );
+    }
+
+    #[test]
+    fn classify_workload_routes_generic_octobot_advisories_to_reserved_pool() {
+        assert_eq!(
+            classify_workload_with_context(
+                "direct",
+                "assistant",
+                Some("trading_advisory"),
+                None,
+                None,
+                None,
+            ),
+            WorkloadClass::Trading
+        );
+        assert_eq!(
+            classify_workload_with_context(
+                "direct",
+                "assistant",
+                None,
+                Some("octobot_trading"),
+                None,
+                None,
+            ),
             WorkloadClass::Trading
         );
     }
