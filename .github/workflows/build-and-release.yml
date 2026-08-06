@@ -77,9 +77,12 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runs_on: '["self-hosted","Linux","X64"]'
+            # Use GitHub-hosted runners so release progress does not depend on
+            # an intermittently registered local runner.
+            runs_on: '["ubuntu-latest"]'
           - arch: arm64
-            runs_on: '["self-hosted","Linux","ARM64"]'
+            # Public repositories have access to the hosted ARM64 runner.
+            runs_on: '["ubuntu-24.04-arm"]'
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -241,7 +244,7 @@ jobs:
         include:
           - os: linux
             arch: amd64
-            runs_on: '["self-hosted","Linux","X64"]'
+            runs_on: '["ubuntu-latest"]'
             rust_target: x86_64-unknown-linux-gnu
             platform: linux-amd64
             archive_format: tar.gz
@@ -250,7 +253,7 @@ jobs:
             can_execute: true
           - os: linux
             arch: arm64
-            runs_on: '["self-hosted","Linux","ARM64"]'
+            runs_on: '["ubuntu-24.04-arm"]'
             rust_target: aarch64-unknown-linux-gnu
             platform: linux-arm64
             archive_format: tar.gz
@@ -615,11 +618,11 @@ jobs:
         include:
           - arch: amd64
             platform: linux/amd64
-            runs_on: '["self-hosted","Linux","X64"]'
+            runs_on: '["ubuntu-latest"]'
             pytorch_jobs_default: auto
           - arch: arm64
             platform: linux/arm64
-            runs_on: '["self-hosted","Linux","ARM64"]'
+            runs_on: '["ubuntu-24.04-arm"]'
             pytorch_jobs_default: "2"
     env:
       BUILD_VERSION: ${{ needs.version.outputs.build_version }}
@@ -858,7 +861,7 @@ jobs:
         ) ||
         (github.event_name == 'workflow_dispatch' && inputs.publish_release)
       }}
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
