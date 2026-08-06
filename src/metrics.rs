@@ -44,6 +44,8 @@ pub struct AiResponseTimeStats {
     pub ewma_latency_ms: Option<f64>,
     /// Latency distribution for successful responses only.
     #[serde(default)]
+    pub successful_latency_samples: u64,
+    #[serde(default)]
     pub successful_latency_total_ms: u64,
     #[serde(default)]
     pub successful_latency_average_ms: Option<f64>,
@@ -54,6 +56,8 @@ pub struct AiResponseTimeStats {
     #[serde(default)]
     pub successful_latency_ewma_ms: Option<f64>,
     /// Latency distribution for failed responses only.
+    #[serde(default)]
+    pub failed_latency_samples: u64,
     #[serde(default)]
     pub failed_latency_total_ms: u64,
     #[serde(default)]
@@ -105,6 +109,8 @@ pub struct StatsBucket {
     #[serde(default)]
     pub ewma_latency_ms: Option<f64>,
     #[serde(default)]
+    pub successful_latency_samples: u64,
+    #[serde(default)]
     pub successful_latency_total_ms: u64,
     #[serde(default)]
     pub successful_latency_average_ms: Option<f64>,
@@ -114,6 +120,8 @@ pub struct StatsBucket {
     pub successful_latency_max_ms: Option<u64>,
     #[serde(default)]
     pub successful_latency_ewma_ms: Option<f64>,
+    #[serde(default)]
+    pub failed_latency_samples: u64,
     #[serde(default)]
     pub failed_latency_total_ms: u64,
     #[serde(default)]
@@ -179,10 +187,12 @@ pub struct CandidateMetricsSummary {
     pub max_latency_ms: Option<u64>,
     pub success_rate: Option<f64>,
     pub ewma_latency_ms: Option<f64>,
+    pub successful_latency_samples: u64,
     pub successful_latency_average_ms: Option<f64>,
     pub successful_latency_min_ms: Option<u64>,
     pub successful_latency_max_ms: Option<u64>,
     pub successful_latency_ewma_ms: Option<f64>,
+    pub failed_latency_samples: u64,
     pub failed_latency_average_ms: Option<f64>,
     pub failed_latency_min_ms: Option<u64>,
     pub failed_latency_max_ms: Option<u64>,
@@ -263,11 +273,12 @@ impl MetricsStore {
             bucket.failures = bucket.failures.saturating_add(1);
         }
         let sample_count = if success {
-            bucket.successes
+            bucket.successful_latency_samples = bucket.successful_latency_samples.saturating_add(1);
+            bucket.successful_latency_samples
         } else {
-            bucket.failures
-        }
-        .max(1);
+            bucket.failed_latency_samples = bucket.failed_latency_samples.saturating_add(1);
+            bucket.failed_latency_samples
+        };
         let (total, average, minimum, maximum, ewma) = if success {
             (
                 &mut bucket.successful_latency_total_ms,
@@ -588,11 +599,13 @@ impl MetricsStore {
         bucket.total = bucket.successes + bucket.failures;
         if let Some(latency_ms) = latency_ms {
             let sample_count = if success {
-                bucket.successes
+                bucket.successful_latency_samples =
+                    bucket.successful_latency_samples.saturating_add(1);
+                bucket.successful_latency_samples
             } else {
-                bucket.failures
-            }
-            .max(1);
+                bucket.failed_latency_samples = bucket.failed_latency_samples.saturating_add(1);
+                bucket.failed_latency_samples
+            };
             let (total, average, minimum, maximum, ewma) = if success {
                 (
                     &mut bucket.successful_latency_total_ms,
@@ -875,10 +888,12 @@ impl MetricsStore {
                     None
                 },
                 ewma_latency_ms: bucket.stats.ewma_latency_ms,
+                successful_latency_samples: bucket.stats.successful_latency_samples,
                 successful_latency_average_ms: bucket.stats.successful_latency_average_ms,
                 successful_latency_min_ms: bucket.stats.successful_latency_min_ms,
                 successful_latency_max_ms: bucket.stats.successful_latency_max_ms,
                 successful_latency_ewma_ms: bucket.stats.successful_latency_ewma_ms,
+                failed_latency_samples: bucket.stats.failed_latency_samples,
                 failed_latency_average_ms: bucket.stats.failed_latency_average_ms,
                 failed_latency_min_ms: bucket.stats.failed_latency_min_ms,
                 failed_latency_max_ms: bucket.stats.failed_latency_max_ms,
@@ -1554,7 +1569,9 @@ mod tests {
 
         let candidate_metrics = &store.summary(10).await.candidates[0];
         assert_eq!(candidate_metrics.successful_latency_average_ms, Some(200.0));
+        assert_eq!(candidate_metrics.successful_latency_samples, 1);
         assert_eq!(candidate_metrics.failed_latency_average_ms, Some(9_000.0));
+        assert_eq!(candidate_metrics.failed_latency_samples, 1);
         assert_eq!(candidate_metrics.queue_wait_average_ms, Some(4_010.0));
         assert_eq!(candidate_metrics.successes, 1);
         assert_eq!(candidate_metrics.failures, 1);

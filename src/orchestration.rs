@@ -5992,10 +5992,12 @@ Return only a JSON data instance that satisfies this schema:
                     None
                 },
                 ewma_latency_ms: Some(420.0),
+                successful_latency_samples: 3,
                 successful_latency_average_ms: Some(420.0),
                 successful_latency_min_ms: Some(100),
                 successful_latency_max_ms: Some(900),
                 successful_latency_ewma_ms: Some(420.0),
+                failed_latency_samples: 0,
                 failed_latency_average_ms: None,
                 failed_latency_min_ms: None,
                 failed_latency_max_ms: None,
