@@ -738,6 +738,18 @@ jobs:
             no_cache_flag+=(--no-cache)
           fi
 
+          # Some hosted ARM64 runner images ship a crun/container-spec
+          # combination that fails before the first Dockerfile RUN step with
+          # "unknown version specified". Prefer runc for build containers on
+          # that architecture when it is installed; leave the runner default
+          # unchanged elsewhere. This affects only the build sandbox, not the
+          # runtime configured inside the published image.
+          podman_build_runtime_args=()
+          if [[ "${MATRIX_ARCH}" == "arm64" ]] && command -v runc >/dev/null 2>&1; then
+            podman_build_runtime_args+=(--runtime "$(command -v runc)")
+            echo "Using runc for ARM64 Podman build containers"
+          fi
+
           if [[ "${MATRIX_ARCH}" == "arm64" ]]; then
             echo "ARM64 CPU features:"
             grep -m1 -E '^Features[[:space:]]*:' /proc/cpuinfo || true
@@ -769,7 +781,7 @@ jobs:
             else
               echo "Building libtorch seed image ${libtorch_seed_image}"
               seed_iid_file="$(mktemp)"
-              podman build \
+              podman "${podman_build_runtime_args[@]}" build \
                 --platform "${MATRIX_PLATFORM}" \
                 --network=host \
                 --pull \
@@ -807,7 +819,7 @@ jobs:
           echo "Building ${ARCH_TAG} on ${MATRIX_PLATFORM} with BUILD_JOBS=${build_jobs}, CARGO_BUILD_JOBS=${cargo_jobs}, PYTORCH_BUILD_PARALLEL_LEVEL=${pytorch_jobs}, LIBTORCH_ACCELERATOR=${INPUT_LIBTORCH_ACCELERATOR}, LIBTORCH_SEED_IMAGE=${libtorch_seed_image}"
 
           arch_iid_file="$(mktemp)"
-          podman build \
+          podman "${podman_build_runtime_args[@]}" build \
             --platform "${MATRIX_PLATFORM}" \
             --network=host \
             --pull \
