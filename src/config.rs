@@ -66,6 +66,11 @@ pub struct OrchestrationConfig {
     /// requests use this pool instead of competing with interactive chat or
     /// long-running solver/research requests.
     pub trading_pool_max_in_flight: usize,
+    /// Per-class admission waits let short interactive calls fail quickly
+    /// while long solver and trading work remains queued independently.
+    pub interactive_pool_wait_timeout_ms: u64,
+    pub solver_pool_wait_timeout_ms: u64,
+    pub trading_pool_wait_timeout_ms: u64,
     pub workload_pool_wait_timeout_ms: u64,
     /// Bounded backpressure wait for a provider/host resource reservation.
     pub candidate_queue_wait_timeout_ms: u64,
@@ -288,6 +293,9 @@ impl Default for OrchestrationConfig {
             interactive_pool_max_in_flight: 8,
             solver_pool_max_in_flight: 4,
             trading_pool_max_in_flight: 3,
+            interactive_pool_wait_timeout_ms: 30_000,
+            solver_pool_wait_timeout_ms: 900_000,
+            trading_pool_wait_timeout_ms: 900_000,
             workload_pool_wait_timeout_ms: 30_000,
             candidate_queue_wait_timeout_ms: 30_000,
             deduplicate_model_candidates: true,
@@ -537,6 +545,18 @@ impl GailConfig {
             self.orchestration.solver_pool_max_in_flight.clamp(1, 4096);
         self.orchestration.trading_pool_max_in_flight =
             self.orchestration.trading_pool_max_in_flight.clamp(1, 4096);
+        self.orchestration.interactive_pool_wait_timeout_ms = self
+            .orchestration
+            .interactive_pool_wait_timeout_ms
+            .clamp(1, MAX_WORKLOAD_POOL_WAIT_TIMEOUT_MS);
+        self.orchestration.solver_pool_wait_timeout_ms = self
+            .orchestration
+            .solver_pool_wait_timeout_ms
+            .clamp(1, MAX_WORKLOAD_POOL_WAIT_TIMEOUT_MS);
+        self.orchestration.trading_pool_wait_timeout_ms = self
+            .orchestration
+            .trading_pool_wait_timeout_ms
+            .clamp(1, MAX_WORKLOAD_POOL_WAIT_TIMEOUT_MS);
         self.orchestration.workload_pool_wait_timeout_ms = self
             .orchestration
             .workload_pool_wait_timeout_ms

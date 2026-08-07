@@ -26,8 +26,12 @@ orchestration:
   interactive_pool_max_in_flight: 8
   solver_pool_max_in_flight: 4
   trading_pool_max_in_flight: 3
-  # Backpressure is bounded: callers wait briefly for global and per-host
-  # capacity rather than immediately creating a retry storm.
+  interactive_pool_wait_timeout_ms: 30000
+  solver_pool_wait_timeout_ms: 900000
+  trading_pool_wait_timeout_ms: 900000
+  # Interactive callers wait briefly; solver and trading requests use their
+  # independent long-lived queues above. Candidate capacity remains bounded
+  # by each provider/native host's concurrency limit.
   workload_pool_wait_timeout_ms: 30000
   candidate_queue_wait_timeout_ms: 30000
   deduplicate_model_candidates: true

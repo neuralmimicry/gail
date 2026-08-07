@@ -754,7 +754,7 @@ impl GailService {
                     format!(
                         "{} workload pool is saturated; retry after {}ms",
                         workload_class.label(),
-                        self.workload_pool_wait_timeout_ms()
+                        self.workload_pool_wait_timeout_ms_for(workload_class)
                     ),
                 ));
             }
@@ -2072,6 +2072,9 @@ impl GailService {
             "solver_pool_max_in_flight": self.inner.config.orchestration.solver_pool_max_in_flight,
             "trading_pool_max_in_flight": self.inner.config.orchestration.trading_pool_max_in_flight,
             "workload_pool_wait_timeout_ms": self.workload_pool_wait_timeout_ms(),
+            "interactive_pool_wait_timeout_ms": self.workload_pool_wait_timeout_ms_for(WorkloadClass::Interactive),
+            "solver_pool_wait_timeout_ms": self.workload_pool_wait_timeout_ms_for(WorkloadClass::Solver),
+            "trading_pool_wait_timeout_ms": self.workload_pool_wait_timeout_ms_for(WorkloadClass::Trading),
             "health_ttl_seconds": self.health_ttl_seconds(),
             "interactive_model_floor_b": self.model_floor_b(WorkloadClass::Interactive),
             "solver_model_floor_b": self.model_floor_b(WorkloadClass::Solver),
@@ -3102,7 +3105,7 @@ impl GailService {
                 error: Some(format!(
                     "{} workload pool is saturated; retry after {}ms",
                     workload_class.label(),
-                    self.workload_pool_wait_timeout_ms(),
+                    self.workload_pool_wait_timeout_ms_for(workload_class),
                 )),
                 latency_ms: None,
                 quality: -1.0,
@@ -3359,6 +3362,36 @@ impl GailService {
         .clamp(1, MAX_WORKLOAD_POOL_WAIT_TIMEOUT_MS)
     }
 
+    fn workload_pool_wait_timeout_ms_for(&self, class: WorkloadClass) -> u64 {
+        let (names, configured) = match class {
+            WorkloadClass::Interactive => (
+                [
+                    "GAIL_INTERACTIVE_POOL_WAIT_TIMEOUT_MS",
+                    "REFINER_AI_INTERACTIVE_POOL_WAIT_TIMEOUT_MS",
+                ],
+                self.inner
+                    .config
+                    .orchestration
+                    .interactive_pool_wait_timeout_ms,
+            ),
+            WorkloadClass::Solver => (
+                [
+                    "GAIL_SOLVER_POOL_WAIT_TIMEOUT_MS",
+                    "REFINER_AI_SOLVER_POOL_WAIT_TIMEOUT_MS",
+                ],
+                self.inner.config.orchestration.solver_pool_wait_timeout_ms,
+            ),
+            WorkloadClass::Trading => (
+                [
+                    "GAIL_TRADING_POOL_WAIT_TIMEOUT_MS",
+                    "GAIL_ADVISORY_QUEUE_WAIT_TIMEOUT_MS",
+                ],
+                self.inner.config.orchestration.trading_pool_wait_timeout_ms,
+            ),
+        };
+        env_int_any(&names, configured).clamp(1, MAX_WORKLOAD_POOL_WAIT_TIMEOUT_MS)
+    }
+
     fn candidate_queue_wait_timeout_ms(&self) -> u64 {
         env_int_any(
             &["GAIL_CANDIDATE_QUEUE_WAIT_TIMEOUT_MS"],
@@ -3412,7 +3445,7 @@ impl GailService {
     }
 
     async fn acquire_workload_permit(&self, class: WorkloadClass) -> Option<OwnedSemaphorePermit> {
-        let wait_timeout = Duration::from_millis(self.workload_pool_wait_timeout_ms());
+        let wait_timeout = Duration::from_millis(self.workload_pool_wait_timeout_ms_for(class));
         let semaphore = match class {
             WorkloadClass::Interactive => self.inner.interactive_pool.clone(),
             WorkloadClass::Solver => self.inner.solver_pool.clone(),
