@@ -715,13 +715,21 @@ impl GailService {
         if effective_request.role.is_none() {
             effective_request.role = Some("assistant".to_string());
         }
+        // Classify from the actual prompt before taking a workload permit. A
+        // number of OpenAI-compatible callers use the generic direct/assistant
+        // route even for long research or solver work; classifying only from
+        // workflow/role would incorrectly consume interactive capacity.
+        let prompt_text = flatten_prompt_text(
+            &effective_request.messages,
+            effective_request.system.as_deref(),
+        );
         let workload_class = classify_workload_with_context(
             effective_request.workflow.as_deref().unwrap_or("direct"),
             effective_request.role.as_deref().unwrap_or("assistant"),
             effective_request.request_category.as_deref(),
             effective_request.request_profile.as_deref(),
             effective_request.source.as_deref(),
-            None,
+            Some(prompt_text.as_str()),
         );
         if effective_request.min_model_size_b.is_none() {
             effective_request.min_model_size_b = self.model_floor_b(workload_class);
@@ -732,10 +740,6 @@ impl GailService {
         let request_id = Uuid::new_v4().to_string();
         let profile = self.direct_provider_profile(&effective_request);
         self.prepare_provider_request(&profile, &mut effective_request);
-        let prompt_text = flatten_prompt_text(
-            &effective_request.messages,
-            effective_request.system.as_deref(),
-        );
         let expected_json = expected_json(
             &effective_request.messages,
             effective_request.system.as_deref(),
@@ -1069,13 +1073,14 @@ impl GailService {
         let api_source = normalize_key(request.source.as_deref().unwrap_or("unknown"), "unknown");
         let workflow = normalize_key(request.workflow.as_deref().unwrap_or("general"), "general");
         let role = normalize_key(request.role.as_deref().unwrap_or("general"), "general");
+        let prompt_text = flatten_prompt_text(&request.messages, request.system.as_deref());
         let workload_class = classify_workload_with_context(
             workflow.as_str(),
             role.as_str(),
             request.request_category.as_deref(),
             request.request_profile.as_deref(),
             request.source.as_deref(),
-            None,
+            Some(prompt_text.as_str()),
         );
         let model_floor_b = self.model_floor_b(workload_class);
         let strict_no_downgrade = self.strict_no_downgrade();
@@ -1122,10 +1127,6 @@ impl GailService {
             request_profile: request.request_profile.clone(),
         };
 
-        let prompt_text = flatten_prompt_text(
-            &provider_request.messages,
-            provider_request.system.as_deref(),
-        );
         let prompt_tokens_estimate = estimate_prompt_tokens(&prompt_text);
         let mut task_tags = workflow_tags(&workflow, &role, &prompt_text);
         if let Some(category) = request
@@ -1278,8 +1279,14 @@ impl GailService {
             &provider_request.messages,
             provider_request.system.as_deref(),
         ) || task_tags_expect_json(&task_tags);
-        let timeout_cap =
-            self.candidate_timeout_cap(&workflow, &role, expected_json, &task_tags, &prompt_text);
+        let timeout_cap = self.candidate_timeout_cap(
+            workload_class,
+            &workflow,
+            &role,
+            expected_json,
+            &task_tags,
+            &prompt_text,
+        );
         let wave_size = max_candidates.max(1);
         let mut results = Vec::new();
         let mut attempted_candidate_ids = HashSet::new();
@@ -3498,13 +3505,14 @@ impl GailService {
 
     fn candidate_timeout_cap(
         &self,
+        workload_class: WorkloadClass,
         workflow: &str,
         role: &str,
         expected_json: bool,
         task_tags: &HashSet<String>,
         prompt_text: &str,
     ) -> Option<u64> {
-        let default = if is_interactive_workflow(workflow, role) {
+        let default = if workload_class == WorkloadClass::Interactive {
             45
         } else {
             self.inner
@@ -3521,7 +3529,7 @@ impl GailService {
             default.max(0) as u64,
         );
         let base = (value > 0).then(|| value.max(1));
-        if is_interactive_workflow(workflow, role) {
+        if workload_class == WorkloadClass::Interactive {
             return base;
         }
         if expected_json
@@ -5473,6 +5481,33 @@ fn classify_workload_with_context(
     }) {
         return WorkloadClass::Trading;
     }
+    // Long-running solver/research traffic must not consume the interactive
+    // pool merely because its caller uses a generic direct/assistant route.
+    // The prompt is intentionally a secondary signal: explicit trading
+    // markers above always win, while these markers route planning work to the
+    // solver pool and leave interactive capacity available for short calls.
+    let solver_markers = [
+        "project_solver",
+        "solver",
+        "research",
+        "planner",
+        "researcher",
+        "execution plan",
+        "technical analysis",
+        "code solution",
+        "coding task",
+        "refiner",
+        "conductor",
+    ];
+    if solver_markers.iter().any(|marker| {
+        workflow_lower.contains(marker)
+            || role_lower.contains(marker)
+            || profile_lower.contains(marker)
+            || source_lower.contains(marker)
+            || prompt_lower.contains(marker)
+    }) {
+        return WorkloadClass::Solver;
+    }
     if is_interactive_workflow(workflow, role) {
         return WorkloadClass::Interactive;
     }
@@ -6448,6 +6483,32 @@ Return only a JSON data instance that satisfies this schema:
                 None,
             ),
             WorkloadClass::Trading
+        );
+    }
+
+    #[test]
+    fn classify_workload_routes_generic_solver_prompts_away_from_interactive_pool() {
+        assert_eq!(
+            classify_workload_with_context(
+                "direct",
+                "assistant",
+                None,
+                None,
+                Some("refiner"),
+                Some("Research the problem and propose a coding solution."),
+            ),
+            WorkloadClass::Solver
+        );
+        assert_eq!(
+            classify_workload_with_context(
+                "general",
+                "general",
+                None,
+                None,
+                Some("continuum"),
+                Some("Create an execution plan for the planner."),
+            ),
+            WorkloadClass::Solver
         );
     }
 
