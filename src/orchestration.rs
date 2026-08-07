@@ -3529,9 +3529,6 @@ impl GailService {
             default.max(0) as u64,
         );
         let base = (value > 0).then(|| value.max(1));
-        if workload_class == WorkloadClass::Interactive {
-            return base;
-        }
         if expected_json
             && (prompt_requests_execution_plan(prompt_text)
                 || prompt_requests_manager_tool_call(prompt_text)
@@ -3543,9 +3540,12 @@ impl GailService {
             // degraded no-op envelopes.
             return base;
         }
-        if !expected_json
-            && !text_or_tags_indicate_automation(workflow, role, task_tags, prompt_text)
-        {
+        let automation_request = expected_json
+            || text_or_tags_indicate_automation(workflow, role, task_tags, prompt_text);
+        if workload_class == WorkloadClass::Interactive && !automation_request {
+            return base;
+        }
+        if !automation_request {
             return base;
         }
         let automation_default = self
