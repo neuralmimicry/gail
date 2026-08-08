@@ -109,6 +109,13 @@ struct PostgresWriterState {
     client: Option<tokio_postgres::Client>,
     failure_streak: u32,
     cooldown_until: f64,
+    last_reported_error: Option<String>,
+}
+
+#[derive(Debug)]
+enum PostgresPersistError {
+    CoolingDown { remaining_seconds: u64 },
+    Failure { message: String, report: bool },
 }
 
 impl Default for ApiIssue {
@@ -557,15 +564,33 @@ fn spawn_save(save: Option<SaveRequest>) {
             tracing::warn!(error = %error, "failed to persist Gail API issue registry");
         }
         if let Some(dsn) = save.postgres_dsn.as_deref() {
-            if let Err(error) = persist_postgres(dsn, &save.snapshot).await {
-                tracing::warn!(error = %error, "failed to persist Gail API issues to Postgres");
-                let mut store = GLOBAL_STORE.lock().await;
-                store.registry.storage.last_postgres_error =
-                    Some(truncate(&error.to_string(), 700));
-            } else {
-                let mut store = GLOBAL_STORE.lock().await;
-                store.registry.storage.last_postgres_save_at = Some(now_ts());
-                store.registry.storage.last_postgres_error = None;
+            match persist_postgres(dsn, &save.snapshot).await {
+                Ok(()) => {
+                    let mut store = GLOBAL_STORE.lock().await;
+                    store.registry.storage.last_postgres_save_at = Some(now_ts());
+                    store.registry.storage.last_postgres_error = None;
+                }
+                Err(PostgresPersistError::CoolingDown { remaining_seconds }) => {
+                    tracing::debug!(
+                        remaining_seconds,
+                        "Gail API issue Postgres persistence is cooling down"
+                    );
+                }
+                Err(PostgresPersistError::Failure { message, report }) => {
+                    if report {
+                        tracing::warn!(
+                            error = %message,
+                            "failed to persist Gail API issues to Postgres"
+                        );
+                    } else {
+                        tracing::debug!(
+                            error = %message,
+                            "Gail API issue Postgres persistence failure remains unchanged"
+                        );
+                    }
+                    let mut store = GLOBAL_STORE.lock().await;
+                    store.registry.storage.last_postgres_error = Some(truncate(&message, 700));
+                }
             }
         }
     });
@@ -593,54 +618,95 @@ async fn persist_file(path: &PathBuf, snapshot: &ApiIssueRegistry) -> std::io::R
     Ok(store.registry.storage.last_file_save_at)
 }
 
-async fn persist_postgres(dsn: &str, snapshot: &ApiIssueRegistry) -> Result<(), String> {
+async fn persist_postgres(
+    dsn: &str,
+    snapshot: &ApiIssueRegistry,
+) -> Result<(), PostgresPersistError> {
     let mut writer = POSTGRES_WRITER.lock().await;
     let now = now_ts();
     if writer.cooldown_until > now {
         let remaining = (writer.cooldown_until - now).ceil().max(1.0);
-        return Err(format!(
-            "Postgres persistence is cooling down for {}s after recent failures",
-            remaining as u64
-        ));
+        return Err(PostgresPersistError::CoolingDown {
+            remaining_seconds: remaining as u64,
+        });
     }
 
     let dsn_changed = writer.dsn.as_deref().is_none_or(|active| active != dsn);
     if writer.client.is_none() || dsn_changed {
-        let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.map_err(|error| {
-            apply_postgres_failure_backoff(&mut writer, &error);
-            describe_postgres_error(&error)
-        })?;
+        if dsn_changed {
+            writer.failure_streak = 0;
+            writer.cooldown_until = 0.0;
+            writer.last_reported_error = None;
+            writer.dsn = Some(dsn.to_string());
+        }
+        let (client, connection) = match tokio_postgres::connect(dsn, NoTls).await {
+            Ok(connection) => connection,
+            Err(error) => return Err(record_postgres_failure(&mut writer, &error)),
+        };
         tokio::spawn(async move {
             if let Err(error) = connection.await {
                 tracing::debug!(error = %error, "Gail API issue Postgres connection ended");
             }
         });
-        ensure_postgres_tables(&client).await.map_err(|error| {
-            apply_postgres_failure_backoff(&mut writer, &error);
-            describe_postgres_error(&error)
-        })?;
+        if let Err(error) = ensure_postgres_tables(&client).await {
+            return Err(record_postgres_failure(&mut writer, &error));
+        }
         writer.client = Some(client);
         writer.dsn = Some(dsn.to_string());
         writer.failure_streak = 0;
         writer.cooldown_until = 0.0;
+        writer.last_reported_error = None;
     }
 
     let Some(client) = writer.client.as_ref() else {
-        return Err("Postgres writer is not connected".to_string());
+        return Err(record_postgres_failure_message(
+            &mut writer,
+            "Postgres writer is not connected".to_string(),
+            false,
+        ));
     };
 
-    match persist_postgres_snapshot(client, snapshot).await {
+    let persist_result = persist_postgres_snapshot(client, snapshot).await;
+    match persist_result {
         Ok(()) => {
             writer.failure_streak = 0;
             writer.cooldown_until = 0.0;
+            writer.last_reported_error = None;
             Ok(())
         }
         Err(error) => {
             writer.client = None;
-            apply_postgres_failure_backoff(&mut writer, &error);
-            Err(describe_postgres_error(&error))
+            Err(record_postgres_failure_message(
+                &mut writer,
+                describe_postgres_error(&error),
+                postgres_error_is_too_many_clients(&error),
+            ))
         }
     }
+}
+
+fn record_postgres_failure(
+    writer: &mut PostgresWriterState,
+    error: &tokio_postgres::Error,
+) -> PostgresPersistError {
+    record_postgres_failure_message(
+        writer,
+        describe_postgres_error(error),
+        postgres_error_is_too_many_clients(error),
+    )
+}
+
+fn record_postgres_failure_message(
+    writer: &mut PostgresWriterState,
+    message: String,
+    too_many_clients: bool,
+) -> PostgresPersistError {
+    apply_postgres_failure_backoff(writer, too_many_clients);
+    let report = writer.last_reported_error.as_deref() != Some(message.as_str());
+    if report {
+        writer.last_reported_error = Some(message.clone());
+    }
+    PostgresPersistError::Failure { message, report }
 }
 
 async fn ensure_postgres_tables(
@@ -716,9 +782,16 @@ async fn persist_postgres_snapshot(
     Ok(())
 }
 
-fn apply_postgres_failure_backoff(state: &mut PostgresWriterState, error: &tokio_postgres::Error) {
+fn apply_postgres_failure_backoff(state: &mut PostgresWriterState, too_many_clients: bool) {
     state.failure_streak = state.failure_streak.saturating_add(1);
-    state.cooldown_until = now_ts() + postgres_backoff_seconds(error, state.failure_streak);
+    let backoff = if too_many_clients {
+        API_ISSUES_POSTGRES_TOO_MANY_CLIENTS_BACKOFF_SECONDS
+    } else {
+        let exponent = state.failure_streak.saturating_sub(1).min(8);
+        (API_ISSUES_POSTGRES_FAILURE_BASE_BACKOFF_SECONDS * 2u32.pow(exponent) as f64)
+            .min(API_ISSUES_POSTGRES_FAILURE_MAX_BACKOFF_SECONDS)
+    };
+    state.cooldown_until = now_ts() + backoff;
 }
 
 fn describe_postgres_error(error: &tokio_postgres::Error) -> String {
@@ -731,16 +804,6 @@ fn describe_postgres_error(error: &tokio_postgres::Error) -> String {
         return details;
     }
     error.to_string()
-}
-
-fn postgres_backoff_seconds(error: &tokio_postgres::Error, failure_streak: u32) -> f64 {
-    if postgres_error_is_too_many_clients(error) {
-        return API_ISSUES_POSTGRES_TOO_MANY_CLIENTS_BACKOFF_SECONDS;
-    }
-    let exponent = failure_streak.saturating_sub(1).min(8);
-    let multiplier = 2u32.pow(exponent) as f64;
-    (API_ISSUES_POSTGRES_FAILURE_BASE_BACKOFF_SECONDS * multiplier)
-        .min(API_ISSUES_POSTGRES_FAILURE_MAX_BACKOFF_SECONDS)
 }
 
 fn postgres_error_is_too_many_clients(error: &tokio_postgres::Error) -> bool {
@@ -1047,5 +1110,38 @@ mod tests {
                 .iter()
                 .all(|line| line.contains("endpoint=\"GET /api/"))
         );
+    }
+
+    #[test]
+    fn postgres_failure_warning_is_reported_once_until_the_error_changes() {
+        let mut writer = PostgresWriterState::default();
+
+        let first = record_postgres_failure_message(
+            &mut writer,
+            "password authentication failed (28P01)".to_string(),
+            false,
+        );
+        let repeated = record_postgres_failure_message(
+            &mut writer,
+            "password authentication failed (28P01)".to_string(),
+            false,
+        );
+        let changed =
+            record_postgres_failure_message(&mut writer, "connection refused".to_string(), false);
+
+        assert!(matches!(
+            first,
+            PostgresPersistError::Failure { report: true, .. }
+        ));
+        assert!(matches!(
+            repeated,
+            PostgresPersistError::Failure { report: false, .. }
+        ));
+        assert!(matches!(
+            changed,
+            PostgresPersistError::Failure { report: true, .. }
+        ));
+        assert_eq!(writer.failure_streak, 3);
+        assert!(writer.cooldown_until > now_ts());
     }
 }
