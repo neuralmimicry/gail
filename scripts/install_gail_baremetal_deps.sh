@@ -35,6 +35,9 @@
 #
 set -Eeuo pipefail
 
+# shellcheck source=ensure_64k_hwe_nvidia.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ensure_64k_hwe_nvidia.sh"
+
 trap 'echo "ERROR: line ${LINENO}: command failed: ${BASH_COMMAND}" >&2' ERR
 
 : "${INSTALL_PREFIX:=/opt}"
@@ -118,6 +121,7 @@ resolve_jobs() {
 
 install_system_packages() {
   log "Installing Ubuntu system dependencies"
+  gail_ensure_64k_hwe_nvidia "${LIBTORCH_ACCELERATOR}"
   as_root apt-get update
   as_root apt-get install -y --no-install-recommends \
     apt-transport-https build-essential ca-certificates ccache clang cmake curl \

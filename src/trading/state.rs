@@ -299,7 +299,12 @@ impl TradingState {
                 !is_cash_asset(asset)
                     && balance.total.is_finite()
                     && balance.total > 0.0
-                    && balance.value_usd.is_none_or(|value| value > 0.01)
+                    // Without a reliable USD valuation we cannot establish
+                    // that the asset is an economically meaningful position.
+                    // Do not let unvalued dust block new entries.
+                    && balance
+                        .value_usd
+                        .is_some_and(|value| value.is_finite() && value > 0.01)
             })
             .count()
     }

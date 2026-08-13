@@ -569,7 +569,11 @@ async fn query_provider(
             content: MessageContent::Text(prompt),
         }],
         system: Some(system),
-        max_tokens: Some(512),
+        // Trading responses must have enough budget to finish the JSON object
+        // even when a local reasoning model would otherwise spend most of its
+        // allocation on hidden thought. Local providers receive an explicit
+        // no-thinking directive below in their transport implementation.
+        max_tokens: Some(16_384),
         temperature: Some(0.2),
         timeout_seconds: Some(timeout_secs),
         reasoning_effort: None,
@@ -839,6 +843,19 @@ fn parse_advisory_response(raw: &str) -> ParsedAdvisory {
         };
     }
 
+    if !has_complete_advisory_fields(object) {
+        return ParsedAdvisory {
+            action: "hold".to_string(),
+            confidence: 0.0,
+            reasoning: "advisory JSON was incomplete".to_string(),
+            suggested_amount_usd: None,
+            risk_score: 1.0,
+            risk_flags: vec!["incomplete_json".to_string()],
+            target_symbol: None,
+            parsed_ok: false,
+        };
+    }
+
     let mut action = string_field(object, &["action", "recommendation", "decision"])
         .map(normalise_action)
         .unwrap_or_else(|| "hold".to_string());
@@ -912,20 +929,14 @@ fn parse_advisory_response(raw: &str) -> ParsedAdvisory {
 }
 
 fn extract_advisory_json(raw: &str) -> Option<Value> {
-    let cleaned = raw
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
-    serde_json::from_str::<Value>(cleaned).ok().or_else(|| {
-        let start = cleaned.find(['{', '['])?;
-        let end = cleaned.rfind(['}', ']'])?;
-        if end <= start {
-            return None;
-        }
-        serde_json::from_str::<Value>(&cleaned[start..=end]).ok()
-    })
+    // Do not recover a JSON-looking substring from prose or a truncated
+    // response. A trading response is executable input and must be one
+    // complete JSON document from the first byte to the last.
+    let cleaned = raw.trim();
+    if cleaned.starts_with("```") || cleaned.ends_with("```") {
+        return None;
+    }
+    serde_json::from_str::<Value>(cleaned).ok()
 }
 
 fn advisory_payload_object(value: &Value) -> Option<&serde_json::Map<String, Value>> {
@@ -936,7 +947,6 @@ fn advisory_payload_object(value: &Value) -> Option<&serde_json::Map<String, Val
             .or_else(|| object.get("decision"))
             .and_then(Value::as_object)
             .or(Some(object)),
-        Value::Array(items) => items.iter().find_map(Value::as_object),
         _ => None,
     }
 }
@@ -953,6 +963,34 @@ fn looks_like_schema_echo(object: &serde_json::Map<String, Value>) -> bool {
             .and_then(Value::as_str)
             .is_some_and(|value| value.eq_ignore_ascii_case("object"))
         && !object.contains_key("action")
+}
+
+fn has_complete_advisory_fields(object: &serde_json::Map<String, Value>) -> bool {
+    let required = [
+        "action",
+        "confidence",
+        "reasoning",
+        "suggested_amount_usd",
+        "risk_score",
+        "risk_flags",
+        "target_symbol",
+    ];
+    required.iter().all(|key| object.contains_key(*key))
+        && object
+            .get("action")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        && object
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        && numeric_field(object, &["confidence"]).is_some()
+        && object
+            .get("risk_score")
+            .is_some_and(|value| !value.is_null())
+        && object
+            .get("risk_flags")
+            .is_some_and(|value| value.is_array() || value.is_string())
 }
 
 fn string_field<'a>(object: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Option<&'a str> {
@@ -1299,6 +1337,22 @@ mod tests {
         assert_eq!(parsed.risk_score, 0.25);
         assert_eq!(parsed.risk_flags, vec!["thin_liquidity".to_string()]);
         assert_eq!(parsed.target_symbol.as_deref(), Some("BTC/USDT"));
+    }
+
+    #[test]
+    fn parse_advisory_response_rejects_prose_or_truncated_json() {
+        let complete = r#"{"action":"hold","confidence":0.5,"reasoning":"uncertain","suggested_amount_usd":null,"risk_score":0.5,"risk_flags":[],"target_symbol":null}"#;
+        let with_prose = format!("Here is the answer: {complete}");
+        let truncated = &complete[..complete.len() - 2];
+        assert!(!parse_advisory_response(&with_prose).parsed_ok);
+        assert!(!parse_advisory_response(truncated).parsed_ok);
+    }
+
+    #[test]
+    fn parse_advisory_response_rejects_incomplete_object() {
+        let parsed = parse_advisory_response(r#"{"action":"buy","confidence":0.8}"#);
+        assert!(!parsed.parsed_ok);
+        assert!(parsed.risk_flags.contains(&"incomplete_json".to_string()));
     }
 
     #[test]

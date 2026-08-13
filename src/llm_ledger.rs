@@ -622,11 +622,13 @@ pub async fn recover_training_infrastructure_failures(
             SELECT id, train_error
             FROM gail_llm_interactions
             WHERE train_status = 'failed'
-              AND training_snapshot IS NULL
               AND (
                   train_error ILIKE '%gail-qlora-sft%'
                   OR train_error ILIKE '%failed to spawn trainer command%'
                   OR train_error ILIKE '%Ollama API /api/create failed%'
+                  OR train_error ILIKE '%Slurm training exited with status%'
+                  OR train_error ILIKE '%Ollama adapter conversion exited%'
+                  OR train_error ILIKE '%unable to inspect Safetensors adapter%'
               )
             ORDER BY id ASC
             LIMIT $1
@@ -658,7 +660,6 @@ pub async fn recover_training_infrastructure_failures(
                 training_snapshot = NULL
             WHERE id = ANY($1)
               AND train_status = 'failed'
-              AND training_snapshot IS NULL
             "#,
             &[&ids],
         )

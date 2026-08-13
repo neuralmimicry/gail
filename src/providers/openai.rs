@@ -1,5 +1,6 @@
 use std::{
     env,
+    net::IpAddr,
     time::{Duration, Instant},
 };
 
@@ -294,10 +295,16 @@ impl OpenAIProvider {
         }
 
         let url = endpoint(&base_url, "chat/completions");
+        let local_trading_request = is_local_trading_request(request, &base_url);
         for attempt in 0..2 {
             let mut messages = Vec::new();
             if let Some(system) = request.system.as_ref() {
-                messages.push(json!({"role": "system", "content": system}));
+                let content = if local_trading_request {
+                    format!("{system}\n/no_think")
+                } else {
+                    system.clone()
+                };
+                messages.push(json!({"role": "system", "content": content}));
             }
             for message in &request.messages {
                 messages.push(json!({
@@ -312,6 +319,12 @@ impl OpenAIProvider {
             });
             if let Some(max_tokens) = request.max_tokens {
                 payload["max_tokens"] = json!(max_tokens);
+            }
+            if local_trading_request {
+                // llama.cpp accepts this OpenAI-compatible extension and
+                // avoids spending the output budget on a reasoning channel.
+                payload["chat_template_kwargs"] = json!({"enable_thinking": false});
+                payload["response_format"] = json!({"type": "json_object"});
             }
             if self.supports_prompt_cache
                 && let Some(cache_key) =
@@ -430,9 +443,13 @@ impl OpenAIProvider {
     ) -> Result<ProviderInvocationResponse> {
         let url = endpoint(base_url, "completions");
         let mut prompt = String::new();
+        let local_trading_request = is_local_trading_request(request, base_url);
         if let Some(system) = request.system.as_deref() {
             prompt.push_str("System:\n");
             prompt.push_str(system);
+            if local_trading_request {
+                prompt.push_str("\n/no_think");
+            }
             prompt.push_str("\n\n");
         }
         for message in &request.messages {
@@ -703,6 +720,36 @@ fn openai_model_supports_reasoning_effort(model: &str) -> bool {
         || normalized.starts_with("o3")
         || normalized.starts_with("o4")
         || normalized.starts_with("codex")
+}
+
+fn is_local_trading_request(request: &ProviderCompletionRequest, base_url: &str) -> bool {
+    if !request
+        .request_category
+        .as_deref()
+        .is_some_and(|category| category.eq_ignore_ascii_case("trading_advisory"))
+    {
+        return false;
+    }
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if matches!(
+        host.to_ascii_lowercase().as_str(),
+        "localhost" | "llama.cpp"
+    ) || host.ends_with(".local")
+        || host.ends_with(".svc")
+    {
+        return true;
+    }
+    host.parse::<IpAddr>().is_ok_and(|address| match address {
+        IpAddr::V4(address) => {
+            address.is_private() || address.is_loopback() || address.is_link_local()
+        }
+        IpAddr::V6(address) => address.is_loopback() || address.is_unique_local(),
+    })
 }
 
 fn background_enabled(

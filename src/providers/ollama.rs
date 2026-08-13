@@ -450,8 +450,20 @@ impl OllamaProvider {
             .clone()
             .unwrap_or_else(|| self.base_url.clone());
         let mut model = request.model.clone().unwrap_or_else(|| self.model.clone());
-        let prompt = collapse_messages(request);
-        let max_predict = env_int("GAIL_OLLAMA_MAX_PREDICT", 512).max(1) as u32;
+        let local_trading_request = request
+            .request_category
+            .as_deref()
+            .is_some_and(|category| category.eq_ignore_ascii_case("trading_advisory"));
+        let mut prompt = collapse_messages(request);
+        if local_trading_request {
+            prompt.push_str("\n/no_think");
+        }
+        let configured_max_predict = env_int("GAIL_OLLAMA_MAX_PREDICT", 512).max(1) as u32;
+        let max_predict = if local_trading_request {
+            configured_max_predict.max(16_384)
+        } else {
+            configured_max_predict
+        };
         let num_ctx = env_int("GAIL_OLLAMA_NUM_CTX", 0).max(0) as u32;
         let requested_predict = request
             .max_tokens

@@ -619,10 +619,20 @@ jobs:
           - arch: amd64
             platform: linux/amd64
             runs_on: '["ubuntu-latest"]'
+            variant: amd64
+            page_size: 4k
             pytorch_jobs_default: auto
           - arch: arm64
             platform: linux/arm64
             runs_on: '["ubuntu-24.04-arm"]'
+            variant: arm64-4k
+            page_size: 4k
+            pytorch_jobs_default: "2"
+          - arch: arm64
+            platform: linux/arm64
+            runs_on: '["ubuntu-24.04-arm"]'
+            variant: arm64-64k-hwe
+            page_size: 64k-hwe
             pytorch_jobs_default: "2"
     env:
       BUILD_VERSION: ${{ needs.version.outputs.build_version }}
@@ -641,6 +651,15 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Ensure 64K HWE NVIDIA host package when required
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.page_size }}" == "64k-hwe" ]]; then
+            source scripts/ensure_64k_hwe_nvidia.sh
+            gail_ensure_64k_hwe_nvidia "${{ github.event_name == 'workflow_dispatch' && inputs.container_libtorch_accelerator || 'cpu' }}"
+          fi
+
       - name: Prepare image metadata
         id: image
         run: |
@@ -648,7 +667,7 @@ jobs:
           image_repo="ghcr.io/${GITHUB_REPOSITORY,,}"
           created="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           echo "repo=${image_repo}" >> "${GITHUB_OUTPUT}"
-          echo "arch_tag=${image_repo}:${BUILD_VERSION}-${{ matrix.arch }}" >> "${GITHUB_OUTPUT}"
+          echo "arch_tag=${image_repo}:${BUILD_VERSION}-${{ matrix.variant }}" >> "${GITHUB_OUTPUT}"
           echo "created=${created}" >> "${GITHUB_OUTPUT}"
 
       - name: Validate container tooling
@@ -770,10 +789,10 @@ jobs:
           libtorch_seed_image="${provided_libtorch_seed_image}"
 
           if [[ -z "${libtorch_seed_image}" ]]; then
-            libtorch_key_seed="arch=${MATRIX_ARCH};version=${libtorch_version};accel=${INPUT_LIBTORCH_ACCELERATOR};url=${libtorch_url};build_from_source=${libtorch_build_from_source};amd64_from_source=${libtorch_amd64_build_from_source};arm64_from_source=${libtorch_arm64_build_from_source};arm64_sve=${arm64_sve};arm64_xnnpack=${libtorch_arm64_xnnpack};arm64_kleidiai=${libtorch_arm64_kleidiai};pytorch_tag=${pytorch_git_tag}"
+            libtorch_key_seed="arch=${MATRIX_ARCH};page_size=${{ matrix.page_size }};version=${libtorch_version};accel=${INPUT_LIBTORCH_ACCELERATOR};url=${libtorch_url};build_from_source=${libtorch_build_from_source};amd64_from_source=${libtorch_amd64_build_from_source};arm64_from_source=${libtorch_arm64_build_from_source};arm64_sve=${arm64_sve};arm64_xnnpack=${libtorch_arm64_xnnpack};arm64_kleidiai=${libtorch_arm64_kleidiai};pytorch_tag=${pytorch_git_tag}"
             libtorch_cache_hash="$(printf '%s' "${libtorch_key_seed}" | sha256sum | cut -c1-24)"
             libtorch_version_tag="$(printf '%s' "${libtorch_version}" | tr -c '[:alnum:]._-' '-')"
-            libtorch_cache_tag="libtorch-${MATRIX_ARCH}-${libtorch_version_tag}-${libtorch_cache_hash}"
+            libtorch_cache_tag="libtorch-${{ matrix.variant }}-${libtorch_version_tag}-${libtorch_cache_hash}"
             libtorch_seed_image="${IMAGE_REPO}:${libtorch_cache_tag}"
 
             if skopeo inspect --creds "${registry_user}:${registry_token}" "docker://${libtorch_seed_image}" >/dev/null 2>&1; then
@@ -787,6 +806,7 @@ jobs:
                 --pull \
                 --layers \
                 --build-arg LIBTORCH_VERSION="${libtorch_version}" \
+                --build-arg TARGET_PAGE_SIZE="${{ matrix.page_size }}" \
                 --build-arg LIBTORCH_ACCELERATOR="${INPUT_LIBTORCH_ACCELERATOR}" \
                 --build-arg LIBTORCH_URL="${libtorch_url}" \
                 --build-arg LIBTORCH_BUILD_FROM_SOURCE="${libtorch_build_from_source}" \
@@ -826,6 +846,7 @@ jobs:
             --layers \
             "${no_cache_flag[@]}" \
             --build-arg GAIL_VERSION=source \
+            --build-arg TARGET_PAGE_SIZE="${{ matrix.page_size }}" \
             --build-arg BUILD_VERSION="${BUILD_VERSION}" \
             --build-arg VCS_REF="${GITHUB_SHA}" \
             --build-arg GITHUB_REPOSITORY="${GITHUB_REPOSITORY}" \
@@ -927,7 +948,7 @@ jobs:
           set -euo pipefail
           manifest_local="gail-manifest-${BUILD_VERSION}"
           amd64_ref="docker://${IMAGE_REPO}:${BUILD_VERSION}-amd64"
-          arm64_ref="docker://${IMAGE_REPO}:${BUILD_VERSION}-arm64"
+          arm64_ref="docker://${IMAGE_REPO}:${BUILD_VERSION}-arm64-4k"
 
           podman manifest rm "${manifest_local}" >/dev/null 2>&1 || true
           podman manifest create "${manifest_local}"

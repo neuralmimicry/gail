@@ -86,6 +86,7 @@ pub struct AarnnMirrorClient {
     audit_enabled: bool,
     audit_log_llm_prompts: bool,
     audit_log_llm_responses: bool,
+    audit_store_llm_content: bool,
     audit_log_aer_payloads: bool,
     audit_max_chars: usize,
 }
@@ -143,6 +144,7 @@ impl AarnnMirrorClient {
             audit_enabled: config.audit_logging.enabled,
             audit_log_llm_prompts: config.audit_logging.log_llm_prompts,
             audit_log_llm_responses: config.audit_logging.log_llm_responses,
+            audit_store_llm_content: config.audit_logging.store_llm_content,
             audit_log_aer_payloads: config.audit_logging.log_aer_payloads,
             audit_max_chars: config.audit_logging.max_chars.clamp(1, 262_144),
         };
@@ -302,10 +304,14 @@ impl AarnnMirrorClient {
         value: Option<&str>,
     ) -> Option<String> {
         match direction {
-            AarnnMirrorDirection::Input if self.audit_log_llm_prompts => {
+            AarnnMirrorDirection::Input
+                if self.audit_log_llm_prompts && self.audit_store_llm_content =>
+            {
                 self.optional_audit_text(value)
             }
-            AarnnMirrorDirection::Output if self.audit_log_llm_responses => {
+            AarnnMirrorDirection::Output
+                if self.audit_log_llm_responses && self.audit_store_llm_content =>
+            {
                 self.optional_audit_text(value)
             }
             _ => None,
@@ -319,7 +325,7 @@ impl AarnnMirrorClient {
         let text = self.audit_text_for_direction(&request.direction, Some(request.text.as_str()));
         let prompt_text =
             self.audit_text_for_direction(&request.direction, request.prompt_text.as_deref());
-        let system_text = if self.audit_log_llm_prompts {
+        let system_text = if self.audit_log_llm_prompts && self.audit_store_llm_content {
             self.optional_audit_text(request.system.as_deref())
         } else {
             None
@@ -373,7 +379,7 @@ impl AarnnMirrorClient {
         if !self.audit_enabled {
             return;
         }
-        let candidate_reply_text = if self.audit_log_llm_responses {
+        let candidate_reply_text = if self.audit_log_llm_responses && self.audit_store_llm_content {
             self.optional_audit_text(
                 response
                     .candidate
@@ -996,6 +1002,7 @@ mod tests {
             audit_enabled: false,
             audit_log_llm_prompts: true,
             audit_log_llm_responses: true,
+            audit_store_llm_content: false,
             audit_log_aer_payloads: true,
             audit_max_chars: 2048,
         };

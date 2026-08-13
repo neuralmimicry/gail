@@ -947,6 +947,32 @@ async fn resolve_training_invocation(
     }
 
     if matches!(trainer.algorithm.as_str(), "qlora_sft" | "lora_sft") {
+        let python_runner = env_string("GAIL_PYTHON_QLORA_SFT_BIN")
+            .unwrap_or_else(|| "/usr/local/libexec/gail-qlora-sft-python".to_string());
+        let prefer_python = env::var("GAIL_TRAINER_BACKEND")
+            .map(|value| !value.trim().eq_ignore_ascii_case("rust_torchscript"))
+            .unwrap_or(true);
+        if prefer_python && Path::new(&python_runner).is_file() {
+            let python = bootstrap_python_binary();
+            let ollama_base_model = trainer.ollama_base_model.as_str();
+            let hf_base_model = env_string("GAIL_TRAIN_HF_BASE_MODEL")
+                .or_else(|| mapped_hf_model(ollama_base_model).map(ToOwned::to_owned))
+                .ok_or_else(|| {
+                    GailError::invalid_config(format!(
+                        "Python PEFT trainer requires a Hugging Face base model; set GAIL_TRAIN_HF_BASE_MODEL for Ollama model {ollama_base_model}"
+                    ))
+                })?;
+            return Ok(Some(format!(
+                "env -u LD_LIBRARY_PATH {} {} --dataset {} --output {} --algorithm {} --base-model {} --ollama-base-model {}",
+                shell_escape(python.as_str()),
+                shell_escape(python_runner.as_str()),
+                shell_escape(&dataset_path.to_string_lossy()),
+                shell_escape(&snapshot_dir.to_string_lossy()),
+                shell_escape(trainer.algorithm.as_str()),
+                shell_escape(hf_base_model.as_str()),
+                shell_escape(ollama_base_model),
+            )));
+        }
         let runner = std::env::var("GAIL_RUST_QLORA_SFT_BIN")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -1205,6 +1231,9 @@ fn mapped_hf_model(base_model: &str) -> Option<&'static str> {
         "qwen2.5:1.5b" => Some("Qwen/Qwen2.5-1.5B"),
         "qwen2.5:3b" => Some("Qwen/Qwen2.5-3B"),
         "qwen2.5:7b" => Some("Qwen/Qwen2.5-7B"),
+        "qwen3.5:0.8b" => Some("Qwen/Qwen3.5-0.8B"),
+        "qwen3.5:2b" => Some("Qwen/Qwen3.5-2B"),
+        "qwen3.5:4b" => Some("Qwen/Qwen3.5-4B"),
         _ => None,
     }
 }
@@ -1482,7 +1511,65 @@ async fn register_snapshot_with_ollama(
         }),
     )
     .await?;
+    if registration_mode == OllamaRegistrationMode::Adapter {
+        publish_llama_cpp_adapter(snapshot_dir, snapshot_id).await?;
+    }
     Ok(registration_mode)
+}
+
+/// Publish the validated adapter at a stable path consumed by the qc01
+/// llama.cpp service.  The rename is atomic on the shared filesystem, so the
+/// watcher can never restart llama.cpp against a partially written GGUF.
+async fn publish_llama_cpp_adapter(snapshot_dir: &Path, snapshot_id: &str) -> Result<()> {
+    let source = snapshot_dir.join("adapter.gguf");
+    let metadata = fs::metadata(&source).await.map_err(|error| {
+        GailError::invalid_config(format!(
+            "validated GGUF adapter is missing for llama.cpp publication: {error}"
+        ))
+    })?;
+    if !metadata.is_file() || metadata.len() < 4 {
+        return Err(GailError::invalid_config(
+            "validated GGUF adapter is empty; refusing llama.cpp publication",
+        ));
+    }
+    let output_root = snapshot_dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| GailError::invalid_config("snapshot path has no training output root"))?;
+    let serving_dir = output_root.join("serving");
+    fs::create_dir_all(&serving_dir).await.map_err(|error| {
+        GailError::invalid_config(format!(
+            "failed to create llama.cpp serving directory: {error}"
+        ))
+    })?;
+    let temporary = serving_dir.join(format!(
+        ".adapter.gguf-{snapshot_id}-{}",
+        std::process::id()
+    ));
+    fs::copy(&source, &temporary).await.map_err(|error| {
+        GailError::invalid_config(format!(
+            "failed to stage GGUF adapter for llama.cpp: {error}"
+        ))
+    })?;
+    fs::rename(&temporary, serving_dir.join("adapter.gguf"))
+        .await
+        .map_err(|error| {
+            GailError::invalid_config(format!(
+                "failed to atomically publish llama.cpp adapter: {error}"
+            ))
+        })?;
+    fs::write(
+        serving_dir.join("adapter.snapshot"),
+        format!("{snapshot_id}\n"),
+    )
+    .await
+    .map_err(|error| {
+        GailError::invalid_config(format!(
+            "failed to publish llama.cpp adapter metadata: {error}"
+        ))
+    })?;
+    tracing::info!(snapshot = snapshot_id, path = %serving_dir.display(), "published trained GGUF adapter for llama.cpp");
+    Ok(())
 }
 
 /// Prepare an adapter in the format accepted by the selected serving runtime.

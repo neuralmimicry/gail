@@ -407,7 +407,7 @@ impl Default for TradingConfig {
             advisory_candidate_limit: 8,
             micro_trade_max_usd: 25.0,
             micro_trade_min_usd: 1.0,
-            max_open_positions: 5,
+            max_open_positions: 40,
             min_trade_interval_seconds: 120,
             target_exchanges: Vec::new(),
             target_currencies: Vec::new(),

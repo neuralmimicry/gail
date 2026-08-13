@@ -339,7 +339,7 @@ mod tests {
         assert_eq!(cfg.decision_roi_feedback_max_signal_adjustment, 0.2);
         assert_eq!(cfg.decision_roi_feedback_max_confidence_penalty, 0.35);
         assert_eq!(cfg.decision_roi_feedback_max_confidence_boost, 0.1);
-        assert_eq!(cfg.max_open_positions, 5);
+        assert_eq!(cfg.max_open_positions, 40);
         assert_eq!(cfg.evaluation_interval_seconds, 900);
         assert_eq!(cfg.advisor_timeout_seconds, 840.0);
         assert_eq!(cfg.advisor_round_timeout_seconds, 900.0);
@@ -877,6 +877,36 @@ mod tests {
         assert_eq!(snap.quant_mode, "shadow");
         assert_eq!(snap.quant_active_parameter_id, "balanced-v1");
         assert_eq!(snap.quant_pending_evaluations, 0);
+    }
+
+    #[test]
+    fn unvalued_non_cash_assets_do_not_count_as_open_positions() {
+        use crate::trading::state::TradingState;
+        let mut state = TradingState::new(100, 100);
+        state.current_portfolio = Some(OctobotPortfolio {
+            currencies: [
+                (
+                    "BTC".to_string(),
+                    CurrencyBalance {
+                        total: 0.1,
+                        value_usd: Some(100.0),
+                        ..CurrencyBalance::default()
+                    },
+                ),
+                (
+                    "UNKNOWN".to_string(),
+                    CurrencyBalance {
+                        total: 100.0,
+                        value_usd: None,
+                        ..CurrencyBalance::default()
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..OctobotPortfolio::default()
+        });
+        assert_eq!(state.open_position_count(), 1);
     }
 
     #[test]

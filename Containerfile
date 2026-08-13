@@ -41,6 +41,7 @@
 #   --build-arg LIBTORCH_STRICT_ACCELERATOR=true
 #
 
+ARG TARGET_PAGE_SIZE=4k
 ARG LIBTORCH_SEED_IMAGE=docker.io/library/debian:bookworm-slim
 FROM ${LIBTORCH_SEED_IMAGE} AS libtorch-seed
 
@@ -87,11 +88,13 @@ RUN set -eu; \
     export BUILD_JOBS CMAKE_BUILD_PARALLEL_LEVEL PYTORCH_BUILD_PARALLEL_LEVEL; \
     export MAKEFLAGS="-j${BUILD_JOBS}"; \
     echo "Build parallelism: BUILD_JOBS=${BUILD_JOBS} CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL} PYTORCH_BUILD_PARALLEL_LEVEL=${PYTORCH_BUILD_PARALLEL_LEVEL}"; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
+    apt-get -o Acquire::ForceIPv4=true update; \
+    apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends \
         ca-certificates \
         curl \
-        unzip; \
+        unzip \
+        python3 \
+        python3-venv; \
     rm -rf /var/lib/apt/lists/*; \
     detected_arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
     case "${detected_arch}" in \
@@ -196,8 +199,6 @@ RUN set -eu; \
     fi; \
     if [ "${reuse_cached_libtorch}" != "true" ] && [ "${install_from_python_wheel}" = "true" ]; then \
         echo "Installing arm64 CPU libtorch from the official PyTorch ${LIBTORCH_VERSION} wheel"; \
-        apt-get update; \
-        apt-get install -y --no-install-recommends python3 python3-venv; \
         python3 -m venv /tmp/libtorch-wheel-venv; \
         if /tmp/libtorch-wheel-venv/bin/python -m pip install \
             --no-cache-dir \
@@ -266,8 +267,8 @@ RUN set -eu; \
                 pytorch_tag="${expected_pytorch_tag}"; \
             fi; \
             echo "Building CPU libtorch directly with CMake from PyTorch source tag ${pytorch_tag} for ${norm_arch}"; \
-            apt-get update; \
-            apt-get install -y --no-install-recommends \
+            apt-get -o Acquire::ForceIPv4=true update; \
+            apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends \
                 build-essential \
                 ccache \
                 cmake \
@@ -433,8 +434,8 @@ COPY --from=libtorch /opt/libtorch /opt/libtorch
 FROM docker.io/library/debian:bookworm-slim AS llama-converter
 ARG LLAMA_CPP_COMMIT=6a32c29a746a2e44de463de647f9f6661eb5086b
 RUN set -eu; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates curl tar; \
+    apt-get -o Acquire::ForceIPv4=true update; \
+    apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends ca-certificates curl tar; \
     rm -rf /var/lib/apt/lists/*; \
     mkdir -p /opt; \
     curl -fsSL "https://github.com/ggml-org/llama.cpp/archive/${LLAMA_CPP_COMMIT}.tar.gz" -o /tmp/llama.cpp.tar.gz; \
@@ -444,6 +445,10 @@ RUN set -eu; \
     test -f /opt/gail-llama-converter/convert_lora_to_gguf.py; \
     test -d /opt/gail-llama-converter/conversion; \
     test -d /opt/gail-llama-converter/gguf-py; \
+    # llama.cpp's converter treats PEFT LoRA tensors like Torch tensors and
+    # calls dim(); its LoraTorchTensor wrapper in this pinned revision only
+    # exposed shape/size, so genuine Qwen PEFT adapters failed at promotion.
+    sed -i '/^        return self.shape$/a\    def dim(self):\n        return len(self.shape)\n' /opt/gail-llama-converter/convert_lora_to_gguf.py; \
     printf '%s\n' "${LLAMA_CPP_COMMIT}" > /opt/gail-llama-converter/COMMIT
 
 FROM docker.io/library/rust:1-bookworm AS source-deb
@@ -473,8 +478,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 COPY --from=libtorch /opt/libtorch /opt/libtorch
 
 RUN set -eu; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
+    apt-get -o Acquire::ForceIPv4=true update; \
+    apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends \
         build-essential \
         ca-certificates \
         clang \
@@ -541,6 +546,7 @@ COPY --from=libtorch /opt/libtorch /opt/libtorch
 COPY --from=llama-converter /opt/gail-llama-converter /opt/gail-llama-converter
 
 ARG TARGETARCH
+ARG TARGET_PAGE_SIZE
 ARG GAIL_VERSION=latest
 ARG GAIL_DEB_URL=
 ARG GAIL_RELEASE_REPOSITORY=neuralmimicry/gail
@@ -562,7 +568,8 @@ ARG IMAGE_CREATED=unknown
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-LABEL org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" \
+LABEL org.opencontainers.image.page-size="${TARGET_PAGE_SIZE}" \
+      org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.source-tree="${SOURCE_TREE}" \
       org.opencontainers.image.source-dirty="${SOURCE_DIRTY}" \
@@ -572,14 +579,15 @@ LABEL org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" 
 
 COPY --from=source-deb /out/*.deb /tmp/source-gail.deb
 COPY scripts/trainer/convert_lora_to_gguf.py /usr/local/libexec/gail-convert-lora-to-gguf
+COPY scripts/trainer/qlora_sft.py /usr/local/libexec/gail-qlora-sft-python
 COPY gail.yaml /tmp/gail-defaults/gail.yaml
 COPY config/ai-routing-profiles.json /tmp/gail-defaults/ai-routing-profiles.json
 
 RUN --mount=type=secret,id=gail_release_token set -eu; \
     GAIL_RELEASE_TOKEN="$(cat /run/secrets/gail_release_token 2>/dev/null || true)"; \
     export GAIL_RELEASE_TOKEN; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
+    apt-get -o Acquire::ForceIPv4=true update; \
+    apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends \
         ca-certificates \
         clinfo \
         curl \
@@ -651,10 +659,11 @@ RUN --mount=type=secret,id=gail_release_token set -eu; \
             curl -fsSL "${deb_url}" -o /tmp/gail.deb; \
         fi; \
     fi; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends /tmp/gail.deb; \
+    apt-get -o Acquire::ForceIPv4=true update; \
+    apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends /tmp/gail.deb; \
     test -x /usr/bin/gail-qlora-sft; \
     chmod 0755 /usr/local/libexec/gail-convert-lora-to-gguf; \
+    chmod 0755 /usr/local/libexec/gail-qlora-sft-python; \
     rm -f /tmp/gail.deb /tmp/source-gail.deb; \
     mkdir -p /app/config /app/data /app/scripts /var/lib/gail; \
     if [ -f /tmp/gail-defaults/gail.yaml ]; then \
@@ -781,6 +790,7 @@ ENV GAIL_CONFIG=/app/config/gail.yaml \
     GAIL_GPU_AVAILABLE=false \
     GAIL_GPU_BACKEND=none \
     GAIL_RUST_QLORA_SFT_BIN=/usr/bin/gail-qlora-sft \
+    GAIL_PYTHON_QLORA_SFT_BIN=/usr/local/libexec/gail-qlora-sft-python \
     GAIL_PYTHON=/opt/gail-python/bin/python \
     PATH=/opt/gail-python/bin:${PATH} \
     RUST_LOG=info

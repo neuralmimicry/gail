@@ -807,21 +807,20 @@ async fn run_single_evaluation(
         now_ts(),
     );
     let llm_future = async {
-        if quant_primary {
-            None
-        } else {
-            Some(
-                advisor
-                    .consult_all(
-                        &market_snapshots,
-                        &historical_features,
-                        &research,
-                        &portfolio,
-                        config.max_parallel_advisors,
-                    )
-                    .await,
-            )
-        }
+        // Keep the LLM path live after quant promotion. It remains the
+        // paired benchmark, risk overlay, and rollback signal while quant is
+        // the preferred execution method.
+        Some(
+            advisor
+                .consult_all(
+                    &market_snapshots,
+                    &historical_features,
+                    &research,
+                    &portfolio,
+                    config.max_parallel_advisors,
+                )
+                .await,
+        )
     };
     let (sleeve_result, llm_consensus) = tokio::join!(sleeve_future, llm_future);
     match sleeve_result {
@@ -896,9 +895,13 @@ async fn run_single_evaluation(
         }
         application
     };
-    let consensus = llm_consensus
-        .clone()
-        .unwrap_or_else(|| quant_signal.as_consensus());
+    let consensus = if quant_primary {
+        quant_signal.as_consensus()
+    } else {
+        llm_consensus
+            .clone()
+            .unwrap_or_else(|| quant_signal.as_consensus())
+    };
 
     debug!(
         "trading: AI consensus = action={} signal={:.3} confidence={:.2} responders={}",
@@ -1234,12 +1237,15 @@ async fn resolve_quant_evaluations(
             );
         }
         if let Some(migration) = update.migration.as_ref() {
-            current.log(
-                "warn",
-                "quant_migration",
-                "QUANT_REPLACED_LLM",
-                json!(migration),
-            );
+            let marker = if matches!(
+                migration.transition,
+                quant::QuantMigrationTransition::Demoted
+            ) {
+                "QUANT_DEMOTED_LLM"
+            } else {
+                "QUANT_PROMOTED_PRIMARY"
+            };
+            current.log("warn", "quant_migration", marker, json!(migration));
         }
     }
 
@@ -1276,13 +1282,22 @@ async fn resolve_quant_evaluations(
         );
     }
     if let Some(migration) = update.migration {
+        let marker = if matches!(
+            migration.transition,
+            quant::QuantMigrationTransition::Demoted
+        ) {
+            "QUANT_DEMOTED_LLM"
+        } else {
+            "QUANT_PROMOTED_PRIMARY"
+        };
         warn!(
             parameter_id = migration.parameter_id,
             samples = migration.samples,
             actionable_samples = migration.actionable_samples,
             outperformance_bps = migration.outperformance_bps,
             confirmation_streak = migration.confirmation_streak,
-            "QUANT_REPLACED_LLM"
+            transition = ?migration.transition,
+            "{marker}"
         );
     }
 }
@@ -2271,7 +2286,9 @@ fn select_portfolio_pruning_candidates(
         .filter(|(asset, balance)| {
             !is_stablecoin(asset)
                 && (balance.free > 0.0 || balance.total > 0.0)
-                && balance.value_usd.unwrap_or(min_holding_usd) >= min_holding_usd
+                && balance
+                    .value_usd
+                    .is_some_and(|value| value.is_finite() && value >= min_holding_usd)
         })
         .map(|(asset, _)| asset.to_ascii_uppercase())
         .collect::<HashSet<_>>();
@@ -2326,10 +2343,12 @@ fn snapshot_in_portfolio(snapshot: &MarketSnapshot, portfolio: &OctobotPortfolio
     let Some(base_asset) = symbol_base_asset(&snapshot.symbol) else {
         return false;
     };
-    portfolio
-        .currencies
-        .get(base_asset)
-        .is_some_and(|balance| balance.free > 0.0 || balance.total > 0.0)
+    portfolio.currencies.get(base_asset).is_some_and(|balance| {
+        (balance.free > 0.0 || balance.total > 0.0)
+            && balance
+                .value_usd
+                .is_some_and(|value| value.is_finite() && value > 0.01)
+    })
 }
 
 fn holding_value_usd_for_symbol(portfolio: &OctobotPortfolio, symbol: &str) -> Option<f64> {
@@ -3077,8 +3096,7 @@ async fn execute_if_warranted(
         }
     }
 
-    if !config.strict_exchange_selection
-        && side == "buy"
+    if side == "buy"
         && let Some((rerouted_exchange, reason)) = maybe_reroute_execution_exchange(
             state,
             &execution_exchange,
@@ -3178,7 +3196,7 @@ async fn execute_if_warranted(
             .unwrap_or_default();
 
         if !base_asset.is_empty() {
-            match ensure_sell_balance_available(
+            let mut sell_availability = ensure_sell_balance_available(
                 octobot,
                 state,
                 &execution_exchange,
@@ -3186,39 +3204,53 @@ async fn execute_if_warranted(
                 &decision.symbol,
                 config.strict_exchange_selection,
             )
+            .await;
+
+            // The market candidate may come from an exchange with no base
+            // asset. Route to the exchange that actually holds the asset,
+            // even when strict exchange selection is enabled; strict means
+            // balances must be exchange-scoped, not that an unfunded venue
+            // must be used.
+            if let Some((rerouted_exchange, reason)) = maybe_reroute_execution_exchange(
+                state,
+                &execution_exchange,
+                &decision.symbol,
+                side,
+                execution_amount_usd,
+            )
             .await
             {
+                warn!(
+                    "trading: rerouting sell execution for {} from {} to {} ({})",
+                    decision.symbol, execution_exchange, rerouted_exchange, reason
+                );
+                state
+                    .log_warn(
+                        "execute",
+                        format!(
+                            "Rerouted SELL execution for {} from {} to {} ({})",
+                            decision.symbol, execution_exchange, rerouted_exchange, reason
+                        ),
+                    )
+                    .await;
+                execution_exchange = rerouted_exchange;
+                sell_availability = ensure_sell_balance_available(
+                    octobot,
+                    state,
+                    &execution_exchange,
+                    base_asset,
+                    &decision.symbol,
+                    config.strict_exchange_selection,
+                )
+                .await;
+            }
+
+            match sell_availability {
                 SellBalanceAvailability::Available {
                     free,
                     total,
                     value_usd,
                 } => {
-                    if !config.strict_exchange_selection
-                        && let Some((rerouted_exchange, reason)) = maybe_reroute_execution_exchange(
-                            state,
-                            &execution_exchange,
-                            &decision.symbol,
-                            side,
-                            execution_amount_usd,
-                        )
-                        .await
-                    {
-                        warn!(
-                            "trading: rerouting sell execution for {} from {} to {} ({})",
-                            decision.symbol, execution_exchange, rerouted_exchange, reason
-                        );
-                        state
-                            .log_warn(
-                                "execute",
-                                format!(
-                                    "Rerouted SELL execution for {} from {} to {} ({})",
-                                    decision.symbol, execution_exchange, rerouted_exchange, reason
-                                ),
-                            )
-                            .await;
-                        execution_exchange = rerouted_exchange;
-                    }
-
                     if let Some(max_sell_amount_usd) = max_sell_amount_usd_from_balance(
                         octobot,
                         &execution_exchange,

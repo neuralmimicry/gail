@@ -139,6 +139,8 @@ pub struct AuditLoggingConfig {
     pub enabled: bool,
     pub log_llm_prompts: bool,
     pub log_llm_responses: bool,
+    /// Full prompt/response bodies require an explicit opt-in.
+    pub store_llm_content: bool,
     pub log_aer_payloads: bool,
     pub max_chars: usize,
 }
@@ -432,6 +434,7 @@ impl Default for AuditLoggingConfig {
             enabled: false,
             log_llm_prompts: true,
             log_llm_responses: true,
+            store_llm_content: false,
             log_aer_payloads: true,
             max_chars: 65_536,
         }
@@ -703,8 +706,8 @@ impl GailConfig {
                 normalize_optional_string(Some(provider.provider_type.as_str()))
                     .unwrap_or_default();
             provider.model = normalize_optional_string(provider.model.as_deref());
-            provider.api_key = normalize_optional_string(provider.api_key.as_deref());
-            provider.access_token = normalize_optional_string(provider.access_token.as_deref());
+            provider.api_key = normalize_secret_string(provider.api_key.as_deref());
+            provider.access_token = normalize_secret_string(provider.access_token.as_deref());
             provider.base_url = normalize_optional_url(provider.base_url.as_deref());
             provider.context_window_tokens = provider
                 .context_window_tokens
@@ -765,6 +768,9 @@ impl GailConfig {
                 provider.name = provider.provider_type.clone();
             }
         }
+        for token in &mut self.security.api_tokens {
+            token.token = normalize_secret_string(Some(token.token.as_str())).unwrap_or_default();
+        }
         self.providers
             .retain(|provider| !provider.provider_type.trim().is_empty());
         for specialist in &mut self.specialists {
@@ -787,6 +793,29 @@ fn normalize_optional_string(value: Option<&str>) -> Option<String> {
         return None;
     }
     Some(cleaned.to_owned())
+}
+
+/// Resolve a secret reference from the environment while keeping the
+/// reference itself safe to place in a mounted configuration file.
+fn normalize_secret_string(value: Option<&str>) -> Option<String> {
+    let cleaned = normalize_optional_string(value)?;
+    let variable = cleaned
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+        .or_else(|| cleaned.strip_prefix('$'))
+        .filter(|value| {
+            !value.is_empty()
+                && value.chars().enumerate().all(|(index, ch)| {
+                    ch == '_'
+                        || ch.is_ascii_alphanumeric() && (index > 0 || ch.is_ascii_alphabetic())
+                })
+        });
+    if let Some(variable) = variable {
+        return std::env::var(variable)
+            .ok()
+            .and_then(|resolved| normalize_optional_string(Some(resolved.as_str())));
+    }
+    Some(cleaned)
 }
 
 fn normalize_optional_url(value: Option<&str>) -> Option<String> {

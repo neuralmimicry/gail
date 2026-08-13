@@ -373,6 +373,9 @@ pub struct QuantMigrationState {
     pub pending: VecDeque<QuantPendingEvaluation>,
     pub resolved: VecDeque<QuantResolvedEvaluation>,
     pub promotion_streak: usize,
+    /// Consecutive rolling-window failures while quant is primary.
+    #[serde(default)]
+    pub demotion_streak: usize,
     pub initialized_at: Option<f64>,
     pub promoted_at: Option<f64>,
     pub last_shadow_recorded_at: Option<f64>,
@@ -393,6 +396,7 @@ impl Default for QuantMigrationState {
             pending: VecDeque::new(),
             resolved: VecDeque::new(),
             promotion_streak: 0,
+            demotion_streak: 0,
             initialized_at: None,
             promoted_at: None,
             last_shadow_recorded_at: None,
@@ -582,9 +586,9 @@ impl QuantMigrationState {
 
         if update.resolved > 0 {
             update.parameter_adjustment = self.maybe_retune(config);
-            if self.mode == QuantMode::Shadow {
-                update.migration = self.evaluate_migration(config, now);
-            }
+            // Continue evaluating the paired LLM benchmark after promotion so
+            // quant can be rolled back when its edge disappears.
+            update.migration = self.evaluate_migration(config, now);
             update.performance = Some(self.controller_performance(config));
         }
         update
@@ -816,6 +820,35 @@ impl QuantMigrationState {
             && outperformance >= config.quant_migration_min_outperformance_bps
             && quant.mean_downside_bps
                 <= llm.mean_downside_bps + config.quant_migration_max_downside_regression_bps;
+        if self.mode == QuantMode::Primary {
+            if qualified {
+                self.demotion_streak = 0;
+                return None;
+            }
+            if paired.len() < config.quant_migration_min_samples {
+                return None;
+            }
+            self.demotion_streak = self.demotion_streak.saturating_add(1);
+            if self.demotion_streak < config.quant_migration_required_streak {
+                return None;
+            }
+            self.mode = QuantMode::Shadow;
+            self.promoted_at = None;
+            self.promotion_streak = 0;
+            self.demotion_streak = 0;
+            return Some(QuantMigrationDecision {
+                transition: QuantMigrationTransition::Demoted,
+                parameter_id: self.active_parameter_id.clone(),
+                samples: paired.len(),
+                actionable_samples,
+                quant,
+                llm,
+                outperformance_bps: outperformance,
+                confirmation_streak: config.quant_migration_required_streak,
+            });
+        }
+
+        self.demotion_streak = 0;
         if qualified {
             self.promotion_streak = self.promotion_streak.saturating_add(1);
         } else {
@@ -827,6 +860,7 @@ impl QuantMigrationState {
         self.mode = QuantMode::Primary;
         self.promoted_at = Some(now);
         Some(QuantMigrationDecision {
+            transition: QuantMigrationTransition::Promoted,
             parameter_id: self.active_parameter_id.clone(),
             samples: paired.len(),
             actionable_samples,
@@ -1023,6 +1057,7 @@ pub struct QuantParameterAdjustment {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct QuantMigrationDecision {
+    pub transition: QuantMigrationTransition,
     pub parameter_id: String,
     pub samples: usize,
     pub actionable_samples: usize,
@@ -1030,6 +1065,14 @@ pub struct QuantMigrationDecision {
     pub llm: PerformanceSummary,
     pub outperformance_bps: f64,
     pub confirmation_streak: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuantMigrationTransition {
+    #[default]
+    Promoted,
+    Demoted,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1254,7 +1297,9 @@ fn portfolio_holds_symbol(portfolio: &OctobotPortfolio, symbol: &str) -> bool {
         asset.eq_ignore_ascii_case(base)
             && balance.total.is_finite()
             && balance.total > 0.0
-            && balance.value_usd.is_none_or(|value| value > 0.01)
+            && balance
+                .value_usd
+                .is_some_and(|value| value.is_finite() && value > 0.01)
     })
 }
 
@@ -1755,8 +1800,36 @@ mod tests {
         }
         let decision = state.evaluate_migration(&config, 100.0);
         assert!(decision.is_some());
+        assert_eq!(
+            decision.unwrap().transition,
+            QuantMigrationTransition::Promoted
+        );
         assert_eq!(state.mode, QuantMode::Primary);
         assert_eq!(state.promoted_at, Some(100.0));
+    }
+
+    #[test]
+    fn migration_demotes_quant_after_sustained_llm_outperformance() {
+        let mut state = QuantMigrationState::default();
+        let config = config();
+        let active = state.active_parameter_id.clone();
+        state.mode = QuantMode::Primary;
+        state.promoted_at = Some(1.0);
+        for index in 0..3 {
+            state.resolved.push_back(QuantResolvedEvaluation {
+                evaluation_id: index.to_string(),
+                active_parameter_id: active.clone(),
+                active_quant_actionable: true,
+                active_quant_net_return_bps: -25.0,
+                llm_actionable: true,
+                llm_net_return_bps: Some(25.0),
+                ..QuantResolvedEvaluation::default()
+            });
+        }
+        let decision = state.evaluate_migration(&config, 100.0).unwrap();
+        assert_eq!(decision.transition, QuantMigrationTransition::Demoted);
+        assert_eq!(state.mode, QuantMode::Shadow);
+        assert!(state.promoted_at.is_none());
     }
 
     #[test]

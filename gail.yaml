@@ -198,8 +198,9 @@ llm_ledger:
 
 audit_logging:
   enabled: true
-  log_llm_prompts: true
-  log_llm_responses: true
+  log_llm_prompts: false
+  log_llm_responses: false
+  store_llm_content: false
   log_aer_payloads: true
   max_chars: 65536
 

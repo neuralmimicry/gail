@@ -9,6 +9,7 @@ use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{
     sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, oneshot},
     task::JoinSet,
@@ -530,17 +531,17 @@ impl GailService {
         if !audit.enabled {
             return;
         }
-        let prompt_text = if audit.log_llm_prompts {
+        let prompt_text = if audit.log_llm_prompts && audit.store_llm_content {
             self.optional_audit_text(Some(record.prompt_text.as_str()))
         } else {
             None
         };
-        let response_text = if audit.log_llm_responses {
+        let response_text = if audit.log_llm_responses && audit.store_llm_content {
             self.optional_audit_text(record.response_text.as_deref())
         } else {
             None
         };
-        let system_prompt = if audit.log_llm_prompts {
+        let system_prompt = if audit.log_llm_prompts && audit.store_llm_content {
             self.optional_audit_text(record.system_prompt.as_deref())
         } else {
             None
@@ -664,6 +665,7 @@ impl GailService {
         &self,
         request: ProviderCompletionRequest,
     ) -> Result<CompletionResponse> {
+        let _ = self.inner.metrics.record_request_received().await;
         let api_source = request
             .source
             .clone()
@@ -674,6 +676,7 @@ impl GailService {
             self.inner.metrics.ai_response_time_estimate_ms("all").await;
         let started = Instant::now();
         let result = self.direct_complete_inner(request).await;
+        let _ = self.inner.metrics.record_request_replied().await;
         let source = result
             .as_ref()
             .map(completion_metric_source)
@@ -797,6 +800,13 @@ impl GailService {
         let response = match response_result {
             Ok(response) => response,
             Err(error) => {
+                if error.is_timeout() {
+                    let _ = self
+                        .inner
+                        .metrics
+                        .record_orchestration_event("timeout", None)
+                        .await;
+                }
                 let category = runtime_failure_health_bucket(Some(&error.to_string()), None)
                     .mode
                     .unwrap_or_else(|| "runtime_error".to_string());
@@ -844,6 +854,11 @@ impl GailService {
             }
         };
         if response.text.trim().is_empty() {
+            let _ = self
+                .inner
+                .metrics
+                .record_orchestration_event("empty_plan", None)
+                .await;
             let error = GailError::upstream(
                 response.provider.as_str(),
                 Some(StatusCode::BAD_GATEWAY),
@@ -1028,6 +1043,7 @@ impl GailService {
     }
 
     pub async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+        let _ = self.inner.metrics.record_request_received().await;
         let api_source = request
             .source
             .clone()
@@ -1038,6 +1054,7 @@ impl GailService {
             self.inner.metrics.ai_response_time_estimate_ms("all").await;
         let started = Instant::now();
         let result = self.complete_inner(request).await;
+        let _ = self.inner.metrics.record_request_replied().await;
         let source = result
             .as_ref()
             .map(completion_metric_source)
@@ -1069,7 +1086,17 @@ impl GailService {
     }
 
     async fn complete_inner(&self, request: CompletionRequest) -> Result<CompletionResponse> {
-        let request_id = Uuid::new_v4().to_string();
+        let request_id = request
+            .request_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 128
+                    && value.chars().all(|ch| ch.is_ascii_graphic())
+            })
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let api_source = normalize_key(request.source.as_deref().unwrap_or("unknown"), "unknown");
         let workflow = normalize_key(request.workflow.as_deref().unwrap_or("general"), "general");
         let role = normalize_key(request.role.as_deref().unwrap_or("general"), "general");
@@ -1225,6 +1252,18 @@ impl GailService {
                     "filtered candidates below configured model floor"
                 );
             }
+        }
+        let before_role_filter = candidates.len();
+        candidates.retain(|candidate| candidate_supports_role(candidate, role.as_str()));
+        let role_filtered = before_role_filter.saturating_sub(candidates.len());
+        if role_filtered > 0 {
+            info!(
+                request_id = %request_id,
+                workflow = %workflow,
+                role = %role,
+                removed = role_filtered,
+                "filtered candidates that do not declare the requested workflow role"
+            );
         }
         if candidates.is_empty() {
             return Err(GailError::bad_request(
@@ -1432,12 +1471,18 @@ impl GailService {
                 }
                 break;
             }
+            let _ = self
+                .inner
+                .metrics
+                .record_orchestration_event("candidate_selection", None)
+                .await;
             wave_index += 1;
             for candidate in &selected {
                 attempted_candidate_ids.insert(candidate_attempt_key(candidate));
             }
 
             info!(
+                request_id = %request_id,
                 workflow = %workflow,
                 role = %role,
                 fallback_wave = wave_index,
@@ -1449,8 +1494,17 @@ impl GailService {
                 tags = %preview_labels(task_tags.iter().cloned().collect::<Vec<_>>(), 8),
                 "dispatching Gail orchestration"
             );
+            if wave_index > 1 {
+                let _ = self
+                    .inner
+                    .metrics
+                    .record_orchestration_event("fallback", None)
+                    .await;
+            }
 
             let mut wave_results = if selected.len() == 1 {
+                let wait_for_capacity =
+                    !ranked_candidate_is_capacity_available(&ranked, &selected[0]);
                 vec![
                     self.invoke_candidate(
                         selected[0].clone(),
@@ -1458,10 +1512,16 @@ impl GailService {
                         expected_json,
                         timeout_cap,
                         workload_class,
+                        wait_for_capacity,
                     )
                     .await,
                 ]
             } else {
+                let capacity_available_ids = ranked
+                    .iter()
+                    .filter(|item| item.health_ok)
+                    .map(|item| item.candidate.candidate_id())
+                    .collect::<HashSet<_>>();
                 self.invoke_candidates(
                     selected.clone(),
                     provider_request.clone(),
@@ -1472,6 +1532,7 @@ impl GailService {
                     early_success_min_quality,
                     timeout_cap,
                     workload_class,
+                    capacity_available_ids,
                 )
                 .await?
             };
@@ -1493,7 +1554,8 @@ impl GailService {
             if !backoff_providers.is_empty() {
                 throttled_provider_types.extend(backoff_providers.iter().cloned());
                 info!(
-                    workflow = %workflow,
+                request_id = %request_id,
+                workflow = %workflow,
                     role = %role,
                     fallback_wave = wave_index,
                     throttled_providers = %preview_labels(sorted_strings(backoff_providers.into_iter()), 6),
@@ -1567,6 +1629,17 @@ impl GailService {
             } else {
                 let health_bucket =
                     runtime_failure_health_bucket(result.error.as_deref(), result.latency_ms);
+                if result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.to_ascii_lowercase().contains("timeout"))
+                {
+                    let _ = self
+                        .inner
+                        .metrics
+                        .record_orchestration_event("timeout", None)
+                        .await;
+                }
                 let category = health_bucket
                     .mode
                     .clone()
@@ -1744,6 +1817,7 @@ impl GailService {
         .collect::<Vec<_>>();
 
         info!(
+            request_id = %request_id,
             workflow = %workflow,
             role = %role,
             provider = %chosen_response.provider,
@@ -2329,7 +2403,12 @@ impl GailService {
         }
     }
 
-    async fn record_llm_interaction(&self, record: LlmLedgerRecord) {
+    async fn record_llm_interaction(&self, mut record: LlmLedgerRecord) {
+        if !self.audit_logging().store_llm_content {
+            record.prompt_text = summarize_llm_content(&record.prompt_text);
+            record.system_prompt = record.system_prompt.as_deref().map(summarize_llm_content);
+            record.response_text = record.response_text.as_deref().map(summarize_llm_content);
+        }
         self.log_llm_audit_record(&record);
         if let Some(ledger) = self.llm_ledger() {
             ledger.record(record).await;
@@ -2867,6 +2946,7 @@ impl GailService {
         &self,
         candidate: &ProviderCandidate,
     ) -> Option<LoadReservation> {
+        let started = Instant::now();
         let deadline =
             Instant::now() + Duration::from_millis(self.candidate_queue_wait_timeout_ms());
         loop {
@@ -2878,15 +2958,33 @@ impl GailService {
             tokio::pin!(notified);
             notified.as_mut().enable();
             if let Some(reservation) = self.reserve_candidate_load(candidate).await {
+                let _ = self
+                    .inner
+                    .metrics
+                    .record_orchestration_event(
+                        "queue_wait",
+                        Some(started.elapsed().as_millis() as u64),
+                    )
+                    .await;
                 return Some(reservation);
             }
             if Instant::now() >= deadline {
+                let _ = self
+                    .inner
+                    .metrics
+                    .record_orchestration_event("queue_wait_timeout", None)
+                    .await;
                 return None;
             }
             if tokio::time::timeout_at(deadline, notified.as_mut())
                 .await
                 .is_err()
             {
+                let _ = self
+                    .inner
+                    .metrics
+                    .record_orchestration_event("queue_wait_timeout", None)
+                    .await;
                 return None;
             }
         }
@@ -2941,11 +3039,13 @@ impl GailService {
         early_success_min_quality: f64,
         timeout_cap: Option<u64>,
         workload_class: WorkloadClass,
+        capacity_available_ids: HashSet<String>,
     ) -> Result<Vec<InvocationResult>> {
         let mut join_set = JoinSet::new();
         for candidate in selected.iter().cloned() {
             let service = self.clone();
             let request = provider_request.clone();
+            let wait_for_capacity = !capacity_available_ids.contains(&candidate.candidate_id());
             join_set.spawn(async move {
                 service
                     .invoke_candidate(
@@ -2954,6 +3054,7 @@ impl GailService {
                         expected_json,
                         timeout_cap,
                         workload_class,
+                        wait_for_capacity,
                     )
                     .await
             });
@@ -3071,6 +3172,7 @@ impl GailService {
         expected_json: bool,
         timeout_cap: Option<u64>,
         workload_class: WorkloadClass,
+        wait_for_capacity: bool,
     ) -> InvocationResult {
         self.prepare_provider_request(&candidate.profile, &mut provider_request);
         if let Some(signal) = self.nmc_signal_for_candidate(&candidate).await
@@ -3112,16 +3214,40 @@ impl GailService {
                 score: f64::NEG_INFINITY,
             };
         };
-        let Some(load_reservation) = self
-            .reserve_candidate_load_with_backpressure(&candidate)
-            .await
-        else {
+        let load_reservation = if wait_for_capacity {
+            self.reserve_candidate_load_with_backpressure(&candidate)
+                .await
+        } else {
+            // The ranker observed capacity for this candidate, but another
+            // request may have claimed it between ranking and dispatch. Do
+            // not turn that normal race into a long queue wait: the caller's
+            // fallback wave can immediately try the next model tier.
+            self.reserve_candidate_load(&candidate).await
+        };
+        let Some(load_reservation) = load_reservation else {
+            let event = if wait_for_capacity {
+                "queue_wait_timeout"
+            } else {
+                "capacity_race"
+            };
+            let _ = self
+                .inner
+                .metrics
+                .record_orchestration_event(event, None)
+                .await;
             return InvocationResult {
                 candidate,
                 response: None,
                 error: Some(format!(
-                    "candidate queue remained saturated after {}ms because configured concurrency/resource budget is exhausted",
-                    self.candidate_queue_wait_timeout_ms()
+                    "candidate capacity was unavailable at dispatch{}",
+                    if wait_for_capacity {
+                        format!(
+                            " after {}ms of queue waiting",
+                            self.candidate_queue_wait_timeout_ms()
+                        )
+                    } else {
+                        " (reservation race; trying fallback candidates)".to_string()
+                    }
                 )),
                 latency_ms: None,
                 quality: -1.0,
@@ -3177,6 +3303,11 @@ impl GailService {
                             if retry_empty && attempts < 2 {
                                 continue;
                             }
+                            let _ = self
+                                .inner
+                                .metrics
+                                .record_orchestration_event("empty_plan", None)
+                                .await;
                             return InvocationResult {
                                 candidate: candidate_for_invocation.clone(),
                                 response: None,
@@ -3445,6 +3576,7 @@ impl GailService {
     }
 
     async fn acquire_workload_permit(&self, class: WorkloadClass) -> Option<OwnedSemaphorePermit> {
+        let started = Instant::now();
         let wait_timeout = Duration::from_millis(self.workload_pool_wait_timeout_ms_for(class));
         let semaphore = match class {
             WorkloadClass::Interactive => self.inner.interactive_pool.clone(),
@@ -3452,8 +3584,25 @@ impl GailService {
             WorkloadClass::Trading => self.inner.trading_pool.clone(),
         };
         match tokio::time::timeout(wait_timeout, semaphore.acquire_owned()).await {
-            Ok(Ok(permit)) => Some(permit),
-            _ => None,
+            Ok(Ok(permit)) => {
+                let _ = self
+                    .inner
+                    .metrics
+                    .record_orchestration_event(
+                        "queue_wait",
+                        Some(started.elapsed().as_millis() as u64),
+                    )
+                    .await;
+                Some(permit)
+            }
+            _ => {
+                let _ = self
+                    .inner
+                    .metrics
+                    .record_orchestration_event("queue_wait_timeout", None)
+                    .await;
+                None
+            }
         }
     }
 
@@ -3618,6 +3767,15 @@ impl GailService {
                 false,
             )
     }
+}
+
+fn summarize_llm_content(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    format!(
+        "<redacted chars={} sha256={}>",
+        value.chars().count(),
+        hex::encode(digest)
+    )
 }
 
 impl ProviderCandidate {
@@ -3930,6 +4088,15 @@ fn provider_profile_is_usable(profile: &ProviderProfile) -> bool {
     }
 }
 
+fn candidate_supports_role(candidate: &ProviderCandidate, role: &str) -> bool {
+    let requested = normalize_key(role, "general");
+    candidate.roles.is_empty()
+        || candidate.roles.contains(&requested)
+        // Older OpenAI-compatible callers omit `role`; Gail normalises that
+        // to `general`, while legacy profiles commonly declare `assistant`.
+        || (requested == "general" && candidate.roles.contains("assistant"))
+}
+
 fn has_usable_value(value: Option<&str>) -> bool {
     value
         .map(str::trim)
@@ -3986,61 +4153,82 @@ fn select_ranked_candidates(
     let mut selected_ids = HashSet::new();
     let mut selected_models = HashSet::new();
     let mut selected_provider_types = HashSet::new();
+    // `rank_candidate` folds the current candidate/host capacity snapshot
+    // into `health_ok`.  Sort the currently available candidates by model
+    // tier before applying the normal score/provider diversity rules. This
+    // gives each request the largest free model, then a free 9B, then a free
+    // 4B, while still allowing lower tiers to fill a deliberately parallel
+    // wave when more than one candidate is requested.
+    let mut ordered = ranked.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        right.health_ok.cmp(&left.health_ok).then_with(|| {
+            model_size_tier(&right.candidate.configured_model)
+                .cmp(&model_size_tier(&left.candidate.configured_model))
+        })
+    });
     let local_fallback = if target >= 2 {
         best_local_fallback_candidate(&ranked)
     } else {
         None
     };
 
-    for health_ok in [true, false] {
-        for item in ranked.iter().filter(|item| item.health_ok == health_ok) {
-            if selected_provider_types.contains(&item.candidate.provider_type) {
-                continue;
-            }
-            let candidate_key = candidate_attempt_key(&item.candidate);
-            let model_key = candidate_model_key(&item.candidate);
-            if deduplicate_models && selected_models.contains(&model_key) {
-                continue;
-            }
-            if selected_ids.insert(candidate_key) {
-                selected_provider_types.insert(item.candidate.provider_type.clone());
-                selected_models.insert(model_key);
-                selected.push(item.candidate.clone());
-                if selected.len() == target {
-                    return ensure_local_fallback_selected(
-                        selected,
-                        local_fallback,
-                        target,
-                        deduplicate_models,
-                    );
-                }
+    // First pass preserves the existing preference for distinct provider
+    // families. `ordered` already puts healthy/high-tier candidates first.
+    for item in &ordered {
+        if selected_provider_types.contains(&item.candidate.provider_type) {
+            continue;
+        }
+        let candidate_key = candidate_attempt_key(&item.candidate);
+        let model_key = candidate_model_key(&item.candidate);
+        if deduplicate_models && selected_models.contains(&model_key) {
+            continue;
+        }
+        if selected_ids.insert(candidate_key) {
+            selected_provider_types.insert(item.candidate.provider_type.clone());
+            selected_models.insert(model_key);
+            selected.push(item.candidate.clone());
+            if selected.len() == target {
+                return ensure_local_fallback_selected(
+                    selected,
+                    local_fallback,
+                    target,
+                    deduplicate_models,
+                );
             }
         }
     }
 
-    for health_ok in [true, false] {
-        for item in ranked.iter().filter(|item| item.health_ok == health_ok) {
-            let candidate_key = candidate_attempt_key(&item.candidate);
-            let model_key = candidate_model_key(&item.candidate);
-            if deduplicate_models && selected_models.contains(&model_key) {
-                continue;
-            }
-            if selected_ids.insert(candidate_key) {
-                selected_models.insert(model_key);
-                selected.push(item.candidate.clone());
-                if selected.len() == target {
-                    return ensure_local_fallback_selected(
-                        selected,
-                        local_fallback,
-                        target,
-                        deduplicate_models,
-                    );
-                }
+    for item in &ordered {
+        let candidate_key = candidate_attempt_key(&item.candidate);
+        let model_key = candidate_model_key(&item.candidate);
+        if deduplicate_models && selected_models.contains(&model_key) {
+            continue;
+        }
+        if selected_ids.insert(candidate_key) {
+            selected_models.insert(model_key);
+            selected.push(item.candidate.clone());
+            if selected.len() == target {
+                return ensure_local_fallback_selected(
+                    selected,
+                    local_fallback,
+                    target,
+                    deduplicate_models,
+                );
             }
         }
     }
 
     ensure_local_fallback_selected(selected, local_fallback, target, deduplicate_models)
+}
+
+fn ranked_candidate_is_capacity_available(
+    ranked: &[RankedCandidate],
+    candidate: &ProviderCandidate,
+) -> bool {
+    ranked
+        .iter()
+        .find(|item| item.candidate.candidate_id() == candidate.candidate_id())
+        .is_some_and(|item| item.health_ok)
 }
 
 fn round_robin_context(
@@ -4686,6 +4874,19 @@ fn parse_model_size_billions(model: &str) -> Option<f64> {
         }
     }
     None
+}
+
+/// Coarse routing tiers for the configured local pool. The boundaries are
+/// intentionally broad so model aliases such as `qwen3.6:35b`, `qwen3.5:9b`
+/// and `qwen3.5:4b` retain the expected 35B > 9B > 4B ordering without
+/// hard-coding a particular vendor or model family.
+fn model_size_tier(model: &str) -> u8 {
+    match parse_model_size_billions(model) {
+        Some(size) if size >= 20.0 => 3,
+        Some(size) if size >= 7.0 => 2,
+        Some(size) if size > 0.0 => 1,
+        _ => 0,
+    }
 }
 
 fn candidate_meets_model_floor(candidate: &ProviderCandidate, min_model_size_b: f64) -> bool {
@@ -5841,6 +6042,104 @@ Return only a JSON data instance that satisfies this schema:
     }
 
     #[test]
+    fn select_ranked_candidates_prefers_available_35b_over_smaller_models() {
+        let ranked = |provider: &str, model: &str, health_ok: bool| RankedCandidate {
+            score: 1.0,
+            health_ok,
+            health_mode: (!health_ok).then(|| "resource_saturated".to_string()),
+            candidate: ProviderCandidate::from_profile(ProviderProfile {
+                name: format!("{provider}-{model}"),
+                provider_type: provider.to_string(),
+                model: Some(model.to_string()),
+                api_key: Some("token".to_string()),
+                base_url: Some(format!("http://{provider}.internal")),
+                ..ProviderProfile::default()
+            }),
+        };
+
+        let selected = select_ranked_candidates(
+            vec![
+                ranked("openai", "qwen3.6:35b", true),
+                ranked("ollama", "qwen3.5:9b", true),
+                ranked("ollama", "qwen3.5:4b", true),
+            ],
+            1,
+            true,
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].configured_model, "qwen3.6:35b");
+    }
+
+    #[test]
+    fn select_ranked_candidates_falls_from_busy_35b_to_available_9b() {
+        let ranked = |provider: &str, model: &str, health_ok: bool| RankedCandidate {
+            score: 1.0,
+            health_ok,
+            health_mode: (!health_ok).then(|| "resource_saturated".to_string()),
+            candidate: ProviderCandidate::from_profile(ProviderProfile {
+                name: format!("{provider}-{model}"),
+                provider_type: provider.to_string(),
+                model: Some(model.to_string()),
+                api_key: Some("token".to_string()),
+                base_url: Some(format!("http://{provider}.internal")),
+                ..ProviderProfile::default()
+            }),
+        };
+
+        let selected = select_ranked_candidates(
+            vec![
+                ranked("openai", "qwen3.6:35b", false),
+                ranked("ollama9", "qwen3.5:9b", true),
+                ranked("ollama4", "qwen3.5:4b", true),
+            ],
+            1,
+            true,
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].configured_model, "qwen3.5:9b");
+    }
+
+    #[test]
+    fn select_ranked_candidates_falls_from_busy_35b_and_9b_to_4b() {
+        let ranked = |provider: &str, model: &str, health_ok: bool| RankedCandidate {
+            score: 1.0,
+            health_ok,
+            health_mode: (!health_ok).then(|| "resource_saturated".to_string()),
+            candidate: ProviderCandidate::from_profile(ProviderProfile {
+                name: format!("{provider}-{model}"),
+                provider_type: provider.to_string(),
+                model: Some(model.to_string()),
+                api_key: Some("token".to_string()),
+                base_url: Some(format!("http://{provider}.internal")),
+                ..ProviderProfile::default()
+            }),
+        };
+
+        let selected = select_ranked_candidates(
+            vec![
+                ranked("openai", "qwen3.6:35b", false),
+                ranked("ollama9", "qwen3.5:9b", false),
+                ranked("ollama4", "qwen3.5:4b", true),
+            ],
+            1,
+            true,
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].configured_model, "qwen3.5:4b");
+    }
+
+    #[test]
+    fn model_size_tiers_match_local_pool_order() {
+        assert_eq!(model_size_tier("qwen3.6:35b"), 3);
+        assert_eq!(model_size_tier("qwen3.5:9b"), 2);
+        assert_eq!(model_size_tier("qwen3.5:4b"), 1);
+        assert_eq!(model_size_tier("unlabelled-model"), 0);
+    }
+
+    #[test]
     fn select_ranked_candidates_uses_fallback_family_before_duplicate_provider() {
         fn ranked(
             provider_type: &str,
@@ -6291,6 +6590,19 @@ Return only a JSON data instance that satisfies this schema:
             .await
             .expect("candidate reservation should be released after guard drop");
 
+        // A dispatch-time race must be handled by the caller's fallback
+        // wave, not by entering the long queue wait intended for a candidate
+        // that was already known to be busy during ranking.
+        let race_started = Instant::now();
+        assert!(
+            service.reserve_candidate_load(&candidate).await.is_none(),
+            "the single-slot candidate must reject the competing reservation"
+        );
+        assert!(
+            race_started.elapsed() < Duration::from_secs(1),
+            "a reservation race must return without queueing"
+        );
+
         // The next request must remain pending without polling, then wake as
         // soon as the active reservation releases capacity.
         let waiting_service = service.clone();
@@ -6546,8 +6858,34 @@ Return only a JSON data instance that satisfies this schema:
     }
 
     #[test]
+    fn configured_candidates_are_filtered_to_declared_workflow_roles() {
+        let planner = ProviderCandidate::from_profile(ProviderProfile {
+            provider_type: "ollama".to_string(),
+            model: Some("planner".to_string()),
+            roles: vec!["planner".to_string()],
+            ..ProviderProfile::default()
+        });
+        let generalist = ProviderCandidate::from_profile(ProviderProfile {
+            provider_type: "ollama".to_string(),
+            model: Some("generalist".to_string()),
+            roles: vec![
+                "general".to_string(),
+                "planner".to_string(),
+                "reviewer".to_string(),
+                "researcher".to_string(),
+            ],
+            ..ProviderProfile::default()
+        });
+
+        assert!(candidate_supports_role(&planner, "planner"));
+        assert!(!candidate_supports_role(&planner, "researcher"));
+        assert!(candidate_supports_role(&generalist, "researcher"));
+    }
+
+    #[test]
     fn configured_candidates_are_included_for_preferred_provider_fallback() {
         let request = CompletionRequest {
+            request_id: None,
             workflow: Some("project_solver".to_string()),
             role: Some("planner".to_string()),
             preferred_provider: Some("openai".to_string()),
@@ -6578,6 +6916,7 @@ Return only a JSON data instance that satisfies this schema:
     #[test]
     fn configured_candidates_respect_explicit_non_preferred_request_mode() {
         let request = CompletionRequest {
+            request_id: None,
             workflow: Some("direct".to_string()),
             role: Some("assistant".to_string()),
             preferred_provider: None,

@@ -132,6 +132,9 @@ pub struct ProviderCompletionRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompletionRequest {
+    /// Correlation ID supplied by Refiner; generated when absent.
+    #[serde(default)]
+    pub request_id: Option<String>,
     pub workflow: Option<String>,
     pub role: Option<String>,
     pub preferred_provider: Option<String>,

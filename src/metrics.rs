@@ -19,13 +19,39 @@ fn now_ts() -> f64 {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct MetricsData {
     pub candidates: HashMap<String, CandidateBucket>,
     #[serde(default)]
     pub ai_response_times: HashMap<String, AiResponseTimeStats>,
     #[serde(default)]
     pub api_response_times: HashMap<String, AiResponseTimeStats>,
+    #[serde(default)]
+    pub orchestration_events: OrchestrationEventMetrics,
+    #[serde(default)]
+    pub request_flow: RequestFlowMetrics,
     pub updated_at: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct OrchestrationEventMetrics {
+    pub candidate_selections: u64,
+    pub capacity_races: u64,
+    pub queue_waits: u64,
+    pub queue_wait_total_ms: u64,
+    pub queue_wait_timeouts: u64,
+    pub timeouts: u64,
+    pub fallbacks: u64,
+    pub empty_plans: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RequestFlowMetrics {
+    pub received: u64,
+    pub in_progress: u64,
+    pub replied: u64,
 }
 
 /// One completed or failed training run.  Training is written by a separate
@@ -154,6 +180,23 @@ fn rate(tokens: u64, runtime_seconds: f64) -> f64 {
 struct TrainingMetricsData {
     runs: Vec<TrainingRunObservation>,
     updated_at: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct TrainingProgressObservation {
+    snapshot_id: String,
+    status: String,
+    backend: String,
+    slurm_job_id: Option<String>,
+    completed_steps: u64,
+    total_steps: u64,
+    progress_ratio: f64,
+    progress_per_hour: f64,
+    eta_seconds: f64,
+    elapsed_seconds: f64,
+    started_ts: Option<f64>,
+    updated_ts: Option<f64>,
 }
 
 /// Unified response-time statistics for user-visible AI work.
@@ -384,6 +427,7 @@ pub struct MetricsSummary {
 pub struct MetricsStore {
     path: PathBuf,
     inner: Arc<Mutex<MetricsData>>,
+    persist_lock: Arc<Mutex<()>>,
 }
 
 /// Persist one Slurm/local training observation without touching the routing
@@ -511,6 +555,29 @@ pub async fn backfill_training_observations(
     Ok(count)
 }
 
+async fn discover_training_progress(snapshot_root: PathBuf) -> Vec<TrainingProgressObservation> {
+    let mut observations = Vec::new();
+    let Ok(mut entries) = fs::read_dir(snapshot_root).await else {
+        return observations;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path().join("progress.json");
+        let Ok(raw) = fs::read_to_string(path).await else {
+            continue;
+        };
+        let Ok(progress) = serde_json::from_str::<TrainingProgressObservation>(&raw) else {
+            continue;
+        };
+        if !progress.snapshot_id.is_empty()
+            && progress.status != "completed"
+            && progress.status != "failed"
+        {
+            observations.push(progress);
+        }
+    }
+    observations
+}
+
 impl AiResponseTimeStats {
     fn normalize_split_latency_fields(&mut self) {
         // The split fields were introduced after the legacy aggregate file
@@ -571,9 +638,14 @@ impl MetricsStore {
                 stats.normalize_split_latency_fields();
             }
         }
+        // An in-progress gauge describes this Gail process, not historical
+        // work from a previous process lifetime. Avoid exposing a stale value
+        // after a restart while retaining the received/replied counters.
+        data.request_flow.in_progress = 0;
         Ok(Self {
             path,
             inner: Arc::new(Mutex::new(data)),
+            persist_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -768,12 +840,93 @@ impl MetricsStore {
         self.save(&snapshot).await
     }
 
+    pub async fn record_request_received(&self) -> Result<()> {
+        let mut data = self.inner.lock().await;
+        data.request_flow.received = data.request_flow.received.saturating_add(1);
+        data.request_flow.in_progress = data.request_flow.in_progress.saturating_add(1);
+        data.updated_at = now_ts();
+        let snapshot = data.clone();
+        drop(data);
+        self.save(&snapshot).await
+    }
+
+    pub async fn record_request_replied(&self) -> Result<()> {
+        let mut data = self.inner.lock().await;
+        data.request_flow.replied = data.request_flow.replied.saturating_add(1);
+        data.request_flow.in_progress = data.request_flow.in_progress.saturating_sub(1);
+        data.updated_at = now_ts();
+        let snapshot = data.clone();
+        drop(data);
+        self.save(&snapshot).await
+    }
+
+    pub async fn record_orchestration_event(
+        &self,
+        event: &str,
+        duration_ms: Option<u64>,
+    ) -> Result<()> {
+        let mut data = self.inner.lock().await;
+        match event {
+            "candidate_selection" => {
+                data.orchestration_events.candidate_selections = data
+                    .orchestration_events
+                    .candidate_selections
+                    .saturating_add(1)
+            }
+            "capacity_race" => {
+                data.orchestration_events.capacity_races =
+                    data.orchestration_events.capacity_races.saturating_add(1)
+            }
+            "queue_wait" => {
+                data.orchestration_events.queue_waits =
+                    data.orchestration_events.queue_waits.saturating_add(1);
+                data.orchestration_events.queue_wait_total_ms = data
+                    .orchestration_events
+                    .queue_wait_total_ms
+                    .saturating_add(duration_ms.unwrap_or(0));
+            }
+            "queue_wait_timeout" => {
+                data.orchestration_events.queue_wait_timeouts = data
+                    .orchestration_events
+                    .queue_wait_timeouts
+                    .saturating_add(1)
+            }
+            "timeout" => {
+                data.orchestration_events.timeouts =
+                    data.orchestration_events.timeouts.saturating_add(1)
+            }
+            "fallback" => {
+                data.orchestration_events.fallbacks =
+                    data.orchestration_events.fallbacks.saturating_add(1)
+            }
+            "empty_plan" => {
+                data.orchestration_events.empty_plans =
+                    data.orchestration_events.empty_plans.saturating_add(1)
+            }
+            _ => return Ok(()),
+        }
+        data.updated_at = now_ts();
+        let snapshot = data.clone();
+        drop(data);
+        self.save(&snapshot).await
+    }
+
     async fn save(&self, data: &MetricsData) -> Result<()> {
+        let _persist_guard = self.persist_lock.lock().await;
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).await?;
         }
         let rendered = serde_json::to_string_pretty(data)?;
-        fs::write(&self.path, rendered).await?;
+        // A scrape or restart must never observe a partially-written JSON
+        // snapshot. The old direct write could truncate the file while
+        // multiple request completions persisted telemetry concurrently.
+        let temporary = self.path.with_extension(format!(
+            "json.tmp-{}-{}",
+            std::process::id(),
+            now_ts().to_bits()
+        ));
+        fs::write(&temporary, rendered + "\n").await?;
+        fs::rename(temporary, &self.path).await?;
         Ok(())
     }
 
@@ -1372,8 +1525,13 @@ impl MetricsStore {
                 }
             }
         };
+        let snapshot_root = training_path
+            .parent()
+            .map(|parent| parent.join("training").join("snapshots"))
+            .unwrap_or_else(|| PathBuf::from("training/snapshots"));
+        let progress = discover_training_progress(snapshot_root).await;
         let mut rendered = render_prometheus_metrics(&data);
-        render_training_prometheus_metrics(&mut rendered, &training);
+        render_training_prometheus_metrics(&mut rendered, &training, &progress);
         rendered
     }
 }
@@ -1414,6 +1572,63 @@ fn routing_profile_key(
 
 fn render_prometheus_metrics(data: &MetricsData) -> String {
     let mut out = String::new();
+    out.push_str(
+        "# HELP gail_orchestration_events_total Gail orchestration lifecycle events by outcome.\n",
+    );
+    out.push_str("# TYPE gail_orchestration_events_total counter\n");
+    let events = &data.orchestration_events;
+    out.push_str(&format!(
+        "gail_orchestration_events_total{{event=\"candidate_selection\"}} {}\n",
+        events.candidate_selections
+    ));
+    out.push_str(&format!(
+        "gail_orchestration_events_total{{event=\"capacity_race\"}} {}\n",
+        events.capacity_races
+    ));
+    out.push_str(&format!(
+        "gail_orchestration_events_total{{event=\"queue_wait\"}} {}\n",
+        events.queue_waits
+    ));
+    out.push_str(&format!(
+        "gail_orchestration_events_total{{event=\"queue_wait_timeout\"}} {}\n",
+        events.queue_wait_timeouts
+    ));
+    out.push_str(&format!(
+        "gail_orchestration_events_total{{event=\"timeout\"}} {}\n",
+        events.timeouts
+    ));
+    out.push_str(&format!(
+        "gail_orchestration_events_total{{event=\"fallback\"}} {}\n",
+        events.fallbacks
+    ));
+    out.push_str(&format!(
+        "gail_orchestration_events_total{{event=\"empty_plan\"}} {}\n",
+        events.empty_plans
+    ));
+    out.push_str("# HELP gail_orchestration_queue_wait_total_ms Gail orchestration queue wait time in milliseconds.\n");
+    out.push_str("# TYPE gail_orchestration_queue_wait_total_ms counter\n");
+    out.push_str(&format!(
+        "gail_orchestration_queue_wait_total_ms {}\n",
+        events.queue_wait_total_ms
+    ));
+    out.push_str("# HELP gail_requests_received_total Gail LLM requests received.\n");
+    out.push_str("# TYPE gail_requests_received_total counter\n");
+    out.push_str(&format!(
+        "gail_requests_received_total {}\n",
+        data.request_flow.received
+    ));
+    out.push_str("# HELP gail_requests_in_progress Gail LLM requests currently being processed.\n");
+    out.push_str("# TYPE gail_requests_in_progress gauge\n");
+    out.push_str(&format!(
+        "gail_requests_in_progress {}\n",
+        data.request_flow.in_progress
+    ));
+    out.push_str("# HELP gail_requests_replied_total Gail LLM requests that completed a reply.\n");
+    out.push_str("# TYPE gail_requests_replied_total counter\n");
+    out.push_str(&format!(
+        "gail_requests_replied_total {}\n",
+        data.request_flow.replied
+    ));
     out.push_str("# HELP gail_provider_candidate_successes_total Gail provider candidate successful completions.\n");
     out.push_str("# TYPE gail_provider_candidate_successes_total counter\n");
     out.push_str("# HELP gail_provider_candidate_failures_total Gail provider candidate failed completions.\n");
@@ -1731,11 +1946,70 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
     out
 }
 
-fn render_training_prometheus_metrics(out: &mut String, data: &TrainingMetricsData) {
+fn render_training_prometheus_metrics(
+    out: &mut String,
+    data: &TrainingMetricsData,
+    progress: &[TrainingProgressObservation],
+) {
     out.push_str(
         "# HELP gail_training_runs_total Gail training runs observed by backend and status.\n",
     );
     out.push_str("# TYPE gail_training_runs_total counter\n");
+    out.push_str("# HELP gail_training_task_progress_ratio Current progress ratio for active training tasks.\n");
+    out.push_str("# TYPE gail_training_task_progress_ratio gauge\n");
+    out.push_str("# HELP gail_training_task_progress_per_hour Training optimizer steps completed per hour.\n");
+    out.push_str("# TYPE gail_training_task_progress_per_hour gauge\n");
+    out.push_str("# HELP gail_training_task_eta_seconds Estimated seconds remaining for each active training task.\n");
+    out.push_str("# TYPE gail_training_task_eta_seconds gauge\n");
+    out.push_str("# HELP gail_training_task_elapsed_seconds Elapsed seconds for each active training task.\n");
+    out.push_str("# TYPE gail_training_task_elapsed_seconds gauge\n");
+    out.push_str("# HELP gail_training_task_updated_timestamp_seconds Last progress update timestamp for each active training task.\n");
+    out.push_str("# TYPE gail_training_task_updated_timestamp_seconds gauge\n");
+    out.push_str("# HELP gail_training_active_tasks Number of active Gail training tasks.\n");
+    out.push_str("# TYPE gail_training_active_tasks gauge\n");
+    out.push_str("# HELP gail_training_average_eta_seconds Average estimated seconds remaining across active training tasks.\n");
+    out.push_str("# TYPE gail_training_average_eta_seconds gauge\n");
+    let mut eta_total = 0.0;
+    for task in progress {
+        let labels = format!(
+            "snapshot_id=\"{}\",backend=\"{}\",slurm_job_id=\"{}\"",
+            escape_label(&task.snapshot_id),
+            escape_label(&task.backend),
+            escape_label(task.slurm_job_id.as_deref().unwrap_or("")),
+        );
+        out.push_str(&format!(
+            "gail_training_task_progress_ratio{{{labels}}} {:.6}\n",
+            task.progress_ratio
+        ));
+        out.push_str(&format!(
+            "gail_training_task_progress_per_hour{{{labels}}} {:.3}\n",
+            task.progress_per_hour
+        ));
+        out.push_str(&format!(
+            "gail_training_task_eta_seconds{{{labels}}} {:.3}\n",
+            task.eta_seconds
+        ));
+        out.push_str(&format!(
+            "gail_training_task_elapsed_seconds{{{labels}}} {:.3}\n",
+            task.elapsed_seconds
+        ));
+        if let Some(updated) = task.updated_ts {
+            out.push_str(&format!(
+                "gail_training_task_updated_timestamp_seconds{{{labels}}} {:.3}\n",
+                updated
+            ));
+        }
+        eta_total += task.eta_seconds;
+    }
+    out.push_str(&format!("gail_training_active_tasks {}\n", progress.len()));
+    out.push_str(&format!(
+        "gail_training_average_eta_seconds {:.3}\n",
+        if progress.is_empty() {
+            0.0
+        } else {
+            eta_total / progress.len() as f64
+        }
+    ));
     out.push_str("# HELP gail_training_tokens_total Tokens processed by training runs.\n");
     out.push_str("# TYPE gail_training_tokens_total counter\n");
     out.push_str("# HELP gail_training_tokens_per_second Training throughput for each run.\n");
@@ -2086,6 +2360,27 @@ mod tests {
                 .await
                 .contains("gail_ai_response_time_average_ms")
         );
+    }
+
+    #[tokio::test]
+    async fn request_flow_metrics_track_received_in_progress_and_replied() {
+        let path = tempfile::NamedTempFile::new()
+            .expect("temp file")
+            .into_temp_path();
+        let store = MetricsStore::new(path.to_path_buf()).await.expect("store");
+
+        store.record_request_received().await.expect("received");
+        store.record_request_received().await.expect("received");
+        let during = store.prometheus_metrics().await;
+        assert!(during.contains("gail_requests_received_total 2"));
+        assert!(during.contains("gail_requests_in_progress 2"));
+        assert!(during.contains("gail_requests_replied_total 0"));
+
+        store.record_request_replied().await.expect("replied");
+        let after = store.prometheus_metrics().await;
+        assert!(after.contains("gail_requests_received_total 2"));
+        assert!(after.contains("gail_requests_in_progress 1"));
+        assert!(after.contains("gail_requests_replied_total 1"));
     }
 
     #[tokio::test]

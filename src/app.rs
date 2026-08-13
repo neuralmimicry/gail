@@ -1316,6 +1316,7 @@ fn build_completion_request(
 ) -> CompletionRequest {
     match route {
         OpenAIResolvedRoute::Orchestrated { .. } => CompletionRequest {
+            request_id: None,
             workflow,
             role,
             preferred_provider: None,
@@ -1366,6 +1367,7 @@ fn build_completion_request(
                 model_matches.then(|| item.base_url.clone()).flatten()
             });
             CompletionRequest {
+                request_id: None,
                 workflow,
                 role,
                 preferred_provider: Some(provider),

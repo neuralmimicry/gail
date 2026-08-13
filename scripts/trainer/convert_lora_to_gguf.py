@@ -71,7 +71,12 @@ def validate_adapter(adapter: Path) -> None:
     try:
         from safetensors import safe_open
 
-        with safe_open(str(weights_path), framework="pt", device="cpu") as handle:
+        # Header inspection does not need PyTorch.  Using the NumPy backend is
+        # important because Gail's Rust process exports libtorch in
+        # LD_LIBRARY_PATH while the Python training environment has its own
+        # wheel; importing torch here otherwise fails with an extension ABI
+        # mismatch before llama.cpp conversion even starts.
+        with safe_open(str(weights_path), framework="numpy", device="cpu") as handle:
             names = list(handle.keys())
     except Exception as exc:  # pragma: no cover - dependency/runtime detail
         fail(f"unable to inspect Safetensors adapter: {exc}")
