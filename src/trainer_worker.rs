@@ -470,6 +470,7 @@ async fn run_training_pipeline(
     })?;
     let execution_plan = build_training_execution_plan(trainer, hardware);
     let artifact_mode = training_artifact_mode();
+    let resume_adapter = active_adapter_path(trainer)?;
     write_json(
         snapshot_dir.join("training_execution_plan.json").as_path(),
         &serde_json::to_value(&execution_plan).unwrap_or(Value::Null),
@@ -491,10 +492,18 @@ async fn run_training_pipeline(
         "gpu_free_memory_mb": hardware.total_gpu_free_memory_mb(),
         "execution_plan": execution_plan,
         "started_ts": now_ts(),
+        "resume_adapter": resume_adapter.as_ref().map(|path| path.to_string_lossy().to_string()),
+        "cumulative_training": resume_adapter.is_some(),
     });
-    let training_invocation =
-        resolve_training_invocation(trainer, hardware, snapshot_id, dataset_path, snapshot_dir)
-            .await?;
+    let training_invocation = resolve_training_invocation(
+        trainer,
+        hardware,
+        snapshot_id,
+        dataset_path,
+        snapshot_dir,
+        resume_adapter.as_deref(),
+    )
+    .await?;
     let mut training_executed = false;
     if let Some(command_line) = training_invocation {
         let command_output = if let Some(spool) = env_string("GAIL_TRAIN_SLURM_SPOOL") {
@@ -539,6 +548,7 @@ async fn run_training_pipeline(
     let mut registration_succeeded = false;
     let mut registration_error = None;
     if trainer.register_with_ollama && training_executed {
+        let previous_snapshot = active_snapshot_id(trainer)?;
         match register_snapshot_with_ollama(trainer, snapshot_id, snapshot_dir).await {
             Ok(registration_mode) => {
                 registration_succeeded = true;
@@ -547,6 +557,20 @@ async fn run_training_pipeline(
                     OllamaRegistrationMode::Adapter | OllamaRegistrationMode::BaseModel => {
                         pipeline_report["ollama_registration"] = json!("registered");
                     }
+                }
+                if let Err(error) =
+                    publish_active_snapshot(trainer, snapshot_id, snapshot_dir).await
+                {
+                    if let Err(rollback_error) =
+                        rollback_ollama_alias(trainer, previous_snapshot.as_deref()).await
+                    {
+                        tracing::error!(error = %rollback_error, snapshot = snapshot_id, "failed to roll back serving alias after active snapshot publication failure");
+                    }
+                    registration_succeeded = false;
+                    registration_error =
+                        Some(format!("active snapshot publication failed: {error}"));
+                    pipeline_report["ollama_registration"] = json!("rolled_back");
+                    pipeline_report["ollama_registration_error"] = json!(error.to_string());
                 }
                 if let Err(error) = rotate_ollama_models(trainer).await {
                     tracing::warn!(
@@ -558,6 +582,15 @@ async fn run_training_pipeline(
                 }
             }
             Err(error) => {
+                if let Err(rollback_error) =
+                    rollback_ollama_alias(trainer, previous_snapshot.as_deref()).await
+                {
+                    tracing::error!(
+                        error = %rollback_error,
+                        snapshot = snapshot_id,
+                        "failed to roll back serving alias after snapshot registration failure"
+                    );
+                }
                 tracing::warn!(
                     error = %error,
                     snapshot = snapshot_id,
@@ -934,6 +967,7 @@ async fn resolve_training_invocation(
     snapshot_id: &str,
     dataset_path: &Path,
     snapshot_dir: &Path,
+    resume_adapter: Option<&Path>,
 ) -> Result<Option<String>> {
     if let Some(command_template) = trainer.command_template.as_deref() {
         return Ok(Some(render_training_command(
@@ -943,6 +977,7 @@ async fn resolve_training_invocation(
             snapshot_id,
             dataset_path,
             snapshot_dir,
+            resume_adapter,
         )));
     }
 
@@ -963,7 +998,7 @@ async fn resolve_training_invocation(
                     ))
                 })?;
             return Ok(Some(format!(
-                "env -u LD_LIBRARY_PATH {} {} --dataset {} --output {} --algorithm {} --base-model {} --ollama-base-model {}",
+                "env -u LD_LIBRARY_PATH {} {} --dataset {} --output {} --algorithm {} --base-model {} --ollama-base-model {}{}",
                 shell_escape(python.as_str()),
                 shell_escape(python_runner.as_str()),
                 shell_escape(&dataset_path.to_string_lossy()),
@@ -971,6 +1006,12 @@ async fn resolve_training_invocation(
                 shell_escape(trainer.algorithm.as_str()),
                 shell_escape(hf_base_model.as_str()),
                 shell_escape(ollama_base_model),
+                resume_adapter
+                    .map(|path| format!(
+                        " --resume-adapter {}",
+                        shell_escape(&path.to_string_lossy())
+                    ))
+                    .unwrap_or_default(),
             )));
         }
         let runner = std::env::var("GAIL_RUST_QLORA_SFT_BIN")
@@ -985,7 +1026,7 @@ async fn resolve_training_invocation(
             ensure_torchscript_artifacts(trainer, base_model.as_str(), dataset_path).await?;
 
         return Ok(Some(format!(
-            "{} --dataset {} --output {} --algorithm {} --base-model {} --model-module {} --tokenizer {} --timeout-seconds {}",
+            "{} --dataset {} --output {} --algorithm {} --base-model {} --model-module {} --tokenizer {} --timeout-seconds {}{}",
             shell_escape(runner.as_str()),
             shell_escape(&dataset_path.to_string_lossy()),
             shell_escape(&snapshot_dir.to_string_lossy()),
@@ -994,6 +1035,12 @@ async fn resolve_training_invocation(
             shell_escape(&model_module.to_string_lossy()),
             shell_escape(&tokenizer.to_string_lossy()),
             trainer.command_timeout_seconds.max(1),
+            resume_adapter
+                .map(|path| format!(
+                    " --resume-adapter {}",
+                    shell_escape(&path.to_string_lossy())
+                ))
+                .unwrap_or_default(),
         )));
     }
 
@@ -2145,6 +2192,104 @@ async fn write_json(path: &Path, value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+fn active_snapshot_id(trainer: &TrainerConfig) -> Result<Option<String>> {
+    let path = PathBuf::from(&trainer.output_root).join("active_snapshot.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    let value: Value = serde_json::from_str(&raw).map_err(|error| {
+        GailError::invalid_config(format!("invalid active training snapshot pointer: {error}"))
+    })?;
+    let snapshot = value
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty()
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                })
+        })
+        .ok_or_else(|| {
+            GailError::invalid_config("active training snapshot pointer has an unsafe snapshot_id")
+        })?;
+    Ok(Some(snapshot.to_string()))
+}
+
+fn active_adapter_path(trainer: &TrainerConfig) -> Result<Option<PathBuf>> {
+    let Some(snapshot) = active_snapshot_id(trainer)? else {
+        return Ok(None);
+    };
+    let root = PathBuf::from(&trainer.output_root);
+    let adapter = root.join("snapshots").join(snapshot).join("adapter");
+    let resolved_root = std::fs::canonicalize(&root).map_err(|error| {
+        GailError::invalid_config(format!("failed to resolve training output root: {error}"))
+    })?;
+    let resolved_adapter = std::fs::canonicalize(&adapter).map_err(|error| {
+        GailError::invalid_config(format!("active training adapter is unavailable: {error}"))
+    })?;
+    if !resolved_adapter.starts_with(&resolved_root) || !resolved_adapter.is_dir() {
+        return Err(GailError::invalid_config(
+            "active training adapter escapes the training output root",
+        ));
+    }
+    Ok(Some(resolved_adapter))
+}
+
+async fn publish_active_snapshot(
+    trainer: &TrainerConfig,
+    snapshot_id: &str,
+    snapshot_dir: &Path,
+) -> Result<()> {
+    let adapter = snapshot_dir.join("adapter");
+    let metadata = fs::metadata(&adapter).await.map_err(|error| {
+        GailError::invalid_config(format!("trained snapshot adapter is unavailable: {error}"))
+    })?;
+    if !metadata.is_dir() {
+        return Err(GailError::invalid_config(
+            "trained snapshot adapter is not a directory",
+        ));
+    }
+    let output_root = PathBuf::from(&trainer.output_root);
+    let pointer = output_root.join("active_snapshot.json");
+    let temporary = output_root.join(format!(".active_snapshot.json-{}", std::process::id()));
+    let value = json!({
+        "version": 1,
+        "snapshot_id": snapshot_id,
+        "adapter_path": format!("snapshots/{snapshot_id}/adapter"),
+        "base_model": trainer.ollama_base_model,
+        "model_alias": trainer.model_alias,
+        "promoted_at": now_ts(),
+    });
+    write_json(&temporary, &value).await?;
+    fs::rename(&temporary, &pointer).await.map_err(|error| {
+        GailError::invalid_config(format!(
+            "failed to atomically publish active training snapshot: {error}"
+        ))
+    })?;
+    tracing::info!(snapshot = snapshot_id, pointer = %pointer.display(), "published cumulative Gail training base");
+    Ok(())
+}
+
+async fn rollback_ollama_alias(
+    trainer: &TrainerConfig,
+    previous_snapshot: Option<&str>,
+) -> Result<()> {
+    let Some(previous_snapshot) = previous_snapshot else {
+        return Ok(());
+    };
+    ollama_api_post(
+        &ollama_api_client(),
+        trainer,
+        "copy",
+        &json!({
+            "source": format!("{}:{previous_snapshot}", trainer.model_prefix),
+            "destination": trainer.model_alias,
+        }),
+    )
+    .await
+    .map(|_| ())
+}
+
 fn render_training_command(
     template: &str,
     trainer: &TrainerConfig,
@@ -2152,6 +2297,7 @@ fn render_training_command(
     snapshot_id: &str,
     dataset_path: &Path,
     snapshot_dir: &Path,
+    resume_adapter: Option<&Path>,
 ) -> String {
     template
         .replace("{snapshot}", snapshot_id)
@@ -2171,6 +2317,12 @@ fn render_training_command(
             &hardware.preferred_worker_threads().to_string(),
         )
         .replace("{gpu_count}", &hardware.gpu_count().to_string())
+        .replace(
+            "{resume_adapter}",
+            &resume_adapter
+                .map(|path| shell_escape(&path.to_string_lossy()))
+                .unwrap_or_default(),
+        )
 }
 
 fn default_model_module_path(trainer: &TrainerConfig, base_model: &str) -> PathBuf {

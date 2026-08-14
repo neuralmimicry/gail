@@ -658,7 +658,9 @@ impl GailService {
     }
 
     pub async fn provider_prometheus_metrics(&self) -> String {
-        self.inner.metrics.prometheus_metrics().await
+        let mut rendered = self.inner.metrics.prometheus_metrics().await;
+        rendered.push_str(&crate::aarnn_bridge::AarnnMirrorClient::evaluation_prometheus_metrics());
+        rendered
     }
 
     pub async fn direct_complete(
@@ -935,6 +937,17 @@ impl GailService {
             )
             .await;
         let mirror_input = self.await_aarnn_mirror_task(mirror_input).await;
+        let aarnn_evaluation =
+            self.aarnn_bridge()
+                .zip(mirror_output.as_ref())
+                .map(|(bridge, trace)| {
+                    serde_json::to_value(bridge.evaluate_candidate(
+                        trace,
+                        response.text.as_str(),
+                        prompt_text.as_str(),
+                    ))
+                    .unwrap_or(Value::Null)
+                });
         let mut text = response.text.clone();
         let mut provider = response.provider.clone();
         let mut model = response.model.clone();
@@ -945,7 +958,11 @@ impl GailService {
         // Optionally promote an AARNN candidate reply over the LLM response when
         // the bridge confidence gates are explicitly configured to allow it.
         if let (Some(bridge), Some(output_trace)) = (self.aarnn_bridge(), mirror_output.as_ref())
-            && bridge.should_promote_candidate(output_trace, response.text.as_str())
+            && bridge.should_promote_candidate(
+                output_trace,
+                response.text.as_str(),
+                prompt_text.as_str(),
+            )
             && let Some(reply_text) = bridge.promoted_reply(output_trace)
         {
             text = reply_text;
@@ -1035,6 +1052,7 @@ impl GailService {
                     .trace
                     .as_ref()
                     .map(|trace| trace.final_source.clone()),
+                "aarnn_evaluation": aarnn_evaluation,
             })),
             created_ts: current_ts(),
         })
@@ -1838,7 +1856,11 @@ impl GailService {
         // Optionally promote an AARNN candidate reply over the selected LLM
         // candidate when confidence/quality gates pass.
         if let (Some(bridge), Some(output_trace)) = (self.aarnn_bridge(), mirror_output.as_ref())
-            && bridge.should_promote_candidate(output_trace, chosen_response.text.as_str())
+            && bridge.should_promote_candidate(
+                output_trace,
+                chosen_response.text.as_str(),
+                mirrored_prompt_text.as_str(),
+            )
             && let Some(reply_text) = bridge.promoted_reply(output_trace)
         {
             text = reply_text;
@@ -2429,6 +2451,21 @@ impl GailService {
             .trace
             .as_ref()
             .map(|trace| trace.final_source.clone());
+        let aarnn_evaluation = response
+            .trace
+            .as_ref()
+            .and_then(|trace| trace.aarnn_mirroring.as_ref())
+            .and_then(|mirror| mirror.output.as_ref())
+            .and_then(|output| {
+                self.aarnn_bridge().map(|bridge| {
+                    serde_json::to_value(bridge.evaluate_candidate(
+                        output,
+                        response.text.as_str(),
+                        prompt_text,
+                    ))
+                    .unwrap_or(Value::Null)
+                })
+            });
         self.record_llm_interaction(LlmLedgerRecord {
             request_id: response.request_id.clone(),
             conversation_id: response.request_id.clone(),
@@ -2468,6 +2505,7 @@ impl GailService {
                 "source": "orchestrated_complete",
                 "selection_mode": response.trace.as_ref().map(|trace| trace.selection_mode.clone()),
                 "final_source": final_source,
+                "aarnn_evaluation": aarnn_evaluation,
             })),
             created_ts: current_ts(),
         })

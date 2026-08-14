@@ -4,7 +4,10 @@
 //! into sensory spikes, encoding them as AER payloads, and posting the exchange
 //! to `/api/llm/mirror`.
 
+use once_cell::sync::Lazy;
+use std::sync::Mutex;
 use std::{
+    collections::{HashMap, VecDeque},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -13,6 +16,7 @@ use reqwest::{
     Client,
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
 };
+use serde::Serialize;
 use serde_json::Value;
 use tokio::{
     sync::{Semaphore, mpsc, oneshot},
@@ -89,6 +93,27 @@ pub struct AarnnMirrorClient {
     audit_store_llm_content: bool,
     audit_log_aer_payloads: bool,
     audit_max_chars: usize,
+}
+
+static PROMOTION_HISTORY: Lazy<Mutex<HashMap<String, VecDeque<f64>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static EVALUATION_METRICS: Lazy<Mutex<HashMap<String, (u64, f64, f64, f64, f64, u64)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static DECODER_METRICS: Lazy<Mutex<(u64, u64, u64)>> = Lazy::new(|| Mutex::new((0, 0, 0)));
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AarnnPairedEvaluation {
+    pub task: String,
+    pub observed: bool,
+    pub agreement_score: f64,
+    pub relevance_score: f64,
+    pub confidence_score: f64,
+    pub quality_score: f64,
+    pub sustained_samples: usize,
+    pub eligible: bool,
+    pub decoder_version: u64,
+    pub decoder_mapped_neurons: usize,
+    pub network_neurons: u64,
 }
 
 impl AarnnMirrorClient {
@@ -243,11 +268,15 @@ impl AarnnMirrorClient {
         &self,
         trace: &AarnnMirrorInvocationTrace,
         llm_text: &str,
+        prompt_text: &str,
     ) -> bool {
         // Candidate promotion is intentionally strict so Gail only replaces the
         // selected LLM text when AARNN returned a distinct, high-confidence
         // response that cleared configured quality gates.
-        if self.response_preference != AarnnResponsePreference::PreferAarnnWhenConfident {
+        let evaluation = self.evaluate_candidate(trace, llm_text, prompt_text);
+        if self.response_preference != AarnnResponsePreference::PreferAarnnWhenConfident
+            || !evaluation.eligible
+        {
             return false;
         }
         let Some(candidate) = trace.candidate.as_ref() else {
@@ -270,10 +299,135 @@ impl AarnnMirrorClient {
         if reply_text.chars().count() < self.candidate_min_reply_chars {
             return false;
         }
-        if candidate.confidence.unwrap_or(0.0) < self.candidate_confidence_threshold {
-            return false;
+        let promoted = normalise_for_compare(reply_text) != normalise_for_compare(llm_text);
+        if promoted {
+            if let Ok(mut metrics) = EVALUATION_METRICS.lock() {
+                if let Some(entry) =
+                    metrics.get_mut(trace.request_category.as_deref().unwrap_or("general"))
+                {
+                    entry.5 = entry.5.saturating_add(1);
+                }
+            }
         }
-        normalise_for_compare(reply_text) != normalise_for_compare(llm_text)
+        promoted
+    }
+
+    pub fn evaluate_candidate(
+        &self,
+        trace: &AarnnMirrorInvocationTrace,
+        llm_text: &str,
+        prompt_text: &str,
+    ) -> AarnnPairedEvaluation {
+        let task = trace
+            .request_category
+            .clone()
+            .unwrap_or_else(|| "general".to_string());
+        let candidate = trace.candidate.as_ref();
+        let candidate_text = candidate
+            .and_then(|value| value.reply_text.as_deref())
+            .unwrap_or("");
+        let agreement_score = token_overlap(candidate_text, llm_text);
+        let relevance_score = token_overlap(candidate_text, prompt_text);
+        let confidence_score = candidate.and_then(|value| value.confidence).unwrap_or(0.0);
+        if let Some(candidate) = candidate {
+            if let Ok(mut decoder) = DECODER_METRICS.lock() {
+                decoder.0 = decoder.0.max(candidate.decoder_version);
+                decoder.1 = decoder.1.max(candidate.decoder_mapped_neurons as u64);
+                decoder.2 = decoder.2.max(candidate.network_neurons);
+            }
+        }
+        let quality_score = if candidate.is_some_and(|value| value.usable)
+            && candidate_text.chars().count() >= self.candidate_min_reply_chars
+            && candidate
+                .is_some_and(|value| value.source.as_deref() == Some("network_output_decoder"))
+        {
+            (agreement_score * 0.45 + relevance_score * 0.25 + confidence_score * 0.30)
+                .clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        {
+            let mut metrics = EVALUATION_METRICS.lock().expect("evaluation metrics lock");
+            let entry = metrics.entry(task.clone()).or_default();
+            entry.0 = entry.0.saturating_add(1);
+            entry.1 += quality_score;
+            entry.2 += agreement_score;
+            entry.3 += relevance_score;
+            entry.4 += confidence_score;
+        }
+        let mut history = PROMOTION_HISTORY.lock().expect("promotion history lock");
+        let samples = history.entry(task.clone()).or_default();
+        samples.push_back(quality_score);
+        while samples.len() > 32 {
+            samples.pop_front();
+        }
+        let sustained_samples = samples.len();
+        let average = samples.iter().sum::<f64>() / sustained_samples.max(1) as f64;
+        let recent =
+            samples.iter().rev().take(10).sum::<f64>() / samples.len().min(10).max(1) as f64;
+        AarnnPairedEvaluation {
+            task,
+            observed: candidate.is_some(),
+            agreement_score,
+            relevance_score,
+            confidence_score,
+            quality_score,
+            sustained_samples,
+            eligible: sustained_samples >= 20
+                && average >= 0.80
+                && recent >= 0.75
+                && confidence_score >= self.candidate_confidence_threshold,
+            decoder_version: candidate.map(|value| value.decoder_version).unwrap_or(0),
+            decoder_mapped_neurons: candidate
+                .map(|value| value.decoder_mapped_neurons)
+                .unwrap_or(0),
+            network_neurons: candidate.map(|value| value.network_neurons).unwrap_or(0),
+        }
+    }
+
+    pub fn evaluation_prometheus_metrics() -> String {
+        let metrics = EVALUATION_METRICS.lock().expect("evaluation metrics lock");
+        let mut out = String::from(
+            "# HELP gail_aarnn_paired_evaluations_total Paired LLM/AARNN evaluations.\n\
+# TYPE gail_aarnn_paired_evaluations_total counter\n\
+# HELP gail_aarnn_quality_score_average Average guarded AARNN quality score.\n\
+# TYPE gail_aarnn_quality_score_average gauge\n\
+# HELP gail_aarnn_agreement_score_average Average AARNN/LLM agreement score.\n\
+# TYPE gail_aarnn_agreement_score_average gauge\n\
+# HELP gail_aarnn_relevance_score_average Average AARNN prompt relevance score.\n\
+# TYPE gail_aarnn_relevance_score_average gauge\n\
+# HELP gail_aarnn_confidence_score_average Average AARNN decoder confidence score.\n\
+# TYPE gail_aarnn_confidence_score_average gauge\n\
+# HELP gail_aarnn_promotions_total AARNN responses promoted after sustained gates.\n\
+# TYPE gail_aarnn_promotions_total counter\n",
+        );
+        for (task, (count, quality, agreement, relevance, confidence, promotions)) in metrics.iter()
+        {
+            let task = task.replace('\\', "\\\\").replace('"', "\\\"");
+            let labels = format!("task=\"{}\"", task);
+            let denominator = (*count).max(1) as f64;
+            out.push_str(&format!(
+                "gail_aarnn_paired_evaluations_total{{{labels}}} {count}\n\
+gail_aarnn_quality_score_average{{{labels}}} {}\n\
+gail_aarnn_agreement_score_average{{{labels}}} {}\n\
+gail_aarnn_relevance_score_average{{{labels}}} {}\n\
+gail_aarnn_confidence_score_average{{{labels}}} {}\n\
+gail_aarnn_promotions_total{{{labels}}} {promotions}\n",
+                quality / denominator,
+                agreement / denominator,
+                relevance / denominator,
+                confidence / denominator
+            ));
+        }
+        if let Ok(decoder) = DECODER_METRICS.lock() {
+            out.push_str(&format!(
+                "gail_aarnn_decoder_version {}\n\
+gail_aarnn_decoder_mapped_neurons {}\n\
+gail_aarnn_network_neurons {}\n",
+                decoder.0, decoder.1, decoder.2
+            ));
+        }
+        out
     }
 
     pub fn promoted_reply(&self, trace: &AarnnMirrorInvocationTrace) -> Option<String> {
@@ -542,6 +696,7 @@ impl AarnnMirrorClient {
                 self.log_mirror_response_audit(&request, &response, text_chars, spike_count);
                 AarnnMirrorInvocationTrace {
                     direction: request.direction.clone(),
+                    request_category: request.request_category.clone(),
                     accepted: response.accepted,
                     endpoint: self.endpoint.clone(),
                     latency_ms: started.elapsed().as_millis() as u64,
@@ -558,6 +713,7 @@ impl AarnnMirrorClient {
                 self.log_mirror_error_audit(&request, error.as_str(), text_chars, spike_count);
                 AarnnMirrorInvocationTrace {
                     direction: request.direction,
+                    request_category: request.request_category,
                     accepted: false,
                     endpoint: self.endpoint.clone(),
                     latency_ms: started.elapsed().as_millis() as u64,
@@ -914,6 +1070,27 @@ fn normalise_for_compare(value: &str) -> String {
     compact_text(value).to_ascii_lowercase()
 }
 
+fn token_overlap(left: &str, right: &str) -> f64 {
+    use std::collections::HashSet;
+
+    let left_tokens = left
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let right_tokens = right
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    if left_tokens.is_empty() || right_tokens.is_empty() {
+        return 0.0;
+    }
+    let intersection = left_tokens.intersection(&right_tokens).count() as f64;
+    let union = left_tokens.union(&right_tokens).count() as f64;
+    (intersection / union).clamp(0.0, 1.0)
+}
+
 fn normalized_url(raw: &str) -> Option<String> {
     let value = raw.trim();
     if value.is_empty() {
@@ -1008,6 +1185,7 @@ mod tests {
         };
         let promoted = AarnnMirrorInvocationTrace {
             direction: AarnnMirrorDirection::Output,
+            request_category: Some("general".to_string()),
             accepted: true,
             endpoint: client.endpoint.clone(),
             latency_ms: 5,
@@ -1020,11 +1198,21 @@ mod tests {
                 source: Some("network_output_decoder".to_string()),
                 output_spike_indices: vec![1, 2],
                 output_aer_payload_hex: Some("41455231".to_string()),
+                decoder_version: 1,
+                decoder_mapped_neurons: 2,
+                network_neurons: 2,
             }),
             stimulation: None,
             error: None,
         };
-        assert!(client.should_promote_candidate(&promoted, "LLM answer"));
+        for _ in 0..20 {
+            client.evaluate_candidate(&promoted, "Alternative answer", "Alternative SNN answer");
+        }
+        assert!(client.should_promote_candidate(
+            &promoted,
+            "Alternative answer",
+            "Alternative SNN answer"
+        ));
 
         let duplicate = AarnnMirrorInvocationTrace {
             candidate: Some(AarnnMirrorCandidate {
@@ -1034,10 +1222,13 @@ mod tests {
                 source: Some("network_output_decoder".to_string()),
                 output_spike_indices: vec![],
                 output_aer_payload_hex: None,
+                decoder_version: 1,
+                decoder_mapped_neurons: 2,
+                network_neurons: 2,
             }),
             ..promoted.clone()
         };
-        assert!(!client.should_promote_candidate(&duplicate, "LLM answer"));
+        assert!(!client.should_promote_candidate(&duplicate, "LLM answer", "prompt"));
 
         let legacy_echo = AarnnMirrorInvocationTrace {
             candidate: Some(AarnnMirrorCandidate {
@@ -1047,10 +1238,13 @@ mod tests {
                 source: Some("stimulated_transport_echo".to_string()),
                 output_spike_indices: vec![1],
                 output_aer_payload_hex: None,
+                decoder_version: 1,
+                decoder_mapped_neurons: 2,
+                network_neurons: 2,
             }),
             ..promoted
         };
-        assert!(!client.should_promote_candidate(&legacy_echo, "LLM answer"));
+        assert!(!client.should_promote_candidate(&legacy_echo, "LLM answer", "prompt"));
     }
 
     #[test]

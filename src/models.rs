@@ -333,6 +333,12 @@ pub struct AarnnMirrorCandidate {
     #[serde(default)]
     pub output_spike_indices: Vec<u32>,
     pub output_aer_payload_hex: Option<String>,
+    #[serde(default)]
+    pub decoder_version: u64,
+    #[serde(default)]
+    pub decoder_mapped_neurons: usize,
+    #[serde(default)]
+    pub network_neurons: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -371,6 +377,8 @@ pub struct AarnnMirrorResponse {
 pub struct AarnnMirrorInvocationTrace {
     /// Requested mirror direction (`input` or `output`).
     pub direction: AarnnMirrorDirection,
+    #[serde(default)]
+    pub request_category: Option<String>,
     /// Whether AARNN accepted and processed this exchange.
     pub accepted: bool,
     pub endpoint: String,

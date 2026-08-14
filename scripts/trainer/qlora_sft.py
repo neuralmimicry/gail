@@ -91,6 +91,9 @@ class TrainingConfig:
     system_prompt: str
     report_to: str
     ollama_base_model: str
+    save_steps: int
+    save_total_limit: int
+    resume_adapter: str
 
 
 def slurm_context() -> tuple[int, int, str]:
@@ -105,10 +108,31 @@ def slurm_context() -> tuple[int, int, str]:
     return rank, world_size, job_id
 
 
-def distributed_rank_output(output_root: Path, rank: int, world_size: int, job_id: str) -> Path:
+def distributed_rank_output(output_root: Path, rank: int, world_size: int) -> Path:
+    """Use snapshot-stable paths so a new Slurm allocation can resume."""
     if world_size == 1:
         return output_root
-    return output_root / ".distributed" / job_id / f"rank-{rank:05d}"
+    return output_root / ".distributed" / f"rank-{rank:05d}"
+
+
+def latest_valid_checkpoint(checkpoint_root: Path) -> Path | None:
+    candidates = []
+    for path in checkpoint_root.glob("checkpoint-*"):
+        if not path.is_dir() or not (path / "trainer_state.json").is_file():
+            continue
+        if not (path / "optimizer.pt").is_file() or not (path / "scheduler.pt").is_file():
+            continue
+        if not (
+            (path / "adapter_model.safetensors").is_file()
+            or (path / "adapter_model.bin").is_file()
+        ):
+            continue
+        try:
+            step = int(path.name.removeprefix("checkpoint-"))
+        except ValueError:
+            continue
+        candidates.append((step, path))
+    return max(candidates, default=(0, None), key=lambda item: item[0])[1]
 
 
 def write_json(path: Path, value: object) -> None:
@@ -169,7 +193,6 @@ def aggregate_distributed_snapshot(
     rank_root: Path,
     rank: int,
     world_size: int,
-    job_id: str,
     sample_counts: list[int],
 ) -> None:
     """Federated-average PEFT adapters after every Slurm rank completes.
@@ -181,7 +204,7 @@ def aggregate_distributed_snapshot(
     timeout = max(60, int(os.getenv("GAIL_TRAIN_DISTRIBUTED_TIMEOUT_SECONDS", "82800")))
     deadline = time.monotonic() + timeout
     rank_roots = [
-        output_root / ".distributed" / job_id / f"rank-{index:05d}"
+        output_root / ".distributed" / f"rank-{index:05d}"
         for index in range(world_size)
     ]
     while True:
@@ -283,6 +306,21 @@ def parse_args(argv: Sequence[str]) -> TrainingConfig:
         default=os.getenv("GAIL_TRAIN_OLLAMA_BASE_MODEL", ""),
         help="Ollama model tag used in the generated Modelfile (the training base may be a HF ID)",
     )
+    parser.add_argument(
+        "--save-steps", type=int,
+        default=int(os.getenv("GAIL_TRAIN_SAVE_STEPS", "100")),
+        help="Periodic durable checkpoint interval in optimizer steps",
+    )
+    parser.add_argument(
+        "--save-total-limit", type=int,
+        default=int(os.getenv("GAIL_TRAIN_SAVE_TOTAL_LIMIT", "3")),
+        help="Number of periodic checkpoints to retain per rank",
+    )
+    parser.add_argument(
+        "--resume-adapter",
+        default=os.getenv("GAIL_TRAIN_RESUME_ADAPTER", ""),
+        help="Previously promoted PEFT adapter directory to continue training",
+    )
     args = parser.parse_args(argv)
     return TrainingConfig(
         dataset=args.dataset,
@@ -301,6 +339,9 @@ def parse_args(argv: Sequence[str]) -> TrainingConfig:
         system_prompt=args.system_prompt,
         report_to=args.report_to,
         ollama_base_model=args.ollama_base_model,
+        save_steps=max(1, args.save_steps),
+        save_total_limit=max(1, args.save_total_limit),
+        resume_adapter=args.resume_adapter.strip(),
     )
 
 
@@ -366,8 +407,10 @@ def train(cfg: TrainingConfig) -> None:
     rank, world_size, job_id = slurm_context()
     dataset_path = Path(cfg.dataset)
     output_root = Path(cfg.output)
-    rank_root = distributed_rank_output(output_root, rank, world_size, job_id)
+    rank_root = distributed_rank_output(output_root, rank, world_size)
     rank_root.mkdir(parents=True, exist_ok=True)
+    if rank == 0:
+        (output_root / "_SUCCESS").unlink(missing_ok=True)
     started_ts = time.time()
     progress_path = (output_root if rank == 0 else rank_root) / "progress.json"
     adapter_dir = output_root / "adapter"
@@ -406,6 +449,16 @@ def train(cfg: TrainingConfig) -> None:
     if device != "cuda":
         model = model.to(device)
 
+    resume_adapter = Path(cfg.resume_adapter) if cfg.resume_adapter else None
+    if resume_adapter is not None:
+        if not resume_adapter.is_dir():
+            raise RuntimeError(f"promoted resume adapter does not exist: {resume_adapter}")
+        model = PeftModel.from_pretrained(
+            model,
+            str(resume_adapter),
+            is_trainable=True,
+        )
+
     texts = load_training_texts(dataset_path, tokenizer)
     if world_size > 1:
         texts = texts[rank::world_size]
@@ -430,7 +483,9 @@ def train(cfg: TrainingConfig) -> None:
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         learning_rate=cfg.learning_rate,
         logging_steps=10,
-        save_strategy="epoch",
+        save_strategy="steps",
+        save_steps=cfg.save_steps,
+        save_total_limit=cfg.save_total_limit,
         report_to=cfg.report_to,
         bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
         fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
@@ -456,8 +511,9 @@ def train(cfg: TrainingConfig) -> None:
         model=model,
         train_dataset=train_dataset,
         args=training_args,
-        peft_config=peft_config,
     )
+    if resume_adapter is None:
+        trainer_kwargs["peft_config"] = peft_config
     if "processing_class" in trainer_parameters:
         trainer_kwargs["processing_class"] = tokenizer
     else:
@@ -470,7 +526,8 @@ def train(cfg: TrainingConfig) -> None:
     trainer.add_callback(
         TrainingProgressCallback(progress_path, output_root.name, started_ts, rank, world_size, job_id)
     )
-    train_result = trainer.train()
+    checkpoint = latest_valid_checkpoint(rank_root / "checkpoints")
+    train_result = trainer.train(resume_from_checkpoint=str(checkpoint) if checkpoint else None)
 
     trained_model = trainer.model
     if isinstance(trained_model, PeftModel):
@@ -507,6 +564,8 @@ def train(cfg: TrainingConfig) -> None:
         else None,
         "adapter_dir": str(adapter_dir.resolve()),
         "modelfile": str(modelfile.resolve()),
+        "resume_adapter": str(resume_adapter.resolve()) if resume_adapter else None,
+        "cumulative_training": resume_adapter is not None,
     }
     report["slurm"] = {"rank": rank, "world_size": world_size, "job_id": job_id}
     write_json(rank_root / "training_report.json", report)
@@ -524,7 +583,7 @@ def train(cfg: TrainingConfig) -> None:
                     raise TimeoutError(f"timed out waiting for rank report: {peer_report}")
                 time.sleep(2)
             sample_counts.append(int(json.loads(peer_report.read_text(encoding="utf-8"))["samples"]))
-        aggregate_distributed_snapshot(cfg, output_root, rank_root, rank, world_size, job_id, sample_counts)
+        aggregate_distributed_snapshot(cfg, output_root, rank_root, rank, world_size, sample_counts)
     print(json.dumps(report))
 
 
