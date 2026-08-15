@@ -139,6 +139,49 @@ def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
 
 
+TOKENIZER_PROBE_TEXT = "Gail tokenizer probe: BTC/USDT 123."
+
+
+def resolve_tokenizer_metadata(tokenizer) -> dict:
+    """Resolve and verify tokenizer IDs before model loading/training."""
+    ids = {}
+    for name in ("pad_token_id", "bos_token_id", "eos_token_id"):
+        value = getattr(tokenizer, name, None)
+        ids[name] = int(value) if value is not None else None
+    encoded = tokenizer(TOKENIZER_PROBE_TEXT, add_special_tokens=True)
+    input_ids = encoded.get("input_ids") if isinstance(encoded, dict) else None
+    if not input_ids:
+        raise RuntimeError("tokenizer startup probe produced no input IDs")
+    decoded = tokenizer.decode(input_ids, skip_special_tokens=False)
+    if not str(decoded).strip() or TOKENIZER_PROBE_TEXT.split()[0] not in str(decoded):
+        raise RuntimeError(
+            "tokenizer startup probe failed round-trip: "
+            f"decoded={decoded!r}"
+        )
+    return {
+        "pad_token_id": ids["pad_token_id"],
+        "bos_token_id": ids["bos_token_id"],
+        "eos_token_id": ids["eos_token_id"],
+        "probe": {
+            "text": TOKENIZER_PROBE_TEXT,
+            "token_count": len(input_ids),
+            "decoded": str(decoded),
+            "round_trip_ok": True,
+        },
+    }
+
+
+def align_model_special_tokens(model, metadata: dict) -> None:
+    """Make model and generation configs use the persisted tokenizer IDs."""
+    for config in (getattr(model, "config", None), getattr(model, "generation_config", None)):
+        if config is None:
+            continue
+        for name in ("pad_token_id", "bos_token_id", "eos_token_id"):
+            value = metadata.get(name)
+            if value is not None:
+                setattr(config, name, int(value))
+
+
 class TrainingProgressCallback(TrainerCallback):
     """Publish a scrape-friendly progress snapshot while a task is running."""
 
@@ -240,7 +283,14 @@ def aggregate_distributed_snapshot(
     adapter_dir = output_root / "adapter"
     adapter_dir.mkdir(parents=True, exist_ok=True)
     save_file(averaged, str(adapter_dir / "adapter_model.safetensors"))
-    for filename in ("adapter_config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"):
+    for filename in (
+        "adapter_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "tokenizer_metadata.json",
+        "training_manifest.json",
+    ):
         source = rank_roots[0] / "adapter" / filename
         if source.is_file():
             shutil.copy2(source, adapter_dir / filename)
@@ -438,14 +488,16 @@ def train(cfg: TrainingConfig) -> None:
     tokenizer = AutoTokenizer.from_pretrained(cfg.base_model, trust_remote_code=True)
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer_metadata = resolve_tokenizer_metadata(tokenizer)
 
     model = AutoModelForCausalLM.from_pretrained(
         cfg.base_model,
         trust_remote_code=True,
         quantization_config=quant_config,
         device_map="auto" if device == "cuda" else None,
-        torch_dtype=torch.float32 if device == "cpu" else None,
+        dtype=torch.float32 if device == "cpu" else None,
     )
+    align_model_special_tokens(model, tokenizer_metadata)
     if device != "cuda":
         model = model.to(device)
 
@@ -489,6 +541,7 @@ def train(cfg: TrainingConfig) -> None:
         report_to=cfg.report_to,
         bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
         fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
+        dataloader_pin_memory=device == "cuda",
     )
     training_parameters = inspect.signature(TrainingArguments).parameters
     if "warmup_ratio" in training_parameters:
@@ -536,6 +589,36 @@ def train(cfg: TrainingConfig) -> None:
         # Keep behaviour explicit even if TRL internals change.
         raise RuntimeError("Expected a PEFT LoRA model but received a non-PEFT model")
     tokenizer.save_pretrained(str(adapter_dir))
+    # Some tokenizer implementations omit auxiliary files when they are
+    # loaded from a minimal local artifact. Keep the snapshot contract
+    # explicit so promotion validation is deterministic.
+    if not (adapter_dir / "tokenizer_config.json").is_file():
+        write_json(adapter_dir / "tokenizer_config.json", tokenizer.init_kwargs)
+    if not (adapter_dir / "special_tokens_map.json").is_file():
+        write_json(
+            adapter_dir / "special_tokens_map.json",
+            {
+                "pad_token": tokenizer.pad_token,
+                "bos_token": tokenizer.bos_token,
+                "eos_token": tokenizer.eos_token,
+            },
+        )
+    write_json(
+        adapter_dir / "tokenizer_metadata.json",
+        tokenizer_metadata,
+    )
+
+    effective_backend = "cuda_qlora" if device == "cuda" and cfg.algorithm == "qlora_sft" else (
+        "cuda_lora" if device == "cuda" else "cpu_lora"
+    )
+    cpu_fallback = device != "cuda" and cfg.algorithm == "qlora_sft"
+    print(
+        "GAIL_TRAINING_BACKEND "
+        f"requested_algorithm={cfg.algorithm} effective_backend={effective_backend} "
+        f"device={device} quantisation={'4bit_nf4' if quant_config is not None else 'none'} "
+        f"pin_memory={device == 'cuda'} cpu_fallback={cpu_fallback}",
+        file=sys.stderr,
+    )
 
     modelfile = rank_root / "Modelfile"
     ollama_base_model = cfg.ollama_base_model.strip() or cfg.base_model
@@ -557,6 +640,12 @@ def train(cfg: TrainingConfig) -> None:
         "base_model": cfg.base_model,
         "ollama_base_model": ollama_base_model,
         "device": device,
+        "backend": effective_backend,
+        "effective_algorithm": "qlora_sft" if effective_backend == "cuda_qlora" else "lora_sft",
+        "quantisation_backend": "4bit_nf4" if quant_config is not None else "none",
+        "pin_memory": device == "cuda",
+        "cpu_fallback": cpu_fallback,
+        "tokenizer_metadata": tokenizer_metadata,
         "samples": len(texts),
         "target_modules": target_modules,
         "training_loss": float(train_result.training_loss)
@@ -567,6 +656,30 @@ def train(cfg: TrainingConfig) -> None:
         "resume_adapter": str(resume_adapter.resolve()) if resume_adapter else None,
         "cumulative_training": resume_adapter is not None,
     }
+    write_json(
+        adapter_dir / "training_manifest.json",
+        {
+            "format": "gail-lora-training-manifest",
+            "algorithm_requested": cfg.algorithm,
+            "algorithm_executed": report["effective_algorithm"],
+            "backend": effective_backend,
+            "device": device,
+            "cpu_fallback": cpu_fallback,
+            "quantisation_backend": report["quantisation_backend"],
+            "pin_memory": report["pin_memory"],
+            "base_model": cfg.base_model,
+            "tokenizer": "tokenizer.json",
+            "tokenizer_metadata": tokenizer_metadata,
+            "tokenizer_files": [
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "special_tokens_map.json",
+            ],
+            "adapter_model": "adapter_model.safetensors",
+            "adapter_config": "adapter_config.json",
+            "cumulative_training": resume_adapter is not None,
+        },
+    )
     report["slurm"] = {"rank": rank, "world_size": world_size, "job_id": job_id}
     write_json(rank_root / "training_report.json", report)
     if world_size == 1:

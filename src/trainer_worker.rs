@@ -497,6 +497,17 @@ async fn run_training_pipeline(
     let execution_plan = build_training_execution_plan(trainer, hardware);
     let artifact_mode = training_artifact_mode();
     let resume_adapter = active_adapter_path(trainer)?;
+    tracing::info!(
+        snapshot = snapshot_id,
+        requested_algorithm = %trainer.algorithm,
+        effective_backend = %execution_plan.backend,
+        device = %execution_plan.device,
+        quantisation_backend = %execution_plan.quantisation_backend,
+        pin_memory = execution_plan.device == "cuda",
+        cpu_fallback = execution_plan.device == "cpu"
+            && trainer.algorithm.eq_ignore_ascii_case("qlora_sft"),
+        "training execution path selected"
+    );
     write_json(
         snapshot_dir.join("training_execution_plan.json").as_path(),
         &serde_json::to_value(&execution_plan).unwrap_or(Value::Null),
@@ -1549,6 +1560,7 @@ async fn register_snapshot_with_ollama(
     };
     let mut parsed_modelfile = parse_modelfile(&modelfile);
     validate_registration_artifacts(trainer, &parsed_modelfile)?;
+    validate_tokenizer_registration_manifest(snapshot_dir).await?;
     let adapter_directives =
         prepare_ollama_adapter(trainer, snapshot_id, snapshot_dir, &mut parsed_modelfile).await?;
     let create_payload = build_ollama_create_payload_from_modelfile(
@@ -1845,6 +1857,75 @@ fn validate_registration_artifacts(
             trainer.algorithm
         )));
     }
+    Ok(())
+}
+
+/// Refuse to promote an adapter whose tokenizer contract was not persisted
+/// with the snapshot. Serving must use the same special-token IDs as training.
+async fn validate_tokenizer_registration_manifest(snapshot_dir: &Path) -> Result<()> {
+    let adapter_dir = snapshot_dir.join("adapter");
+    let manifest_path = adapter_dir.join("training_manifest.json");
+    let raw = fs::read_to_string(&manifest_path).await.map_err(|error| {
+        GailError::invalid_config(format!(
+            "tokenizer manifest is missing before Ollama registration ({}): {error}",
+            manifest_path.display()
+        ))
+    })?;
+    let manifest: Value = serde_json::from_str(&raw).map_err(|error| {
+        GailError::invalid_config(format!(
+            "tokenizer manifest is invalid before Ollama registration: {error}"
+        ))
+    })?;
+    let metadata = manifest
+        .get("tokenizer_metadata")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            GailError::invalid_config(
+                "tokenizer metadata is absent before Ollama registration".to_string(),
+            )
+        })?;
+    for name in ["pad_token_id", "bos_token_id", "eos_token_id"] {
+        if !metadata.contains_key(name) {
+            return Err(GailError::invalid_config(format!(
+                "tokenizer metadata is missing {name} before Ollama registration"
+            )));
+        }
+        if !metadata[name].is_null() && metadata[name].as_u64().is_none() {
+            return Err(GailError::invalid_config(format!(
+                "tokenizer metadata {name} is not an integer or null"
+            )));
+        }
+    }
+    if metadata
+        .get("probe")
+        .and_then(Value::as_object)
+        .and_then(|probe| probe.get("round_trip_ok"))
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Err(GailError::invalid_config(
+            "tokenizer startup probe was not successful; refusing Ollama registration".to_string(),
+        ));
+    }
+    for filename in [
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+    ] {
+        let path = adapter_dir.join(filename);
+        if !path.is_file() {
+            return Err(GailError::invalid_config(format!(
+                "tokenizer artifact {filename} is missing before Ollama registration"
+            )));
+        }
+    }
+    tracing::info!(
+        path = %manifest_path.display(),
+        pad_token_id = ?metadata.get("pad_token_id"),
+        bos_token_id = ?metadata.get("bos_token_id"),
+        eos_token_id = ?metadata.get("eos_token_id"),
+        "validated tokenizer/model contract before Ollama registration"
+    );
     Ok(())
 }
 

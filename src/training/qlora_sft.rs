@@ -39,6 +39,7 @@ use tokio::fs;
 
 const SUPPORTED_ALGORITHMS: &[&str] = &["qlora_sft", "lora_sft"];
 const DEFAULT_SYSTEM_PROMPT: &str = "You are the Gail in-house continuously trained model. Use prior interaction learning when useful.";
+const TOKENIZER_PROBE_TEXT: &str = "Gail tokenizer probe: BTC/USDT 123.";
 
 #[derive(Debug, Clone, Serialize)]
 struct TrainingConfig {
@@ -512,6 +513,8 @@ async fn run_training(
         "tokenizer_threads": plan.tokenizer_threads,
         "compute_dtype": plan.compute_dtype.as_str(),
         "quantisation_backend": plan.quantisation_backend,
+        "cpu_fallback": plan.device_index.is_none() && cfg.algorithm.eq_ignore_ascii_case("qlora_sft"),
+        "pin_memory": plan.device_index.is_some(),
         "execution_profile": plan.profile,
         "metrics": run_result.metrics,
         "exported_adapter_tensors": run_result.exported_adapter_tensors,
@@ -654,6 +657,31 @@ async fn aggregate_distributed_outputs_inner(
     fs::create_dir_all(&distributed.root_output).await?;
     let adapter_dir = distributed.root_output.join("adapter");
     fs::create_dir_all(&adapter_dir).await?;
+    let tokenizer_metadata = tokenizer_metadata(&cfg.tokenizer)?;
+    fs::copy(&cfg.tokenizer, adapter_dir.join("tokenizer.json")).await?;
+    fs::write(
+        adapter_dir.join("tokenizer_config.json"),
+        serde_json::to_string_pretty(&json!({
+            "pad_token_id": tokenizer_metadata["pad_token_id"],
+            "bos_token_id": tokenizer_metadata["bos_token_id"],
+            "eos_token_id": tokenizer_metadata["eos_token_id"],
+        }))? + "\n",
+    )
+    .await?;
+    fs::write(
+        adapter_dir.join("special_tokens_map.json"),
+        serde_json::to_string_pretty(&json!({
+            "pad_token": "[PAD]",
+            "bos_token": "[BOS]",
+            "eos_token": "[EOS]",
+        }))? + "\n",
+    )
+    .await?;
+    fs::write(
+        adapter_dir.join("tokenizer_metadata.json"),
+        serde_json::to_string_pretty(&tokenizer_metadata)? + "\n",
+    )
+    .await?;
 
     let mut reports = Vec::with_capacity(distributed.world_size);
     let mut sample_weights = Vec::with_capacity(distributed.world_size);
@@ -764,6 +792,7 @@ async fn aggregate_distributed_outputs_inner(
         "algorithm_requested": cfg.algorithm,
         "algorithm_executed": reports.first().and_then(|report| report.get("algorithm_executed")).cloned().unwrap_or(Value::Null),
         "base_model": cfg.base_model,
+        "tokenizer_metadata": tokenizer_metadata,
         "adapter_model": "adapter_model.safetensors",
         "adapter_config": "adapter_config.json",
         "exported_adapter_tensors": output_tensors.len(),
@@ -1499,6 +1528,31 @@ async fn write_training_manifest(
     run_result: &TrainingRunResult,
     adapter_dir: &Path,
 ) -> anyhow::Result<()> {
+    let tokenizer_metadata = tokenizer_metadata(&cfg.tokenizer)?;
+    fs::copy(&cfg.tokenizer, adapter_dir.join("tokenizer.json")).await?;
+    fs::write(
+        adapter_dir.join("tokenizer_config.json"),
+        serde_json::to_string_pretty(&json!({
+            "pad_token_id": tokenizer_metadata["pad_token_id"],
+            "bos_token_id": tokenizer_metadata["bos_token_id"],
+            "eos_token_id": tokenizer_metadata["eos_token_id"],
+        }))? + "\n",
+    )
+    .await?;
+    fs::write(
+        adapter_dir.join("special_tokens_map.json"),
+        serde_json::to_string_pretty(&json!({
+            "pad_token": "[PAD]",
+            "bos_token": "[BOS]",
+            "eos_token": "[EOS]",
+        }))? + "\n",
+    )
+    .await?;
+    fs::write(
+        adapter_dir.join("tokenizer_metadata.json"),
+        serde_json::to_string_pretty(&tokenizer_metadata)? + "\n",
+    )
+    .await?;
     let manifest = json!({
         "format": "gail-lora-training-manifest",
         "algorithm_requested": cfg.algorithm,
@@ -1508,6 +1562,8 @@ async fn write_training_manifest(
         "device": plan.device_label,
         "compute_dtype": plan.compute_dtype.as_str(),
         "quantisation_backend": plan.quantisation_backend,
+        "cpu_fallback": plan.device_index.is_none() && cfg.algorithm.eq_ignore_ascii_case("qlora_sft"),
+        "pin_memory": plan.device_index.is_some(),
         "activation_checkpointing": plan.activation_checkpointing,
         "dynamic_padding": plan.dynamic_padding,
         "sequence_packing": plan.sequence_packing,
@@ -1517,6 +1573,8 @@ async fn write_training_manifest(
         "base_model": cfg.base_model,
         "model_module": cfg.model_module.to_string_lossy(),
         "tokenizer": cfg.tokenizer.to_string_lossy(),
+        "tokenizer_metadata": tokenizer_metadata,
+        "tokenizer_files": ["tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"],
         "adapter_model": "adapter_model.safetensors",
         "adapter_config": "adapter_config.json",
         "metrics": run_result.metrics,
@@ -1529,6 +1587,37 @@ async fn write_training_manifest(
     )
     .await?;
     Ok(())
+}
+
+fn tokenizer_metadata(path: &Path) -> anyhow::Result<Value> {
+    let tokenizer = Tokenizer::from_file(path)
+        .map_err(|error| anyhow::anyhow!("failed to load tokenizer metadata: {error}"))?;
+    let encoding = tokenizer
+        .encode(TOKENIZER_PROBE_TEXT, true)
+        .map_err(|error| anyhow::anyhow!("tokenizer startup probe failed: {error}"))?;
+    let decoded = tokenizer
+        .decode(encoding.get_ids(), false)
+        .map_err(|error| anyhow::anyhow!("tokenizer startup decode failed: {error}"))?;
+    if encoding.get_ids().is_empty() || !decoded.contains("Gail") {
+        anyhow::bail!("tokenizer startup probe did not round-trip usable text");
+    }
+    let pad_token_id = tokenizer
+        .get_padding()
+        .map(|padding| padding.pad_id as u64)
+        .or_else(|| tokenizer.token_to_id("[PAD]").map(u64::from));
+    let bos_token_id = tokenizer.token_to_id("[BOS]").map(u64::from);
+    let eos_token_id = tokenizer.token_to_id("[EOS]").map(u64::from);
+    Ok(json!({
+        "pad_token_id": pad_token_id,
+        "bos_token_id": bos_token_id,
+        "eos_token_id": eos_token_id,
+        "probe": {
+            "text": TOKENIZER_PROBE_TEXT,
+            "token_count": encoding.get_ids().len(),
+            "decoded": decoded,
+            "round_trip_ok": true,
+        }
+    }))
 }
 
 async fn write_modelfile(cfg: &TrainingConfig, modelfile: &Path) -> anyhow::Result<()> {

@@ -81,6 +81,14 @@ pub struct TrainingRunObservation {
     /// learning from timestamps or snapshot names.
     #[serde(default)]
     pub cumulative_training: bool,
+    /// True when a requested QLoRA run intentionally executed as CPU LoRA.
+    #[serde(default)]
+    pub cpu_fallback: bool,
+    /// Effective DataLoader pinned-memory setting for the run.
+    #[serde(default)]
+    pub pin_memory: bool,
+    #[serde(default)]
+    pub quantisation_backend: String,
 }
 
 impl TrainingRunObservation {
@@ -169,6 +177,19 @@ impl TrainingRunObservation {
                 .get("cumulative_training")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            cpu_fallback: report
+                .get("cpu_fallback")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            pin_memory: report
+                .get("pin_memory")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            quantisation_backend: report
+                .get("quantisation_backend")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
         }
     }
 }
@@ -2052,6 +2073,12 @@ fn render_training_prometheus_metrics(
     out.push_str("# TYPE gail_training_last_finished_timestamp_seconds gauge\n");
     out.push_str("# HELP gail_training_cumulative_training Whether the run resumed from the previous adapter.\n");
     out.push_str("# TYPE gail_training_cumulative_training gauge\n");
+    out.push_str("# HELP gail_training_cpu_fallback Whether requested QLoRA intentionally ran as CPU LoRA.\n");
+    out.push_str("# TYPE gail_training_cpu_fallback gauge\n");
+    out.push_str("# HELP gail_training_pin_memory Whether DataLoader pinned memory was enabled.\n");
+    out.push_str("# TYPE gail_training_pin_memory gauge\n");
+    out.push_str("# HELP gail_training_quantisation_backend_info Effective quantisation backend for the run.\n");
+    out.push_str("# TYPE gail_training_quantisation_backend_info gauge\n");
     for run in &data.runs {
         let labels = format!(
             "snapshot_id=\"{}\",backend=\"{}\",status=\"{}\",model=\"{}\",slurm_job_id=\"{}\",nodelist=\"{}\"",
@@ -2091,6 +2118,19 @@ fn render_training_prometheus_metrics(
         out.push_str(&format!(
             "gail_training_cumulative_training{{{labels}}} {}\n",
             if run.cumulative_training { 1 } else { 0 }
+        ));
+        out.push_str(&format!(
+            "gail_training_cpu_fallback{{{labels}}} {}\n",
+            if run.cpu_fallback { 1 } else { 0 }
+        ));
+        out.push_str(&format!(
+            "gail_training_pin_memory{{{labels}}} {}\n",
+            if run.pin_memory { 1 } else { 0 }
+        ));
+        out.push_str(&format!(
+            "gail_training_quantisation_backend_info{{{},quantisation_backend=\"{}\"}} 1\n",
+            labels,
+            escape_label(&run.quantisation_backend)
         ));
     }
     let mut totals: HashMap<(String, String), u64> = HashMap::new();
@@ -2279,6 +2319,9 @@ mod tests {
                 started_ts: Some(1.0),
                 finished_ts: Some(2.0),
                 cumulative_training: false,
+                cpu_fallback: false,
+                pin_memory: false,
+                quantisation_backend: "none".to_string(),
             },
         )
         .await
