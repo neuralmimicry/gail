@@ -745,6 +745,13 @@ impl GailService {
         let request_id = Uuid::new_v4().to_string();
         let profile = self.direct_provider_profile(&effective_request);
         self.prepare_provider_request(&profile, &mut effective_request);
+        if !effective_request.messages.iter().any(|message| {
+            message.role.eq_ignore_ascii_case("user") && !message.flattened_text().trim().is_empty()
+        }) {
+            return Err(GailError::bad_request(
+                "direct provider requests require at least one non-empty user message",
+            ));
+        }
         let expected_json = expected_json(
             &effective_request.messages,
             effective_request.system.as_deref(),
