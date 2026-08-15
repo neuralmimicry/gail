@@ -937,6 +937,7 @@ mod tests {
         // Write some data.
         {
             let mut s = state.0.lock().await;
+            s.paused = true;
             s.evaluation_count = 42;
             s.trade_count = 6; // record_trade will increment this to 7
             s.record_trade(ExecutedTrade {
@@ -1000,6 +1001,7 @@ mod tests {
         let restored = SharedTradingState::new(100, 50);
         restored.restore(&tmp_path).await;
         let s = restored.0.lock().await;
+        assert!(s.paused, "operator pause must survive restart");
         assert_eq!(s.evaluation_count, 42);
         assert_eq!(s.trade_count, 7);
         assert_eq!(s.recent_trades.len(), 1);

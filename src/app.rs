@@ -881,10 +881,28 @@ async fn trading_set_config(
     match service.trading_bridge() {
         None => trading_unavailable(),
         Some(bridge) => {
-            let mut state = bridge.state.0.lock().await;
-            state.config_overrides = Some(overrides);
-            state.log_info("config", "Runtime config overrides updated via API");
-            Json(json!({ "ok": true, "message": "config overrides applied" })).into_response()
+            {
+                let mut state = bridge.state.0.lock().await;
+                state.config_overrides = Some(overrides);
+                state.log_info("config", "Runtime config overrides updated via API");
+            }
+            if let Err(error) = bridge
+                .state
+                .persist_checked(&std::path::PathBuf::from(&bridge.config.data_path))
+                .await
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "ok": false,
+                        "message": "config override was not durably persisted",
+                        "error": error
+                    })),
+                )
+                    .into_response();
+            }
+            Json(json!({ "ok": true, "message": "config overrides applied and persisted" }))
+                .into_response()
         }
     }
 }
@@ -896,9 +914,22 @@ async fn trading_pause(State(service): State<GailService>, headers: HeaderMap) -
     match service.trading_bridge() {
         None => trading_unavailable(),
         Some(bridge) => {
-            let mut state = bridge.state.0.lock().await;
-            state.paused = true;
-            state.log_info("control", "Trading bridge PAUSED via API");
+            {
+                let mut state = bridge.state.0.lock().await;
+                state.paused = true;
+                state.log_info("control", "Trading bridge PAUSED via API");
+            }
+            if let Err(error) = bridge
+                .state
+                .persist_checked(&std::path::PathBuf::from(&bridge.config.data_path))
+                .await
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "ok": false, "message": "pause was not durably persisted", "error": error })),
+                )
+                    .into_response();
+            }
             Json(json!({ "ok": true, "paused": true })).into_response()
         }
     }
@@ -911,9 +942,22 @@ async fn trading_resume(State(service): State<GailService>, headers: HeaderMap) 
     match service.trading_bridge() {
         None => trading_unavailable(),
         Some(bridge) => {
-            let mut state = bridge.state.0.lock().await;
-            state.paused = false;
-            state.log_info("control", "Trading bridge RESUMED via API");
+            {
+                let mut state = bridge.state.0.lock().await;
+                state.paused = false;
+                state.log_info("control", "Trading bridge RESUMED via API");
+            }
+            if let Err(error) = bridge
+                .state
+                .persist_checked(&std::path::PathBuf::from(&bridge.config.data_path))
+                .await
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "ok": false, "message": "resume was not durably persisted", "error": error })),
+                )
+                    .into_response();
+            }
             Json(json!({ "ok": true, "paused": false })).into_response()
         }
     }
@@ -965,10 +1009,23 @@ async fn trading_override(
                 issued_at: now,
                 issued_by: auth_ctx.client_id.unwrap_or_else(|| "unknown".to_string()),
             };
-            let mut state = bridge.state.0.lock().await;
-            state.pending_override = Some(override_req);
-            state.log_info("control", format!("Trade override set: {action_str}"));
-            Json(json!({ "ok": true, "message": "override queued for next evaluation" }))
+            {
+                let mut state = bridge.state.0.lock().await;
+                state.pending_override = Some(override_req);
+                state.log_info("control", format!("Trade override set: {action_str}"));
+            }
+            if let Err(error) = bridge
+                .state
+                .persist_checked(&std::path::PathBuf::from(&bridge.config.data_path))
+                .await
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "ok": false, "message": "override was not durably persisted", "error": error })),
+                )
+                    .into_response();
+            }
+            Json(json!({ "ok": true, "message": "override queued and persisted for next evaluation" }))
                 .into_response()
         }
     }

@@ -592,7 +592,11 @@ impl SharedTradingState {
             Ok(raw) => match parse_persisted_state(&raw) {
                 Ok((restored, repaired_snapshot)) => {
                     let mut state = self.0.lock().await;
-                    // Restore counters and history but not ephemeral fields
+                    // Restore durable decisions and history, but not ephemeral
+                    // exchange observations/positions which are refreshed from
+                    // OctoBot after startup. A persisted pause is deliberate
+                    // operator state and must survive a reboot fail-closed.
+                    state.paused = restored.paused;
                     state.evaluation_count = restored.evaluation_count;
                     state.trade_count = restored.trade_count;
                     state.last_evaluation_at = restored.last_evaluation_at;
