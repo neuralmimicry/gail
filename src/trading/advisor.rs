@@ -30,6 +30,10 @@ use super::refiner::ResearchContext;
 const TRADING_ADVISORY_OUTPUT_TOKENS_DEFAULT: u32 = 2_048;
 const TRADING_ADVISORY_OUTPUT_TOKENS_COMPLEX: u32 = 4_096;
 const TRADING_ADVISORY_COMPLEXITY_THRESHOLD_TOKENS: usize = 2_048;
+const TRADING_CONTEXT_WINDOW_TOKENS: usize = 16_384;
+const TRADING_PROMPT_SAFETY_MARGIN_TOKENS: usize = 512;
+const TRADING_CHARS_PER_TOKEN: usize = 3;
+const TRADING_CHUNK_OVERHEAD_CHARS: usize = 1_024;
 
 // ---------------------------------------------------------------------------
 // Domain types
@@ -79,6 +83,15 @@ pub struct AiConsensus {
     pub responders: usize,
     /// Number of providers that failed / timed out.
     pub failures: usize,
+}
+
+/// A semantically bounded interpretation unit. The chunk is deliberately
+/// opaque to the reducer: providers interpret it, but only the deterministic
+/// reducer may decide how evidence affects execution.
+#[derive(Clone, Debug)]
+struct AdvisoryPromptChunk {
+    id: usize,
+    prompt: String,
 }
 
 impl AiConsensus {
@@ -159,23 +172,50 @@ impl TradingAdvisor {
             build_advisory_prompt(&ranked_snapshots, historical_features, research, portfolio);
         let system = advisory_system_prompt();
         let timeout_secs = self.timeout.as_secs();
+        let chunks = split_advisory_prompt(&prompt, &system);
+        let chunk_count = chunks.len();
 
         let mut join_set: JoinSet<AiAdvice> = JoinSet::new();
         for profile in providers {
-            let svc = self.service.clone();
-            let prompt_clone = prompt.clone();
-            let system_clone = system.clone();
-            let profile_clone = profile.clone();
-            join_set.spawn(async move {
-                query_provider(svc, profile_clone, prompt_clone, system_clone, timeout_secs).await
-            });
+            for chunk in &chunks {
+                let svc = self.service.clone();
+                let prompt_clone = chunk.prompt.clone();
+                let system_clone = system.clone();
+                let profile_clone = profile.clone();
+                let chunk_id = chunk.id;
+                join_set.spawn(async move {
+                    let mut advice = query_provider(
+                        svc,
+                        profile_clone,
+                        prompt_clone,
+                        system_clone,
+                        timeout_secs,
+                    )
+                    .await;
+                    // A provider must not gain influence merely because the
+                    // evidence required more chunks. The reducer still sees
+                    // every interpretation, but normalises its vote mass.
+                    advice.weight /= chunk_count as f64;
+                    advice.reasoning = format!("[chunk={chunk_id}] {}", advice.reasoning);
+                    advice
+                });
+            }
         }
 
-        let min_responder_target = self.early_quorum.min(max_advisors.max(1));
+        // A multi-coin request must not stop after the first few chunks: keep
+        // every legible coin interpretation and let the deadline, rather than
+        // an early quorum, bound the work. Partial evidence is reduced below
+        // and its lower coverage keeps live execution conservative.
+        let required_quorum = self.early_quorum.min(max_advisors.max(1)) * chunk_count;
+        let collection_quorum = if chunk_count > 1 {
+            usize::MAX
+        } else {
+            required_quorum
+        };
         let (mut advices, mut failures, first_wave_expired) =
-            collect_advice_wave(&mut join_set, deadline, min_responder_target).await;
+            collect_advice_wave(&mut join_set, deadline, collection_quorum).await;
         let mut parsed_responders = advices.iter().filter(|advice| advice.parsed_ok).count();
-        if parsed_responders < min_responder_target && !first_wave_expired {
+        if parsed_responders < required_quorum && !first_wave_expired {
             let fallback_candidates = tokio::time::timeout_at(
                 deadline,
                 self.select_providers(max_advisors.max(1).saturating_add(3)),
@@ -188,13 +228,24 @@ impl TradingAdvisor {
                     continue;
                 }
                 let service = self.service.clone();
-                let prompt = prompt.clone();
                 let system = system.clone();
-                fallback_join_set.spawn(async move {
-                    query_provider(service, profile, prompt, system, timeout_secs).await
-                });
+                for chunk in &chunks {
+                    let prompt = chunk.prompt.clone();
+                    let chunk_id = chunk.id;
+                    let chunk_count = chunk_count;
+                    let profile = profile.clone();
+                    let service = service.clone();
+                    let system = system.clone();
+                    fallback_join_set.spawn(async move {
+                        let mut advice =
+                            query_provider(service, profile, prompt, system, timeout_secs).await;
+                        advice.weight /= chunk_count as f64;
+                        advice.reasoning = format!("[chunk={chunk_id}] {}", advice.reasoning);
+                        advice
+                    });
+                }
             }
-            let remaining_quorum = min_responder_target.saturating_sub(parsed_responders);
+            let remaining_quorum = required_quorum.saturating_sub(parsed_responders);
             let (fallback_advices, fallback_failures, _) =
                 collect_advice_wave(&mut fallback_join_set, deadline, remaining_quorum.max(1))
                     .await;
@@ -640,6 +691,86 @@ async fn query_provider(
             }
         }
     }
+}
+
+/// Split an oversized advisory by newline-delimited records. This is a
+/// deterministic, format-preserving first pass: complete JSON/CSV records
+/// should already be rendered as one line by the prompt builder, and long
+/// unstructured lines are split only as a last resort.
+fn split_advisory_prompt(prompt: &str, system: &str) -> Vec<AdvisoryPromptChunk> {
+    let output_tokens = adaptive_advisory_output_tokens(prompt, system) as usize;
+    let input_tokens = TRADING_CONTEXT_WINDOW_TOKENS
+        .saturating_sub(output_tokens)
+        .saturating_sub(TRADING_PROMPT_SAFETY_MARGIN_TOKENS)
+        .max(256);
+    let max_prompt_chars = input_tokens
+        .saturating_mul(TRADING_CHARS_PER_TOKEN)
+        .saturating_sub(system.chars().count())
+        .saturating_sub(TRADING_CHUNK_OVERHEAD_CHARS)
+        .max(1_024);
+
+    if prompt.chars().count() <= max_prompt_chars {
+        return vec![AdvisoryPromptChunk {
+            id: 0,
+            prompt: prompt.to_string(),
+        }];
+    }
+
+    let lines = prompt.lines().collect::<Vec<_>>();
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut id = 0;
+    for line in lines {
+        let line_chars = line.chars().count() + 1;
+        if !current.is_empty() && current.chars().count() + line_chars > max_prompt_chars {
+            chunks.push(AdvisoryPromptChunk {
+                id,
+                prompt: current,
+            });
+            id += 1;
+            current = String::new();
+        }
+        if line_chars > max_prompt_chars {
+            let chars = line.chars().collect::<Vec<_>>();
+            for piece in chars.chunks(max_prompt_chars.saturating_sub(1).max(1)) {
+                let piece = piece.iter().collect::<String>();
+                if !current.is_empty() {
+                    chunks.push(AdvisoryPromptChunk {
+                        id,
+                        prompt: current,
+                    });
+                    id += 1;
+                    current = String::new();
+                }
+                chunks.push(AdvisoryPromptChunk {
+                    id,
+                    prompt: piece.to_string(),
+                });
+                id += 1;
+            }
+        } else {
+            current.push_str(line);
+            current.push('\n');
+        }
+    }
+    if !current.trim().is_empty() {
+        chunks.push(AdvisoryPromptChunk {
+            id,
+            prompt: current,
+        });
+    }
+    chunks
+        .into_iter()
+        .map(|chunk| AdvisoryPromptChunk {
+            id: chunk.id,
+            prompt: format!(
+                "ADVISORY EVIDENCE CHUNK {}/{}:\n{}\nInterpret only the evidence present in this chunk; return the required JSON advisory.",
+                chunk.id + 1,
+                id.max(1),
+                chunk.prompt
+            ),
+        })
+        .collect()
 }
 
 fn adaptive_advisory_output_tokens(prompt: &str, system: &str) -> u32 {
@@ -1140,6 +1271,7 @@ fn aggregate_consensus(advices: Vec<AiAdvice>, failures: usize) -> AiConsensus {
     let mut weighted_confidence = 0.0_f64;
     let mut weighted_risk = 0.0_f64;
     let mut vote_map: HashMap<String, f64> = HashMap::new();
+    let mut legible_targets: HashMap<String, usize> = HashMap::new();
 
     for advice in &advices {
         if !advice.parsed_ok {
@@ -1155,6 +1287,12 @@ fn aggregate_consensus(advices: Vec<AiAdvice>, failures: usize) -> AiConsensus {
         weighted_risk += advice.risk_score.clamp(0.0, 1.0) * provider_weight;
         total_weight += effective_weight;
         *vote_map.entry(advice.action.clone()).or_insert(0.0) += effective_weight;
+        if let Some(target) = advice.target_symbol.as_deref() {
+            let target = target.trim().to_ascii_uppercase();
+            if !target.is_empty() {
+                *legible_targets.entry(target).or_insert(0) += 1;
+            }
+        }
     }
 
     let signal = if total_weight > 0.0 {
@@ -1193,6 +1331,8 @@ fn aggregate_consensus(advices: Vec<AiAdvice>, failures: usize) -> AiConsensus {
 
     let vote_distribution = json!({
         "votes": vote_map,
+        "legible_targets": legible_targets,
+        "partial_evidence": failures > 0,
         "agreement": agreement,
         "coverage": coverage,
         "average_risk": average_risk,
@@ -1225,6 +1365,26 @@ mod tests {
             adaptive_advisory_output_tokens(&complex_prompt, ""),
             TRADING_ADVISORY_OUTPUT_TOKENS_COMPLEX
         );
+    }
+
+    #[test]
+    fn oversized_advisory_is_split_into_context_bounded_chunks() {
+        let prompt = (0..20_000)
+            .map(|index| format!("record-{index}: BTC/USDT price=1.0"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let chunks = split_advisory_prompt(&prompt, "system instructions");
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| {
+            chunk.prompt.chars().count()
+                <= (TRADING_CONTEXT_WINDOW_TOKENS
+                    - TRADING_ADVISORY_OUTPUT_TOKENS_COMPLEX as usize
+                    - TRADING_PROMPT_SAFETY_MARGIN_TOKENS)
+                    * TRADING_CHARS_PER_TOKEN
+                    + TRADING_CHUNK_OVERHEAD_CHARS
+        }));
+        assert_eq!(chunks[0].id, 0);
+        assert!(chunks[0].prompt.contains("ADVISORY EVIDENCE CHUNK 1/"));
     }
 
     fn profile(name: &str, provider_type: &str, weight: f64) -> ProviderProfile {
@@ -1407,6 +1567,22 @@ mod tests {
                 .as_f64()
                 .is_some_and(|value| value <= 0.5)
         );
+    }
+
+    #[test]
+    fn aggregate_consensus_retains_legible_coin_when_other_chunk_fails() {
+        let mut failed = advice("hold", 0.0, 1.0, 1.0);
+        failed.parsed_ok = false;
+        let consensus = aggregate_consensus(vec![advice("buy", 0.8, 1.0, 0.2), failed], 1);
+
+        assert_eq!(consensus.action, "buy");
+        assert_eq!(consensus.responders, 1);
+        assert_eq!(
+            consensus.vote_distribution["legible_targets"]["BTC/USDT"],
+            1
+        );
+        assert_eq!(consensus.vote_distribution["partial_evidence"], true);
+        assert!(consensus.confidence < 0.8);
     }
 
     #[test]
