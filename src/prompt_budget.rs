@@ -17,6 +17,7 @@ use crate::models::{ChatMessage, ContentPart, MessageContent, ProviderCompletion
 const MIN_CONTEXT_WINDOW_TOKENS: usize = 1_024;
 const MIN_INPUT_BUDGET_TOKENS: usize = 256;
 const COMPACTION_MARKER_BUDGET_CHARS: usize = 512;
+const MIN_USER_QUERY_CHARS: usize = 64;
 
 /// Observable details for a request that was changed to fit a context window.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,9 +65,13 @@ pub fn compact_provider_request(
         return None;
     }
 
-    // System policy is more important than old conversation history. Give it a
-    // bounded share so a pathological system prompt cannot evict the user task.
-    let system_budget = input_budget_chars / 3;
+    // System policy is more important than old conversation history, but it
+    // must never evict the user task. Reserve room for the compaction marker
+    // and a meaningful minimum user query before assigning the system share.
+    let system_budget = input_budget_chars
+        .saturating_sub(COMPACTION_MARKER_BUDGET_CHARS)
+        .saturating_sub(MIN_USER_QUERY_CHARS)
+        .min(input_budget_chars / 3);
     if let Some(system) = request.system.as_mut()
         && char_count(system) > system_budget
     {
@@ -78,6 +83,14 @@ pub fn compact_provider_request(
         .saturating_sub(retained_system_chars)
         .saturating_sub(COMPACTION_MARKER_BUDGET_CHARS);
 
+    let newest_user_message = request
+        .messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message.role.eq_ignore_ascii_case("user") && !message.flattened_text().trim().is_empty()
+        })
+        .cloned();
     let mut retained_reversed = Vec::new();
     let mut retained_chars = 0usize;
     let mut omitted_messages = Vec::new();
@@ -117,6 +130,21 @@ pub fn compact_provider_request(
     drop(omitted_messages);
     request.messages = retained_reversed;
 
+    // The provider chat templates require a user turn. Keep the newest user
+    // query even when an unusually large system prompt and output reservation
+    // consume the normal message budget. This may exceed the estimate by a
+    // few characters, but is safer than dispatching a system-only prompt that
+    // fails inside the model's Jinja chat template.
+    if !request.messages.iter().any(|message| {
+        message.role.eq_ignore_ascii_case("user") && !message.flattened_text().trim().is_empty()
+    }) && let Some(user_message) = newest_user_message
+    {
+        request.messages.push(compact_message(
+            &user_message,
+            MIN_USER_QUERY_CHARS.min(message_budget.max(MIN_USER_QUERY_CHARS)),
+        ));
+    }
+
     // The marker and UTF-8-safe truncation can be slightly conservative. Apply
     // one final cap to the newest text message if required.
     let after_first_pass = request_char_count(request);
@@ -124,7 +152,11 @@ pub fn compact_provider_request(
         && let Some(last) = request.messages.last_mut()
     {
         let overflow = after_first_pass - input_budget_chars;
-        let target = message_char_count(last).saturating_sub(overflow);
+        let target = if last.role.eq_ignore_ascii_case("user") {
+            MIN_USER_QUERY_CHARS
+        } else {
+            message_char_count(last).saturating_sub(overflow)
+        };
         *last = compact_message(last, target);
     }
 
@@ -313,5 +345,22 @@ mod tests {
         assert!(compacted.starts_with("START"));
         assert!(compacted.ends_with("END"));
         assert!(compacted.contains("middle omitted by Gail"));
+    }
+
+    #[test]
+    fn preserves_user_turn_when_system_prompt_consumes_compaction_budget() {
+        let mut request = request(vec![message(
+            "user",
+            "The trading query must remain available to the model.",
+        )]);
+        request.system = Some("system policy ".repeat(2_000));
+        request.max_tokens = Some(16_384);
+
+        compact_provider_request(&mut request, 1_024, 1, 256)
+            .expect("oversized system prompt should be compacted");
+
+        assert!(request.messages.iter().any(|message| {
+            message.role.eq_ignore_ascii_case("user") && !message.flattened_text().trim().is_empty()
+        }));
     }
 }
