@@ -27,6 +27,10 @@ use super::datalake::{MarketHistoricalFeatures, market_feature_key};
 use super::octobot::{MarketSnapshot, OctobotPortfolio};
 use super::refiner::ResearchContext;
 
+const TRADING_ADVISORY_OUTPUT_TOKENS_DEFAULT: u32 = 2_048;
+const TRADING_ADVISORY_OUTPUT_TOKENS_COMPLEX: u32 = 4_096;
+const TRADING_ADVISORY_COMPLEXITY_THRESHOLD_TOKENS: usize = 2_048;
+
 // ---------------------------------------------------------------------------
 // Domain types
 // ---------------------------------------------------------------------------
@@ -558,6 +562,7 @@ async fn query_provider(
     system: String,
     timeout_secs: u64,
 ) -> AiAdvice {
+    let output_tokens = adaptive_advisory_output_tokens(&prompt, &system);
     let request = ProviderCompletionRequest {
         provider: profile.provider_type.clone(),
         model: profile.model.clone(),
@@ -569,11 +574,12 @@ async fn query_provider(
             content: MessageContent::Text(prompt),
         }],
         system: Some(system),
-        // Trading responses must have enough budget to finish the JSON object
-        // even when a local reasoning model would otherwise spend most of its
-        // allocation on hidden thought. Local providers receive an explicit
-        // no-thinking directive below in their transport implementation.
-        max_tokens: Some(16_384),
+        // Reserve only the output space an advisory needs. The provider
+        // context remains 16,384 tokens; reserving the entire context here
+        // would leave only Gail's 256-token compaction floor for the prompt.
+        // Larger prompts receive a larger bounded response allowance, while
+        // ordinary structured advisories stay well below the context limit.
+        max_tokens: Some(output_tokens),
         temperature: Some(0.2),
         timeout_seconds: Some(timeout_secs),
         reasoning_effort: None,
@@ -633,6 +639,15 @@ async fn query_provider(
                 weight,
             }
         }
+    }
+}
+
+fn adaptive_advisory_output_tokens(prompt: &str, system: &str) -> u32 {
+    let estimated_input_tokens = (prompt.chars().count() + system.chars().count()).div_ceil(3);
+    if estimated_input_tokens >= TRADING_ADVISORY_COMPLEXITY_THRESHOLD_TOKENS {
+        TRADING_ADVISORY_OUTPUT_TOKENS_COMPLEX
+    } else {
+        TRADING_ADVISORY_OUTPUT_TOKENS_DEFAULT
     }
 }
 
@@ -1197,6 +1212,20 @@ fn aggregate_consensus(advices: Vec<AiAdvice>, failures: usize) -> AiConsensus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advisory_output_budget_is_bounded_and_adaptive() {
+        assert_eq!(
+            adaptive_advisory_output_tokens("short prompt", "short system"),
+            2_048
+        );
+
+        let complex_prompt = "x".repeat(TRADING_ADVISORY_COMPLEXITY_THRESHOLD_TOKENS * 3);
+        assert_eq!(
+            adaptive_advisory_output_tokens(&complex_prompt, ""),
+            TRADING_ADVISORY_OUTPUT_TOKENS_COMPLEX
+        );
+    }
 
     fn profile(name: &str, provider_type: &str, weight: f64) -> ProviderProfile {
         ProviderProfile {
