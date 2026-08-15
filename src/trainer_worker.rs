@@ -35,6 +35,14 @@ pub async fn run(config: GailConfig) -> Result<()> {
     llm_ledger::initialize_schema(&dsn).await.map_err(|error| {
         GailError::invalid_config(format!("failed to initialise LLM ledger schema: {error}"))
     })?;
+    let _training_worker_lock = llm_ledger::acquire_training_worker_lock(&dsn)
+        .await
+        .map_err(|error| {
+            GailError::invalid_config(format!("failed to acquire trainer lock: {error}"))
+        })?
+        .ok_or_else(|| {
+            GailError::invalid_config("another Gail trainer worker is already running")
+        })?;
     let trainer = config.trainer.clone();
     match llm_ledger::recover_incomplete_training_registrations(&dsn, trainer.recovery_batch_size)
         .await
@@ -251,6 +259,24 @@ async fn record_training_observation(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
+    let mut report = report;
+    // The command writes training metrics while Gail writes lifecycle timing
+    // to pipeline.json. Merge the latter into the former so provenance is
+    // stable across backfill/restart and is not replaced with backfill time.
+    let pipeline_path = snapshot_dir.join("pipeline.json");
+    if let Ok(raw) = fs::read_to_string(&pipeline_path).await
+        && let Ok(pipeline) = serde_json::from_str::<Value>(&raw)
+    {
+        if let (Some(metrics), Some(pipeline_object)) = (report.as_mut(), pipeline.as_object())
+            && let Some(metrics_object) = metrics.as_object_mut()
+        {
+            for key in ["started_ts", "finished_ts", "cumulative_training"] {
+                if let Some(value) = pipeline_object.get(key) {
+                    metrics_object.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+    }
     let status = outcome_status.unwrap_or_else(|| {
         if training_error.is_some() {
             if report.is_some() {
@@ -2617,7 +2643,7 @@ async fn ollama_api_delete(client: &Client, trainer: &TrainerConfig, model: &str
 fn snapshot_id() -> String {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
+        .map(|duration| duration.as_millis())
         .unwrap_or(0);
     format!("{ts}")
 }

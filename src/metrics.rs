@@ -76,6 +76,11 @@ pub struct TrainingRunObservation {
     pub non_padding_tokens_per_second: f64,
     pub started_ts: Option<f64>,
     pub finished_ts: Option<f64>,
+    /// True when the trainer resumed from the previously published adapter.
+    /// This is recorded explicitly so dashboards do not infer cumulative
+    /// learning from timestamps or snapshot names.
+    #[serde(default)]
+    pub cumulative_training: bool,
 }
 
 impl TrainingRunObservation {
@@ -159,10 +164,11 @@ impl TrainingRunObservation {
             tokens_per_second,
             non_padding_tokens_per_second,
             started_ts: report.get("started_ts").and_then(Value::as_f64),
-            finished_ts: report
-                .get("finished_ts")
-                .and_then(Value::as_f64)
-                .or_else(|| Some(now_ts())),
+            finished_ts: report.get("finished_ts").and_then(Value::as_f64),
+            cumulative_training: report
+                .get("cumulative_training")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         }
     }
 }
@@ -517,6 +523,7 @@ pub async fn discover_training_observations(
             Ok(report) => report,
             Err(_) => continue,
         };
+        let report = merge_pipeline_provenance(entry.path().join("pipeline.json"), report).await;
         if report.get("metrics").is_none() {
             continue;
         }
@@ -533,6 +540,27 @@ pub async fn discover_training_observations(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     Ok(observations)
+}
+
+async fn merge_pipeline_provenance(pipeline_path: PathBuf, mut report: Value) -> Value {
+    let Ok(raw) = fs::read_to_string(pipeline_path).await else {
+        return report;
+    };
+    let Ok(pipeline) = serde_json::from_str::<Value>(&raw) else {
+        return report;
+    };
+    let Some(report_object) = report.as_object_mut() else {
+        return report;
+    };
+    let Some(pipeline_object) = pipeline.as_object() else {
+        return report;
+    };
+    for key in ["started_ts", "finished_ts", "cumulative_training"] {
+        if let Some(value) = pipeline_object.get(key) {
+            report_object.insert(key.to_string(), value.clone());
+        }
+    }
+    report
 }
 
 /// Backfill the persistent metrics file from existing training reports.
@@ -2022,6 +2050,8 @@ fn render_training_prometheus_metrics(
     out.push_str("# TYPE gail_training_optimizer_steps_total gauge\n");
     out.push_str("# HELP gail_training_last_finished_timestamp_seconds Unix timestamp of the latest training observation.\n");
     out.push_str("# TYPE gail_training_last_finished_timestamp_seconds gauge\n");
+    out.push_str("# HELP gail_training_cumulative_training Whether the run resumed from the previous adapter.\n");
+    out.push_str("# TYPE gail_training_cumulative_training gauge\n");
     for run in &data.runs {
         let labels = format!(
             "snapshot_id=\"{}\",backend=\"{}\",status=\"{}\",model=\"{}\",slurm_job_id=\"{}\",nodelist=\"{}\"",
@@ -2058,6 +2088,10 @@ fn render_training_prometheus_metrics(
                 finished
             ));
         }
+        out.push_str(&format!(
+            "gail_training_cumulative_training{{{labels}}} {}\n",
+            if run.cumulative_training { 1 } else { 0 }
+        ));
     }
     let mut totals: HashMap<(String, String), u64> = HashMap::new();
     for run in &data.runs {
@@ -2244,6 +2278,7 @@ mod tests {
                 non_padding_tokens_per_second: 160.0,
                 started_ts: Some(1.0),
                 finished_ts: Some(2.0),
+                cumulative_training: false,
             },
         )
         .await
@@ -2288,6 +2323,26 @@ mod tests {
         assert_eq!(observation.slurm_job_id.as_deref(), Some("1786023597"));
         assert_eq!(observation.nodelist.as_deref(), Some("qc[00-05]"));
         assert_eq!(observation.world_size, Some(6));
+        assert_eq!(observation.started_ts, Some(10.0));
+        assert_eq!(observation.finished_ts, Some(13.0));
+        assert!(!observation.cumulative_training);
+    }
+
+    #[test]
+    fn training_report_conversion_does_not_invent_finish_time() {
+        let report = serde_json::json!({
+            "metrics": { "total_tokens": 10, "runtime_seconds": 1.0 },
+            "cumulative_training": true
+        });
+        let observation = TrainingRunObservation::from_report(
+            "snapshot-without-finish",
+            &report,
+            "historical_completed",
+            "fallback-model",
+        );
+
+        assert_eq!(observation.finished_ts, None);
+        assert!(observation.cumulative_training);
     }
 
     #[tokio::test]
@@ -2308,6 +2363,17 @@ mod tests {
         )
         .await
         .expect("training report");
+        fs::write(
+            snapshot.join("pipeline.json"),
+            serde_json::to_string(&serde_json::json!({
+                "started_ts": 100.0,
+                "finished_ts": 102.5,
+                "cumulative_training": true
+            }))
+            .expect("pipeline JSON"),
+        )
+        .await
+        .expect("pipeline provenance");
 
         let metrics_path = directory.path().join("training_metrics.json");
         let first = backfill_training_observations(&metrics_path, &snapshot_root, "fallback-model")
@@ -2319,6 +2385,10 @@ mod tests {
                 .expect("second backfill");
         assert_eq!(first, 1);
         assert_eq!(second, 1);
+        let persisted = read_training_metrics(&metrics_path).await;
+        assert_eq!(persisted.runs[0].started_ts, Some(100.0));
+        assert_eq!(persisted.runs[0].finished_ts, Some(102.5));
+        assert!(persisted.runs[0].cumulative_training);
 
         let mut replacement = TrainingRunObservation::default();
         replacement.snapshot_id = "snapshot-a".to_string();

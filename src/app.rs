@@ -1036,6 +1036,17 @@ async fn trading_run_backtest(
         Some(bridge) => {
             let config = bridge.config.clone();
             let state = bridge.state.clone();
+            {
+                let mut current = state.0.lock().await;
+                if current.backtest_in_progress {
+                    return Json(json!({
+                        "ok": false,
+                        "message": "a backtest is already running; poll /v1/trading/backtest"
+                    }))
+                    .into_response();
+                }
+                current.backtest_in_progress = true;
+            }
             // Run the backtest in a background task so the HTTP response is immediate.
             tokio::spawn(async move {
                 use crate::trading::backtest::BacktestEngine;

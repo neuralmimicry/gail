@@ -241,6 +241,10 @@ pub struct TradingState {
     pub trade_ring_size: usize,
     /// Most recent backtesting run result.
     pub last_backtest: Option<BacktestSummary>,
+    /// Prevents overlapping historical replays from competing for the same
+    /// OctoBot/Gail data and producing misleading duplicate snapshots.
+    #[serde(default)]
+    pub backtest_in_progress: bool,
     /// Ring buffer of historical backtest summaries (most recent last).
     pub backtest_history: VecDeque<BacktestSummary>,
     /// Runtime state for guarded backtest-driven strategy tuning.
@@ -327,6 +331,7 @@ impl TradingState {
             log_ring_size,
             trade_ring_size,
             last_backtest: None,
+            backtest_in_progress: false,
             backtest_history: VecDeque::with_capacity(20),
             backtest_auto_tune: BacktestAutoTuneState::default(),
             api_schema: AdaptiveApiSchema::default(),
@@ -452,6 +457,7 @@ impl TradingState {
         }
         self.backtest_history.push_back(summary.clone());
         self.last_backtest = Some(summary);
+        self.backtest_in_progress = false;
     }
 
     /// Take any pending override and clear it from the state.

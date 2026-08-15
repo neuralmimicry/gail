@@ -498,6 +498,23 @@ pub async fn fetch_pending_training(
         .collect())
 }
 
+/// Hold a database-scoped lease for the lifetime of the trainer worker. This
+/// prevents a second trainer replica from selecting the same pending rows and
+/// producing overlapping snapshots. The returned client must stay alive.
+pub async fn acquire_training_worker_lock(
+    dsn: &str,
+) -> Result<Option<tokio_postgres::Client>, tokio_postgres::Error> {
+    let client = connect_client(dsn).await?;
+    let acquired = client
+        .query_one(
+            "SELECT pg_try_advisory_lock(hashtextextended('gail-training-worker', 0))",
+            &[],
+        )
+        .await?
+        .get::<_, bool>(0);
+    Ok(acquired.then_some(client))
+}
+
 pub async fn mark_training_success(
     dsn: &str,
     ids: &[i64],

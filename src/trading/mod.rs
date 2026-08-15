@@ -390,7 +390,16 @@ async fn run_evaluation_loop(
                 // --- Periodic backtest ---
                 if config.backtesting_enabled {
                     let due = now_ts() - last_backtest_ts >= config.backtest_interval_seconds as f64;
-                    if due {
+                    let already_running = {
+                        let mut current = state.0.lock().await;
+                        if due && !current.backtest_in_progress {
+                            current.backtest_in_progress = true;
+                            false
+                        } else {
+                            current.backtest_in_progress
+                        }
+                    };
+                    if due && !already_running {
                         info!("trading: running periodic backtest");
                         state.log_info("backtest", "Starting periodic backtesting run").await;
                         let native_enabled = config.quantitative.enabled
@@ -493,6 +502,10 @@ async fn run_evaluation_loop(
                             }
                             info!("trading: OctoBot compatibility backtest complete — assessment={}", assessment);
                         }
+                        // A failed/incomplete replay must not permanently lock
+                        // the scheduler. Successful runs clear this in
+                        // `record_backtest`; error paths clear it here.
+                        state.0.lock().await.backtest_in_progress = false;
                         last_backtest_ts = now_ts();
                     }
                 }
@@ -3480,7 +3493,14 @@ async fn execute_if_warranted(
     };
     let auto_live_ready =
         config.live_execution_auto_gate_enabled && paper_qualified && profitability_qualified;
-    let effective_live_execution = config.live_execution_enabled || auto_live_ready;
+    // `live_execution_enabled` is an operator permission, not a bypass of
+    // qualification.  In particular, a deployment with that flag set must
+    // still remain in paper-observation mode until the current build has
+    // qualified.  This allows a clean paper window to accumulate instead of
+    // entering the live path and silently starving qualification evidence.
+    let effective_live_execution = (config.live_execution_enabled || auto_live_ready)
+        && paper_qualified
+        && profitability_qualified;
 
     if !effective_live_execution {
         if decision.override_applied {
