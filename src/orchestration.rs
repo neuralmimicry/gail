@@ -15,7 +15,7 @@ use tokio::{
     task::JoinSet,
     time::{Instant, sleep},
 };
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -250,6 +250,9 @@ struct RoundRobinContext {
 }
 
 impl GailService {
+    pub fn metrics(&self) -> MetricsStore {
+        self.inner.metrics.clone()
+    }
     pub async fn new(config: GailConfig) -> Result<Self> {
         adaptive_schema::configure_persistence(config.storage.adaptive_schema_path.clone()).await;
         api_issues::configure_persistence(
@@ -678,7 +681,17 @@ impl GailService {
             self.inner.metrics.ai_response_time_estimate_ms("all").await;
         let started = Instant::now();
         let result = self.direct_complete_inner(request).await;
-        let _ = self.inner.metrics.record_request_replied().await;
+        let terminal_ok = result.as_ref().is_ok_and(completion_metric_success);
+        let timed_out = result
+            .as_ref()
+            .err()
+            .map(|error| error.to_string().to_ascii_lowercase().contains("timeout"))
+            .unwrap_or(false);
+        let _ = self
+            .inner
+            .metrics
+            .record_request_terminal(terminal_ok, timed_out)
+            .await;
         let source = result
             .as_ref()
             .map(completion_metric_source)
@@ -689,7 +702,7 @@ impl GailService {
             .record_ai_response_time_with_prompt(
                 source,
                 started.elapsed().as_millis() as u64,
-                result.as_ref().is_ok_and(completion_metric_success),
+                terminal_ok,
                 Some(prompt_tokens_estimate),
             )
             .await;
@@ -699,7 +712,7 @@ impl GailService {
             .record_api_source_response_time(
                 api_source.as_str(),
                 started.elapsed().as_millis() as u64,
-                result.as_ref().is_ok_and(completion_metric_success),
+                terminal_ok,
                 Some(prompt_tokens_estimate),
             )
             .await;
@@ -743,6 +756,8 @@ impl GailService {
             effective_request.strict_no_downgrade = Some(self.strict_no_downgrade());
         }
         let request_id = Uuid::new_v4().to_string();
+        info!(request_id = %request_id, workflow = ?effective_request.workflow, role = ?effective_request.role, request_category = ?effective_request.request_category, source = ?effective_request.source, lifecycle = "received", "GAIL_ORCHESTRATION_LIFECYCLE");
+        info!(request_id = %request_id, lifecycle = "queued", "GAIL_ORCHESTRATION_LIFECYCLE");
         let profile = self.direct_provider_profile(&effective_request);
         self.prepare_provider_request(&profile, &mut effective_request);
         if !effective_request.messages.iter().any(|message| {
@@ -815,6 +830,7 @@ impl GailService {
                         .metrics
                         .record_orchestration_event("timeout", None)
                         .await;
+                    warn!(request_id = %request_id, lifecycle = "timed_out", "GAIL_ORCHESTRATION_LIFECYCLE");
                 }
                 let category = runtime_failure_health_bucket(Some(&error.to_string()), None)
                     .mode
@@ -1027,6 +1043,8 @@ impl GailService {
             trace,
             raw,
         };
+        info!(request_id = %completion_response.request_id, lifecycle = "provider_completed", parsed_valid = true, "GAIL_ORCHESTRATION_LIFECYCLE");
+        info!(request_id = %completion_response.request_id, lifecycle = "selected", "GAIL_ORCHESTRATION_LIFECYCLE");
         self.record_llm_interaction(LlmLedgerRecord {
             request_id: completion_response.request_id.clone(),
             conversation_id: completion_response.request_id.clone(),
@@ -1079,7 +1097,17 @@ impl GailService {
             self.inner.metrics.ai_response_time_estimate_ms("all").await;
         let started = Instant::now();
         let result = self.complete_inner(request).await;
-        let _ = self.inner.metrics.record_request_replied().await;
+        let terminal_ok = result.as_ref().is_ok_and(completion_metric_success);
+        let timed_out = result
+            .as_ref()
+            .err()
+            .map(|error| error.to_string().to_ascii_lowercase().contains("timeout"))
+            .unwrap_or(false);
+        let _ = self
+            .inner
+            .metrics
+            .record_request_terminal(terminal_ok, timed_out)
+            .await;
         let source = result
             .as_ref()
             .map(completion_metric_source)
@@ -1090,7 +1118,7 @@ impl GailService {
             .record_ai_response_time_with_prompt(
                 source,
                 started.elapsed().as_millis() as u64,
-                result.as_ref().is_ok_and(completion_metric_success),
+                terminal_ok,
                 Some(prompt_tokens_estimate),
             )
             .await;
@@ -1100,7 +1128,7 @@ impl GailService {
             .record_api_source_response_time(
                 api_source.as_str(),
                 started.elapsed().as_millis() as u64,
-                result.as_ref().is_ok_and(completion_metric_success),
+                terminal_ok,
                 Some(prompt_tokens_estimate),
             )
             .await;
@@ -1519,6 +1547,7 @@ impl GailService {
                 tags = %preview_labels(task_tags.iter().cloned().collect::<Vec<_>>(), 8),
                 "dispatching Gail orchestration"
             );
+            info!(request_id = %request_id, workflow = %workflow, role = %role, lifecycle = "dispatched", "GAIL_ORCHESTRATION_LIFECYCLE");
             if wave_index > 1 {
                 let _ = self
                     .inner
@@ -1664,6 +1693,7 @@ impl GailService {
                         .metrics
                         .record_orchestration_event("timeout", None)
                         .await;
+                    warn!(request_id = %request_id, lifecycle = "timed_out", "GAIL_ORCHESTRATION_LIFECYCLE");
                 }
                 let category = health_bucket
                     .mode

@@ -100,6 +100,8 @@ static PROMOTION_HISTORY: Lazy<Mutex<HashMap<String, VecDeque<f64>>>> =
 static EVALUATION_METRICS: Lazy<Mutex<HashMap<String, (u64, f64, f64, f64, f64, u64)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static DECODER_METRICS: Lazy<Mutex<(u64, u64, u64)>> = Lazy::new(|| Mutex::new((0, 0, 0)));
+static MIRROR_RECONCILIATION: Lazy<Mutex<(HashMap<String, bool>, u64, u64, u64)>> =
+    Lazy::new(|| Mutex::new((HashMap::new(), 0, 0, 0)));
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AarnnPairedEvaluation {
@@ -427,6 +429,20 @@ gail_aarnn_network_neurons {}\n",
                 decoder.0, decoder.1, decoder.2
             ));
         }
+        if let Ok(reconciliation) = MIRROR_RECONCILIATION.lock() {
+            let (ids, inputs, outputs, usable) = &*reconciliation;
+            out.push_str(&format!(
+                "gail_aarnn_mirror_inputs_total {}\n\
+gail_aarnn_mirror_outputs_total {}\n\
+gail_aarnn_mirror_usable_outputs_total {}\n\
+gail_aarnn_mirror_unmatched_inputs {}\n",
+                inputs,
+                outputs,
+                usable,
+                inputs.saturating_sub(*outputs)
+            ));
+            let _ = ids;
+        }
         out
     }
 
@@ -473,6 +489,18 @@ gail_aarnn_network_neurons {}\n",
     }
 
     fn log_mirror_request_audit(&self, request: &AarnnMirrorRequest, spike_count: usize) {
+        if let Ok(mut reconciliation) = MIRROR_RECONCILIATION.lock() {
+            if reconciliation.0.len() >= 100_000 {
+                reconciliation.0.clear();
+            }
+            if reconciliation
+                .0
+                .insert(request.request_id.clone(), false)
+                .is_none()
+            {
+                reconciliation.1 = reconciliation.1.saturating_add(1);
+            }
+        }
         if !self.audit_enabled {
             return;
         }
@@ -530,6 +558,25 @@ gail_aarnn_network_neurons {}\n",
         text_chars: usize,
         spike_count: usize,
     ) {
+        if let Ok(mut reconciliation) = MIRROR_RECONCILIATION.lock() {
+            if reconciliation
+                .0
+                .get(&request.request_id)
+                .is_some_and(|seen| !*seen)
+            {
+                if let Some(seen) = reconciliation.0.get_mut(&request.request_id) {
+                    *seen = true;
+                }
+                reconciliation.2 = reconciliation.2.saturating_add(1);
+                if response
+                    .candidate
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.usable)
+                {
+                    reconciliation.3 = reconciliation.3.saturating_add(1);
+                }
+            }
+        }
         if !self.audit_enabled {
             return;
         }

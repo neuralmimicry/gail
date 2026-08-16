@@ -651,6 +651,19 @@ async fn query_provider(
         Ok(resp) => {
             let raw = resp.text.clone();
             let parsed = parse_advisory_response(&raw);
+            let semantic_outcome = if parsed.parsed_ok {
+                "parsed_valid"
+            } else {
+                parsed
+                    .risk_flags
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("invalid_shape")
+            };
+            let _ = service
+                .metrics()
+                .record_trading_semantic(semantic_outcome)
+                .await;
             AiAdvice {
                 provider: provider_name,
                 model: Some(resp.model),
@@ -667,6 +680,10 @@ async fn query_provider(
             }
         }
         Err(err) => {
+            let _ = service
+                .metrics()
+                .record_trading_semantic("provider_failure")
+                .await;
             debug!(
                 "trading: advisory query to {} failed: {}",
                 provider_type, err

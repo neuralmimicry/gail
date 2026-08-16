@@ -149,7 +149,7 @@ def resolve_tokenizer_metadata(tokenizer) -> dict:
         value = getattr(tokenizer, name, None)
         ids[name] = int(value) if value is not None else None
     encoded = tokenizer(TOKENIZER_PROBE_TEXT, add_special_tokens=True)
-    input_ids = encoded.get("input_ids") if isinstance(encoded, dict) else None
+    input_ids = encoded.get("input_ids") if hasattr(encoded, "get") else None
     if not input_ids:
         raise RuntimeError("tokenizer startup probe produced no input IDs")
     decoded = tokenizer.decode(input_ids, skip_special_tokens=False)

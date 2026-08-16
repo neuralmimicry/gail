@@ -30,7 +30,20 @@ pub struct MetricsData {
     pub orchestration_events: OrchestrationEventMetrics,
     #[serde(default)]
     pub request_flow: RequestFlowMetrics,
+    #[serde(default)]
+    pub trading_semantic: TradingSemanticMetrics,
     pub updated_at: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TradingSemanticMetrics {
+    pub responses: u64,
+    pub parsed_valid: u64,
+    pub invalid_json: u64,
+    pub invalid_shape: u64,
+    pub incomplete: u64,
+    pub provider_failures: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -50,8 +63,11 @@ pub struct OrchestrationEventMetrics {
 #[serde(default)]
 pub struct RequestFlowMetrics {
     pub received: u64,
+    pub queued: u64,
     pub in_progress: u64,
     pub replied: u64,
+    pub failed: u64,
+    pub timed_out: u64,
 }
 
 /// One completed or failed training run.  Training is written by a separate
@@ -892,6 +908,7 @@ impl MetricsStore {
     pub async fn record_request_received(&self) -> Result<()> {
         let mut data = self.inner.lock().await;
         data.request_flow.received = data.request_flow.received.saturating_add(1);
+        data.request_flow.queued = data.request_flow.queued.saturating_add(1);
         data.request_flow.in_progress = data.request_flow.in_progress.saturating_add(1);
         data.updated_at = now_ts();
         let snapshot = data.clone();
@@ -899,10 +916,42 @@ impl MetricsStore {
         self.save(&snapshot).await
     }
 
-    pub async fn record_request_replied(&self) -> Result<()> {
+    pub async fn record_request_terminal(&self, success: bool, timed_out: bool) -> Result<()> {
         let mut data = self.inner.lock().await;
-        data.request_flow.replied = data.request_flow.replied.saturating_add(1);
+        data.request_flow.queued = data.request_flow.queued.saturating_sub(1);
+        if success {
+            data.request_flow.replied = data.request_flow.replied.saturating_add(1);
+        } else {
+            data.request_flow.failed = data.request_flow.failed.saturating_add(1);
+            if timed_out {
+                data.request_flow.timed_out = data.request_flow.timed_out.saturating_add(1);
+            }
+        }
         data.request_flow.in_progress = data.request_flow.in_progress.saturating_sub(1);
+        data.updated_at = now_ts();
+        let snapshot = data.clone();
+        drop(data);
+        self.save(&snapshot).await
+    }
+
+    pub async fn record_request_replied(&self) -> Result<()> {
+        self.record_request_terminal(true, false).await
+    }
+
+    pub async fn record_trading_semantic(&self, outcome: &str) -> Result<()> {
+        let mut data = self.inner.lock().await;
+        let metrics = &mut data.trading_semantic;
+        metrics.responses = metrics.responses.saturating_add(1);
+        match outcome {
+            "parsed_valid" => metrics.parsed_valid = metrics.parsed_valid.saturating_add(1),
+            "invalid_json" => metrics.invalid_json = metrics.invalid_json.saturating_add(1),
+            "invalid_shape" => metrics.invalid_shape = metrics.invalid_shape.saturating_add(1),
+            "incomplete_json" => metrics.incomplete = metrics.incomplete.saturating_add(1),
+            "provider_failure" => {
+                metrics.provider_failures = metrics.provider_failures.saturating_add(1)
+            }
+            _ => {}
+        }
         data.updated_at = now_ts();
         let snapshot = data.clone();
         drop(data);
@@ -1672,12 +1721,43 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
         "gail_requests_in_progress {}\n",
         data.request_flow.in_progress
     ));
+    out.push_str("# HELP gail_requests_queued Gail LLM requests queued or awaiting terminal accounting.\n# TYPE gail_requests_queued gauge\n");
+    out.push_str(&format!(
+        "gail_requests_queued {}\n",
+        data.request_flow.queued
+    ));
     out.push_str("# HELP gail_requests_replied_total Gail LLM requests that completed a reply.\n");
     out.push_str("# TYPE gail_requests_replied_total counter\n");
     out.push_str(&format!(
         "gail_requests_replied_total {}\n",
         data.request_flow.replied
     ));
+    out.push_str("# HELP gail_requests_failed_total Gail LLM requests that failed.\n# TYPE gail_requests_failed_total counter\n");
+    out.push_str(&format!(
+        "gail_requests_failed_total {}\n",
+        data.request_flow.failed
+    ));
+    out.push_str("# HELP gail_requests_timed_out_total Gail LLM requests that timed out.\n# TYPE gail_requests_timed_out_total counter\n");
+    out.push_str(&format!(
+        "gail_requests_timed_out_total {}\n",
+        data.request_flow.timed_out
+    ));
+    out.push_str("# HELP gail_trading_responses_total Trading advisory responses classified by semantic validity.\n# TYPE gail_trading_responses_total counter\n");
+    out.push_str(&format!(
+        "gail_trading_responses_total {}\n",
+        data.trading_semantic.responses
+    ));
+    for (name, value) in [
+        ("parsed_valid", data.trading_semantic.parsed_valid),
+        ("invalid_json", data.trading_semantic.invalid_json),
+        ("invalid_shape", data.trading_semantic.invalid_shape),
+        ("incomplete_json", data.trading_semantic.incomplete),
+        ("provider_failure", data.trading_semantic.provider_failures),
+    ] {
+        out.push_str(&format!(
+            "gail_trading_responses_total{{outcome=\"{name}\"}} {value}\n"
+        ));
+    }
     out.push_str("# HELP gail_provider_candidate_successes_total Gail provider candidate successful completions.\n");
     out.push_str("# TYPE gail_provider_candidate_successes_total counter\n");
     out.push_str("# HELP gail_provider_candidate_failures_total Gail provider candidate failed completions.\n");
