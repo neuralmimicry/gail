@@ -703,9 +703,10 @@ impl MetricsStore {
                 stats.normalize_split_latency_fields();
             }
         }
-        // An in-progress gauge describes this Gail process, not historical
-        // work from a previous process lifetime. Avoid exposing a stale value
-        // after a restart while retaining the received/replied counters.
+        // Queue and in-progress gauges describe this Gail process, not
+        // historical work from a previous process lifetime. Avoid exposing
+        // stale values after a restart while retaining terminal counters.
+        data.request_flow.queued = 0;
         data.request_flow.in_progress = 0;
         Ok(Self {
             path,
