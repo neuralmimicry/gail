@@ -438,7 +438,14 @@ RUN set -eu; \
     apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends ca-certificates curl tar; \
     rm -rf /var/lib/apt/lists/*; \
     mkdir -p /opt; \
-    curl -fsSL "https://github.com/ggml-org/llama.cpp/archive/${LLAMA_CPP_COMMIT}.tar.gz" -o /tmp/llama.cpp.tar.gz; \
+    if ! curl -fL --retry 8 --retry-all-errors --retry-delay 3 --connect-timeout 20 \
+        "https://github.com/ggml-org/llama.cpp/archive/${LLAMA_CPP_COMMIT}.tar.gz" \
+        -o /tmp/llama.cpp.tar.gz; then \
+        echo "Primary llama.cpp archive endpoint failed; retrying via codeload.github.com" >&2; \
+        curl -fL --retry 8 --retry-all-errors --retry-delay 3 --connect-timeout 20 \
+            "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/${LLAMA_CPP_COMMIT}" \
+            -o /tmp/llama.cpp.tar.gz; \
+    fi; \
     tar -xzf /tmp/llama.cpp.tar.gz -C /opt; \
     mv "/opt/llama.cpp-${LLAMA_CPP_COMMIT}" /opt/gail-llama-converter; \
     rm -f /tmp/llama.cpp.tar.gz; \
