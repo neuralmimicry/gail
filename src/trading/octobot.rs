@@ -1772,6 +1772,14 @@ impl OctobotClient {
                 }
                 Err(error) => {
                     last_error = error;
+                    // A symbol with no usable dashboard or ticker data is a
+                    // deterministic per-symbol condition, not an exchange
+                    // outage.  The caller records the symbol cooldown, so
+                    // retrying here only duplicates requests and can open an
+                    // exchange breaker for a bad/unsupported symbol.
+                    if is_market_snapshot_unavailable_error(&last_error) {
+                        return Err(last_error);
+                    }
                     self.record_exchange_failure(exchange, &last_error).await;
                     if attempt + 1 < MARKET_SNAPSHOT_RETRY_ATTEMPTS
                         && !self.exchange_circuit_open(exchange).await
