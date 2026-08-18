@@ -34,6 +34,12 @@ use crate::{
 
 const OCTOBOT_API: &str = "octobot";
 const MAX_PARALLEL_MARKET_SNAPSHOT_REQUESTS: usize = 8;
+const MAX_MARKET_SNAPSHOT_SYMBOLS_PER_EXCHANGE: usize = 4;
+const MARKET_SNAPSHOT_RETRY_ATTEMPTS: usize = 3;
+const MAX_ORDER_POLL_ATTEMPTS: usize = 4;
+const EXCHANGE_BREAKER_FAILURE_THRESHOLD: u32 = 3;
+const EXCHANGE_BREAKER_BASE_COOLDOWN_SECONDS: f64 = 30.0;
+const EXCHANGE_BREAKER_MAX_COOLDOWN_SECONDS: f64 = 900.0;
 /// OctoBot API hard-cap for market snapshot requests per fetch.
 ///
 /// Gail must not request more than this in one call. Coverage across the
@@ -129,6 +135,18 @@ pub struct OctobotStatus {
     pub version: Option<String>,
     pub uptime_seconds: Option<f64>,
     pub trading_enabled: bool,
+}
+
+/// Durable exchange-scoped failure state.  The trading loop restores this
+/// state before its first request, so a restart does not immediately hammer a
+/// venue that was already failing.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ExchangeCircuitState {
+    pub consecutive_failures: u32,
+    pub opened_until: Option<f64>,
+    pub last_success_at: Option<f64>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -323,6 +341,8 @@ pub struct OctobotClient {
     /// requesting OctoBot restart on every evaluation while a restart is
     /// already in progress for the same pair activation.
     trading_pair_restart_cooldown_until: Arc<Mutex<HashMap<String, f64>>>,
+
+    exchange_circuit: Arc<Mutex<HashMap<String, ExchangeCircuitState>>>,
 }
 
 impl OctobotClient {
@@ -361,6 +381,62 @@ impl OctobotClient {
             market_snapshot_blacklisted_until: Arc::new(Mutex::new(HashMap::new())),
             market_snapshot_available_symbols: Arc::new(Mutex::new(HashSet::new())),
             trading_pair_restart_cooldown_until: Arc::new(Mutex::new(HashMap::new())),
+            exchange_circuit: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub async fn exchange_circuit_snapshot(&self) -> HashMap<String, ExchangeCircuitState> {
+        self.exchange_circuit.lock().await.clone()
+    }
+
+    pub async fn restore_exchange_circuit(&self, restored: HashMap<String, ExchangeCircuitState>) {
+        *self.exchange_circuit.lock().await = restored;
+    }
+
+    async fn exchange_circuit_open(&self, exchange: &str) -> bool {
+        let key =
+            normalize_exchange_name(exchange).unwrap_or_else(|| exchange.to_ascii_lowercase());
+        let now = current_unix_timestamp_f64();
+        let mut states = self.exchange_circuit.lock().await;
+        let Some(state) = states.get_mut(&key) else {
+            return false;
+        };
+        if state.opened_until.is_some_and(|until| until > now) {
+            return true;
+        }
+        if state.opened_until.is_some() {
+            state.opened_until = None;
+        }
+        false
+    }
+
+    async fn record_exchange_success(&self, exchange: &str) {
+        let key =
+            normalize_exchange_name(exchange).unwrap_or_else(|| exchange.to_ascii_lowercase());
+        let mut states = self.exchange_circuit.lock().await;
+        let state = states.entry(key).or_default();
+        state.consecutive_failures = 0;
+        state.opened_until = None;
+        state.last_success_at = Some(current_unix_timestamp_f64());
+        state.last_error = None;
+    }
+
+    async fn record_exchange_failure(&self, exchange: &str, error: &str) {
+        let key =
+            normalize_exchange_name(exchange).unwrap_or_else(|| exchange.to_ascii_lowercase());
+        let now = current_unix_timestamp_f64();
+        let mut states = self.exchange_circuit.lock().await;
+        let state = states.entry(key).or_default();
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        state.last_error = Some(error.chars().take(400).collect());
+        if state.consecutive_failures >= EXCHANGE_BREAKER_FAILURE_THRESHOLD {
+            let exponent = state
+                .consecutive_failures
+                .saturating_sub(EXCHANGE_BREAKER_FAILURE_THRESHOLD)
+                .min(8);
+            let cooldown = (EXCHANGE_BREAKER_BASE_COOLDOWN_SECONDS * 2_f64.powi(exponent as i32))
+                .min(EXCHANGE_BREAKER_MAX_COOLDOWN_SECONDS);
+            state.opened_until = Some(now + cooldown);
         }
     }
 
@@ -1337,10 +1413,9 @@ impl OctobotClient {
         baseline: &OrderPlacementBaseline,
         request_started_at: f64,
     ) -> Option<OctobotOrderResult> {
-        const ORDER_POLL_ATTEMPTS: usize = 6;
         const ORDER_POLL_DELAY_MS: u64 = 500;
 
-        for _ in 0..ORDER_POLL_ATTEMPTS {
+        for _ in 0..MAX_ORDER_POLL_ATTEMPTS {
             if let Ok(open_orders) = self.get_open_orders().await
                 && let Some(order) = open_orders.into_iter().find(|order| {
                     order.symbol.eq_ignore_ascii_case(symbol)
@@ -1677,6 +1752,40 @@ impl OctobotClient {
         symbols.sort();
         symbols.dedup();
         Ok(symbols)
+    }
+
+    /// Fetch market data with exchange-scoped retry/backoff and circuit state.
+    async fn get_market_snapshot_with_resilience(
+        &self,
+        exchange: &str,
+        symbol: &str,
+    ) -> Result<MarketSnapshot, String> {
+        if self.exchange_circuit_open(exchange).await {
+            return Err(format!("exchange circuit breaker open for {exchange}"));
+        }
+        let mut last_error = String::new();
+        for attempt in 0..MARKET_SNAPSHOT_RETRY_ATTEMPTS {
+            match self.get_market_snapshot(exchange, symbol).await {
+                Ok(snapshot) => {
+                    self.record_exchange_success(exchange).await;
+                    return Ok(snapshot);
+                }
+                Err(error) => {
+                    last_error = error;
+                    self.record_exchange_failure(exchange, &last_error).await;
+                    if attempt + 1 < MARKET_SNAPSHOT_RETRY_ATTEMPTS
+                        && !self.exchange_circuit_open(exchange).await
+                    {
+                        let jitter_ms = ((current_unix_timestamp_f64() * 1_000.0) as u64) % 250;
+                        let backoff_ms = 250_u64
+                            .saturating_mul(1_u64 << attempt)
+                            .saturating_add(jitter_ms);
+                        sleep(Duration::from_millis(backoff_ms)).await;
+                    }
+                }
+            }
+        }
+        Err(last_error)
     }
 
     /// Fetch market data (ticker) for a symbol on an exchange.
@@ -2617,11 +2726,16 @@ fn parse_graph_history_snapshots(
     let first_close = closes.first().copied();
 
     let mut snapshots = Vec::with_capacity(closes.len());
+    let mut last_timestamp = f64::NEG_INFINITY;
     for (idx, close) in closes.iter().copied().enumerate() {
         let fetched_at = times
             .get(idx)
             .and_then(|value| parse_dashboard_time_to_ts(value))
             .unwrap_or(fallback_start + fallback_step * idx as f64);
+        if !fetched_at.is_finite() || fetched_at <= last_timestamp {
+            continue;
+        }
+        last_timestamp = fetched_at;
         let price_change_pct_24h = first_close
             .filter(|first| first.abs() > f64::EPSILON)
             .map(|first| ((close - first) / first) * 100.0);
@@ -3720,6 +3834,10 @@ impl OctobotClient {
             let Some(exchange_key) = normalize_exchange_name(&exchange.name) else {
                 continue;
             };
+            if self.exchange_circuit_open(&exchange_key).await {
+                warn!(exchange = %exchange.name, "trading: exchange circuit breaker open; skipping market requests");
+                continue;
+            }
             let mut market_status_symbols = exchange
                 .market_status_symbols
                 .iter()
@@ -3799,6 +3917,8 @@ impl OctobotClient {
                 }
                 selected
             };
+            let mut selected = selected;
+            selected.truncate(MAX_MARKET_SNAPSHOT_SYMBOLS_PER_EXCHANGE);
             if selected.is_empty() {
                 continue;
             }
@@ -3852,7 +3972,7 @@ impl OctobotClient {
             let client = self.clone();
             join_set.spawn(async move {
                 let result = client
-                    .get_market_snapshot(&target.exchange_name, &target.symbol)
+                    .get_market_snapshot_with_resilience(&target.exchange_name, &target.symbol)
                     .await;
                 (
                     target.exchange_name,
@@ -3882,7 +4002,7 @@ impl OctobotClient {
                         let client = self.clone();
                         join_set.spawn(async move {
                             let result = client
-                                .get_market_snapshot(
+                                .get_market_snapshot_with_resilience(
                                     &next_target.exchange_name,
                                     &next_target.symbol,
                                 )
@@ -3911,7 +4031,7 @@ impl OctobotClient {
                         let client = self.clone();
                         join_set.spawn(async move {
                             let result = client
-                                .get_market_snapshot(
+                                .get_market_snapshot_with_resilience(
                                     &next_target.exchange_name,
                                     &next_target.symbol,
                                 )

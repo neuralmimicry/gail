@@ -114,7 +114,27 @@ pub async fn run(config: GailConfig) -> Result<()> {
                 tracing::info!("trainer worker received shutdown signal");
                 break;
             }
-            _ = tokio::time::sleep(poll_interval) => {}
+        _ = tokio::time::sleep(poll_interval) => {}
+        }
+        if let Some(spool) = env_string("GAIL_TRAIN_SLURM_SPOOL") {
+            if let Err(error) =
+                requeue_stale_slurm_requests(&dsn, Path::new(&spool), &trainer).await
+            {
+                tracing::warn!(error = %error, "failed to reconcile stale Slurm training requests");
+            }
+        }
+        match active_training_snapshot(&trainer, &dsn).await {
+            Ok(true) => {
+                tracing::info!(
+                    "trainer worker is waiting for the unresolved snapshot lifecycle to finish"
+                );
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "trainer worker could not inspect active snapshot lifecycle");
+                continue;
+            }
         }
         let mut entries = match llm_ledger::fetch_pending_training(
             &dsn,
@@ -170,14 +190,24 @@ pub async fn run(config: GailConfig) -> Result<()> {
             continue;
         }
         let ids = entries.iter().map(|entry| entry.id).collect::<Vec<_>>();
+        if let Err(error) =
+            write_active_training_marker(&trainer, &snapshot_id, &ids, "submitted").await
+        {
+            tracing::warn!(error = %error, snapshot = %snapshot_id, "failed to persist active training lifecycle marker");
+            continue;
+        }
         let train_outcome = run_training_pipeline(
             &trainer,
             &hardware,
             &snapshot_id,
             dataset_path.as_path(),
             snapshot_dir.as_path(),
+            ids.as_slice(),
         )
         .await;
+        if let Err(error) = remove_active_training_marker(&trainer).await {
+            tracing::warn!(error = %error, snapshot = %snapshot_id, "failed to clear active training lifecycle marker");
+        }
         let training_error = train_outcome.as_ref().err().map(ToString::to_string);
         if let Err(error) = record_training_observation(
             &trainer,
@@ -244,6 +274,191 @@ fn training_metrics_path(trainer: &TrainerConfig) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("training_metrics.json"))
 }
 
+fn active_training_marker_path(trainer: &TrainerConfig) -> PathBuf {
+    PathBuf::from(&trainer.output_root).join("active_training.json")
+}
+
+async fn write_active_training_marker(
+    trainer: &TrainerConfig,
+    snapshot_id: &str,
+    ledger_ids: &[i64],
+    state: &str,
+) -> Result<()> {
+    write_json(
+        &active_training_marker_path(trainer),
+        &json!({
+            "version": 1,
+            "snapshot_id": snapshot_id,
+            "ledger_ids": ledger_ids,
+            "state": state,
+            "started_ts": now_ts(),
+            "heartbeat_ts": now_ts(),
+        }),
+    )
+    .await
+}
+
+async fn remove_active_training_marker(trainer: &TrainerConfig) -> Result<()> {
+    match fs::remove_file(active_training_marker_path(trainer)).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Return true while a previous snapshot is still unresolved.  A stale
+/// marker is recovered explicitly so a worker restart cannot create a second
+/// snapshot for the same ledger rows or leave a dead queue request forever.
+async fn active_training_snapshot(trainer: &TrainerConfig, dsn: &str) -> Result<bool> {
+    let path = active_training_marker_path(trainer);
+    let raw = match fs::read_to_string(&path).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let value: Value = serde_json::from_str(&raw).map_err(|error| {
+        GailError::invalid_config(format!("invalid active training marker: {error}"))
+    })?;
+    let heartbeat = value
+        .get("heartbeat_ts")
+        .and_then(Value::as_f64)
+        .or_else(|| value.get("started_ts").and_then(Value::as_f64))
+        .unwrap_or(0.0);
+    let stale_after = trainer.command_timeout_seconds.max(60) as f64;
+    if heartbeat > 0.0 && now_ts() - heartbeat <= stale_after {
+        return Ok(true);
+    }
+
+    let snapshot_id = value
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let ids = value
+        .get("ledger_ids")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_i64).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if let Some(spool) = env_string("GAIL_TRAIN_SLURM_SPOOL") {
+        let request = Path::new(&spool)
+            .join("queue")
+            .join(format!("{snapshot_id}.request"));
+        if request.exists() {
+            fs::remove_file(&request).await.map_err(|error| {
+                GailError::invalid_config(format!("failed to cancel stale Slurm request: {error}"))
+            })?;
+        }
+    }
+    for id in ids {
+        let _ = llm_ledger::mark_training_retry(
+            dsn,
+            id,
+            "stale unresolved training lifecycle; request cancelled and requeued",
+            trainer.max_attempts,
+            trainer.retry_backoff_seconds,
+        )
+        .await;
+    }
+    remove_active_training_marker(trainer).await?;
+    tracing::warn!(
+        snapshot = snapshot_id,
+        "recovered stale unresolved training lifecycle"
+    );
+    Ok(false)
+}
+
+async fn requeue_stale_slurm_requests(
+    dsn: &str,
+    spool: &Path,
+    trainer: &TrainerConfig,
+) -> Result<()> {
+    let queue = spool.join("queue");
+    let mut entries = match fs::read_dir(&queue).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("request") {
+            continue;
+        }
+        let raw = match fs::read_to_string(&path).await {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        let value: Value = match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let requested_at = value
+            .get("requested_at")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        if requested_at <= 0.0
+            || now_ts() - requested_at <= trainer.command_timeout_seconds.max(60) as f64
+        {
+            continue;
+        }
+        let snapshot_id = value
+            .get("snapshot_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if let Some(job_id) = value.get("slurm_job_id").and_then(Value::as_str) {
+            cancel_slurm_job(job_id).await;
+        }
+        let ids = value
+            .get("ledger_ids")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(Value::as_i64).collect::<Vec<_>>())
+            .unwrap_or_default();
+        fs::remove_file(&path).await.map_err(|error| {
+            GailError::invalid_config(format!("failed to remove stale Slurm request: {error}"))
+        })?;
+        let cancelled = spool
+            .join("results")
+            .join(format!("{snapshot_id}.cancelled.json"));
+        write_json(
+            &cancelled,
+            &json!({"snapshot_id": snapshot_id, "state": "cancelled", "reason": "stale queue request", "cancelled_at": now_ts()}),
+        )
+        .await?;
+        for id in ids {
+            let _ = llm_ledger::mark_training_retry(
+                dsn,
+                id,
+                "stale Slurm queue request cancelled and requeued",
+                trainer.max_attempts,
+                trainer.retry_backoff_seconds,
+            )
+            .await;
+        }
+        tracing::warn!(
+            snapshot = snapshot_id,
+            "cancelled and requeued stale Slurm training request"
+        );
+    }
+    Ok(())
+}
+
+async fn cancel_slurm_job(job_id: &str) {
+    if job_id.trim().is_empty() {
+        return;
+    }
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        Command::new("scancel").arg(job_id).status(),
+    )
+    .await;
+    match result {
+        Ok(Ok(status)) if status.success() => tracing::info!(job_id, "cancelled stale Slurm job"),
+        Ok(Ok(status)) => tracing::warn!(job_id, code = ?status.code(), "scancel returned failure"),
+        Ok(Err(error)) => {
+            tracing::debug!(job_id, error = %error, "scancel unavailable while cancelling stale job")
+        }
+        Err(_) => tracing::warn!(job_id, "timed out cancelling stale Slurm job"),
+    }
+}
+
 async fn record_training_observation(
     trainer: &TrainerConfig,
     snapshot_id: &str,
@@ -273,6 +488,26 @@ async fn record_training_observation(
             for key in ["started_ts", "finished_ts", "cumulative_training"] {
                 if let Some(value) = pipeline_object.get(key) {
                     metrics_object.insert(key.to_string(), value.clone());
+                }
+            }
+            if let Some(job_id) = pipeline_object
+                .get("slurm_job_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                let distributed = metrics_object
+                    .get_mut("distributed")
+                    .and_then(Value::as_object_mut)
+                    .map(|_| ())
+                    .is_some();
+                if !distributed {
+                    metrics_object.insert("distributed".to_string(), json!({}));
+                }
+                if let Some(distributed) = metrics_object
+                    .get_mut("distributed")
+                    .and_then(Value::as_object_mut)
+                {
+                    distributed.insert("slurm_job_id".to_string(), json!(job_id));
                 }
             }
         }
@@ -490,6 +725,7 @@ async fn run_training_pipeline(
     snapshot_id: &str,
     dataset_path: &Path,
     snapshot_dir: &Path,
+    ledger_ids: &[i64],
 ) -> Result<TrainingOutcome> {
     fs::create_dir_all(snapshot_dir).await.map_err(|error| {
         GailError::invalid_config(format!("failed to create snapshot output path: {error}"))
@@ -551,6 +787,7 @@ async fn run_training_pipeline(
                 snapshot_id,
                 dataset_path,
                 snapshot_dir,
+                ledger_ids,
             )
             .await?
         } else {
@@ -575,6 +812,9 @@ async fn run_training_pipeline(
         pipeline_report["training_stderr_tail"] = json!(command_output.stderr);
         pipeline_report["training_exit_code"] = json!(command_output.exit_code);
         pipeline_report["training_runtime_seconds"] = json!(command_output.runtime_seconds);
+        pipeline_report["slurm_job_id"] = json!(command_output.backend_job_id);
+        pipeline_report["heartbeat_ts"] = json!(command_output.heartbeat_ts);
+        pipeline_report["lifecycle"] = json!(["submitted", "trained"]);
         training_executed = true;
     } else {
         pipeline_report["training_command"] = json!(
@@ -584,12 +824,40 @@ async fn run_training_pipeline(
     let mut snapshot_tag = format!("{}:{}", trainer.model_prefix, snapshot_id);
     let mut registration_succeeded = false;
     let mut registration_error = None;
+    if training_executed {
+        match qualify_training_snapshot(snapshot_dir).await {
+            Ok(qualification) => {
+                pipeline_report["evaluation"] = qualification;
+                pipeline_report["lifecycle"] =
+                    json!(["submitted", "trained", "evaluated", "qualified"]);
+            }
+            Err(error) => {
+                pipeline_report["lifecycle"] = json!(["submitted", "trained", "evaluated"]);
+                pipeline_report["qualification_error"] = json!(error.to_string());
+                pipeline_report["finished_ts"] = json!(now_ts());
+                write_json(
+                    snapshot_dir.join("pipeline.json").as_path(),
+                    &pipeline_report,
+                )
+                .await?;
+                return Err(GailError::invalid_config(format!(
+                    "training snapshot failed qualification; model was not registered or promoted: {error}"
+                )));
+            }
+        }
+    }
     if trainer.register_with_ollama && training_executed {
         let previous_snapshot = active_snapshot_id(trainer)?;
+        let previous_pointer =
+            fs::read_to_string(PathBuf::from(&trainer.output_root).join("active_snapshot.json"))
+                .await
+                .ok();
         match register_snapshot_with_ollama(trainer, snapshot_id, snapshot_dir).await {
             Ok(registration_mode) => {
                 registration_succeeded = true;
                 snapshot_tag = trainer.model_alias.clone();
+                pipeline_report["lifecycle"] =
+                    json!(["submitted", "trained", "evaluated", "qualified", "promoted"]);
                 match registration_mode {
                     OllamaRegistrationMode::Adapter | OllamaRegistrationMode::BaseModel => {
                         pipeline_report["ollama_registration"] = json!("registered");
@@ -608,8 +876,36 @@ async fn run_training_pipeline(
                         Some(format!("active snapshot publication failed: {error}"));
                     pipeline_report["ollama_registration"] = json!("rolled_back");
                     pipeline_report["ollama_registration_error"] = json!(error.to_string());
+                } else if let Err(error) = health_check_promoted_model(trainer).await {
+                    if let Err(rollback_error) =
+                        rollback_ollama_alias(trainer, previous_snapshot.as_deref()).await
+                    {
+                        tracing::error!(error = %rollback_error, snapshot = snapshot_id, "failed to roll back unhealthy serving alias");
+                    }
+                    restore_active_snapshot_pointer(trainer, previous_pointer.as_deref()).await;
+                    registration_succeeded = false;
+                    registration_error =
+                        Some(format!("promoted model health check failed: {error}"));
+                    pipeline_report["lifecycle"] = json!([
+                        "submitted",
+                        "trained",
+                        "evaluated",
+                        "qualified",
+                        "promoted",
+                        "rolled_back"
+                    ]);
+                    pipeline_report["health_check_error"] = json!(error.to_string());
+                } else {
+                    pipeline_report["lifecycle"] = json!([
+                        "submitted",
+                        "trained",
+                        "evaluated",
+                        "qualified",
+                        "promoted",
+                        "health_checked"
+                    ]);
                 }
-                if let Err(error) = rotate_ollama_models(trainer).await {
+                if registration_succeeded && let Err(error) = rotate_ollama_models(trainer).await {
                     tracing::warn!(
                         error = %error,
                         snapshot = snapshot_id,
@@ -673,11 +969,139 @@ async fn run_training_pipeline(
     })
 }
 
+async fn qualify_training_snapshot(snapshot_dir: &Path) -> Result<Value> {
+    let report_path = snapshot_dir.join("training_report.json");
+    let report_raw = fs::read_to_string(&report_path).await.map_err(|error| {
+        GailError::invalid_config(format!(
+            "training result artifact is missing training_report.json: {error}"
+        ))
+    })?;
+    let report: Value = serde_json::from_str(&report_raw).map_err(|error| {
+        GailError::invalid_config(format!("training result report is invalid JSON: {error}"))
+    })?;
+    let has_artifact = [
+        "adapter",
+        "adapter.gguf",
+        "model.safetensors",
+        "pytorch_model.bin",
+    ]
+    .iter()
+    .any(|name| std::fs::metadata(snapshot_dir.join(name)).is_ok());
+    if !has_artifact {
+        return Err(GailError::invalid_config(
+            "training completed without a valid model artifact",
+        ));
+    }
+    let evaluation = if let Some(value) = report.get("evaluation") {
+        value.clone()
+    } else {
+        let path = snapshot_dir.join("evaluation.json");
+        let raw = fs::read_to_string(&path).await.map_err(|_| {
+            GailError::invalid_config(
+                "evaluation metrics are missing; provide training_report.json.evaluation or evaluation.json",
+            )
+        })?;
+        serde_json::from_str(&raw).map_err(|error| {
+            GailError::invalid_config(format!("evaluation metrics are invalid JSON: {error}"))
+        })?
+    };
+    let metric_name = ["score", "accuracy", "f1", "loss", "perplexity"]
+        .iter()
+        .find(|name| evaluation.get(*name).and_then(Value::as_f64).is_some())
+        .copied()
+        .ok_or_else(|| {
+            GailError::invalid_config("evaluation metrics contain no finite score/loss metric")
+        })?;
+    let candidate = evaluation
+        .get(metric_name)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| GailError::invalid_config("candidate evaluation metric is not finite"))?;
+    let baseline = if let Some(value) = evaluation.get("baseline") {
+        value.clone()
+    } else if let Some(value) = report.get("baseline") {
+        value.clone()
+    } else {
+        let path = snapshot_dir.join("baseline.json");
+        let raw = fs::read_to_string(&path).await.map_err(|_| {
+            GailError::invalid_config(
+                "baseline comparison is missing; provide evaluation.baseline, baseline, or baseline.json",
+            )
+        })?;
+        serde_json::from_str(&raw).map_err(|error| {
+            GailError::invalid_config(format!("baseline metrics are invalid JSON: {error}"))
+        })?
+    };
+    let baseline_value = baseline
+        .get(metric_name)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| GailError::invalid_config("baseline comparison metric is not finite"))?;
+    let lower_is_better = matches!(metric_name, "loss" | "perplexity");
+    let improvement = if lower_is_better {
+        baseline_value - candidate
+    } else {
+        candidate - baseline_value
+    };
+    let minimum_improvement = env::var("GAIL_TRAIN_MIN_BASELINE_IMPROVEMENT")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    if improvement < minimum_improvement {
+        return Err(GailError::invalid_config(format!(
+            "candidate {metric_name}={candidate:.6} did not beat baseline {baseline_value:.6} by {minimum_improvement:.6}"
+        )));
+    }
+    Ok(json!({
+        "metric": metric_name,
+        "candidate": candidate,
+        "baseline": baseline_value,
+        "improvement": improvement,
+        "minimum_improvement": minimum_improvement,
+    }))
+}
+
+async fn health_check_promoted_model(trainer: &TrainerConfig) -> Result<()> {
+    let response = ollama_api_post(
+        &ollama_api_client(),
+        trainer,
+        "generate",
+        &json!({"model": trainer.model_alias, "prompt": "health check", "stream": false, "options": {"num_predict": 2}}),
+    )
+    .await?;
+    if response
+        .get("response")
+        .and_then(Value::as_str)
+        .is_none_or(|text| text.trim().is_empty())
+    {
+        return Err(GailError::invalid_config(
+            "promoted model returned no health-check response",
+        ));
+    }
+    Ok(())
+}
+
+async fn restore_active_snapshot_pointer(trainer: &TrainerConfig, previous: Option<&str>) {
+    let pointer = PathBuf::from(&trainer.output_root).join("active_snapshot.json");
+    match previous {
+        Some(previous) => {
+            if let Err(error) = fs::write(pointer, previous).await {
+                tracing::error!(error = %error, "failed to restore active snapshot pointer after rollback");
+            }
+        }
+        None => {
+            let _ = fs::remove_file(pointer).await;
+        }
+    }
+}
+
 struct CommandOutcome {
     stdout: String,
     stderr: String,
     exit_code: i32,
     runtime_seconds: f64,
+    backend_job_id: Option<String>,
+    heartbeat_ts: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -686,6 +1110,10 @@ struct SlurmTrainingResult {
     runtime_seconds: f64,
     log_file: Option<String>,
     message: Option<String>,
+    #[serde(default)]
+    slurm_job_id: Option<String>,
+    #[serde(default)]
+    heartbeat_ts: Option<f64>,
 }
 
 async fn execute_slurm_training_request(
@@ -694,6 +1122,7 @@ async fn execute_slurm_training_request(
     snapshot_id: &str,
     dataset_path: &Path,
     snapshot_dir: &Path,
+    ledger_ids: &[i64],
 ) -> Result<CommandOutcome> {
     if snapshot_id.is_empty()
         || !snapshot_id
@@ -715,12 +1144,16 @@ async fn execute_slurm_training_request(
     let request_path = queue.join(format!("{snapshot_id}.request"));
     let temporary_path = queue.join(format!(".{snapshot_id}.request-{}", std::process::id()));
     let result_path = results.join(format!("{snapshot_id}.result"));
+    let status_path = results.join(format!("{snapshot_id}.status"));
+    let heartbeat_path = results.join(format!("{snapshot_id}.heartbeat"));
     let request = json!({
         "version": 1,
         "snapshot_id": snapshot_id,
         "algorithm": trainer.algorithm,
         "dataset_path": dataset_path.to_string_lossy(),
         "snapshot_dir": snapshot_dir.to_string_lossy(),
+        "ledger_ids": ledger_ids,
+        "slurm_job_id": Value::Null,
         "requested_at": now_ts(),
     });
     fs::write(
@@ -746,6 +1179,8 @@ async fn execute_slurm_training_request(
     let timeout = Duration::from_secs(trainer.command_timeout_seconds.max(1));
     let poll_seconds = env_usize("GAIL_TRAIN_SLURM_POLL_SECONDS", 2, 1, 60) as u64;
     loop {
+        let heartbeat_ts = now_ts();
+        let _ = fs::write(&heartbeat_path, format!("{heartbeat_ts:.6}\n")).await;
         if result_path.exists() {
             let body = fs::read_to_string(&result_path).await.map_err(|error| {
                 GailError::invalid_config(format!("failed to read Slurm training result: {error}"))
@@ -781,9 +1216,28 @@ async fn execute_slurm_training_request(
                 stderr: message,
                 exit_code: result.exit_code,
                 runtime_seconds: result.runtime_seconds,
+                backend_job_id: result.slurm_job_id.or_else(|| {
+                    std::fs::read_to_string(&status_path)
+                        .ok()
+                        .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+                        .and_then(|value| {
+                            value
+                                .get("slurm_job_id")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned)
+                        })
+                }),
+                heartbeat_ts: result.heartbeat_ts.or(Some(heartbeat_ts)),
             });
         }
         if started.elapsed() >= timeout {
+            if let Ok(body) = fs::read_to_string(&status_path).await
+                && let Ok(value) = serde_json::from_str::<Value>(&body)
+                && let Some(job_id) = value.get("slurm_job_id").and_then(Value::as_str)
+            {
+                cancel_slurm_job(job_id).await;
+            }
+            let _ = fs::remove_file(&request_path).await;
             return Err(GailError::invalid_config(format!(
                 "Slurm training timed out after {}s waiting for {}",
                 trainer.command_timeout_seconds,
@@ -967,6 +1421,8 @@ async fn execute_training_command(
         stderr: truncate_chars(&stderr, 8_000),
         exit_code,
         runtime_seconds: started.elapsed().as_secs_f64(),
+        backend_job_id: None,
+        heartbeat_ts: None,
     })
 }
 

@@ -79,11 +79,44 @@ fn now_ts() -> f64 {
         .unwrap_or(0.0)
 }
 
+fn filter_fresh_market_snapshots(
+    snapshots: Vec<MarketSnapshot>,
+    ttl_seconds: f64,
+) -> Vec<MarketSnapshot> {
+    let now = now_ts();
+    let ttl = ttl_seconds.max(1.0);
+    let mut latest = HashMap::<String, MarketSnapshot>::new();
+    for snapshot in snapshots {
+        if !snapshot.price.is_finite()
+            || snapshot.price <= 0.0
+            || !snapshot.fetched_at.is_finite()
+            || snapshot.fetched_at <= 0.0
+            || snapshot.fetched_at > now + 5.0
+            || now - snapshot.fetched_at > ttl
+        {
+            continue;
+        }
+        let key = format!(
+            "{}|{}",
+            snapshot.exchange.to_ascii_lowercase(),
+            snapshot.symbol.to_ascii_uppercase()
+        );
+        if latest
+            .get(&key)
+            .is_none_or(|previous| snapshot.fetched_at > previous.fetched_at)
+        {
+            latest.insert(key, snapshot);
+        }
+    }
+    latest.into_values().collect()
+}
+
 const BACKTEST_AUTOTUNE_BASELINE_RUNS: usize = 4;
 const BACKTEST_AUTOTUNE_VALIDATION_RUNS: usize = 2;
 const BACKTEST_AUTOTUNE_MIN_MEAN_IMPROVEMENT_PCT: f64 = 0.35;
 const BACKTEST_AUTOTUNE_MAX_MEDIAN_REGRESSION_PCT: f64 = 0.25;
 const BACKTEST_AUTOTUNE_COOLDOWN_SECONDS: f64 = 3_600.0;
+const MAX_EXECUTIONS_PER_EVALUATION: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Handle for controlling the background task
@@ -178,6 +211,13 @@ async fn run_evaluation_loop(
         config.octobot_timeout_seconds,
         restored_api_schema,
     );
+    let restored_exchange_circuit = {
+        let current = state.0.lock().await;
+        current.exchange_circuit.clone()
+    };
+    octobot
+        .restore_exchange_circuit(restored_exchange_circuit)
+        .await;
     let refiner = RefinerClient::new(
         &config.refiner_base_url,
         config.refiner_api_token.as_deref(),
@@ -349,6 +389,10 @@ async fn run_evaluation_loop(
                         data_path: &data_path,
                     },
                 ).await;
+                {
+                    let mut current = state.0.lock().await;
+                    current.exchange_circuit = octobot.exchange_circuit_snapshot().await;
+                }
                 // The evaluation snapshot is durable before slower maintenance
                 // cycles begin. Individual filled orders also persist eagerly.
                 state.persist(&data_path).await;
@@ -599,13 +643,39 @@ async fn run_single_evaluation(
     let (target_exchanges, target_currencies) = resolve_target_market_filters(config, state).await;
 
     let evaluation_snapshot_limit = OCTOBOT_MARKET_SNAPSHOT_HARD_LIMIT;
-    let market_snapshots = octobot
+    let fetched_market_snapshots = octobot
         .get_all_market_snapshots(
             &target_exchanges,
             &target_currencies,
             evaluation_snapshot_limit,
         )
         .await;
+    let market_snapshots = filter_fresh_market_snapshots(
+        fetched_market_snapshots.clone(),
+        config.market_snapshot_ttl_seconds,
+    );
+    if market_snapshots.len() != fetched_market_snapshots.len() {
+        state
+            .log_warn(
+                "market_data",
+                format!(
+                    "Discarded {} stale, future, invalid, or out-of-order market snapshots",
+                    fetched_market_snapshots
+                        .len()
+                        .saturating_sub(market_snapshots.len())
+                ),
+            )
+            .await;
+    }
+    if market_snapshots.is_empty() {
+        state
+            .log_error(
+                "market_data",
+                "No fresh market data available; skipping advisory and execution cycle",
+            )
+            .await;
+        return;
+    }
     resolve_trade_markouts(state, &market_snapshots, config).await;
     let historical_features = if let Some(lake) = market_data_lake {
         let ingest_summary = lake.ingest_snapshots(&market_snapshots).await;
@@ -1183,7 +1253,10 @@ async fn run_single_evaluation(
         .await;
 
     // --- 6. Execute ranked actionable decisions ---
-    for candidate in &deduped_actionables {
+    for candidate in deduped_actionables
+        .iter()
+        .take(MAX_EXECUTIONS_PER_EVALUATION)
+    {
         execute_if_warranted(octobot, &candidate.decision, state, config).await;
     }
 

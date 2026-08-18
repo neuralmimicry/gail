@@ -84,7 +84,7 @@ pub async fn run(config: GailConfig) -> Result<()> {
                         entry.prompt_text.as_str(),
                     ))
                     .await;
-                if let Some(error) = trace.error {
+                if let Some(error) = mirror_semantic_error(&trace) {
                     errors.push(format!("input mirror: {error}"));
                 }
             }
@@ -109,7 +109,7 @@ pub async fn run(config: GailConfig) -> Result<()> {
                         response_text,
                     ))
                     .await;
-                if let Some(error) = trace.error {
+                if let Some(error) = mirror_semantic_error(&trace) {
                     errors.push(format!("output mirror: {error}"));
                 }
             }
@@ -150,6 +150,41 @@ pub async fn run(config: GailConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Transport acceptance is not semantic success.  In particular, AARNN can
+/// acknowledge an output request while its decoder reports
+/// `network_output_unavailable`; closing the ledger row in that case would
+/// permanently discard the only replay opportunity for that interaction.
+fn mirror_semantic_error(trace: &crate::models::AarnnMirrorInvocationTrace) -> Option<String> {
+    if let Some(error) = trace.error.as_deref() {
+        return Some(error.to_string());
+    }
+    if !trace.accepted {
+        return Some("AARNN transport response was not accepted".to_string());
+    }
+    if matches!(trace.direction, AarnnMirrorDirection::Output) {
+        let Some(candidate) = trace.candidate.as_ref() else {
+            return Some("output candidate missing after accepted transport".to_string());
+        };
+        if !candidate.usable {
+            return Some(format!(
+                "output candidate unusable: {}",
+                candidate
+                    .source
+                    .as_deref()
+                    .unwrap_or("network_output_unavailable")
+            ));
+        }
+        if candidate
+            .reply_text
+            .as_deref()
+            .is_none_or(|reply| reply.trim().is_empty())
+        {
+            return Some("output candidate has no reply text".to_string());
+        }
+    }
+    None
 }
 
 fn build_exchange(

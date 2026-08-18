@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use super::backtest::BacktestSummary;
 use super::config::TradingConfigOverride;
-use super::octobot::{OctobotExchange, OctobotOrder, OctobotPortfolio};
+use super::octobot::{ExchangeCircuitState, OctobotExchange, OctobotOrder, OctobotPortfolio};
 use super::outcomes::OutcomeLedger;
 use super::qualification::PaperQualificationState;
 use super::quant::QuantMigrationState;
@@ -233,6 +233,10 @@ pub struct TradingState {
     pub current_portfolio: Option<OctobotPortfolio>,
     pub open_positions: Vec<OctobotOrder>,
     pub available_exchanges: Vec<OctobotExchange>,
+    /// Exchange-scoped circuit breakers are durable so a restart preserves a
+    /// venue cooldown after repeated API failures.
+    #[serde(default)]
+    pub exchange_circuit: HashMap<String, ExchangeCircuitState>,
     pub recent_trades: VecDeque<ExecutedTrade>,
     pub activity_log: VecDeque<TradingLogEntry>,
     pub last_error: Option<String>,
@@ -324,6 +328,7 @@ impl TradingState {
             current_portfolio: None,
             open_positions: Vec::new(),
             available_exchanges: Vec::new(),
+            exchange_circuit: HashMap::new(),
             recent_trades: VecDeque::with_capacity(trade_ring_size),
             activity_log: VecDeque::with_capacity(log_ring_size),
             last_error: None,
@@ -608,6 +613,7 @@ impl SharedTradingState {
                     state.backtest_history = restored.backtest_history;
                     state.backtest_auto_tune = restored.backtest_auto_tune;
                     state.api_schema = restored.api_schema;
+                    state.exchange_circuit = restored.exchange_circuit;
                     state.observed_external_log_fingerprints =
                         restored.observed_external_log_fingerprints;
                     state.in_flight_order_intents = restored.in_flight_order_intents;
