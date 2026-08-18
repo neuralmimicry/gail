@@ -34,7 +34,6 @@ use crate::{
 
 const OCTOBOT_API: &str = "octobot";
 const MAX_PARALLEL_MARKET_SNAPSHOT_REQUESTS: usize = 8;
-const MAX_MARKET_SNAPSHOT_SYMBOLS_PER_EXCHANGE: usize = 4;
 const MARKET_SNAPSHOT_RETRY_ATTEMPTS: usize = 3;
 const MAX_ORDER_POLL_ATTEMPTS: usize = 4;
 const EXCHANGE_BREAKER_FAILURE_THRESHOLD: u32 = 3;
@@ -3925,8 +3924,6 @@ impl OctobotClient {
                 }
                 selected
             };
-            let mut selected = selected;
-            selected.truncate(MAX_MARKET_SNAPSHOT_SYMBOLS_PER_EXCHANGE);
             if selected.is_empty() {
                 continue;
             }
