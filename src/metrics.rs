@@ -18,6 +18,13 @@ fn now_ts() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Reject malformed or future worker timestamps before they reach Prometheus.
+/// A five-minute allowance accommodates small clock skew between hosts.
+fn valid_unix_timestamp(value: Option<f64>) -> Option<f64> {
+    let now = now_ts();
+    value.filter(|timestamp| timestamp.is_finite() && *timestamp > 0.0 && *timestamp <= now + 300.0)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct MetricsData {
@@ -187,8 +194,8 @@ impl TrainingRunObservation {
             runtime_seconds,
             tokens_per_second,
             non_padding_tokens_per_second,
-            started_ts: report.get("started_ts").and_then(Value::as_f64),
-            finished_ts: report.get("finished_ts").and_then(Value::as_f64),
+            started_ts: valid_unix_timestamp(report.get("started_ts").and_then(Value::as_f64)),
+            finished_ts: valid_unix_timestamp(report.get("finished_ts").and_then(Value::as_f64)),
             cumulative_training: report
                 .get("cumulative_training")
                 .and_then(Value::as_bool)
@@ -637,6 +644,13 @@ async fn discover_training_progress(snapshot_root: PathBuf) -> Vec<TrainingProgr
             && progress.status != "completed"
             && progress.status != "failed"
         {
+            let mut progress = progress;
+            progress.progress_ratio = progress.progress_ratio.clamp(0.0, 1.0);
+            progress.progress_per_hour = progress.progress_per_hour.max(0.0);
+            progress.eta_seconds = progress.eta_seconds.max(0.0);
+            progress.elapsed_seconds = progress.elapsed_seconds.max(0.0);
+            progress.started_ts = valid_unix_timestamp(progress.started_ts);
+            progress.updated_ts = valid_unix_timestamp(progress.updated_ts);
             observations.push(progress);
         }
     }
@@ -1738,6 +1752,15 @@ fn render_prometheus_metrics(data: &MetricsData) -> String {
         "gail_requests_failed_total {}\n",
         data.request_flow.failed
     ));
+    let terminal = data
+        .request_flow
+        .replied
+        .saturating_add(data.request_flow.failed);
+    let unaccounted = data.request_flow.received.saturating_sub(terminal);
+    out.push_str("# HELP gail_requests_terminal_total Gail requests with a recorded terminal outcome.\n# TYPE gail_requests_terminal_total counter\n");
+    out.push_str(&format!("gail_requests_terminal_total {terminal}\n"));
+    out.push_str("# HELP gail_requests_unaccounted_total Received requests without a recorded terminal outcome.\n# TYPE gail_requests_unaccounted_total gauge\n");
+    out.push_str(&format!("gail_requests_unaccounted_total {unaccounted}\n"));
     out.push_str("# HELP gail_requests_timed_out_total Gail LLM requests that timed out.\n# TYPE gail_requests_timed_out_total counter\n");
     out.push_str(&format!(
         "gail_requests_timed_out_total {}\n",
@@ -2109,7 +2132,7 @@ fn render_training_prometheus_metrics(
         );
         out.push_str(&format!(
             "gail_training_task_progress_ratio{{{labels}}} {:.6}\n",
-            task.progress_ratio
+            task.progress_ratio.clamp(0.0, 1.0)
         ));
         out.push_str(&format!(
             "gail_training_task_progress_per_hour{{{labels}}} {:.3}\n",
@@ -2569,12 +2592,16 @@ mod tests {
         assert!(during.contains("gail_requests_received_total 2"));
         assert!(during.contains("gail_requests_in_progress 2"));
         assert!(during.contains("gail_requests_replied_total 0"));
+        assert!(during.contains("gail_requests_terminal_total 0"));
+        assert!(during.contains("gail_requests_unaccounted_total 2"));
 
         store.record_request_replied().await.expect("replied");
         let after = store.prometheus_metrics().await;
         assert!(after.contains("gail_requests_received_total 2"));
         assert!(after.contains("gail_requests_in_progress 1"));
         assert!(after.contains("gail_requests_replied_total 1"));
+        assert!(after.contains("gail_requests_terminal_total 1"));
+        assert!(after.contains("gail_requests_unaccounted_total 1"));
     }
 
     #[tokio::test]
