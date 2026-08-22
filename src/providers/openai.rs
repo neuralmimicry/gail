@@ -295,11 +295,12 @@ impl OpenAIProvider {
         }
 
         let url = endpoint(&base_url, "chat/completions");
+        let local_llamacpp_request = is_local_llamacpp_endpoint(&base_url);
         let local_trading_request = is_local_trading_request(request, &base_url);
         for attempt in 0..2 {
             let mut messages = Vec::new();
             if let Some(system) = request.system.as_ref() {
-                let content = if local_trading_request {
+                let content = if local_llamacpp_request {
                     format!("{system}\n/no_think")
                 } else {
                     system.clone()
@@ -325,6 +326,13 @@ impl OpenAIProvider {
                 // avoids spending the output budget on a reasoning channel.
                 payload["chat_template_kwargs"] = json!({"enable_thinking": false});
                 payload["response_format"] = json!({"type": "json_object"});
+            } else if local_llamacpp_request {
+                // Qwen models served by llama.cpp otherwise spend a small
+                // max_tokens budget entirely in reasoning_content, leaving
+                // message.content empty. Treat every native endpoint as a
+                // non-thinking transport so normal Gail requests remain
+                // usable and do not trigger unnecessary fallback waves.
+                payload["chat_template_kwargs"] = json!({"enable_thinking": false});
             }
             if self.supports_prompt_cache
                 && let Some(cache_key) =
@@ -443,11 +451,11 @@ impl OpenAIProvider {
     ) -> Result<ProviderInvocationResponse> {
         let url = endpoint(base_url, "completions");
         let mut prompt = String::new();
-        let local_trading_request = is_local_trading_request(request, base_url);
+        let local_llamacpp_request = is_local_llamacpp_endpoint(base_url);
         if let Some(system) = request.system.as_deref() {
             prompt.push_str("System:\n");
             prompt.push_str(system);
-            if local_trading_request {
+            if local_llamacpp_request {
                 prompt.push_str("\n/no_think");
             }
             prompt.push_str("\n\n");
@@ -741,6 +749,30 @@ fn is_local_trading_request(request: &ProviderCompletionRequest, base_url: &str)
         "localhost" | "llama.cpp"
     ) || host.ends_with(".local")
         || host.ends_with(".svc")
+    {
+        return true;
+    }
+    host.parse::<IpAddr>().is_ok_and(|address| match address {
+        IpAddr::V4(address) => {
+            address.is_private() || address.is_loopback() || address.is_link_local()
+        }
+        IpAddr::V6(address) => address.is_loopback() || address.is_unique_local(),
+    })
+}
+
+fn is_local_llamacpp_endpoint(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if matches!(
+        host.to_ascii_lowercase().as_str(),
+        "localhost" | "llama.cpp"
+    ) || host.ends_with(".local")
+        || host.ends_with(".svc")
+        || host.ends_with(".svc.cluster.local")
     {
         return true;
     }
