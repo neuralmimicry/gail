@@ -1159,8 +1159,11 @@ async fn select_serving_target(
             let throughput = summaries
                 .iter()
                 .filter(|summary| {
-                    summary.host_id.as_deref() == Some(target.host_id.as_str())
-                        || summary.candidate_id.contains(target.host_id.as_str())
+                    serving_target_metric_matches(
+                        target,
+                        summary.host_id.as_deref(),
+                        summary.candidate_id.as_str(),
+                    )
                 })
                 .filter_map(|summary| summary.generation_tokens_per_second_ewma)
                 .fold(0.0_f64, f64::max);
@@ -1177,6 +1180,34 @@ async fn select_serving_target(
             trainer.ollama_base_model
         ))
     })
+}
+
+/// Provider metrics may identify one serving host by its configured logical
+/// ID, its URL, or the URL-derived candidate ID. Treat all three forms as the
+/// same target so historical throughput remains effective for promotion ties.
+fn serving_target_metric_matches(
+    target: &TrainerServingTarget,
+    metric_host_id: Option<&str>,
+    candidate_id: &str,
+) -> bool {
+    let endpoint = target.endpoint.trim_end_matches('/');
+    let endpoint_without_scheme = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .unwrap_or(endpoint);
+    let endpoint_fingerprint = endpoint_without_scheme.replace(['/', ':', '.'], "_");
+    let endpoint_host = reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned));
+
+    metric_host_id.is_some_and(|host| {
+        host == target.host_id
+            || host == endpoint
+            || endpoint_host
+                .as_deref()
+                .is_some_and(|endpoint_host| host.contains(endpoint_host))
+    }) || candidate_id.contains(target.host_id.as_str())
+        || candidate_id.contains(endpoint_fingerprint.as_str())
 }
 
 fn rank_serving_targets(targets: &mut [ServingTargetSelection]) {
@@ -3688,5 +3719,16 @@ mod tests {
         let mut targets = vec![target("sm01", 12_288, 10.0), target("sm00", 12_288, 10.0)];
         rank_serving_targets(&mut targets);
         assert_eq!(targets[0].target.host_id, "sm00");
+    }
+
+    #[test]
+    fn trained_model_target_matches_url_metrics_to_logical_host() {
+        let mut target = target("sm01", 12_288, 0.0);
+        target.target.endpoint = "http://192.168.1.68:18080/v1".to_string();
+        assert!(serving_target_metric_matches(
+            &target.target,
+            Some("http://192.168.1.68:18080/v1"),
+            "openai/qwen3.5:9b@192_168_1_68_18080_v1"
+        ));
     }
 }
