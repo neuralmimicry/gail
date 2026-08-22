@@ -1472,6 +1472,32 @@ impl MetricsStore {
             .round_to(6)
     }
 
+    /// Return the observed successful generation throughput for a candidate.
+    /// Prefer the request-context EWMA when available, then fall back to the
+    /// candidate-wide EWMA so newly introduced request profiles still benefit
+    /// from endpoint observations already collected by Gail.
+    pub async fn generation_tokens_per_second_for_context(
+        &self,
+        candidate_id: &str,
+        source: &str,
+        request_profile: &str,
+        workflow: &str,
+        role: &str,
+        request_category: Option<&str>,
+    ) -> Option<f64> {
+        let data = self.inner.lock().await;
+        let bucket = data.candidates.get(candidate_id)?;
+        let role_key =
+            routing_profile_key(source, request_profile, workflow, role, request_category);
+        let legacy_key = format!("{workflow}:{role}");
+        bucket
+            .roles
+            .get(&role_key)
+            .or_else(|| bucket.roles.get(&legacy_key))
+            .and_then(|stats| stats.generation_tokens_per_second_ewma)
+            .or(bucket.stats.generation_tokens_per_second_ewma)
+    }
+
     pub async fn recent_usage_penalty(
         &self,
         candidate_id: &str,

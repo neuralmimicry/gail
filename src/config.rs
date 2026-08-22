@@ -291,7 +291,7 @@ impl Default for OrchestrationConfig {
         Self {
             enabled: true,
             selection_mode: SelectionMode::Best,
-            max_parallel_candidates: 3,
+            max_parallel_candidates: 8,
             interactive_pool_max_in_flight: 8,
             solver_pool_max_in_flight: 4,
             trading_pool_max_in_flight: 3,
@@ -300,7 +300,7 @@ impl Default for OrchestrationConfig {
             trading_pool_wait_timeout_ms: 900_000,
             workload_pool_wait_timeout_ms: 30_000,
             candidate_queue_wait_timeout_ms: 30_000,
-            deduplicate_model_candidates: true,
+            deduplicate_model_candidates: false,
             prompt_compaction_enabled: true,
             default_local_context_window_tokens: 16_384,
             // JSON, tool schemas, and Qwen chat templates routinely tokenize

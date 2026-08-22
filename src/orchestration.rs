@@ -157,6 +157,7 @@ struct RankedCandidate {
     score: f64,
     health_ok: bool,
     health_mode: Option<String>,
+    generation_tokens_per_second: Option<f64>,
 }
 
 #[derive(Default)]
@@ -2816,6 +2817,18 @@ impl GailService {
                 request_category,
             )
             .await;
+        let generation_tokens_per_second = self
+            .inner
+            .metrics
+            .generation_tokens_per_second_for_context(
+                candidate_id.as_str(),
+                source,
+                request_profile,
+                workflow,
+                role,
+                request_category,
+            )
+            .await;
         // Prefer the largest configured model when candidates are otherwise
         // comparable. Persistent source/profile latency and queue metrics are
         // deliberately allowed to outweigh this bonus when the large model
@@ -2826,6 +2839,7 @@ impl GailService {
         RankedCandidate {
             health_ok,
             health_mode,
+            generation_tokens_per_second,
             score: candidate.weight
                 + candidate.priority_bias
                 + (overlap * 0.85)
@@ -4230,17 +4244,31 @@ fn select_ranked_candidates(
     let mut selected_models = HashSet::new();
     let mut selected_provider_types = HashSet::new();
     // `rank_candidate` folds the current candidate/host capacity snapshot
-    // into `health_ok`.  Sort the currently available candidates by model
-    // tier before applying the normal score/provider diversity rules. This
-    // gives each request the largest free model, then a free 9B, then a free
-    // 4B, while still allowing lower tiers to fill a deliberately parallel
-    // wave when more than one candidate is requested.
+    // into `health_ok`. Prefer healthy endpoints with the highest observed
+    // generation throughput. Model size and the full routing score remain
+    // deterministic tie-breakers for endpoints without throughput history.
     let mut ordered = ranked.iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| {
-        right.health_ok.cmp(&left.health_ok).then_with(|| {
-            model_size_tier(&right.candidate.configured_model)
-                .cmp(&model_size_tier(&left.candidate.configured_model))
-        })
+        right
+            .health_ok
+            .cmp(&left.health_ok)
+            .then_with(|| {
+                match (
+                    right.generation_tokens_per_second,
+                    left.generation_tokens_per_second,
+                ) {
+                    (Some(right), Some(left)) => right
+                        .partial_cmp(&left)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            })
+            .then_with(|| {
+                model_size_tier(&right.candidate.configured_model)
+                    .cmp(&model_size_tier(&left.candidate.configured_model))
+            })
     });
     let local_fallback = if target >= 2 {
         best_local_fallback_candidate(&ranked)
@@ -6105,6 +6133,7 @@ Return only a JSON data instance that satisfies this schema:
                 score,
                 health_ok,
                 health_mode: None,
+                generation_tokens_per_second: None,
                 candidate: ProviderCandidate::from_profile(ProviderProfile {
                     name: format!("{provider_type}-{model}"),
                     provider_type: provider_type.to_string(),
@@ -6143,6 +6172,7 @@ Return only a JSON data instance that satisfies this schema:
             score: 1.0,
             health_ok,
             health_mode: (!health_ok).then(|| "resource_saturated".to_string()),
+            generation_tokens_per_second: None,
             candidate: ProviderCandidate::from_profile(ProviderProfile {
                 name: format!("{provider}-{model}"),
                 provider_type: provider.to_string(),
@@ -6173,6 +6203,7 @@ Return only a JSON data instance that satisfies this schema:
             score: 1.0,
             health_ok,
             health_mode: (!health_ok).then(|| "resource_saturated".to_string()),
+            generation_tokens_per_second: None,
             candidate: ProviderCandidate::from_profile(ProviderProfile {
                 name: format!("{provider}-{model}"),
                 provider_type: provider.to_string(),
@@ -6203,6 +6234,7 @@ Return only a JSON data instance that satisfies this schema:
             score: 1.0,
             health_ok,
             health_mode: (!health_ok).then(|| "resource_saturated".to_string()),
+            generation_tokens_per_second: None,
             candidate: ProviderCandidate::from_profile(ProviderProfile {
                 name: format!("{provider}-{model}"),
                 provider_type: provider.to_string(),
@@ -6247,6 +6279,7 @@ Return only a JSON data instance that satisfies this schema:
                 score,
                 health_ok,
                 health_mode: None,
+                generation_tokens_per_second: None,
                 candidate: ProviderCandidate::from_profile(ProviderProfile {
                     name: format!("{provider_type}-{model}"),
                     provider_type: provider_type.to_string(),
@@ -6284,6 +6317,7 @@ Return only a JSON data instance that satisfies this schema:
                 score,
                 health_ok: true,
                 health_mode: None,
+                generation_tokens_per_second: None,
                 candidate: ProviderCandidate::from_profile(ProviderProfile {
                     name: format!("llamacpp-{}", base_url.replace(':', "-")),
                     provider_type: "openai".to_string(),
@@ -6322,11 +6356,54 @@ Return only a JSON data instance that satisfies this schema:
     }
 
     #[test]
+    fn select_ranked_candidates_orders_healthy_endpoints_by_generation_throughput() {
+        let ranked = |host: &str, throughput: Option<f64>, health_ok: bool| RankedCandidate {
+            score: 1.0,
+            health_ok,
+            health_mode: (!health_ok).then(|| "error".to_string()),
+            generation_tokens_per_second: throughput,
+            candidate: ProviderCandidate::from_profile(ProviderProfile {
+                name: host.to_string(),
+                provider_type: "openai".to_string(),
+                model: Some("qwen3.5:9b".to_string()),
+                api_key: Some("token".to_string()),
+                base_url: Some(format!("http://{host}:18080/v1")),
+                ..ProviderProfile::default()
+            }),
+        };
+
+        let selected = select_ranked_candidates(
+            vec![
+                ranked("slow", Some(3.5), true),
+                ranked("fast", Some(45.6), true),
+                ranked("middle", Some(31.7), true),
+                ranked("offline", Some(120.0), false),
+            ],
+            4,
+            false,
+        );
+        let hosts = selected
+            .iter()
+            .map(|candidate| candidate.profile.base_url.clone().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hosts,
+            vec![
+                "http://fast:18080/v1",
+                "http://middle:18080/v1",
+                "http://slow:18080/v1",
+                "http://offline:18080/v1",
+            ]
+        );
+    }
+
+    #[test]
     fn select_ranked_candidates_deduplicates_same_model_across_endpoints() {
         let ranked = |base_url: &str, score: f64| RankedCandidate {
             score,
             health_ok: true,
             health_mode: None,
+            generation_tokens_per_second: None,
             candidate: ProviderCandidate::from_profile(ProviderProfile {
                 name: base_url.to_string(),
                 provider_type: "openai".to_string(),
@@ -6358,6 +6435,7 @@ Return only a JSON data instance that satisfies this schema:
                 score,
                 health_ok: true,
                 health_mode: None,
+                generation_tokens_per_second: None,
                 candidate: ProviderCandidate::from_profile(ProviderProfile {
                     name: format!("llamacpp-{}", base_url.replace(':', "-")),
                     provider_type: "openai".to_string(),
@@ -6377,6 +6455,7 @@ Return only a JSON data instance that satisfies this schema:
                 score: 1.0,
                 health_ok: true,
                 health_mode: None,
+                generation_tokens_per_second: None,
                 candidate: ProviderCandidate::from_profile(ProviderProfile {
                     provider_type: "ollama".to_string(),
                     model: Some("qwen3.5:4b".to_string()),
@@ -6443,6 +6522,7 @@ Return only a JSON data instance that satisfies this schema:
                 score,
                 health_ok,
                 health_mode: None,
+                generation_tokens_per_second: None,
                 candidate: ProviderCandidate::from_profile(ProviderProfile {
                     name: format!("{provider_type}-{model}"),
                     provider_type: provider_type.to_string(),
@@ -6726,6 +6806,7 @@ Return only a JSON data instance that satisfies this schema:
             score: 1.0,
             health_ok: false,
             health_mode: Some("quota".to_string()),
+            generation_tokens_per_second: None,
             candidate: ProviderCandidate::from_profile(ProviderProfile {
                 provider_type: "nvidia".to_string(),
                 model: Some("moonshotai/kimi-k2-instruct-0905".to_string()),

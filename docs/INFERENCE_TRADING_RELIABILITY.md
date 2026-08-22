@@ -177,7 +177,7 @@ cross-restart deduplication record.
 | `orchestration.prompt_chars_per_token` | `3` | Conservative estimate for dense JSON, tool schemas, and Qwen chat prompts. |
 | `orchestration.prompt_safety_margin_tokens` | `1024` | Chat-template/tokeniser safety reserve. |
 | `providers[].context_window_tokens` | unset | Explicit per-provider/model context. |
-| `orchestration.deduplicate_model_candidates` | `true` | Avoid equivalent model work in normal waves. |
+| `orchestration.deduplicate_model_candidates` | `false` | Allow equivalent llama.cpp endpoints to share a parallel wave; health and capacity still gate selection. |
 | `orchestration.workload_pool_wait_timeout_ms` | `30000` | Global workload-pool wait. |
 | `orchestration.candidate_queue_wait_timeout_ms` | `30000` | Provider/host reservation wait. |
 | `trading.max_parallel_symbol_evaluations` | `2` | Bounded discovery/pruning parallelism. |
