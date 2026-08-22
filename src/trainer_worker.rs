@@ -1211,11 +1211,14 @@ async fn target_is_ready(target: &TrainerServingTarget) -> bool {
         return false;
     };
     body.get("data")
+        .or_else(|| body.get("models"))
         .and_then(Value::as_array)
         .is_some_and(|models| {
             models.iter().any(|model| {
                 model
                     .get("id")
+                    .or_else(|| model.get("name"))
+                    .or_else(|| model.get("model"))
                     .and_then(Value::as_str)
                     .is_some_and(|id| id == target.base_model)
             })
