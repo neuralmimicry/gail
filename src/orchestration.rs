@@ -2851,6 +2851,7 @@ impl GailService {
             .await;
         let health_ttl_seconds = cached_health_ttl_seconds(
             is_ollama_candidate(candidate),
+            is_local_llamacpp_candidate(candidate),
             cached.mode.as_deref(),
             self.health_ttl_seconds(),
         );
@@ -4429,7 +4430,27 @@ fn ollama_transient_health_ttl_seconds() -> f64 {
     env_float_any(&["GAIL_OLLAMA_TRANSIENT_HEALTH_TTL_SECONDS"], 30.0).max(1.0)
 }
 
-fn cached_health_ttl_seconds(is_ollama: bool, mode: Option<&str>, default_ttl: f64) -> f64 {
+/// Native llama.cpp endpoints disappear during host reboots while Gail keeps
+/// running. Keep both positive and failed endpoint probes short-lived so a
+/// persisted health snapshot cannot hide a recovered node (or keep routing
+/// to a node that has just gone down) for the general provider TTL.
+fn local_llamacpp_health_ttl_seconds() -> f64 {
+    env_float_any(&["GAIL_LOCAL_HEALTH_TTL_SECONDS"], 30.0).max(5.0)
+}
+
+fn is_local_llamacpp_candidate(candidate: &ProviderCandidate) -> bool {
+    candidate.source.eq_ignore_ascii_case("ansible_llamacpp")
+}
+
+fn cached_health_ttl_seconds(
+    is_ollama: bool,
+    is_local_llamacpp: bool,
+    mode: Option<&str>,
+    default_ttl: f64,
+) -> f64 {
+    if is_local_llamacpp {
+        return local_llamacpp_health_ttl_seconds();
+    }
     if !is_ollama {
         return default_ttl;
     }
@@ -6825,16 +6846,28 @@ Return only a JSON data instance that satisfies this schema:
     #[test]
     fn cached_health_ttl_keeps_ollama_transient_failures_short_lived() {
         let default_ttl = 1800.0;
-        let timeout_ttl = cached_health_ttl_seconds(true, Some("timeout"), default_ttl);
-        let upstream_ttl = cached_health_ttl_seconds(true, Some("upstream"), default_ttl);
-        let saturation_ttl = cached_health_ttl_seconds(true, Some("ollama_saturated"), default_ttl);
+        let timeout_ttl = cached_health_ttl_seconds(true, false, Some("timeout"), default_ttl);
+        let upstream_ttl = cached_health_ttl_seconds(true, false, Some("upstream"), default_ttl);
+        let saturation_ttl =
+            cached_health_ttl_seconds(true, false, Some("ollama_saturated"), default_ttl);
 
         assert!(timeout_ttl >= 1.0 && timeout_ttl <= 120.0);
         assert!(upstream_ttl >= 1.0 && upstream_ttl <= 120.0);
         assert!(saturation_ttl >= 1.0 && saturation_ttl <= 120.0);
         assert_eq!(
-            cached_health_ttl_seconds(false, Some("timeout"), default_ttl),
+            cached_health_ttl_seconds(false, false, Some("timeout"), default_ttl),
             default_ttl
+        );
+    }
+
+    #[test]
+    fn cached_health_ttl_keeps_ansible_llamacpp_restarts_short_lived() {
+        let default_ttl = 1800.0;
+        let local_ttl = cached_health_ttl_seconds(true, true, None, default_ttl);
+        assert!(local_ttl >= 5.0 && local_ttl <= 120.0);
+        assert_eq!(
+            cached_health_ttl_seconds(false, true, Some("upstream"), default_ttl),
+            local_ttl
         );
     }
 
