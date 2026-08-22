@@ -167,6 +167,35 @@ pub struct MirrorWorkerConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
+pub struct TrainerServingTarget {
+    /// Stable host identity. This must match the provider host_id emitted by
+    /// Gail so historical throughput can be used as a tie-breaker.
+    pub host_id: String,
+    /// OpenAI-compatible llama.cpp base URL, including the /v1 suffix.
+    pub endpoint: String,
+    /// Base model loaded by the target. Adapters are never sent to a target
+    /// with a different base model.
+    pub base_model: String,
+    /// Configured framebuffer capacity in MiB. The trainer uses this as the
+    /// deterministic capacity ordering; readiness still comes from the API.
+    pub vram_mb: u64,
+    pub enabled: bool,
+}
+
+impl Default for TrainerServingTarget {
+    fn default() -> Self {
+        Self {
+            host_id: String::new(),
+            endpoint: String::new(),
+            base_model: String::new(),
+            vram_mb: 0,
+            enabled: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TrainerConfig {
     pub enabled: bool,
     pub poll_interval_seconds: u64,
@@ -194,6 +223,9 @@ pub struct TrainerConfig {
     /// families which Ollama cannot import directly from Safetensors, such
     /// as Qwen3.5.
     pub ollama_adapter_conversion_command: Option<String>,
+    /// Optional llama.cpp targets for the promoted local adapter. An empty
+    /// list preserves the legacy single Ollama/qc01 publication path.
+    pub serving_targets: Vec<TrainerServingTarget>,
     pub output_root: String,
 }
 
@@ -385,6 +417,7 @@ impl Default for TrainerConfig {
             ollama_cli: "ollama".to_string(),
             ollama_host: None,
             ollama_adapter_conversion_command: None,
+            serving_targets: Vec::new(),
             output_root: "data/training".to_string(),
         }
     }
@@ -701,6 +734,14 @@ impl GailConfig {
         self.trainer.output_root =
             normalize_optional_string(Some(self.trainer.output_root.as_str()))
                 .unwrap_or_else(|| self.storage.trainer_output_path.clone());
+        for target in &mut self.trainer.serving_targets {
+            target.host_id =
+                normalize_optional_string(Some(target.host_id.as_str())).unwrap_or_default();
+            target.endpoint =
+                normalize_optional_url(Some(target.endpoint.as_str())).unwrap_or_default();
+            target.base_model =
+                normalize_optional_string(Some(target.base_model.as_str())).unwrap_or_default();
+        }
         for provider in &mut self.providers {
             provider.provider_type =
                 normalize_optional_string(Some(provider.provider_type.as_str()))

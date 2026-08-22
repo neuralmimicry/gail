@@ -17,12 +17,13 @@ use tokio::{
 };
 
 use crate::{
-    config::{GailConfig, TrainerConfig},
+    config::{GailConfig, TrainerConfig, TrainerServingTarget},
     errors::{GailError, Result},
     hardware::{HardwareProfile, detect_hardware, log_hardware_profile},
     llm_ledger,
     metrics::{
-        TrainingRunObservation, backfill_training_observations, upsert_training_observation,
+        MetricsStore, TrainingRunObservation, backfill_training_observations,
+        classify_training_failure, upsert_training_observation,
     },
 };
 
@@ -106,6 +107,12 @@ pub async fn run(config: GailConfig) -> Result<()> {
             path = %training_metrics_path.display(),
             "failed to backfill historical training telemetry"
         ),
+    }
+    if !trainer.serving_targets.is_empty()
+        && let Err(error) =
+            ensure_active_serving_target(&trainer, config.storage.metrics_path.as_str()).await
+    {
+        tracing::warn!(error = %error, "failed to reconcile the active trained-model serving target");
     }
     let poll_interval = Duration::from_secs(trainer.poll_interval_seconds);
     loop {
@@ -203,6 +210,7 @@ pub async fn run(config: GailConfig) -> Result<()> {
             dataset_path.as_path(),
             snapshot_dir.as_path(),
             ids.as_slice(),
+            config.storage.metrics_path.as_str(),
         )
         .await;
         if let Err(error) = remove_active_training_marker(&trainer).await {
@@ -523,7 +531,7 @@ async fn record_training_observation(
             "completed"
         }
     });
-    let observation = report
+    let mut observation = report
         .as_ref()
         .map(|report| {
             TrainingRunObservation::from_report(
@@ -542,10 +550,19 @@ async fn record_training_observation(
             }
             .to_string(),
             status: status.to_string(),
+            failure_reason: training_error
+                .map(classify_training_failure)
+                .unwrap_or_default()
+                .to_string(),
             base_model: trainer.ollama_base_model.clone(),
             finished_ts: Some(now_ts()),
             ..TrainingRunObservation::default()
         });
+    if observation.failure_reason.is_empty() {
+        if let Some(error) = training_error {
+            observation.failure_reason = classify_training_failure(error).to_string();
+        }
+    }
     upsert_training_observation(training_metrics_path(trainer), observation).await
 }
 
@@ -726,6 +743,7 @@ async fn run_training_pipeline(
     dataset_path: &Path,
     snapshot_dir: &Path,
     ledger_ids: &[i64],
+    metrics_path: &str,
 ) -> Result<TrainingOutcome> {
     fs::create_dir_all(snapshot_dir).await.map_err(|error| {
         GailError::invalid_config(format!("failed to create snapshot output path: {error}"))
@@ -846,6 +864,11 @@ async fn run_training_pipeline(
             }
         }
     }
+    let serving_target = if trainer.serving_targets.is_empty() || !training_executed {
+        None
+    } else {
+        Some(select_serving_target(trainer, metrics_path).await?)
+    };
     if trainer.register_with_ollama && training_executed {
         let previous_snapshot = active_snapshot_id(trainer)?;
         let previous_pointer =
@@ -863,8 +886,13 @@ async fn run_training_pipeline(
                         pipeline_report["ollama_registration"] = json!("registered");
                     }
                 }
-                if let Err(error) =
-                    publish_active_snapshot(trainer, snapshot_id, snapshot_dir).await
+                if let Err(error) = publish_active_snapshot(
+                    trainer,
+                    snapshot_id,
+                    snapshot_dir,
+                    serving_target.as_ref(),
+                )
+                .await
                 {
                     if let Err(rollback_error) =
                         rollback_ollama_alias(trainer, previous_snapshot.as_deref()).await
@@ -886,6 +914,27 @@ async fn run_training_pipeline(
                     registration_succeeded = false;
                     registration_error =
                         Some(format!("promoted model health check failed: {error}"));
+                    pipeline_report["lifecycle"] = json!([
+                        "submitted",
+                        "trained",
+                        "evaluated",
+                        "qualified",
+                        "promoted",
+                        "rolled_back"
+                    ]);
+                    pipeline_report["health_check_error"] = json!(error.to_string());
+                } else if let Some(target) = serving_target.as_ref()
+                    && let Err(error) = health_check_serving_target(target).await
+                {
+                    if let Err(rollback_error) =
+                        rollback_ollama_alias(trainer, previous_snapshot.as_deref()).await
+                    {
+                        tracing::error!(error = %rollback_error, snapshot = snapshot_id, "failed to roll back alias after serving-target readiness failure");
+                    }
+                    restore_active_snapshot_pointer(trainer, previous_pointer.as_deref()).await;
+                    registration_succeeded = false;
+                    registration_error =
+                        Some(format!("serving target health check failed: {error}"));
                     pipeline_report["lifecycle"] = json!([
                         "submitted",
                         "trained",
@@ -1079,6 +1128,149 @@ async fn health_check_promoted_model(trainer: &TrainerConfig) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct ServingTargetSelection {
+    target: TrainerServingTarget,
+    throughput_tokens_per_second: f64,
+}
+
+/// Select only a ready target with the exact training base model. Capacity is
+/// the primary ordering; historical successful generation throughput breaks
+/// equal-capacity (including CPU-only) ties. The final host-id ordering keeps
+/// selection deterministic when no history exists.
+async fn select_serving_target(
+    trainer: &TrainerConfig,
+    metrics_path: &str,
+) -> Result<ServingTargetSelection> {
+    let metrics = MetricsStore::new(metrics_path).await.ok();
+    let summaries = match metrics.as_ref() {
+        Some(store) => store.summary(1024).await.candidates,
+        None => Vec::new(),
+    };
+    let mut ready = Vec::new();
+    for target in trainer
+        .serving_targets
+        .iter()
+        .filter(|target| target.enabled && target.base_model == trainer.ollama_base_model)
+    {
+        if !target.endpoint.trim().is_empty() && target_is_ready(target).await {
+            let throughput = summaries
+                .iter()
+                .filter(|summary| {
+                    summary.host_id.as_deref() == Some(target.host_id.as_str())
+                        || summary.candidate_id.contains(target.host_id.as_str())
+                })
+                .filter_map(|summary| summary.generation_tokens_per_second_ewma)
+                .fold(0.0_f64, f64::max);
+            ready.push(ServingTargetSelection {
+                target: target.clone(),
+                throughput_tokens_per_second: throughput,
+            });
+        }
+    }
+    rank_serving_targets(&mut ready);
+    ready.into_iter().next().ok_or_else(|| {
+        GailError::invalid_config(format!(
+            "no ready trained-model serving target is compatible with base model {}",
+            trainer.ollama_base_model
+        ))
+    })
+}
+
+fn rank_serving_targets(targets: &mut [ServingTargetSelection]) {
+    targets.sort_by(|left, right| {
+        right
+            .target
+            .vram_mb
+            .cmp(&left.target.vram_mb)
+            .then_with(|| {
+                right
+                    .throughput_tokens_per_second
+                    .total_cmp(&left.throughput_tokens_per_second)
+            })
+            .then_with(|| left.target.host_id.cmp(&right.target.host_id))
+    });
+}
+
+async fn target_is_ready(target: &TrainerServingTarget) -> bool {
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(6))
+        .build()
+        .unwrap_or_else(|_| Client::new());
+    let url = format!("{}/models", target.endpoint.trim_end_matches('/'));
+    let Ok(response) = client.get(url).send().await else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    let Ok(body) = response.json::<Value>().await else {
+        return false;
+    };
+    body.get("data")
+        .and_then(Value::as_array)
+        .is_some_and(|models| {
+            models.iter().any(|model| {
+                model
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id == target.base_model)
+            })
+        })
+}
+
+async fn health_check_serving_target(selection: &ServingTargetSelection) -> Result<()> {
+    if target_is_ready(&selection.target).await {
+        tracing::info!(
+            host = %selection.target.host_id,
+            vram_mb = selection.target.vram_mb,
+            throughput_tokens_per_second = selection.throughput_tokens_per_second,
+            "promoted trained model serving target is ready"
+        );
+        Ok(())
+    } else {
+        Err(GailError::invalid_config(format!(
+            "serving target {} is not ready for base model {}",
+            selection.target.host_id, selection.target.base_model
+        )))
+    }
+}
+
+async fn ensure_active_serving_target(trainer: &TrainerConfig, metrics_path: &str) -> Result<()> {
+    let pointer = PathBuf::from(&trainer.output_root).join("active_snapshot.json");
+    let raw = match fs::read_to_string(&pointer).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut value: Value = serde_json::from_str(&raw).map_err(|error| {
+        GailError::invalid_config(format!("invalid active training snapshot pointer: {error}"))
+    })?;
+    if value
+        .get("serving_target")
+        .is_some_and(|target| !target.is_null())
+    {
+        return Ok(());
+    }
+    let selection = select_serving_target(trainer, metrics_path).await?;
+    let target = json!({
+        "host_id": selection.target.host_id,
+        "endpoint": selection.target.endpoint,
+        "base_model": selection.target.base_model,
+        "vram_mb": selection.target.vram_mb,
+        "throughput_tokens_per_second": selection.throughput_tokens_per_second,
+    });
+    value["serving_target"] = target;
+    let temporary = pointer.with_extension(format!("json.tmp-{}", std::process::id()));
+    write_json(&temporary, &value).await?;
+    fs::rename(&temporary, &pointer).await.map_err(|error| {
+        GailError::invalid_config(format!(
+            "failed to publish reconciled serving target: {error}"
+        ))
+    })
 }
 
 async fn restore_active_snapshot_pointer(trainer: &TrainerConfig, previous: Option<&str>) {
@@ -2802,6 +2994,7 @@ async fn publish_active_snapshot(
     trainer: &TrainerConfig,
     snapshot_id: &str,
     snapshot_dir: &Path,
+    serving_target: Option<&ServingTargetSelection>,
 ) -> Result<()> {
     let adapter = snapshot_dir.join("adapter");
     let metadata = fs::metadata(&adapter).await.map_err(|error| {
@@ -2822,6 +3015,13 @@ async fn publish_active_snapshot(
         "base_model": trainer.ollama_base_model,
         "model_alias": trainer.model_alias,
         "promoted_at": now_ts(),
+        "serving_target": serving_target.map(|selection| json!({
+            "host_id": selection.target.host_id,
+            "endpoint": selection.target.endpoint,
+            "base_model": selection.target.base_model,
+            "vram_mb": selection.target.vram_mb,
+            "throughput_tokens_per_second": selection.throughput_tokens_per_second,
+        })),
     });
     write_json(&temporary, &value).await?;
     fs::rename(&temporary, &pointer).await.map_err(|error| {
@@ -3451,5 +3651,39 @@ mod tests {
         assert_eq!(plan.gpu_count, 1);
         assert_eq!(plan.gpu_memory_mb, 12_288);
         assert_eq!(plan.gpu_free_memory_mb, 11_000);
+    }
+
+    fn target(host_id: &str, vram_mb: u64, throughput: f64) -> ServingTargetSelection {
+        ServingTargetSelection {
+            target: TrainerServingTarget {
+                host_id: host_id.to_string(),
+                endpoint: format!("http://{host_id}:18080/v1"),
+                base_model: "qwen3.5:4b".to_string(),
+                vram_mb,
+                enabled: true,
+            },
+            throughput_tokens_per_second: throughput,
+        }
+    }
+
+    #[test]
+    fn trained_model_target_prefers_largest_vram() {
+        let mut targets = vec![target("fast-cpu", 0, 900.0), target("sm00", 16_384, 30.0)];
+        rank_serving_targets(&mut targets);
+        assert_eq!(targets[0].target.host_id, "sm00");
+    }
+
+    #[test]
+    fn trained_model_target_uses_throughput_for_equal_vram_and_cpu() {
+        let mut targets = vec![target("slow", 0, 4.0), target("fast", 0, 42.0)];
+        rank_serving_targets(&mut targets);
+        assert_eq!(targets[0].target.host_id, "fast");
+    }
+
+    #[test]
+    fn trained_model_target_tie_is_deterministic() {
+        let mut targets = vec![target("sm01", 12_288, 10.0), target("sm00", 12_288, 10.0)];
+        rank_serving_targets(&mut targets);
+        assert_eq!(targets[0].target.host_id, "sm00");
     }
 }

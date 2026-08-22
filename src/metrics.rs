@@ -6,7 +6,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::{fs, sync::Mutex};
 
 use crate::{errors::Result, models::CandidateSummary};
@@ -86,6 +86,10 @@ pub struct TrainingRunObservation {
     pub snapshot_id: String,
     pub backend: String,
     pub status: String,
+    /// Stable category for dashboards; detailed stderr remains in the
+    /// snapshot pipeline artifact rather than becoming a Prometheus label.
+    #[serde(default)]
+    pub failure_reason: String,
     pub base_model: String,
     pub slurm_job_id: Option<String>,
     pub nodelist: Option<String>,
@@ -163,6 +167,11 @@ impl TrainingRunObservation {
                 .unwrap_or("unknown")
                 .to_string(),
             status: status.to_string(),
+            failure_reason: report
+                .get("failure_reason")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or_default(),
             base_model: report
                 .get("base_model")
                 .and_then(Value::as_str)
@@ -559,24 +568,44 @@ pub async fn discover_training_observations(
         }
         let snapshot_id = entry.file_name().to_string_lossy().to_string();
         let report_path = entry.path().join("training_report.json");
-        let raw = match fs::read_to_string(report_path).await {
-            Ok(raw) => raw,
-            Err(_) => continue,
-        };
-        let report = match serde_json::from_str::<Value>(&raw) {
-            Ok(report) => report,
+        let report = match fs::read_to_string(report_path).await {
+            Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+                Ok(report) => report,
+                Err(_) => continue,
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
             Err(_) => continue,
         };
         let report = merge_pipeline_provenance(entry.path().join("pipeline.json"), report).await;
-        if report.get("metrics").is_none() {
+        let has_metrics = report.get("metrics").is_some();
+        let failure_reason = report
+            .get("failure_reason")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.is_empty());
+        if !has_metrics && failure_reason.is_none() {
             continue;
         }
-        observations.push(TrainingRunObservation::from_report(
+        let status = if failure_reason.is_some() {
+            if report.get("ollama_registration_error").is_some()
+                || report.get("health_check_error").is_some()
+            {
+                "promotion_failed"
+            } else {
+                "failed"
+            }
+        } else {
+            "historical_completed"
+        };
+        let mut observation = TrainingRunObservation::from_report(
             snapshot_id.as_str(),
             &report,
-            "historical_completed",
+            status,
             default_base_model,
-        ));
+        );
+        if let Some(reason) = failure_reason {
+            observation.failure_reason = reason.to_string();
+        }
+        observations.push(observation);
     }
     observations.sort_by(|left, right| {
         left.finished_ts
@@ -604,7 +633,50 @@ async fn merge_pipeline_provenance(pipeline_path: PathBuf, mut report: Value) ->
             report_object.insert(key.to_string(), value.clone());
         }
     }
+    if report_object.get("failure_reason").is_none() {
+        for key in [
+            "qualification_error",
+            "ollama_registration_error",
+            "health_check_error",
+            "training_error",
+        ] {
+            if let Some(error) = pipeline_object.get(key).and_then(Value::as_str) {
+                report_object.insert(
+                    "failure_reason".to_string(),
+                    Value::String(classify_training_failure(error).to_string()),
+                );
+                break;
+            }
+        }
+    }
     report
+}
+
+pub fn classify_training_failure(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if error.contains("unsupported architecture")
+        || error.contains("cannot be registered as safetensors")
+        || error.contains("adapter conversion")
+    {
+        "unsupported_serving_architecture"
+    } else if error.contains("stale") || error.contains("heartbeat") {
+        "stale_training_lifecycle"
+    } else if error.contains("slurm") || error.contains("scancel") {
+        "slurm_infrastructure"
+    } else if error.contains("timeout") || error.contains("timed out") {
+        "training_timeout"
+    } else if error.contains("cuda") || error.contains("nvidia") || error.contains("out of memory")
+    {
+        "gpu_or_memory"
+    } else if error.contains("dataset") {
+        "dataset_build"
+    } else if error.contains("qualification") || error.contains("baseline") {
+        "qualification_gate"
+    } else if error.contains("ollama") || error.contains("promotion") {
+        "promotion_or_registration"
+    } else {
+        "training_execution"
+    }
 }
 
 /// Backfill the persistent metrics file from existing training reports.
@@ -640,7 +712,12 @@ async fn discover_training_progress(snapshot_root: PathBuf) -> Vec<TrainingProgr
         let Ok(progress) = serde_json::from_str::<TrainingProgressObservation>(&raw) else {
             continue;
         };
-        if !progress.snapshot_id.is_empty()
+        let fresh = progress
+            .updated_ts
+            .and_then(|updated| valid_unix_timestamp(Some(updated)))
+            .is_some_and(|updated| now_ts() - updated <= 900.0);
+        if fresh
+            && !progress.snapshot_id.is_empty()
             && progress.status != "completed"
             && progress.status != "failed"
         {
@@ -2209,12 +2286,15 @@ fn render_training_prometheus_metrics(
     out.push_str("# TYPE gail_training_pin_memory gauge\n");
     out.push_str("# HELP gail_training_quantisation_backend_info Effective quantisation backend for the run.\n");
     out.push_str("# TYPE gail_training_quantisation_backend_info gauge\n");
+    out.push_str("# HELP gail_training_failure_reason_total Training runs grouped by stable failure category.\n");
+    out.push_str("# TYPE gail_training_failure_reason_total gauge\n");
     for run in &data.runs {
         let labels = format!(
-            "snapshot_id=\"{}\",backend=\"{}\",status=\"{}\",model=\"{}\",slurm_job_id=\"{}\",nodelist=\"{}\"",
+            "snapshot_id=\"{}\",backend=\"{}\",status=\"{}\",failure_reason=\"{}\",model=\"{}\",slurm_job_id=\"{}\",nodelist=\"{}\"",
             escape_label(&run.snapshot_id),
             escape_label(&run.backend),
             escape_label(&run.status),
+            escape_label(&run.failure_reason),
             escape_label(&run.base_model),
             escape_label(run.slurm_job_id.as_deref().unwrap_or("")),
             escape_label(run.nodelist.as_deref().unwrap_or("")),
@@ -2276,6 +2356,31 @@ fn render_training_prometheus_metrics(
             escape_label(&status)
         );
         out.push_str(&format!("gail_training_runs_total{{{labels}}} {count}\n"));
+    }
+    let mut failures: HashMap<(String, String), u64> = HashMap::new();
+    for run in &data.runs {
+        if run.status == "failed" || run.status == "promotion_failed" {
+            *failures
+                .entry((
+                    run.backend.clone(),
+                    if run.failure_reason.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        run.failure_reason.clone()
+                    },
+                ))
+                .or_default() += 1;
+        }
+    }
+    for ((backend, reason), count) in failures {
+        let labels = format!(
+            "backend=\"{}\",reason=\"{}\"",
+            escape_label(&backend),
+            escape_label(&reason)
+        );
+        out.push_str(&format!(
+            "gail_training_failure_reason_total{{{labels}}} {count}\n"
+        ));
     }
 }
 
@@ -2435,6 +2540,7 @@ mod tests {
                 snapshot_id: "1786023597".to_string(),
                 backend: "slurm".to_string(),
                 status: "promotion_failed".to_string(),
+                failure_reason: "unsupported_serving_architecture".to_string(),
                 base_model: "qwen3.5:4b".to_string(),
                 slurm_job_id: Some("1786023597".to_string()),
                 nodelist: Some("qc[00-05]".to_string()),
