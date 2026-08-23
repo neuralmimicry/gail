@@ -2647,14 +2647,45 @@ impl GailService {
             !candidates.is_empty(),
         );
         if include_configured_fallback {
+            let requested_provider = request
+                .preferred_provider
+                .as_deref()
+                .map(normalize_provider_type);
+            let requested_model = request
+                .preferred_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty() && !model.eq_ignore_ascii_case("default"));
+            let exact_model_routing = requested_provider
+                .as_deref()
+                .is_some_and(|provider| provider == "openai");
             candidates.extend(
                 self.inner
                     .config
                     .providers
                     .iter()
                     .filter(|profile| {
+                        // An explicit provider/model route names a concrete
+                        // model contract. Do not let an unrelated configured
+                        // model win merely because it is faster; in
+                        // particular, gail-inhouse must never silently fall
+                        // back to a Qwen profile. Matching endpoint replicas
+                        // remain eligible and are ranked by live health and
+                        // historical throughput.
+                        let provider_matches = !exact_model_routing
+                            || requested_provider.as_deref().is_none_or(|provider| {
+                                normalize_provider_type(profile.provider_type.as_str()) == provider
+                            });
+                        let model_matches = !exact_model_routing
+                            || requested_model.is_none_or(|model| {
+                                profile.model.as_deref().is_some_and(|configured| {
+                                    configured.eq_ignore_ascii_case(model)
+                                })
+                            });
                         !(skip_configured_ollama_profiles
                             && normalize_provider_type(profile.provider_type.as_str()) == "ollama")
+                            && provider_matches
+                            && model_matches
                     })
                     .cloned()
                     .map(ProviderCandidate::from_profile),

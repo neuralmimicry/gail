@@ -4153,6 +4153,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_trained_model_route_does_not_fall_back_to_qwen_profiles() {
+        let trained = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "gail-inhouse:latest"}]
+            })))
+            .mount(&trained)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-trained",
+                "object": "chat.completion",
+                "model": "gail-inhouse:latest",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "trained response"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4}
+            })))
+            .mount(&trained)
+            .await;
+
+        let decoy_qwen = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "qwen3.5:9b"}]
+            })))
+            .mount(&decoy_qwen)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-qwen",
+                "object": "chat.completion",
+                "model": "qwen3.5:9b",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "wrong model"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4}
+            })))
+            .mount(&decoy_qwen)
+            .await;
+
+        let mut config = GailConfig::default();
+        config.orchestration.selection_mode = crate::models::SelectionMode::Fastest;
+        config.providers = vec![
+            ProviderProfile {
+                name: "GailTrained".to_string(),
+                provider_type: "openai".to_string(),
+                model: Some("gail-inhouse:latest".to_string()),
+                api_key: Some("llamacpp-local".to_string()),
+                base_url: Some(trained.uri()),
+                ..ProviderProfile::default()
+            },
+            ProviderProfile {
+                name: "LlamaCppQwen".to_string(),
+                provider_type: "openai".to_string(),
+                model: Some("qwen3.5:9b".to_string()),
+                api_key: Some("llamacpp-local".to_string()),
+                base_url: Some(decoy_qwen.uri()),
+                ..ProviderProfile::default()
+            },
+        ];
+        let app = build_router(test_service_with_config(config).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "openai/gail-inhouse:latest",
+                            "messages": [{"role": "user", "content": "hello"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+
+        assert_eq!(
+            payload["choices"][0]["message"]["content"],
+            "trained response"
+        );
+        assert_eq!(payload["gail"]["resolved_model"], "gail-inhouse:latest");
+        assert!(
+            payload["gail"]["trace"]["candidates"]
+                .as_array()
+                .is_some_and(|candidates| candidates
+                    .iter()
+                    .all(|candidate| { candidate["configured_model"] == "gail-inhouse:latest" }))
+        );
+    }
+
+    #[tokio::test]
     async fn openai_chat_completions_explicit_ollama_model_uses_fastest_configured_endpoint_pool() {
         let qc00 = MockServer::start().await;
         Mock::given(method("GET"))
