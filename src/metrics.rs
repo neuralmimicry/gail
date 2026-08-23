@@ -381,6 +381,8 @@ pub struct StatsBucket {
     pub ewma_inference_ms: Option<f64>,
     pub ewma_prompt_tokens: Option<f64>,
     pub ewma_tokens_estimate: Option<f64>,
+    #[serde(default)]
+    pub ewma_completion_tokens: Option<f64>,
     /// Successful generated-token throughput. Queue wait and failed requests
     /// are intentionally excluded from this distribution.
     #[serde(default)]
@@ -408,6 +410,21 @@ pub struct LocalUsageTelemetry {
     pub inference_ms: Option<u64>,
     pub total_tokens_estimate: Option<u32>,
     pub completion_tokens_estimate: Option<u32>,
+}
+
+/// Historical capacity observations for one provider/model/request profile.
+/// These values are deliberately returned as a small routing-facing view of
+/// the persisted statistics rather than exposing the mutable metrics buckets.
+#[derive(Clone, Debug, Default)]
+pub struct CandidateCapacityEstimate {
+    pub samples: u64,
+    pub success_rate: f64,
+    pub quality: f64,
+    pub useful_rate: f64,
+    pub generation_tokens_per_second: Option<f64>,
+    pub service_time_ms: Option<f64>,
+    pub queue_wait_ms: Option<f64>,
+    pub completion_tokens: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -454,6 +471,8 @@ pub struct CandidateMetricsSummary {
     pub ewma_inference_ms: Option<f64>,
     pub ewma_prompt_tokens: Option<f64>,
     pub ewma_tokens_estimate: Option<f64>,
+    #[serde(default)]
+    pub ewma_completion_tokens: Option<f64>,
     pub generation_tokens_per_second_average: Option<f64>,
     pub generation_tokens_per_second_min: Option<f64>,
     pub generation_tokens_per_second_max: Option<f64>,
@@ -1360,6 +1379,14 @@ impl MetricsStore {
                     None => total_tokens_estimate as f64,
                 });
             }
+            if let Some(completion_tokens_estimate) = telemetry.completion_tokens_estimate {
+                bucket.ewma_completion_tokens = Some(match bucket.ewma_completion_tokens {
+                    Some(previous) => {
+                        (previous * 0.75) + (completion_tokens_estimate as f64 * 0.25)
+                    }
+                    None => completion_tokens_estimate as f64,
+                });
+            }
             // OpenAI-compatible llama.cpp nodes do not always report a
             // provider-side inference duration. In that case latency is the
             // effective end-to-end throughput denominator; Ollama nodes use
@@ -1514,7 +1541,9 @@ impl MetricsStore {
         let stats = bucket
             .roles
             .get(&role_key)
+            .filter(|stats| stats.total > 0)
             .or_else(|| bucket.roles.get(&legacy_key))
+            .filter(|stats| stats.total > 0)
             .unwrap_or(&bucket.stats);
         if stats.total == 0 {
             return 0.0;
@@ -1573,6 +1602,92 @@ impl MetricsStore {
             .or_else(|| bucket.roles.get(&legacy_key))
             .and_then(|stats| stats.generation_tokens_per_second_ewma)
             .or(bucket.stats.generation_tokens_per_second_ewma)
+    }
+
+    /// Estimate useful service capacity for one provider/model/request
+    /// profile. A fast endpoint with poor success/quality history is worth
+    /// less than a slightly slower endpoint that reliably returns usable
+    /// output.
+    pub async fn candidate_capacity_estimate_for_context(
+        &self,
+        candidate_id: &str,
+        source: &str,
+        request_profile: &str,
+        workflow: &str,
+        role: &str,
+        request_category: Option<&str>,
+        requested_output_tokens: u32,
+    ) -> CandidateCapacityEstimate {
+        let data = self.inner.lock().await;
+        let Some(bucket) = data.candidates.get(candidate_id) else {
+            return CandidateCapacityEstimate::default();
+        };
+        let role_key =
+            routing_profile_key(source, request_profile, workflow, role, request_category);
+        let legacy_key = format!("{workflow}:{role}");
+        let stats = bucket
+            .roles
+            .get(&role_key)
+            .filter(|stats| stats.total > 0)
+            .or_else(|| bucket.roles.get(&legacy_key))
+            .filter(|stats| stats.total > 0)
+            .unwrap_or(&bucket.stats);
+        let samples = stats.total;
+        let success_rate = if samples == 0 {
+            0.75
+        } else {
+            stats.successes as f64 / samples as f64
+        };
+        let quality = if samples == 0 {
+            0.7
+        } else {
+            stats.ewma_quality
+        };
+        let quality_factor = ((quality + 1.0) / 2.0).clamp(0.1, 1.0);
+        let useful_rate = (success_rate * quality_factor).clamp(0.0, 1.0);
+        let queue_wait_ms = stats.ewma_queue_wait_ms.filter(|value| value.is_finite());
+        let inference_ms = stats.ewma_inference_ms.filter(|value| value.is_finite());
+        let observed_latency_ms = stats
+            .successful_latency_ewma_ms
+            .or(stats.ewma_latency_ms)
+            .filter(|value| value.is_finite());
+        // Provider inference timing excludes the provider queue. When only
+        // end-to-end latency is available, remove the learned queue portion
+        // before adding Gail's current queue estimate.
+        let service_base_ms = inference_ms.or_else(|| {
+            observed_latency_ms.map(|latency| (latency - queue_wait_ms.unwrap_or(0.0)).max(0.0))
+        });
+        let generation_tokens_per_second = stats
+            .generation_tokens_per_second_ewma
+            .filter(|value| value.is_finite() && *value > 0.0);
+        let completion_tokens = stats
+            .ewma_completion_tokens
+            .filter(|value| value.is_finite() && *value > 0.0);
+        let requested_output_tokens = requested_output_tokens.max(1) as f64;
+        let service_time_ms = match (service_base_ms, generation_tokens_per_second) {
+            (Some(base), Some(tokens_per_second)) => {
+                let generated_ms = requested_output_tokens * 1000.0 / tokens_per_second;
+                let historical_generated_ms = completion_tokens
+                    .map(|tokens| tokens * 1000.0 / tokens_per_second)
+                    .unwrap_or(0.0);
+                Some((base - historical_generated_ms).max(0.0) + generated_ms)
+            }
+            (None, Some(tokens_per_second)) => {
+                Some(requested_output_tokens * 1000.0 / tokens_per_second)
+            }
+            (Some(base), None) => Some(base.max(1.0)),
+            (None, None) => None,
+        };
+        CandidateCapacityEstimate {
+            samples,
+            success_rate,
+            quality,
+            useful_rate,
+            generation_tokens_per_second,
+            service_time_ms,
+            queue_wait_ms,
+            completion_tokens,
+        }
     }
 
     pub async fn recent_usage_penalty(
@@ -1651,6 +1766,7 @@ impl MetricsStore {
                 ewma_inference_ms: bucket.stats.ewma_inference_ms,
                 ewma_prompt_tokens: bucket.stats.ewma_prompt_tokens,
                 ewma_tokens_estimate: bucket.stats.ewma_tokens_estimate,
+                ewma_completion_tokens: bucket.stats.ewma_completion_tokens,
                 generation_tokens_per_second_average: bucket
                     .stats
                     .generation_tokens_per_second_average,
@@ -2817,6 +2933,53 @@ mod tests {
             .score_bonus(&slow.candidate_id, "project_solver", "reviewer")
             .await;
         assert!(fast_score > slow_score);
+    }
+
+    #[tokio::test]
+    async fn candidate_capacity_estimate_uses_successful_throughput_and_global_fallback() {
+        let path = tempfile::NamedTempFile::new()
+            .expect("temp file")
+            .into_temp_path();
+        let store = MetricsStore::new(path.to_path_buf()).await.expect("store");
+        let candidate = summary("ollama", "qwen3.5:9b");
+        for _ in 0..5 {
+            store
+                .record_result(
+                    &candidate,
+                    "project_solver",
+                    "planner",
+                    true,
+                    Some(1_000),
+                    Some(LocalUsageTelemetry {
+                        queue_wait_ms: Some(200),
+                        inference_ms: Some(800),
+                        completion_tokens_estimate: Some(100),
+                        ..LocalUsageTelemetry::default()
+                    }),
+                    1.0,
+                    None,
+                )
+                .await
+                .expect("record result");
+        }
+
+        let estimate = store
+            .candidate_capacity_estimate_for_context(
+                &candidate.candidate_id,
+                "different-client",
+                "new-profile",
+                "project_solver",
+                "planner",
+                None,
+                200,
+            )
+            .await;
+        assert_eq!(estimate.samples, 5);
+        assert_eq!(estimate.completion_tokens, Some(100.0));
+        assert_eq!(estimate.generation_tokens_per_second, Some(125.0));
+        assert_eq!(estimate.queue_wait_ms, Some(200.0));
+        assert!(estimate.useful_rate > 0.8);
+        assert_eq!(estimate.service_time_ms, Some(1_600.0));
     }
 
     #[tokio::test]

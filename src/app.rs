@@ -1415,6 +1415,13 @@ fn build_completion_request(
             profile,
             ..
         } => {
+            let profile_model_compatible = model.as_deref().is_none_or(|requested| {
+                profile.as_ref().is_some_and(|item| {
+                    item.model
+                        .as_deref()
+                        .is_some_and(|configured| configured.eq_ignore_ascii_case(requested))
+                })
+            });
             let explicit_provider_override = explicit_request_has_provider_override(
                 api_key.as_deref(),
                 access_token.as_deref(),
@@ -1439,7 +1446,11 @@ fn build_completion_request(
                 fallback_model: None,
                 fallback_api_key: None,
                 fallback_access_token: None,
-                base_url,
+                base_url: base_url.or_else(|| {
+                    profile_model_compatible
+                        .then(|| profile.as_ref().and_then(|item| item.base_url.clone()))
+                        .flatten()
+                }),
                 include_configured: if explicit_provider_override {
                     Some(false)
                 } else {

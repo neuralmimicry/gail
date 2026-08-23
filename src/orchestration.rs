@@ -125,6 +125,7 @@ struct InvocationResult {
     response: Option<ProviderInvocationResponse>,
     error: Option<String>,
     latency_ms: Option<u64>,
+    queue_wait_ms: Option<u64>,
     quality: f64,
     score: f64,
 }
@@ -163,7 +164,42 @@ struct RankedCandidate {
 #[derive(Default)]
 struct LoadTracker {
     candidate_in_flight: HashMap<String, usize>,
+    candidate_waiting: HashMap<String, usize>,
     host_usage: HashMap<String, HostLoad>,
+}
+
+struct CandidateWaitingGuard {
+    service: GailService,
+    candidate_id: Option<String>,
+}
+
+impl CandidateWaitingGuard {
+    fn new(service: GailService, candidate_id: String) -> Self {
+        Self {
+            service,
+            candidate_id: Some(candidate_id),
+        }
+    }
+
+    async fn release(mut self) {
+        if let Some(candidate_id) = self.candidate_id.take() {
+            self.service.release_candidate_waiting(candidate_id).await;
+        }
+    }
+}
+
+impl Drop for CandidateWaitingGuard {
+    fn drop(&mut self) {
+        let Some(candidate_id) = self.candidate_id.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let service = self.service.clone();
+            handle.spawn(async move {
+                service.release_candidate_waiting(candidate_id).await;
+            });
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -176,10 +212,23 @@ struct HostLoad {
 
 #[derive(Clone, Debug, Default)]
 struct CandidateLoadSnapshot {
+    candidate_in_flight: usize,
+    candidate_waiting: usize,
     candidate_limit_ratio: f64,
     candidate_limit_reached: bool,
     host_budget_ratio: f64,
     host_budget_reached: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CandidateDispatchEstimate {
+    samples: u64,
+    useful_rate: f64,
+    service_time_ms: f64,
+    queue_depth: usize,
+    candidate_parallelism: usize,
+    estimated_completion_ms: f64,
+    estimated_useful_completion_ms: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -1229,6 +1278,7 @@ impl GailService {
             request.request_category.as_deref(),
             &task_tags,
         );
+        let requested_output_tokens = request.max_tokens.unwrap_or(512).max(1);
         let mut specialist_meta = None;
         if !self.inner.specialists.is_empty()
             && (task_tags.contains("neuromorphic") || self.always_route_specialists())
@@ -1368,6 +1418,17 @@ impl GailService {
                 .partial_cmp(&left.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        let dispatch_estimates = self
+            .dispatch_estimates(
+                &ranked,
+                &api_source,
+                &request_profile,
+                &workflow,
+                &role,
+                request.request_category.as_deref(),
+                requested_output_tokens,
+            )
+            .await;
         let expected_json = expected_json(
             &provider_request.messages,
             provider_request.system.as_deref(),
@@ -1512,10 +1573,21 @@ impl GailService {
             let selected = if let Some(forced) = forced_selected {
                 forced
             } else if selection_mode == SelectionMode::RoundRobin {
-                self.select_round_robin_candidates(remaining, wave_size, &workflow, &role)
-                    .await
+                self.select_round_robin_candidates(
+                    remaining,
+                    wave_size,
+                    &workflow,
+                    &role,
+                    &dispatch_estimates,
+                )
+                .await
             } else {
-                select_ranked_candidates(remaining, wave_size, deduplicate_wave_models)
+                select_adaptive_candidates(
+                    remaining,
+                    wave_size,
+                    deduplicate_wave_models,
+                    &dispatch_estimates,
+                )
             };
             if selected.is_empty() {
                 if results.is_empty() {
@@ -1535,6 +1607,23 @@ impl GailService {
                 attempted_candidate_ids.insert(candidate_attempt_key(candidate));
             }
 
+            let capacity_forecasts = selected
+                .iter()
+                .filter_map(|candidate| {
+                    let estimate = dispatch_estimates.get(&candidate.candidate_id())?;
+                    Some(format!(
+                        "{}:queue={} lanes={} eta_ms={:.0} useful_eta_ms={:.0} service_ms={:.0} useful_rate={:.2}",
+                        candidate.candidate_id(),
+                        estimate.queue_depth,
+                        estimate.candidate_parallelism,
+                        estimate.estimated_completion_ms,
+                        estimate.estimated_useful_completion_ms,
+                        estimate.service_time_ms,
+                        estimate.useful_rate,
+                    ))
+                })
+                .collect::<Vec<_>>();
+
             info!(
                 request_id = %request_id,
                 workflow = %workflow,
@@ -1546,6 +1635,7 @@ impl GailService {
                 candidate_hosts = %preview_labels(selected.iter().map(candidate_host_label).collect::<Vec<_>>(), 6),
                 throttled_providers = %preview_labels(sorted_strings(throttled_provider_types.iter().cloned()), 6),
                 tags = %preview_labels(task_tags.iter().cloned().collect::<Vec<_>>(), 8),
+                capacity_forecasts = %preview_labels(capacity_forecasts, 6),
                 "dispatching Gail orchestration"
             );
             info!(request_id = %request_id, workflow = %workflow, role = %role, lifecycle = "dispatched", "GAIL_ORCHESTRATION_LIFECYCLE");
@@ -1593,7 +1683,9 @@ impl GailService {
             };
 
             returned_early |= wave_results.len() < selected.len() && selected.len() > 1;
-            let wave_has_success = wave_results.iter().any(|result| result.response.is_some());
+            let wave_has_success = wave_results.iter().any(|result| {
+                result.response.is_some() && result.quality >= early_success_min_quality
+            });
             let backoff_providers = wave_results
                 .iter()
                 .filter(|result| result.response.is_none())
@@ -1626,6 +1718,13 @@ impl GailService {
         let mut successful = Vec::new();
         let mut failures = Vec::new();
         for result in results.iter_mut() {
+            if result.response.is_some() && result.quality < early_success_min_quality {
+                result.error = Some(format!(
+                    "response quality {:.3} was below the useful-response threshold {:.3}",
+                    result.quality, early_success_min_quality
+                ));
+                result.response = None;
+            }
             let candidate_summary = result
                 .candidate
                 .summary(result.response.as_ref().map(|value| value.model.as_str()));
@@ -1646,6 +1745,14 @@ impl GailService {
                 result.score = result.quality - latency_penalty.min(1.25) + metrics_bonus;
                 let mut telemetry = local_usage_telemetry(response);
                 telemetry.prompt_tokens_estimate = Some(prompt_tokens_estimate);
+                if let Some(queue_wait_ms) = result.queue_wait_ms {
+                    telemetry.queue_wait_ms = Some(
+                        telemetry
+                            .queue_wait_ms
+                            .unwrap_or(0)
+                            .saturating_add(queue_wait_ms),
+                    );
+                }
                 self.inner
                     .metrics
                     .record_result_with_context(
@@ -1713,6 +1820,7 @@ impl GailService {
                         result.latency_ms,
                         Some(LocalUsageTelemetry {
                             prompt_tokens_estimate: Some(prompt_tokens_estimate),
+                            queue_wait_ms: result.queue_wait_ms,
                             ..LocalUsageTelemetry::default()
                         }),
                         -1.0,
@@ -2183,6 +2291,7 @@ impl GailService {
             self.inner.metrics.ai_response_time_estimate_ms("all").await;
         let endpoint_telemetry =
             summarize_endpoint_telemetry(&self.inner.metrics.summary(256).await.candidates);
+        let dispatch_load = self.dispatch_load_snapshot().await;
         let api_issues = api_issues::snapshot().await;
         let model_inventory = self.first_ollama_inventory().await;
         let routing_profiles_path = resolve_routing_profiles_path(None::<&std::path::Path>)
@@ -2202,6 +2311,10 @@ impl GailService {
             "routing_profiles_version": routing_profiles_version,
             "selection_mode": self.selection_mode(),
             "max_parallel_candidates": self.max_parallel_candidates(),
+            "adaptive_race_window_seed_ms": adaptive_race_window_seed_ms(),
+            "adaptive_max_raced_candidates_seed":
+                adaptive_race_candidate_seed(self.max_parallel_candidates()),
+            "default_provider_concurrency_seed": default_provider_concurrency_seed(),
             "interactive_pool_max_in_flight": self.inner.config.orchestration.interactive_pool_max_in_flight,
             "solver_pool_max_in_flight": self.inner.config.orchestration.solver_pool_max_in_flight,
             "trading_pool_max_in_flight": self.inner.config.orchestration.trading_pool_max_in_flight,
@@ -2222,6 +2335,7 @@ impl GailService {
             "metrics": metrics,
             "ai_response_times": self.inner.metrics.ai_response_time_summary().await,
             "processing_time_estimate_ms": processing_time_estimate_ms,
+            "dispatch_load": dispatch_load,
             "endpoint_telemetry": {
                 "count": endpoint_telemetry.len(),
                 "candidates": endpoint_telemetry,
@@ -2888,6 +3002,71 @@ impl GailService {
         }
     }
 
+    async fn dispatch_estimates(
+        &self,
+        ranked: &[RankedCandidate],
+        source: &str,
+        request_profile: &str,
+        workflow: &str,
+        role: &str,
+        request_category: Option<&str>,
+        requested_output_tokens: u32,
+    ) -> HashMap<String, CandidateDispatchEstimate> {
+        let mut estimates = HashMap::with_capacity(ranked.len());
+        for item in ranked {
+            let capacity = self
+                .inner
+                .metrics
+                .candidate_capacity_estimate_for_context(
+                    item.candidate.candidate_id().as_str(),
+                    source,
+                    request_profile,
+                    workflow,
+                    role,
+                    request_category,
+                    requested_output_tokens,
+                )
+                .await;
+            let load = self.load_snapshot(&item.candidate).await;
+            let service_time_ms = capacity
+                .service_time_ms
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .unwrap_or(5_000.0)
+                .clamp(1.0, 3_600_000.0);
+            let candidate_parallelism = item
+                .candidate
+                .max_concurrent_requests
+                .unwrap_or_else(|| adaptive_provider_parallelism(&capacity))
+                .max(1);
+            let queue_depth = load
+                .candidate_in_flight
+                .saturating_add(load.candidate_waiting);
+            let occupied_lanes = (queue_depth as f64 / candidate_parallelism as f64).ceil();
+            let historical_queue_wait_ms = capacity
+                .queue_wait_ms
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .unwrap_or(0.0)
+                .min(3_600_000.0);
+            let estimated_completion_ms =
+                historical_queue_wait_ms + (occupied_lanes + 1.0) * service_time_ms;
+            let useful_rate = capacity.useful_rate.clamp(0.1, 1.0);
+            let estimated_useful_completion_ms = estimated_completion_ms / useful_rate;
+            estimates.insert(
+                item.candidate.candidate_id(),
+                CandidateDispatchEstimate {
+                    samples: capacity.samples,
+                    useful_rate,
+                    service_time_ms,
+                    queue_depth,
+                    candidate_parallelism,
+                    estimated_completion_ms,
+                    estimated_useful_completion_ms,
+                },
+            );
+        }
+        estimates
+    }
+
     async fn probe_health(&self, candidate: &ProviderCandidate) -> ProviderHealth {
         let cached = self
             .inner
@@ -2965,11 +3144,55 @@ impl GailService {
         .await
     }
 
+    async fn dispatch_load_snapshot(&self) -> Value {
+        let tracker = self.inner.load_tracker.lock().await;
+        let candidates = tracker
+            .candidate_in_flight
+            .keys()
+            .chain(tracker.candidate_waiting.keys())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|candidate_id| {
+                (
+                    candidate_id.clone(),
+                    json!({
+                        "in_flight": tracker.candidate_in_flight.get(candidate_id).copied().unwrap_or(0),
+                        "waiting": tracker.candidate_waiting.get(candidate_id).copied().unwrap_or(0),
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let hosts = tracker
+            .host_usage
+            .iter()
+            .map(|(host, usage)| {
+                (
+                    host.clone(),
+                    json!({
+                        "requests": usage.requests,
+                        "cpu": usage.cpu,
+                        "ram_mb": usage.ram_mb,
+                        "vram_mb": usage.vram_mb,
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        json!({
+            "candidates": candidates,
+            "hosts": hosts,
+        })
+    }
+
     async fn load_snapshot(&self, candidate: &ProviderCandidate) -> CandidateLoadSnapshot {
         let candidate_id = candidate.candidate_id();
         let tracker = self.inner.load_tracker.lock().await;
         let candidate_in_flight = tracker
             .candidate_in_flight
+            .get(&candidate_id)
+            .copied()
+            .unwrap_or(0);
+        let candidate_waiting = tracker
+            .candidate_waiting
             .get(&candidate_id)
             .copied()
             .unwrap_or(0);
@@ -3002,6 +3225,8 @@ impl GailService {
             .as_ref()
             .is_some_and(|usage| host_budget_exceeded(candidate, usage));
         CandidateLoadSnapshot {
+            candidate_in_flight,
+            candidate_waiting,
             candidate_limit_ratio,
             candidate_limit_reached,
             host_budget_ratio,
@@ -3067,6 +3292,16 @@ impl GailService {
         &self,
         candidate: &ProviderCandidate,
     ) -> Option<LoadReservation> {
+        let candidate_id = candidate.candidate_id();
+        {
+            let mut tracker = self.inner.load_tracker.lock().await;
+            tracker
+                .candidate_waiting
+                .entry(candidate_id.clone())
+                .and_modify(|value| *value += 1)
+                .or_insert(1);
+        }
+        let waiting_guard = CandidateWaitingGuard::new(self.clone(), candidate_id);
         let started = Instant::now();
         let deadline =
             Instant::now() + Duration::from_millis(self.candidate_queue_wait_timeout_ms());
@@ -3079,6 +3314,7 @@ impl GailService {
             tokio::pin!(notified);
             notified.as_mut().enable();
             if let Some(reservation) = self.reserve_candidate_load(candidate).await {
+                waiting_guard.release().await;
                 let _ = self
                     .inner
                     .metrics
@@ -3143,6 +3379,23 @@ impl GailService {
             }
             if should_remove {
                 tracker.host_usage.remove(host_group);
+            }
+        }
+        drop(tracker);
+        self.inner.load_released.notify_waiters();
+    }
+
+    async fn release_candidate_waiting(&self, candidate_id: String) {
+        let mut tracker = self.inner.load_tracker.lock().await;
+        if let Some(current) = tracker
+            .candidate_waiting
+            .get(candidate_id.as_str())
+            .copied()
+        {
+            if current <= 1 {
+                tracker.candidate_waiting.remove(candidate_id.as_str());
+            } else {
+                tracker.candidate_waiting.insert(candidate_id, current - 1);
             }
         }
         drop(tracker);
@@ -3226,6 +3479,7 @@ impl GailService {
                                         "candidate timed out after {timeout_seconds}s"
                                     )),
                                     latency_ms: Some(timeout_seconds * 1000),
+                                    queue_wait_ms: None,
                                     quality: -1.0,
                                     score: f64::NEG_INFINITY,
                                 });
@@ -3252,6 +3506,7 @@ impl GailService {
                     response: None,
                     error: Some(error.to_string()),
                     latency_ms: None,
+                    queue_wait_ms: None,
                     quality: -1.0,
                     score: f64::NEG_INFINITY,
                 },
@@ -3317,10 +3572,12 @@ impl GailService {
                     signal.status, signal.mode, signal.optimize_status, signal.pressure_ratio,
                 )),
                 latency_ms: None,
+                queue_wait_ms: None,
                 quality: -1.0,
                 score: f64::NEG_INFINITY,
             };
         }
+        let queue_wait_started = Instant::now();
         let Some(_workload_permit) = self.acquire_workload_permit(workload_class).await else {
             return InvocationResult {
                 candidate,
@@ -3331,6 +3588,7 @@ impl GailService {
                     self.workload_pool_wait_timeout_ms_for(workload_class),
                 )),
                 latency_ms: None,
+                queue_wait_ms: Some(queue_wait_started.elapsed().as_millis() as u64),
                 quality: -1.0,
                 score: f64::NEG_INFINITY,
             };
@@ -3371,10 +3629,12 @@ impl GailService {
                     }
                 )),
                 latency_ms: None,
+                queue_wait_ms: Some(queue_wait_started.elapsed().as_millis() as u64),
                 quality: -1.0,
                 score: f64::NEG_INFINITY,
             };
         };
+        let queue_wait_ms = queue_wait_started.elapsed().as_millis() as u64;
         let load_reservation_guard = LoadReservationGuard::new(self.clone(), load_reservation);
         let quota_retries = env_int_any(&["LLM_RATE_LIMIT_RETRIES"], 2) as usize;
         let timeout_retries = env_int_any(&["LLM_TIMEOUT_RETRIES"], 0) as usize;
@@ -3412,6 +3672,7 @@ impl GailService {
                             response: None,
                             error: Some(error.to_string()),
                             latency_ms: None,
+                            queue_wait_ms: Some(queue_wait_ms),
                             quality: -1.0,
                             score: f64::NEG_INFINITY,
                         };
@@ -3437,6 +3698,7 @@ impl GailService {
                                     candidate_for_invocation.profile.provider_type, response.model
                                 )),
                                 latency_ms: Some(latency_ms),
+                                queue_wait_ms: Some(queue_wait_ms),
                                 quality: -1.0,
                                 score: f64::NEG_INFINITY,
                             };
@@ -3460,6 +3722,7 @@ impl GailService {
                                         .unwrap_or_else(|| "none".to_string())
                                 )),
                                 latency_ms: Some(latency_ms),
+                                queue_wait_ms: Some(queue_wait_ms),
                                 quality: -1.0,
                                 score: f64::NEG_INFINITY,
                             };
@@ -3470,6 +3733,7 @@ impl GailService {
                             response: Some(response),
                             error: None,
                             latency_ms: Some(latency_ms),
+                            queue_wait_ms: Some(queue_wait_ms),
                             quality,
                             score: f64::NEG_INFINITY,
                         };
@@ -3497,6 +3761,7 @@ impl GailService {
                             response: None,
                             error: Some(error.to_string()),
                             latency_ms: Some(latency_ms),
+                            queue_wait_ms: Some(queue_wait_ms),
                             quality: -1.0,
                             score: f64::NEG_INFINITY,
                         };
@@ -3515,6 +3780,7 @@ impl GailService {
                         timeout_window.as_secs().max(1)
                     )),
                     latency_ms: Some(timeout_window.as_millis() as u64),
+                    queue_wait_ms: Some(queue_wait_ms),
                     quality: -1.0,
                     score: f64::NEG_INFINITY,
                 },
@@ -3570,22 +3836,25 @@ impl GailService {
         max_candidates: usize,
         workflow: &str,
         role: &str,
+        estimates: &HashMap<String, CandidateDispatchEstimate>,
     ) -> Vec<ProviderCandidate> {
         let Some(context) = round_robin_context(&ranked, workflow, role) else {
-            return select_ranked_candidates(
+            return select_adaptive_candidates(
                 ranked,
                 max_candidates,
                 self.deduplicate_model_candidates(),
+                estimates,
             );
         };
         let offset = self
             .next_round_robin_offset(context.key.as_str(), context.group_size)
             .await;
         let reordered = reorder_ranked_candidates_for_round_robin(ranked, &context, offset);
-        select_ranked_candidates(
+        select_adaptive_candidates(
             reordered,
             max_candidates,
             self.deduplicate_model_candidates(),
+            estimates,
         )
     }
 
@@ -4356,6 +4625,98 @@ fn select_ranked_candidates(
     ensure_local_fallback_selected(selected, local_fallback, target, deduplicate_models)
 }
 
+/// Select the shortest expected useful completion rather than blindly racing
+/// the highest-ranked providers. A second provider is raced only when its
+/// quality-adjusted ETA is within the configured window of the best candidate;
+/// the rest remain ordered fallbacks. This lets a fast but busy provider lose
+/// the next request to a slower idle provider when the latter will finish
+/// sooner, while preserving redundancy for near-ties.
+fn select_adaptive_candidates(
+    ranked: Vec<RankedCandidate>,
+    max_candidates: usize,
+    deduplicate_models: bool,
+    estimates: &HashMap<String, CandidateDispatchEstimate>,
+) -> Vec<ProviderCandidate> {
+    if ranked.is_empty() {
+        return Vec::new();
+    }
+    let mut ordered = ranked;
+    ordered.sort_by(|left, right| {
+        let left_eta = estimates
+            .get(&left.candidate.candidate_id())
+            .map(|estimate| estimate.estimated_useful_completion_ms)
+            .unwrap_or(f64::INFINITY);
+        let right_eta = estimates
+            .get(&right.candidate.candidate_id())
+            .map(|estimate| estimate.estimated_useful_completion_ms)
+            .unwrap_or(f64::INFINITY);
+        left_eta
+            .total_cmp(&right_eta)
+            .then_with(|| right.health_ok.cmp(&left.health_ok))
+            .then_with(|| right.score.total_cmp(&left.score))
+    });
+    let best_eta = estimates
+        .get(&ordered[0].candidate.candidate_id())
+        .map(|estimate| estimate.estimated_useful_completion_ms)
+        .unwrap_or(5_000.0);
+    let policy = adaptive_dispatch_policy(estimates, max_candidates);
+    let frontier = best_eta + policy.race_window_ms;
+    let race_limit = policy.max_raced_candidates;
+    let fallback = ordered.first().cloned();
+    let competitive = ordered
+        .into_iter()
+        .filter(|item| {
+            estimates
+                .get(&item.candidate.candidate_id())
+                .map(|estimate| estimate.estimated_useful_completion_ms <= frontier)
+                .unwrap_or(false)
+        })
+        .take(race_limit)
+        .collect::<Vec<_>>();
+    let competitive = if competitive.is_empty() {
+        vec![fallback.expect("adaptive candidates are non-empty")]
+    } else {
+        competitive
+    };
+    let target = competitive.len().min(max_candidates.max(1));
+    let mut selected = Vec::with_capacity(target);
+    let mut ids = HashSet::new();
+    let mut models = HashSet::new();
+    let mut providers = HashSet::new();
+    for item in competitive.iter() {
+        let candidate_id = item.candidate.candidate_id();
+        let model_key = candidate_model_key(&item.candidate);
+        if providers.contains(&item.candidate.provider_type)
+            || (deduplicate_models && models.contains(&model_key))
+        {
+            continue;
+        }
+        if ids.insert(candidate_id) {
+            providers.insert(item.candidate.provider_type.clone());
+            models.insert(model_key);
+            selected.push(item.candidate.clone());
+            if selected.len() == target {
+                return selected;
+            }
+        }
+    }
+    for item in competitive {
+        let candidate_id = item.candidate.candidate_id();
+        let model_key = candidate_model_key(&item.candidate);
+        if deduplicate_models && models.contains(&model_key) {
+            continue;
+        }
+        if ids.insert(candidate_id) {
+            models.insert(model_key);
+            selected.push(item.candidate);
+            if selected.len() == target {
+                break;
+            }
+        }
+    }
+    selected
+}
+
 fn ranked_candidate_is_capacity_available(
     ranked: &[RankedCandidate],
     candidate: &ProviderCandidate,
@@ -4449,6 +4810,98 @@ fn suggested_pool_size(cpu_cores: usize, configured: usize, divisor: usize) -> u
     }
     .clamp(1, 4096);
     configured.max(derived).clamp(1, 4096)
+}
+
+/// Cloud/API profiles do not always declare a concurrency limit. This is a
+/// cold-start seed for the virtual lane count used by ETA calculation; once
+/// useful service and queue observations exist it is adjusted per candidate.
+fn default_provider_concurrency_seed() -> usize {
+    env_int_any(&["GAIL_DEFAULT_PROVIDER_CONCURRENCY"], 4).clamp(1, 64) as usize
+}
+
+fn adaptive_race_window_seed_ms() -> f64 {
+    env_float_any(&["GAIL_ADAPTIVE_RACE_WINDOW_MS"], 750.0).clamp(0.0, 30_000.0)
+}
+
+fn adaptive_race_candidate_seed(target: usize) -> usize {
+    env_int_any(&["GAIL_ADAPTIVE_MAX_RACED_CANDIDATES"], 2).clamp(1, target.max(1) as u64) as usize
+}
+
+fn adaptive_provider_parallelism(capacity: &crate::metrics::CandidateCapacityEstimate) -> usize {
+    let seed = default_provider_concurrency_seed();
+    if capacity.samples < 4 {
+        return seed;
+    }
+    let Some(service_time_ms) = capacity.service_time_ms.filter(|value| *value > 0.0) else {
+        return seed;
+    };
+    let queue_ratio = capacity.queue_wait_ms.unwrap_or_default().max(0.0) / service_time_ms;
+    let mut lanes = seed as isize;
+    if capacity.useful_rate < 0.5 || queue_ratio > 0.75 {
+        lanes -= 1;
+    } else if capacity.useful_rate > 0.85 && queue_ratio < 0.15 {
+        lanes += 1;
+        if capacity.samples >= 20 && queue_ratio < 0.05 {
+            lanes += 1;
+        }
+    }
+    lanes.clamp(1, 64) as usize
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AdaptiveDispatchPolicy {
+    race_window_ms: f64,
+    max_raced_candidates: usize,
+}
+
+fn adaptive_dispatch_policy(
+    estimates: &HashMap<String, CandidateDispatchEstimate>,
+    max_candidates: usize,
+) -> AdaptiveDispatchPolicy {
+    let seed_window = adaptive_race_window_seed_ms();
+    let seed_raced = adaptive_race_candidate_seed(max_candidates);
+    let confidence = estimates
+        .values()
+        .map(|estimate| estimate.samples)
+        .max()
+        .unwrap_or_default() as f64
+        / 20.0;
+    let confidence = confidence.clamp(0.0, 1.0);
+    let best_service_ms = estimates
+        .values()
+        .map(|estimate| estimate.service_time_ms)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .min_by(f64::total_cmp)
+        .unwrap_or(5_000.0);
+    // A fixed millisecond window is too wide for short requests and too
+    // narrow for long generations. Use the seed during cold start, then
+    // converge towards a fraction of the observed service time.
+    let learned_window_ms = (best_service_ms * 0.20).clamp(100.0, 3_000.0);
+    let race_window_ms =
+        (seed_window * (1.0 - confidence) + learned_window_ms * confidence).clamp(50.0, 3_000.0);
+    let best_eta = estimates
+        .values()
+        .map(|estimate| estimate.estimated_useful_completion_ms)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .min_by(f64::total_cmp)
+        .unwrap_or(5_000.0);
+    let near_tie_count = estimates
+        .values()
+        .filter(|estimate| estimate.estimated_useful_completion_ms <= best_eta + race_window_ms)
+        .count();
+    let learned_raced = if near_tie_count <= 1 {
+        1
+    } else {
+        (near_tie_count as f64).sqrt().ceil() as usize
+    };
+    let max_raced_candidates = ((seed_raced as f64 * (1.0 - confidence))
+        + (learned_raced as f64 * confidence))
+        .round()
+        .clamp(1.0, max_candidates.max(1) as f64) as usize;
+    AdaptiveDispatchPolicy {
+        race_window_ms,
+        max_raced_candidates,
+    }
 }
 
 fn current_ts() -> f64 {
@@ -4946,14 +5399,37 @@ fn quality_score(text: &str, expected_json: bool) -> f64 {
     if cleaned.is_empty() {
         return -3.0;
     }
+    let lowered = cleaned.to_ascii_lowercase();
+    let obvious_non_answers = [
+        "i can't help",
+        "i cannot help",
+        "i'm unable",
+        "i am unable",
+        "cannot answer",
+        "no answer",
+        "service unavailable",
+        "model not found",
+        "upstream error",
+        "as an ai language model",
+    ];
+    if obvious_non_answers
+        .iter()
+        .any(|marker| lowered.contains(marker))
+        || matches!(lowered.as_str(), "n/a" | "null" | "none" | "..." | "-")
+    {
+        return -1.5;
+    }
     let mut score = 0.6;
     if cleaned.len() >= 40 {
         score += 0.35;
     }
     if expected_json {
         match try_parse_json(cleaned) {
-            Some(Value::Object(_)) => score += 2.45,
-            Some(Value::Array(_)) => score += 2.35,
+            Some(Value::Object(value)) if !value.is_empty() => score += 2.45,
+            Some(Value::Array(value)) if !value.is_empty() => score += 2.35,
+            Some(Value::Object(_)) | Some(Value::Array(_)) | Some(Value::Null) => {
+                return -1.5;
+            }
             Some(_) => score += 2.2,
             None => score -= 2.0,
         }
@@ -6016,6 +6492,14 @@ mod tests {
     }
 
     #[test]
+    fn quality_score_rejects_obvious_non_answers_and_empty_structures() {
+        assert!(quality_score("I cannot help with that.", false) < 0.5);
+        assert!(quality_score("{}", true) < 0.5);
+        assert!(quality_score("null", true) < 0.5);
+        assert!(quality_score("A useful answer with enough detail.", false) >= 0.5);
+    }
+
+    #[test]
     fn workflow_tags_include_keyword_and_profile_tags() {
         let tags = workflow_tags(
             "assistant_requirements",
@@ -6348,6 +6832,176 @@ Return only a JSON data instance that satisfies this schema:
         assert_eq!(labels.len(), 2);
         assert_eq!(labels[0], "nvidia/moonshotai/kimi-k2-instruct-0905");
         assert!(labels[1].starts_with("ollama/llama3.2"));
+    }
+
+    #[test]
+    fn adaptive_selection_prefers_idle_candidate_over_busy_fast_candidate() {
+        fn ranked(host: &str) -> RankedCandidate {
+            RankedCandidate {
+                score: 1.0,
+                health_ok: true,
+                health_mode: None,
+                generation_tokens_per_second: Some(40.0),
+                candidate: ProviderCandidate::from_profile(ProviderProfile {
+                    name: host.to_string(),
+                    provider_type: "openai".to_string(),
+                    model: Some("qwen3.5:9b".to_string()),
+                    api_key: Some("token".to_string()),
+                    base_url: Some(format!("http://{host}:18080/v1")),
+                    ..ProviderProfile::default()
+                }),
+            }
+        }
+
+        let busy_fast = ranked("busy-fast");
+        let idle_slow = ranked("idle-slow");
+        let mut estimates = HashMap::new();
+        estimates.insert(
+            busy_fast.candidate.candidate_id(),
+            CandidateDispatchEstimate {
+                samples: 20,
+                useful_rate: 1.0,
+                service_time_ms: 1_000.0,
+                queue_depth: 6,
+                candidate_parallelism: 4,
+                estimated_completion_ms: 7_000.0,
+                estimated_useful_completion_ms: 7_000.0,
+            },
+        );
+        estimates.insert(
+            idle_slow.candidate.candidate_id(),
+            CandidateDispatchEstimate {
+                samples: 20,
+                useful_rate: 0.9,
+                service_time_ms: 3_000.0,
+                queue_depth: 0,
+                candidate_parallelism: 4,
+                estimated_completion_ms: 3_000.0,
+                estimated_useful_completion_ms: 3_333.0,
+            },
+        );
+
+        let selected = select_adaptive_candidates(vec![busy_fast, idle_slow], 1, false, &estimates);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].profile.base_url.as_deref(),
+            Some("http://idle-slow:18080/v1")
+        );
+    }
+
+    #[test]
+    fn adaptive_selection_races_only_near_equal_useful_etas() {
+        fn ranked(host: &str) -> RankedCandidate {
+            RankedCandidate {
+                score: 1.0,
+                health_ok: true,
+                health_mode: None,
+                generation_tokens_per_second: None,
+                candidate: ProviderCandidate::from_profile(ProviderProfile {
+                    name: host.to_string(),
+                    provider_type: "openai".to_string(),
+                    model: Some("qwen3.5:9b".to_string()),
+                    api_key: Some("token".to_string()),
+                    base_url: Some(format!("http://{host}:18080/v1")),
+                    ..ProviderProfile::default()
+                }),
+            }
+        }
+
+        let first = ranked("first");
+        let near = ranked("near");
+        let far = ranked("far");
+        let mut estimates = HashMap::new();
+        for (candidate, eta) in [(&first, 1_000.0), (&near, 1_500.0), (&far, 8_000.0)] {
+            estimates.insert(
+                candidate.candidate.candidate_id(),
+                CandidateDispatchEstimate {
+                    samples: 0,
+                    useful_rate: 1.0,
+                    service_time_ms: eta,
+                    queue_depth: 0,
+                    candidate_parallelism: 4,
+                    estimated_completion_ms: eta,
+                    estimated_useful_completion_ms: eta,
+                },
+            );
+        }
+
+        let selected = select_adaptive_candidates(vec![first, near, far], 8, false, &estimates);
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().all(|candidate| {
+            candidate.candidate_id().contains("first") || candidate.candidate_id().contains("near")
+        }));
+    }
+
+    #[test]
+    fn adaptive_policy_converges_from_seed_to_observed_service_time() {
+        let estimates = HashMap::from([
+            (
+                "fast".to_string(),
+                CandidateDispatchEstimate {
+                    samples: 20,
+                    useful_rate: 1.0,
+                    service_time_ms: 200.0,
+                    queue_depth: 0,
+                    candidate_parallelism: 6,
+                    estimated_completion_ms: 200.0,
+                    estimated_useful_completion_ms: 200.0,
+                },
+            ),
+            (
+                "near".to_string(),
+                CandidateDispatchEstimate {
+                    samples: 20,
+                    useful_rate: 1.0,
+                    service_time_ms: 220.0,
+                    queue_depth: 0,
+                    candidate_parallelism: 6,
+                    estimated_completion_ms: 220.0,
+                    estimated_useful_completion_ms: 220.0,
+                },
+            ),
+            (
+                "far".to_string(),
+                CandidateDispatchEstimate {
+                    samples: 20,
+                    useful_rate: 1.0,
+                    service_time_ms: 1_000.0,
+                    queue_depth: 0,
+                    candidate_parallelism: 6,
+                    estimated_completion_ms: 1_000.0,
+                    estimated_useful_completion_ms: 1_000.0,
+                },
+            ),
+        ]);
+        let policy = adaptive_dispatch_policy(&estimates, 8);
+        assert!(policy.race_window_ms < 750.0);
+        assert!(policy.race_window_ms >= 100.0);
+        assert_eq!(policy.max_raced_candidates, 2);
+    }
+
+    #[test]
+    fn provider_concurrency_seed_adjusts_with_useful_queue_capacity() {
+        let seed = default_provider_concurrency_seed();
+        let healthy = crate::metrics::CandidateCapacityEstimate {
+            samples: 20,
+            useful_rate: 0.95,
+            service_time_ms: Some(1_000.0),
+            queue_wait_ms: Some(20.0),
+            ..crate::metrics::CandidateCapacityEstimate::default()
+        };
+        let constrained = crate::metrics::CandidateCapacityEstimate {
+            samples: 20,
+            useful_rate: 0.4,
+            service_time_ms: Some(1_000.0),
+            queue_wait_ms: Some(900.0),
+            ..crate::metrics::CandidateCapacityEstimate::default()
+        };
+        assert_eq!(adaptive_provider_parallelism(&healthy), (seed + 2).min(64));
+        assert_eq!(
+            adaptive_provider_parallelism(&constrained),
+            seed.saturating_sub(1).max(1)
+        );
     }
 
     #[test]
@@ -6727,6 +7381,7 @@ Return only a JSON data instance that satisfies this schema:
                 ewma_inference_ms: Some(340.0),
                 ewma_prompt_tokens: None,
                 ewma_tokens_estimate: None,
+                ewma_completion_tokens: None,
                 generation_tokens_per_second_average: Some(20.0),
                 generation_tokens_per_second_min: Some(10.0),
                 generation_tokens_per_second_max: Some(30.0),
@@ -6838,6 +7493,11 @@ Return only a JSON data instance that satisfies this schema:
             .expect("waiter task should complete")
             .expect("waiter should acquire released capacity");
         service.release_candidate_load(queued_reservation).await;
+        let tracker = service.inner.load_tracker.lock().await;
+        assert_eq!(
+            tracker.candidate_waiting.get(&candidate.candidate_id()),
+            None
+        );
     }
 
     #[test]
