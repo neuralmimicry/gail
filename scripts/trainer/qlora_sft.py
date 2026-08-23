@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import math
 import os
 import shutil
 import sys
@@ -301,6 +302,20 @@ def aggregate_distributed_snapshot(
     for root in rank_roots:
         report_path = root / "training_report.json"
         reports.append(json.loads(report_path.read_text(encoding="utf-8")))
+    evaluation_records = [report["evaluation"] for report in reports]
+    baseline_records = [report["baseline"] for report in reports]
+    evaluation_tokens = sum(int(record["tokens"]) for record in evaluation_records)
+    baseline_tokens = sum(int(record["tokens"]) for record in baseline_records)
+    if evaluation_tokens <= 0 or baseline_tokens <= 0:
+        raise RuntimeError("distributed evaluation produced no scored tokens")
+    candidate_loss = sum(
+        float(record["loss"]) * int(record["tokens"])
+        for record in evaluation_records
+    ) / evaluation_tokens
+    baseline_loss = sum(
+        float(record["loss"]) * int(record["tokens"])
+        for record in baseline_records
+    ) / baseline_tokens
     report = {
         "algorithm": cfg.algorithm,
         "base_model": cfg.base_model,
@@ -315,6 +330,22 @@ def aggregate_distributed_snapshot(
         },
         "rank_reports": reports,
         "adapter_dir": str(adapter_dir.resolve()),
+        "evaluation": {
+            "metric": "loss",
+            "loss": candidate_loss,
+            "perplexity": math.exp(min(candidate_loss, 20.0)),
+            "samples": sum(int(record["samples"]) for record in evaluation_records),
+            "tokens": evaluation_tokens,
+            "method": "held_out_causal_lm_nll",
+        },
+        "baseline": {
+            "metric": "loss",
+            "loss": baseline_loss,
+            "perplexity": math.exp(min(baseline_loss, 20.0)),
+            "samples": sum(int(record["samples"]) for record in baseline_records),
+            "tokens": baseline_tokens,
+            "method": "base_model_on_same_held_out_split",
+        },
     }
     write_json(output_root / "training_report.json", report)
     (output_root / "_SUCCESS").write_text("complete\n", encoding="utf-8")
@@ -434,6 +465,70 @@ def load_training_texts(dataset_path: Path, tokenizer) -> List[str]:
     return texts
 
 
+def evaluate_causal_lm_loss(model, tokenizer, texts: Sequence[str], max_seq_len: int) -> tuple[float, int]:
+    """Measure token NLL on a deterministic held-out set.
+
+    This deliberately evaluates the adapter and the same model with its
+    adapter disabled.  Training loss is not a promotion-quality signal (and
+    can be zero for a short/partially logged run), so promotion needs an
+    independent, reproducible comparison on examples excluded from training.
+    """
+    if not texts:
+        raise RuntimeError("held-out evaluation set is empty")
+    parameter = next(model.parameters(), None)
+    if parameter is None:
+        raise RuntimeError("cannot evaluate a model without parameters")
+    device = parameter.device
+    was_training = model.training
+    model.eval()
+    total_nll = 0.0
+    total_tokens = 0
+    try:
+        with torch.no_grad():
+            for text in texts:
+                encoded = tokenizer(
+                    text,
+                    truncation=True,
+                    max_length=max_seq_len,
+                    padding=True,
+                    return_tensors="pt",
+                )
+                input_ids = encoded["input_ids"].to(device)
+                attention_mask = encoded.get("attention_mask")
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(device)
+                labels = input_ids.clone()
+                if attention_mask is not None:
+                    labels = labels.masked_fill(attention_mask == 0, -100)
+                output = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                )
+                valid_tokens = int((labels != -100).sum().item())
+                if valid_tokens <= 1 or output.loss is None:
+                    continue
+                # Transformers shifts causal labels internally. Exclude the
+                # final unpaired label from the denominator for consistency.
+                scored_tokens = valid_tokens - 1
+                total_nll += float(output.loss.detach().cpu()) * scored_tokens
+                total_tokens += scored_tokens
+    finally:
+        model.train(was_training)
+    if total_tokens <= 0:
+        raise RuntimeError("held-out evaluation produced no scored tokens")
+    return total_nll / total_tokens, total_tokens
+
+
+def held_out_split(texts: Sequence[str]) -> tuple[List[str], List[str]]:
+    """Return stable train/evaluation partitions without using random state."""
+    evaluation = [text for index, text in enumerate(texts) if index % 5 == 0]
+    training = [text for index, text in enumerate(texts) if index % 5 != 0]
+    if not evaluation or not training:
+        raise RuntimeError("dataset is too small for a held-out evaluation split")
+    return training, evaluation
+
+
 def infer_lora_targets(model) -> List[str]:
     preferred = [
         "q_proj",
@@ -512,11 +607,15 @@ def train(cfg: TrainingConfig) -> None:
             is_trainable=True,
         )
 
-    texts = load_training_texts(dataset_path, tokenizer)
+    all_texts = load_training_texts(dataset_path, tokenizer)
+    texts, evaluation_texts = held_out_split(all_texts)
     if world_size > 1:
         texts = texts[rank::world_size]
+        evaluation_texts = evaluation_texts[rank::world_size]
     if not texts:
         raise RuntimeError(f"rank {rank} has no training samples after deterministic sharding")
+    if not evaluation_texts:
+        raise RuntimeError(f"rank {rank} has no held-out evaluation samples")
     train_dataset = Dataset.from_dict({"text": texts})
 
     target_modules = infer_lora_targets(model)
@@ -582,6 +681,17 @@ def train(cfg: TrainingConfig) -> None:
     )
     checkpoint = latest_valid_checkpoint(rank_root / "checkpoints")
     train_result = trainer.train(resume_from_checkpoint=str(checkpoint) if checkpoint else None)
+
+    candidate_loss, candidate_tokens = evaluate_causal_lm_loss(
+        trainer.model, tokenizer, evaluation_texts, cfg.max_seq_len
+    )
+    if isinstance(trainer.model, PeftModel):
+        with trainer.model.disable_adapter():
+            baseline_loss, baseline_tokens = evaluate_causal_lm_loss(
+                trainer.model, tokenizer, evaluation_texts, cfg.max_seq_len
+            )
+    else:
+        raise RuntimeError("cannot evaluate a non-PEFT model against its base model")
 
     trained_model = trainer.model
     if isinstance(trained_model, PeftModel):
@@ -652,6 +762,22 @@ def train(cfg: TrainingConfig) -> None:
         "training_loss": float(train_result.training_loss)
         if train_result.training_loss is not None
         else None,
+        "evaluation": {
+            "metric": "loss",
+            "loss": candidate_loss,
+            "perplexity": math.exp(min(candidate_loss, 20.0)),
+            "samples": len(evaluation_texts),
+            "tokens": candidate_tokens,
+            "method": "held_out_causal_lm_nll",
+        },
+        "baseline": {
+            "metric": "loss",
+            "loss": baseline_loss,
+            "perplexity": math.exp(min(baseline_loss, 20.0)),
+            "samples": len(evaluation_texts),
+            "tokens": baseline_tokens,
+            "method": "base_model_on_same_held_out_split",
+        },
         "adapter_dir": str(adapter_dir.resolve()),
         "modelfile": str(modelfile.resolve()),
         "resume_adapter": str(resume_adapter.resolve()) if resume_adapter else None,

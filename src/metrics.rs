@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    env,
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -23,6 +24,28 @@ fn now_ts() -> f64 {
 fn valid_unix_timestamp(value: Option<f64>) -> Option<f64> {
     let now = now_ts();
     value.filter(|timestamp| timestamp.is_finite() && *timestamp > 0.0 && *timestamp <= now + 300.0)
+}
+
+fn reset_routing_metrics_on_startup() -> bool {
+    let requested = env::var("GAIL_METRICS_RESET_ROUTING_ON_STARTUP")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    if !requested {
+        return false;
+    }
+    // MetricsStore is also used by trainer_worker to read historical
+    // throughput for trained-model placement. Only the serving process may
+    // reset the shared file; worker roles must retain that history.
+    matches!(
+        env::var("GAIL_ROLE").ok().as_deref(),
+        None | Some("") | Some("serve") | Some("api")
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -797,10 +820,26 @@ impl StatsBucket {
 impl MetricsStore {
     pub async fn new(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
+        let reset_routing = reset_routing_metrics_on_startup();
         let mut data = match fs::read_to_string(&path).await {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
             Err(_) => MetricsData::default(),
         };
+        if reset_routing {
+            // Provider health and routing observations describe the previous
+            // Gail process. A node can have rebooted, changed model, or
+            // recovered from a transient fault since those observations were
+            // written. Keep candidate identity metadata, but make the first
+            // requests after restart establish a fresh baseline instead of
+            // inheriting stale failures, latency, or token-rate values.
+            for candidate in data.candidates.values_mut() {
+                candidate.stats = StatsBucket::default();
+                candidate.roles.clear();
+                candidate.health = HealthBucket::default();
+            }
+            data.ai_response_times.clear();
+            data.updated_at = now_ts();
+        }
         for stats in data.ai_response_times.values_mut() {
             stats.normalize_split_latency_fields();
         }
@@ -818,11 +857,16 @@ impl MetricsStore {
         // stale values after a restart while retaining terminal counters.
         data.request_flow.queued = 0;
         data.request_flow.in_progress = 0;
-        Ok(Self {
+        let store = Self {
             path,
             inner: Arc::new(Mutex::new(data)),
             persist_lock: Arc::new(Mutex::new(())),
-        })
+        };
+        if reset_routing {
+            let snapshot = store.inner.lock().await.clone();
+            store.save(&snapshot).await?;
+        }
+        Ok(store)
     }
 
     pub fn path(&self) -> String {
