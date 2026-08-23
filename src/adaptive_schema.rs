@@ -22,6 +22,12 @@ const TRANSIENT_SKIP_SECONDS: f64 = 60.0;
 const SAVE_MIN_INTERVAL_SECONDS: f64 = 5.0;
 const SAVE_MAX_DIRTY_OBSERVATIONS: u64 = 25;
 
+// A saturated counter is not useful evidence.  It can only be produced by a
+// previous saturating increment, and retaining it makes every future merge
+// look permanently unhealthy.  Repair only the saturation sentinel so normal
+// large-but-valid histories remain intact.
+const SATURATED_COUNTER: u64 = u64::MAX;
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AdaptiveApiRegistry {
@@ -472,9 +478,39 @@ pub async fn configure_persistence(path: impl Into<PathBuf>) {
     };
     let mut store = GLOBAL_STORE.lock().await;
     store.path = Some(path);
-    if let Some(loaded) = loaded {
+    if let Some(mut loaded) = loaded {
+        let repaired = repair_saturated_counters(&mut loaded);
         store.registry.merge(loaded);
+        if repaired {
+            // Persist the repaired snapshot at the next opportunity.  This is
+            // deliberately bounded and does not discard endpoint shapes or
+            // timestamps, only counters that had already overflowed.
+            store.dirty_observations = SAVE_MAX_DIRTY_OBSERVATIONS;
+        }
     }
+}
+
+fn repair_saturated_counters(registry: &mut AdaptiveApiRegistry) -> bool {
+    let mut repaired = false;
+    for schema in registry.apis.values_mut() {
+        for endpoint in schema.endpoints.values_mut() {
+            if endpoint.success_count == SATURATED_COUNTER {
+                endpoint.success_count = 0;
+                repaired = true;
+            }
+            if endpoint.failure_count == SATURATED_COUNTER {
+                endpoint.failure_count = 0;
+                repaired = true;
+            }
+        }
+        for hint in schema.semantic_hints.values_mut() {
+            if hint.count == SATURATED_COUNTER {
+                hint.count = 0;
+                repaired = true;
+            }
+        }
+    }
+    repaired
 }
 
 pub async fn snapshot() -> AdaptiveApiRegistry {
@@ -852,5 +888,21 @@ mod tests {
             .expect("merged endpoint");
         assert_eq!(endpoint.success_count, 2);
         assert_eq!(endpoint.response_keys, vec!["new"]);
+    }
+
+    #[test]
+    fn repairs_only_saturated_persisted_counters() {
+        let mut registry = AdaptiveApiRegistry::default();
+        let mut schema = AdaptiveApiSchema::default();
+        schema.observe_success("GET", "/api/ping", "ping", &json!({"ok": true}));
+        let endpoint = schema.endpoints.get_mut("GET /api/ping").unwrap();
+        endpoint.success_count = SATURATED_COUNTER;
+        endpoint.failure_count = 123;
+        registry.apis.insert("octobot".to_string(), schema);
+
+        assert!(repair_saturated_counters(&mut registry));
+        let endpoint = &registry.apis["octobot"].endpoints["GET /api/ping"];
+        assert_eq!(endpoint.success_count, 0);
+        assert_eq!(endpoint.failure_count, 123);
     }
 }

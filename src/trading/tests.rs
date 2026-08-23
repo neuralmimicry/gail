@@ -3359,7 +3359,12 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/exchanges"))
-            .respond_with(ResponseTemplate::new(404))
+            // OctoBot 3 returns the browser page at this URL with HTTP 200;
+            // exchange discovery must continue using first_exchange_details.
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<!doctype html><html><title>Home - OctoBot</title></html>"),
+            )
             .expect(1)
             .mount(&server)
             .await;

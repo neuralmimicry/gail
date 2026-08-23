@@ -663,8 +663,16 @@ impl OpenAIProvider {
                 // probe must exercise the same usable-content contract as a
                 // real request, so make the no-thinking instruction explicit
                 // and leave enough budget for the one-word answer.
-                "messages": [{"role": "user", "content": "Reply with OK only."}],
-                "max_tokens": 24,
+                // Keep the no-thinking marker in the prompt as well as the
+                // llama.cpp extension.  Some compatible builds accept the
+                // extension but do not apply it when the request is made
+                // through their OpenAI adapter; the marker makes the probe
+                // deterministic across both implementations.
+                "messages": [
+                    {"role": "system", "content": "Readiness check. Reply with OK only. /no_think"},
+                    {"role": "user", "content": "Reply with OK only."}
+                ],
+                "max_tokens": 64,
                 "temperature": 0.0,
                 // Keep readiness probes bounded to a single JSON response.
                 // llama.cpp may otherwise use its default streaming path,

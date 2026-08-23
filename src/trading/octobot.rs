@@ -1525,10 +1525,24 @@ impl OctobotClient {
             }
         }
 
-        if let Some(body) = self
-            .get_optional_json("/api/exchanges", "exchanges")
-            .await?
-        {
+        // Some OctoBot releases keep this URL as a browser page and return
+        // HTTP 200 HTML instead of JSON.  It is an optional enrichment
+        // surface: first_exchange_details, the trading page, and configured
+        // currency data are sufficient to identify usable markets.  Do not
+        // let a successful-but-non-JSON compatibility page abort the whole
+        // exchange discovery cycle.
+        let exchange_body = match self.get_optional_json("/api/exchanges", "exchanges").await {
+            Ok(body) => body,
+            Err(error) if error.contains("parse failed") => {
+                debug!(
+                    "trading: OctoBot /api/exchanges returned a non-JSON compatibility page: {}",
+                    error
+                );
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(body) = exchange_body {
             for entry in parse_exchange_info_entries(&body) {
                 let Some(exchange_name_key) = normalize_exchange_name(&entry.name) else {
                     continue;

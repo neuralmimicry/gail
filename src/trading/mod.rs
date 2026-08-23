@@ -46,10 +46,7 @@ use tokio::sync::oneshot;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
-use crate::{
-    adaptive_schema::{self, AdaptiveApiRegistry},
-    orchestration::GailService,
-};
+use crate::{adaptive_schema, orchestration::GailService};
 use advisor::TradingAdvisor;
 use backtest::BacktestEngine;
 use config::{TradingConfig, TradingConfigOverride};
@@ -200,11 +197,6 @@ async fn run_evaluation_loop(
         let mut state = state.0.lock().await;
         state.api_schema = restored_api_schema.clone();
     }
-    let mut restored_registry = AdaptiveApiRegistry::default();
-    restored_registry
-        .apis
-        .insert("octobot".to_string(), restored_api_schema.clone());
-    adaptive_schema::merge_snapshot(restored_registry).await;
     let octobot = OctobotClient::new_with_schema(
         &config.octobot_base_url,
         config.octobot_password.as_deref(),
