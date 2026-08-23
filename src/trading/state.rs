@@ -20,7 +20,7 @@ use super::quantitative::backtest::NativeBacktestReport;
 use super::quantitative::calibration::MultiHorizonCalibrationState;
 use super::quantitative::sleeves::{AlphaSleevesState, LlmRiskOverlayState};
 use super::quantitative::telemetry::ExecutionTelemetryState;
-use crate::adaptive_schema::AdaptiveApiSchema;
+use crate::{adaptive_schema, adaptive_schema::AdaptiveApiSchema};
 
 fn now_ts() -> f64 {
     SystemTime::now()
@@ -659,9 +659,18 @@ impl SharedTradingState {
 
 fn parse_persisted_state(raw: &str) -> Result<(TradingState, Option<String>), serde_json::Error> {
     let mut payload = serde_json::from_str::<serde_json::Value>(raw)?;
-    let repaired = repair_legacy_state_payload(&mut payload);
-    let state = serde_json::from_value::<TradingState>(payload.clone())?;
-    let repaired_snapshot = if repaired {
+    let legacy_repaired = repair_legacy_state_payload(&mut payload);
+    let mut state = serde_json::from_value::<TradingState>(payload.clone())?;
+    let schema_repaired = adaptive_schema::repair_saturated_schema_counters(&mut state.api_schema);
+    if schema_repaired {
+        if let Some(root) = payload.as_object_mut() {
+            root.insert(
+                "api_schema".to_string(),
+                serde_json::to_value(&state.api_schema)?,
+            );
+        }
+    }
+    let repaired_snapshot = if legacy_repaired || schema_repaired {
         Some(serde_json::to_string_pretty(&payload)?)
     } else {
         None

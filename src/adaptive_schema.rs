@@ -493,21 +493,31 @@ pub async fn configure_persistence(path: impl Into<PathBuf>) {
 fn repair_saturated_counters(registry: &mut AdaptiveApiRegistry) -> bool {
     let mut repaired = false;
     for schema in registry.apis.values_mut() {
-        for endpoint in schema.endpoints.values_mut() {
-            if endpoint.success_count == SATURATED_COUNTER {
-                endpoint.success_count = 0;
-                repaired = true;
-            }
-            if endpoint.failure_count == SATURATED_COUNTER {
-                endpoint.failure_count = 0;
-                repaired = true;
-            }
+        repaired |= repair_saturated_schema_counters(schema);
+    }
+    repaired
+}
+
+/// Repair saturated counters in a schema restored by a component-specific
+/// persistence path.  Trading keeps a durable copy of the OctoBot schema in
+/// its own state file, so it must apply the same repair as the global registry
+/// loader before handing the schema to the live client.
+pub fn repair_saturated_schema_counters(schema: &mut AdaptiveApiSchema) -> bool {
+    let mut repaired = false;
+    for endpoint in schema.endpoints.values_mut() {
+        if endpoint.success_count == SATURATED_COUNTER {
+            endpoint.success_count = 0;
+            repaired = true;
         }
-        for hint in schema.semantic_hints.values_mut() {
-            if hint.count == SATURATED_COUNTER {
-                hint.count = 0;
-                repaired = true;
-            }
+        if endpoint.failure_count == SATURATED_COUNTER {
+            endpoint.failure_count = 0;
+            repaired = true;
+        }
+    }
+    for hint in schema.semantic_hints.values_mut() {
+        if hint.count == SATURATED_COUNTER {
+            hint.count = 0;
+            repaired = true;
         }
     }
     repaired
@@ -904,5 +914,18 @@ mod tests {
         let endpoint = &registry.apis["octobot"].endpoints["GET /api/ping"];
         assert_eq!(endpoint.success_count, 0);
         assert_eq!(endpoint.failure_count, 123);
+    }
+
+    #[test]
+    fn repairs_saturated_component_schema_counters() {
+        let mut schema = AdaptiveApiSchema::default();
+        schema.observe_success("GET", "/api/ping", "ping", &json!({"ok": true}));
+        let endpoint = schema.endpoints.get_mut("GET /api/ping").unwrap();
+        endpoint.failure_count = SATURATED_COUNTER;
+
+        assert!(repair_saturated_schema_counters(&mut schema));
+        let endpoint = &schema.endpoints["GET /api/ping"];
+        assert_eq!(endpoint.success_count, 1);
+        assert_eq!(endpoint.failure_count, 0);
     }
 }
