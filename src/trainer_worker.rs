@@ -1283,12 +1283,6 @@ async fn ensure_active_serving_target(trainer: &TrainerConfig, metrics_path: &st
     let mut value: Value = serde_json::from_str(&raw).map_err(|error| {
         GailError::invalid_config(format!("invalid active training snapshot pointer: {error}"))
     })?;
-    if value
-        .get("serving_target")
-        .is_some_and(|target| !target.is_null())
-    {
-        return Ok(());
-    }
     let selection = select_serving_target(trainer, metrics_path).await?;
     let target = json!({
         "host_id": selection.target.host_id,
@@ -1297,6 +1291,19 @@ async fn ensure_active_serving_target(trainer: &TrainerConfig, metrics_path: &st
         "vram_mb": selection.target.vram_mb,
         "throughput_tokens_per_second": selection.throughput_tokens_per_second,
     });
+    let target_changed = value
+        .get("serving_target")
+        .and_then(Value::as_object)
+        .is_none_or(|current| {
+            current.get("host_id").and_then(Value::as_str)
+                != Some(selection.target.host_id.as_str())
+                || current.get("endpoint").and_then(Value::as_str)
+                    != Some(selection.target.endpoint.as_str())
+                || current.get("vram_mb").and_then(Value::as_u64) != Some(selection.target.vram_mb)
+        });
+    if !target_changed {
+        return Ok(());
+    }
     value["serving_target"] = target;
     let temporary = pointer.with_extension(format!("json.tmp-{}", std::process::id()));
     write_json(&temporary, &value).await?;

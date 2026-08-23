@@ -236,6 +236,7 @@ def aggregate_distributed_snapshot(
     rank_root: Path,
     rank: int,
     world_size: int,
+    job_id: str,
     sample_counts: list[int],
 ) -> None:
     """Federated-average PEFT adapters after every Slurm rank completes.
@@ -696,7 +697,9 @@ def train(cfg: TrainingConfig) -> None:
                     raise TimeoutError(f"timed out waiting for rank report: {peer_report}")
                 time.sleep(2)
             sample_counts.append(int(json.loads(peer_report.read_text(encoding="utf-8"))["samples"]))
-        aggregate_distributed_snapshot(cfg, output_root, rank_root, rank, world_size, sample_counts)
+        aggregate_distributed_snapshot(
+            cfg, output_root, rank_root, rank, world_size, job_id, sample_counts
+        )
     print(json.dumps(report))
 
 
