@@ -173,6 +173,10 @@ pub struct TrainerServingTarget {
     pub host_id: String,
     /// OpenAI-compatible llama.cpp base URL, including the /v1 suffix.
     pub endpoint: String,
+    /// Model ID returned by the serving endpoint. This is separate from
+    /// `base_model` because an adapter-backed endpoint advertises the stable
+    /// trained-model alias rather than the underlying Qwen base.
+    pub model_alias: Option<String>,
     /// Base model loaded by the target. Adapters are never sent to a target
     /// with a different base model.
     pub base_model: String,
@@ -187,6 +191,7 @@ impl Default for TrainerServingTarget {
         Self {
             host_id: String::new(),
             endpoint: String::new(),
+            model_alias: None,
             base_model: String::new(),
             vram_mb: 0,
             enabled: true,
@@ -739,6 +744,7 @@ impl GailConfig {
                 normalize_optional_string(Some(target.host_id.as_str())).unwrap_or_default();
             target.endpoint =
                 normalize_optional_url(Some(target.endpoint.as_str())).unwrap_or_default();
+            target.model_alias = normalize_optional_string(target.model_alias.as_deref());
             target.base_model =
                 normalize_optional_string(Some(target.base_model.as_str())).unwrap_or_default();
         }

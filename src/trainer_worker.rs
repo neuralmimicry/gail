@@ -1241,6 +1241,10 @@ async fn target_is_ready(target: &TrainerServingTarget) -> bool {
     let Ok(body) = response.json::<Value>().await else {
         return false;
     };
+    let expected_model = target
+        .model_alias
+        .as_deref()
+        .unwrap_or(target.base_model.as_str());
     body.get("data")
         .or_else(|| body.get("models"))
         .and_then(Value::as_array)
@@ -1251,7 +1255,7 @@ async fn target_is_ready(target: &TrainerServingTarget) -> bool {
                     .or_else(|| model.get("name"))
                     .or_else(|| model.get("model"))
                     .and_then(Value::as_str)
-                    .is_some_and(|id| id == target.base_model)
+                    .is_some_and(|id| id == expected_model)
             })
         })
 }
@@ -1287,6 +1291,7 @@ async fn ensure_active_serving_target(trainer: &TrainerConfig, metrics_path: &st
     let target = json!({
         "host_id": selection.target.host_id,
         "endpoint": selection.target.endpoint,
+        "model_alias": selection.target.model_alias,
         "base_model": selection.target.base_model,
         "vram_mb": selection.target.vram_mb,
         "throughput_tokens_per_second": selection.throughput_tokens_per_second,
@@ -1299,6 +1304,8 @@ async fn ensure_active_serving_target(trainer: &TrainerConfig, metrics_path: &st
                 != Some(selection.target.host_id.as_str())
                 || current.get("endpoint").and_then(Value::as_str)
                     != Some(selection.target.endpoint.as_str())
+                || current.get("model_alias").and_then(Value::as_str)
+                    != selection.target.model_alias.as_deref()
                 || current.get("vram_mb").and_then(Value::as_u64) != Some(selection.target.vram_mb)
         });
     if !target_changed {
@@ -3059,6 +3066,7 @@ async fn publish_active_snapshot(
         "serving_target": serving_target.map(|selection| json!({
             "host_id": selection.target.host_id,
             "endpoint": selection.target.endpoint,
+            "model_alias": selection.target.model_alias,
             "base_model": selection.target.base_model,
             "vram_mb": selection.target.vram_mb,
             "throughput_tokens_per_second": selection.throughput_tokens_per_second,
@@ -3699,6 +3707,7 @@ mod tests {
             target: TrainerServingTarget {
                 host_id: host_id.to_string(),
                 endpoint: format!("http://{host_id}:18080/v1"),
+                model_alias: None,
                 base_model: "qwen3.5:4b".to_string(),
                 vram_mb,
                 enabled: true,
