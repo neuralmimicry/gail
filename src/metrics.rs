@@ -743,6 +743,9 @@ pub async fn backfill_training_observations(
 
 async fn discover_training_progress(snapshot_root: PathBuf) -> Vec<TrainingProgressObservation> {
     let mut observations = Vec::new();
+    let slurm_results_root = snapshot_root
+        .parent()
+        .map(|parent| parent.join("slurm").join("spool").join("results"));
     let Ok(mut entries) = fs::read_dir(snapshot_root).await else {
         return observations;
     };
@@ -751,19 +754,62 @@ async fn discover_training_progress(snapshot_root: PathBuf) -> Vec<TrainingProgr
         let Ok(raw) = fs::read_to_string(path).await else {
             continue;
         };
-        let Ok(progress) = serde_json::from_str::<TrainingProgressObservation>(&raw) else {
+        let Ok(mut progress) = serde_json::from_str::<TrainingProgressObservation>(&raw) else {
             continue;
         };
-        let fresh = progress
+        let progress_fresh = progress
             .updated_ts
             .and_then(|updated| valid_unix_timestamp(Some(updated)))
             .is_some_and(|updated| now_ts() - updated <= 900.0);
-        if fresh
+        // A long CPU training step can leave progress.json unchanged for
+        // longer than the normal reporting TTL.  The Slurm dispatcher still
+        // refreshes its RUNNING status heartbeat every few seconds, which is
+        // the authoritative liveness signal for that case.  Keep the last
+        // known progress/ETA, but advance updated_ts so Grafana does not
+        // incorrectly show zero active tasks while the job is making work.
+        let slurm_fresh = if !progress_fresh {
+            let status_path = slurm_results_root
+                .as_ref()
+                .map(|root| root.join(format!("{}.status", progress.snapshot_id)));
+            let status = match status_path {
+                Some(path) => fs::read_to_string(path)
+                    .await
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok()),
+                None => None,
+            };
+            let state_is_running = status
+                .as_ref()
+                .and_then(|value| value.get("state"))
+                .and_then(Value::as_str)
+                .is_some_and(|state| state.eq_ignore_ascii_case("running"));
+            let heartbeat = status
+                .as_ref()
+                .and_then(|value| value.get("heartbeat_ts"))
+                .and_then(Value::as_f64)
+                .and_then(|value| valid_unix_timestamp(Some(value)));
+            let fresh = state_is_running
+                && heartbeat
+                    .is_some_and(|value| now_ts() - value <= training_heartbeat_stale_seconds());
+            if fresh {
+                if progress.slurm_job_id.is_none() {
+                    progress.slurm_job_id = status
+                        .as_ref()
+                        .and_then(|value| value.get("slurm_job_id"))
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                }
+                progress.updated_ts = heartbeat;
+            }
+            fresh
+        } else {
+            false
+        };
+        if (progress_fresh || slurm_fresh)
             && !progress.snapshot_id.is_empty()
             && progress.status != "completed"
             && progress.status != "failed"
         {
-            let mut progress = progress;
             progress.progress_ratio = progress.progress_ratio.clamp(0.0, 1.0);
             progress.progress_per_hour = progress.progress_per_hour.max(0.0);
             progress.eta_seconds = progress.eta_seconds.max(0.0);
@@ -774,6 +820,14 @@ async fn discover_training_progress(snapshot_root: PathBuf) -> Vec<TrainingProgr
         }
     }
     observations
+}
+
+fn training_heartbeat_stale_seconds() -> f64 {
+    env::var("GAIL_TRAINING_HEARTBEAT_STALE_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 60.0)
+        .unwrap_or(7_200.0)
 }
 
 impl AiResponseTimeStats {
@@ -3128,5 +3182,56 @@ mod tests {
         assert_eq!(candidate_metrics.failures, 0);
         assert_eq!(candidate_metrics.stale_failures, 1);
         assert_eq!(candidate_metrics.last_error, None);
+    }
+
+    #[tokio::test]
+    async fn current_slurm_heartbeat_keeps_long_training_progress_visible() {
+        let directory = tempfile::tempdir().expect("metrics directory");
+        let snapshot_root = directory.path().join("training/snapshots");
+        let snapshot = snapshot_root.join("snapshot-running");
+        let results = directory.path().join("training/slurm/spool/results");
+        fs::create_dir_all(&snapshot)
+            .await
+            .expect("snapshot directory");
+        fs::create_dir_all(&results)
+            .await
+            .expect("results directory");
+        fs::write(
+            snapshot.join("progress.json"),
+            serde_json::to_string(&serde_json::json!({
+                "snapshot_id": "snapshot-running",
+                "status": "running",
+                "backend": "slurm",
+                "slurm_job_id": "305",
+                "completed_steps": 10,
+                "total_steps": 26,
+                "progress_ratio": 10.0 / 26.0,
+                "progress_per_hour": 5.0,
+                "eta_seconds": 11_000.0,
+                "elapsed_seconds": 7_000.0,
+                "started_ts": now_ts() - 7_000.0,
+                "updated_ts": now_ts() - 3_600.0
+            }))
+            .expect("progress JSON"),
+        )
+        .await
+        .expect("progress file");
+        fs::write(
+            results.join("snapshot-running.status"),
+            serde_json::to_string(&serde_json::json!({
+                "state": "running",
+                "slurm_job_id": "305",
+                "heartbeat_ts": now_ts()
+            }))
+            .expect("status JSON"),
+        )
+        .await
+        .expect("status file");
+
+        let observations = discover_training_progress(snapshot_root).await;
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].slurm_job_id.as_deref(), Some("305"));
+        assert!(observations[0].updated_ts.expect("heartbeat") > now_ts() - 60.0);
     }
 }
