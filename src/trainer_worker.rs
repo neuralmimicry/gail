@@ -315,6 +315,66 @@ async fn remove_active_training_marker(trainer: &TrainerConfig) -> Result<()> {
     }
 }
 
+fn terminal_slurm_result_exit_code(raw: &str) -> Option<i32> {
+    serde_json::from_str::<Value>(raw)
+        .ok()?
+        .get("exit_code")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+}
+
+/// Release an active marker when the dispatcher has already written a
+/// terminal result. This can happen when the trainer pod is restarted after
+/// Slurm finished but before the worker consumed the result. The result is
+/// intentionally retained for auditability; snapshot ids are unique, so it
+/// cannot be mistaken for a newly submitted request.
+async fn recover_terminal_slurm_result(
+    trainer: &TrainerConfig,
+    dsn: &str,
+    spool: &Path,
+    snapshot_id: &str,
+    ledger_ids: &[i64],
+) -> Result<bool> {
+    let result_path = spool.join("results").join(format!("{snapshot_id}.result"));
+    let raw = match fs::read_to_string(&result_path).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let exit_code = terminal_slurm_result_exit_code(&raw);
+    let reason = match exit_code {
+        Some(0) => {
+            "terminal Slurm result was written before trainer restart; snapshot will be retried"
+        }
+        Some(code) => {
+            tracing::warn!(
+                snapshot = snapshot_id,
+                exit_code = code,
+                "recovering terminal failed Slurm snapshot"
+            );
+            "terminal Slurm result reported failure; snapshot will be retried"
+        }
+        None => "terminal Slurm result was invalid; snapshot will be retried",
+    };
+    for id in ledger_ids {
+        let _ = llm_ledger::mark_training_retry(
+            dsn,
+            *id,
+            reason,
+            trainer.max_attempts,
+            trainer.retry_backoff_seconds,
+        )
+        .await;
+    }
+    remove_active_training_marker(trainer).await?;
+    tracing::warn!(
+        snapshot = snapshot_id,
+        result = %result_path.display(),
+        "released active training lifecycle after terminal Slurm result"
+    );
+    Ok(true)
+}
+
 /// Return true while a previous snapshot is still unresolved.  A stale
 /// marker is recovered explicitly so a worker restart cannot create a second
 /// snapshot for the same ledger rows or leave a dead queue request forever.
@@ -348,6 +408,10 @@ async fn active_training_snapshot(trainer: &TrainerConfig, dsn: &str) -> Result<
         .map(|items| items.iter().filter_map(Value::as_i64).collect::<Vec<_>>())
         .unwrap_or_default();
     if let Some(spool) = env_string("GAIL_TRAIN_SLURM_SPOOL") {
+        if recover_terminal_slurm_result(trainer, dsn, Path::new(&spool), snapshot_id, &ids).await?
+        {
+            return Ok(false);
+        }
         let request = Path::new(&spool)
             .join("queue")
             .join(format!("{snapshot_id}.request"));
@@ -3460,6 +3524,23 @@ fn now_ts() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_slurm_result_exit_code_requires_valid_result() {
+        assert_eq!(
+            terminal_slurm_result_exit_code(r#"{"exit_code":0}"#),
+            Some(0)
+        );
+        assert_eq!(
+            terminal_slurm_result_exit_code(r#"{"exit_code":75}"#),
+            Some(75)
+        );
+        assert_eq!(
+            terminal_slurm_result_exit_code(r#"{"state":"completed"}"#),
+            None
+        );
+        assert_eq!(terminal_slurm_result_exit_code("not-json"), None);
+    }
 
     #[test]
     fn parse_modelfile_extracts_from_system_and_parameters() {
