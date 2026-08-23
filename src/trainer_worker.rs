@@ -307,6 +307,40 @@ async fn write_active_training_marker(
     .await
 }
 
+/// Keep the lifecycle marker alive while a Slurm request is being serviced.
+///
+/// The trainer worker uses this marker to prevent a second snapshot from
+/// being created for the same pending ledger rows.  A Slurm training step can
+/// legitimately take longer than the worker's stale-marker timeout, so the
+/// marker heartbeat must follow the request heartbeat rather than only being
+/// written at submission time.
+async fn refresh_active_training_marker(
+    trainer: &TrainerConfig,
+    snapshot_id: &str,
+    ledger_ids: &[i64],
+) -> Result<()> {
+    let path = active_training_marker_path(trainer);
+    let started_ts = fs::read_to_string(&path)
+        .await
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .filter(|value| value.get("snapshot_id").and_then(Value::as_str) == Some(snapshot_id))
+        .and_then(|value| value.get("started_ts").and_then(Value::as_f64))
+        .unwrap_or_else(now_ts);
+    write_json(
+        &path,
+        &json!({
+            "version": 1,
+            "snapshot_id": snapshot_id,
+            "ledger_ids": ledger_ids,
+            "state": "submitted",
+            "started_ts": started_ts,
+            "heartbeat_ts": now_ts(),
+        }),
+    )
+    .await
+}
+
 async fn remove_active_training_marker(trainer: &TrainerConfig) -> Result<()> {
     match fs::remove_file(active_training_marker_path(trainer)).await {
         Ok(()) => Ok(()),
@@ -407,6 +441,18 @@ async fn active_training_snapshot(trainer: &TrainerConfig, dsn: &str) -> Result<
         {
             return Ok(false);
         }
+
+        // A request can legitimately wait behind another Slurm allocation for
+        // longer than command_timeout_seconds.  The dispatcher owns queue
+        // ordering and will eventually submit it, so the trainer must not
+        // delete a still-present request merely because its marker heartbeat
+        // was not refreshed during a worker restart.
+        let spool = Path::new(&spool);
+        let queue_request = spool.join("queue").join(format!("{snapshot_id}.request"));
+        let running_request = spool.join("running").join(format!("{snapshot_id}.request"));
+        if queue_request.exists() || running_request.exists() {
+            return Ok(true);
+        }
     }
     let stale_after = trainer.command_timeout_seconds.max(60) as f64;
     if heartbeat > 0.0 && now_ts() - heartbeat <= stale_after {
@@ -445,6 +491,16 @@ async fn requeue_stale_slurm_requests(
     spool: &Path,
     trainer: &TrainerConfig,
 ) -> Result<()> {
+    let active_snapshot = fs::read_to_string(active_training_marker_path(trainer))
+        .await
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|value| {
+            value
+                .get("snapshot_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        });
     let queue = spool.join("queue");
     let mut entries = match fs::read_dir(&queue).await {
         Ok(entries) => entries,
@@ -477,6 +533,13 @@ async fn requeue_stale_slurm_requests(
             .get("snapshot_id")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
+        // The active trainer lifecycle may be older than the queue timeout
+        // while Slurm is busy with an earlier request.  Keep its request for
+        // the dispatcher; active_training_snapshot will release it only when
+        // the request is genuinely gone.
+        if active_snapshot.as_deref() == Some(snapshot_id) {
+            continue;
+        }
         if let Some(job_id) = value.get("slurm_job_id").and_then(Value::as_str) {
             cancel_slurm_job(job_id).await;
         }
@@ -1502,6 +1565,7 @@ async fn execute_slurm_training_request(
     loop {
         let heartbeat_ts = now_ts();
         let _ = fs::write(&heartbeat_path, format!("{heartbeat_ts:.6}\n")).await;
+        refresh_active_training_marker(trainer, snapshot_id, ledger_ids).await?;
         if result_path.exists() {
             let body = fs::read_to_string(&result_path).await.map_err(|error| {
                 GailError::invalid_config(format!("failed to read Slurm training result: {error}"))
@@ -3644,6 +3708,35 @@ mod tests {
         assert_eq!(
             payload["adapters"]["adapter_config.json"],
             json!(manifest[0].digest)
+        );
+    }
+
+    #[tokio::test]
+    async fn active_training_marker_refresh_preserves_snapshot_start_time() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let trainer = TrainerConfig {
+            output_root: temporary.path().display().to_string(),
+            ..TrainerConfig::default()
+        };
+        write_active_training_marker(&trainer, "snapshot-1", &[42], "submitted")
+            .await
+            .expect("write marker");
+        let before = serde_json::from_str::<Value>(
+            &std::fs::read_to_string(active_training_marker_path(&trainer)).expect("read marker"),
+        )
+        .expect("valid marker");
+        refresh_active_training_marker(&trainer, "snapshot-1", &[42])
+            .await
+            .expect("refresh marker");
+        let after = serde_json::from_str::<Value>(
+            &std::fs::read_to_string(active_training_marker_path(&trainer)).expect("read marker"),
+        )
+        .expect("valid refreshed marker");
+        assert_eq!(after["snapshot_id"], json!("snapshot-1"));
+        assert_eq!(after["started_ts"], before["started_ts"]);
+        assert!(
+            after["heartbeat_ts"].as_f64().unwrap_or(0.0)
+                >= before["heartbeat_ts"].as_f64().unwrap_or(0.0)
         );
     }
 
