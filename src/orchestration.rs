@@ -39,6 +39,9 @@ use crate::{
     },
     nmc_telemetry::{NmcAgentSignal, NmcTelemetryClient},
     prompt_budget::{PromptCompactionReport, compact_provider_request},
+    provider_admission::{
+        admission_endpoint_matches, admission_model_matches, admitted_for_kind, admitted_for_model,
+    },
     providers::{
         ProviderHealth, ProviderInvocationResponse, TranscriptionInput, build_adapter,
         normalize_provider_type, provider_request_from_profile,
@@ -93,6 +96,7 @@ struct GailServiceInner {
     interactive_pool: Arc<Semaphore>,
     solver_pool: Arc<Semaphore>,
     trading_pool: Arc<Semaphore>,
+    postgres_dsn: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -320,6 +324,11 @@ impl GailService {
         let hardware = detect_hardware().await;
         log_hardware_profile("api_service", &hardware);
         let llm_ledger = LlmLedger::from_config(&config).await;
+        if let Some(dsn) = config.storage.postgres_dsn.as_deref()
+            && let Err(error) = crate::llm_ledger::initialize_schema(dsn).await
+        {
+            tracing::warn!(error = %error, "failed to initialise comparative validation schema");
+        }
         let metrics = MetricsStore::new(config.storage.metrics_path.clone()).await?;
         let specialists = build_specialist_engines(&config, client.clone());
         let aarnn_bridge = AarnnMirrorClient::from_config(&config, client.clone(), &specialists);
@@ -357,6 +366,7 @@ impl GailService {
             )
             .max(1) as usize,
         ));
+        let postgres_dsn = config.storage.postgres_dsn.clone();
         let trading_pool = Arc::new(Semaphore::new(
             env_int_any(
                 &["GAIL_TRADING_POOL_MAX_IN_FLIGHT"],
@@ -389,6 +399,7 @@ impl GailService {
                 interactive_pool: interactive_pool.clone(),
                 solver_pool: solver_pool.clone(),
                 trading_pool: trading_pool.clone(),
+                postgres_dsn: postgres_dsn.clone(),
             }),
         };
 
@@ -419,6 +430,7 @@ impl GailService {
                 interactive_pool,
                 solver_pool,
                 trading_pool,
+                postgres_dsn,
             }),
         })
     }
@@ -1028,14 +1040,24 @@ impl GailService {
         let mut usage = response.usage.clone();
         let mut raw = response.raw.clone();
         let mut final_source = "llm".to_string();
+        let aarnn_admitted = if let Some(trace) = mirror_output.as_ref() {
+            self.aarnn_candidate_admitted(trace).await
+        } else {
+            false
+        };
         // Optionally promote an AARNN candidate reply over the LLM response when
         // the bridge confidence gates are explicitly configured to allow it.
         if let (Some(bridge), Some(output_trace)) = (self.aarnn_bridge(), mirror_output.as_ref())
-            && bridge.should_promote_candidate(
+            && ((bridge.should_promote_candidate(
                 output_trace,
                 response.text.as_str(),
                 prompt_text.as_str(),
-            )
+            )) || (aarnn_admitted
+                && bridge.should_promote_admitted_candidate(
+                    output_trace,
+                    response.text.as_str(),
+                    prompt_text.as_str(),
+                )))
             && let Some(reply_text) = bridge.promoted_reply(output_trace)
         {
             text = reply_text;
@@ -1123,6 +1145,8 @@ impl GailService {
             raw: completion_response.raw.clone(),
             metadata: Some(json!({
                 "source": "direct_complete",
+                "request_max_tokens": effective_request.max_tokens,
+                "request_temperature": effective_request.temperature,
                 "final_source": completion_response
                     .trace
                     .as_ref()
@@ -1343,6 +1367,8 @@ impl GailService {
             .await;
 
         let mut candidates = self.build_candidates(&request, include_configured);
+        self.retain_admitted_dynamic_candidates(&request, &mut candidates)
+            .await;
         if let Some(min_model_size_b) = model_floor_b.filter(|value| *value > 0.0) {
             let before = candidates.len();
             candidates.retain(|candidate| candidate_meets_model_floor(candidate, min_model_size_b));
@@ -1999,14 +2025,24 @@ impl GailService {
         let mut usage = chosen_response.usage.clone();
         let mut raw = chosen_response.raw.clone();
         let mut final_source = "llm".to_string();
+        let aarnn_admitted = if let Some(trace) = mirror_output.as_ref() {
+            self.aarnn_candidate_admitted(trace).await
+        } else {
+            false
+        };
         // Optionally promote an AARNN candidate reply over the selected LLM
         // candidate when confidence/quality gates pass.
         if let (Some(bridge), Some(output_trace)) = (self.aarnn_bridge(), mirror_output.as_ref())
-            && bridge.should_promote_candidate(
+            && ((bridge.should_promote_candidate(
                 output_trace,
                 chosen_response.text.as_str(),
                 mirrored_prompt_text.as_str(),
-            )
+            )) || (aarnn_admitted
+                && bridge.should_promote_admitted_candidate(
+                    output_trace,
+                    chosen_response.text.as_str(),
+                    mirrored_prompt_text.as_str(),
+                )))
             && let Some(reply_text) = bridge.promoted_reply(output_trace)
         {
             text = reply_text;
@@ -2506,6 +2542,36 @@ impl GailService {
         }
     }
 
+    async fn aarnn_candidate_admitted(
+        &self,
+        trace: &crate::models::AarnnMirrorInvocationTrace,
+    ) -> bool {
+        if !self.inner.config.comparative_validation.enabled {
+            return false;
+        }
+        let Some(dsn) = self.inner.postgres_dsn.as_deref() else {
+            return false;
+        };
+        let Some(bridge) = self.aarnn_bridge() else {
+            return false;
+        };
+        admitted_for_kind(
+            dsn,
+            "aarnn",
+            trace.endpoint.as_str(),
+            bridge.response_model(),
+            self.inner
+                .config
+                .comparative_validation
+                .admission_ttl_seconds,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            tracing::debug!(error = %error, "AARNN comparative admission lookup failed");
+            false
+        })
+    }
+
     async fn run_aarnn_output_mirror(
         &self,
         request_id: &str,
@@ -2578,7 +2644,13 @@ impl GailService {
     }
 
     async fn record_llm_interaction(&self, mut record: LlmLedgerRecord) {
-        if !self.audit_logging().store_llm_content {
+        if !self.audit_logging().store_llm_content
+            && !self
+                .inner
+                .config
+                .comparative_validation
+                .retain_content_for_validation
+        {
             record.prompt_text = summarize_llm_content(&record.prompt_text);
             record.system_prompt = record.system_prompt.as_deref().map(summarize_llm_content);
             record.response_text = record.response_text.as_deref().map(summarize_llm_content);
@@ -2655,6 +2727,8 @@ impl GailService {
             raw: response.raw.clone(),
             metadata: Some(json!({
                 "source": "orchestrated_complete",
+                "request_max_tokens": provider_request.max_tokens,
+                "request_temperature": provider_request.temperature,
                 "selection_mode": response.trace.as_ref().map(|trace| trace.selection_mode.clone()),
                 "final_source": final_source,
                 "aarnn_evaluation": aarnn_evaluation,
@@ -2798,14 +2872,6 @@ impl GailService {
                             });
                         !(skip_configured_ollama_profiles
                             && normalize_provider_type(profile.provider_type.as_str()) == "ollama")
-                            // The trained llama.cpp model is an explicit
-                            // secondary model. Keep it available when a
-                            // caller names that model, but do not let a
-                            // generic gail-auto request spend fallback waves
-                            // on an inactive or reasoning-only trained
-                            // endpoint before trying the primary qwen pool.
-                            && (requested_model.is_some()
-                                || !is_trained_llamacpp_profile(profile))
                             && provider_matches
                             && model_matches
                     })
@@ -2834,6 +2900,76 @@ impl GailService {
             .into_iter()
             .filter(provider_candidate_is_usable)
             .collect()
+    }
+
+    async fn retain_admitted_dynamic_candidates(
+        &self,
+        request: &CompletionRequest,
+        candidates: &mut Vec<ProviderCandidate>,
+    ) {
+        if !self.inner.config.comparative_validation.enabled || request.preferred_model.is_some() {
+            return;
+        }
+        let Some(dsn) = self.inner.postgres_dsn.as_deref() else {
+            candidates.retain(|candidate| !is_trained_llamacpp_profile(&candidate.profile));
+            return;
+        };
+        let Some(model_version) = active_snapshot_id_for_routing(&self.inner.config) else {
+            candidates.retain(|candidate| !is_trained_llamacpp_profile(&candidate.profile));
+            return;
+        };
+        let admissions = match admitted_for_model(
+            dsn,
+            model_version.as_str(),
+            self.inner
+                .config
+                .comparative_validation
+                .admission_ttl_seconds,
+        )
+        .await
+        {
+            Ok(admissions) => admissions,
+            Err(error) => {
+                tracing::warn!(error = %error, "comparative admission lookup failed; keeping dynamic providers out of generic routing");
+                candidates.retain(|candidate| !is_trained_llamacpp_profile(&candidate.profile));
+                return;
+            }
+        };
+        let before = candidates.len();
+        let dynamic_before = candidates
+            .iter()
+            .filter(|candidate| is_trained_llamacpp_profile(&candidate.profile))
+            .count();
+        candidates.retain(|candidate| {
+            if !is_trained_llamacpp_profile(&candidate.profile) {
+                return true;
+            }
+            admissions.iter().any(|admission| {
+                admission.kind == "trained"
+                    && admission_model_matches(
+                        admission.model.as_str(),
+                        candidate.profile.model.as_deref().unwrap_or_default(),
+                    )
+                    && candidate
+                        .profile
+                        .base_url
+                        .as_deref()
+                        .is_some_and(|endpoint| {
+                            admission_endpoint_matches(admission.endpoint.as_str(), endpoint)
+                        })
+            })
+        });
+        let admitted = candidates
+            .iter()
+            .filter(|candidate| is_trained_llamacpp_profile(&candidate.profile))
+            .count()
+            .min(dynamic_before);
+        tracing::info!(
+            model_version,
+            admitted_dynamic_candidates = admitted,
+            removed_dynamic_candidates = before.saturating_sub(candidates.len()),
+            "applied comparative provider admission"
+        );
     }
 
     fn request_candidate(
@@ -5865,6 +6001,18 @@ fn is_trained_llamacpp_profile(profile: &ProviderProfile) -> bool {
         .source
         .as_deref()
         .is_some_and(|source| source.eq_ignore_ascii_case("ansible_llamacpp_trained"))
+}
+
+fn active_snapshot_id_for_routing(config: &GailConfig) -> Option<String> {
+    let path = std::path::PathBuf::from(&config.trainer.output_root).join("active_snapshot.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn should_return_degraded_fallback(

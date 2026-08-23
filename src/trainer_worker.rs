@@ -211,6 +211,7 @@ pub async fn run(config: GailConfig) -> Result<()> {
             snapshot_dir.as_path(),
             ids.as_slice(),
             config.storage.metrics_path.as_str(),
+            dsn.as_str(),
         )
         .await;
         if let Err(error) = remove_active_training_marker(&trainer).await {
@@ -744,6 +745,7 @@ async fn run_training_pipeline(
     snapshot_dir: &Path,
     ledger_ids: &[i64],
     metrics_path: &str,
+    postgres_dsn: &str,
 ) -> Result<TrainingOutcome> {
     fs::create_dir_all(snapshot_dir).await.map_err(|error| {
         GailError::invalid_config(format!("failed to create snapshot output path: {error}"))
@@ -953,6 +955,20 @@ async fn run_training_pipeline(
                         "promoted",
                         "health_checked"
                     ]);
+                }
+                if registration_succeeded {
+                    match llm_ledger::schedule_validation_now(postgres_dsn).await {
+                        Ok(rows) => tracing::info!(
+                            snapshot = snapshot_id,
+                            rows,
+                            "scheduled immediate comparative validation for promoted snapshot"
+                        ),
+                        Err(error) => tracing::error!(
+                            snapshot = snapshot_id,
+                            error = %error,
+                            "failed to schedule immediate comparative validation for promoted snapshot"
+                        ),
+                    }
                 }
                 if registration_succeeded && let Err(error) = rotate_ollama_models(trainer).await {
                     tracing::warn!(

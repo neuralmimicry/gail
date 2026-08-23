@@ -101,6 +101,9 @@ pub struct LedgerInteraction {
     pub latency_ms: Option<u64>,
     pub usage: Option<Value>,
     pub raw: Option<Value>,
+    pub metadata: Option<Value>,
+    pub mirror_status: Option<String>,
+    pub validation_status: Option<String>,
 }
 
 #[derive(Clone)]
@@ -277,6 +280,40 @@ pub async fn initialize_schema(dsn: &str) -> Result<(), tokio_postgres::Error> {
                 ON gail_llm_interactions (trained_at, next_train_at, id);
             CREATE INDEX IF NOT EXISTS idx_gail_llm_interactions_created_at
                 ON gail_llm_interactions (created_at DESC);
+            ALTER TABLE gail_llm_interactions
+                ADD COLUMN IF NOT EXISTS validation_attempts INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE gail_llm_interactions
+                ADD COLUMN IF NOT EXISTS validation_status TEXT;
+            ALTER TABLE gail_llm_interactions
+                ADD COLUMN IF NOT EXISTS validation_error TEXT;
+            ALTER TABLE gail_llm_interactions
+                ADD COLUMN IF NOT EXISTS next_validation_at TIMESTAMPTZ;
+            ALTER TABLE gail_llm_interactions
+                ADD COLUMN IF NOT EXISTS validated_at TIMESTAMPTZ;
+            CREATE INDEX IF NOT EXISTS idx_gail_llm_interactions_validation
+                ON gail_llm_interactions (next_validation_at, validated_at, id);
+            CREATE TABLE IF NOT EXISTS gail_provider_admissions (
+                kind TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                model TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                sample_count BIGINT NOT NULL DEFAULT 0,
+                useful_count BIGINT NOT NULL DEFAULT 0,
+                average_quality DOUBLE PRECISION NOT NULL DEFAULT 0,
+                average_baseline_quality DOUBLE PRECISION NOT NULL DEFAULT 0,
+                average_similarity DOUBLE PRECISION NOT NULL DEFAULT 0,
+                last_quality DOUBLE PRECISION NOT NULL DEFAULT 0,
+                last_baseline_quality DOUBLE PRECISION NOT NULL DEFAULT 0,
+                last_similarity DOUBLE PRECISION NOT NULL DEFAULT 0,
+                last_latency_ms BIGINT,
+                last_error TEXT,
+                admitted BOOLEAN NOT NULL DEFAULT FALSE,
+                last_sample_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (kind, endpoint, model)
+            );
+            CREATE INDEX IF NOT EXISTS idx_gail_provider_admissions_active
+                ON gail_provider_admissions (admitted, model_version, last_sample_at);
             "#,
         )
         .await
@@ -311,13 +348,15 @@ pub async fn fetch_pending_mirror(
                 error_text,
                 latency_ms,
                 usage,
-                raw
+                raw,
+                metadata,
+                mirror_status,
+                validation_status
             FROM gail_llm_interactions
-            WHERE mirrored_at IS NULL
-              AND (next_mirror_at IS NULL OR next_mirror_at <= now())
-              AND (
-                    COALESCE(prompt_text, '') <> ''
-                 OR COALESCE(response_text, '') <> ''
+            WHERE (
+                    (mirrored_at IS NULL AND (next_mirror_at IS NULL OR next_mirror_at <= now()))
+                 OR (COALESCE(response_text, '') <> ''
+                     AND (next_validation_at IS NULL OR next_validation_at <= now()))
               )
             ORDER BY id ASC
             LIMIT $1
@@ -349,6 +388,9 @@ pub async fn fetch_pending_mirror(
                 .and_then(|value| value.try_into().ok()),
             usage: row.get("usage"),
             raw: row.get("raw"),
+            metadata: row.get("metadata"),
+            mirror_status: row.get("mirror_status"),
+            validation_status: row.get("validation_status"),
         })
         .collect())
 }
@@ -418,6 +460,54 @@ pub async fn mark_mirror_retry(
         )
         .await?;
     Ok(())
+}
+
+pub async fn mark_validation(
+    dsn: &str,
+    id: i64,
+    status: &str,
+    error: Option<&str>,
+    interval_seconds: u64,
+) -> Result<(), tokio_postgres::Error> {
+    let client = connect_client(dsn).await?;
+    client
+        .execute(
+            r#"
+            UPDATE gail_llm_interactions
+            SET
+                validation_attempts = validation_attempts + 1,
+                validation_status = $2,
+                validation_error = $3,
+                next_validation_at = now() + make_interval(secs => $4::int),
+                validated_at = now()
+            WHERE id = $1
+            "#,
+            &[
+                &id,
+                &status,
+                &error.map(|value| truncate_chars(value, 4000)),
+                &(interval_seconds.min(i32::MAX as u64) as i32),
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
+/// A new trained snapshot invalidates every previous comparative result. Make
+/// the next mirror-worker pass sample the new snapshot immediately instead of
+/// waiting for each row's old periodic timer.
+pub async fn schedule_validation_now(dsn: &str) -> Result<u64, tokio_postgres::Error> {
+    let client = connect_client(dsn).await?;
+    client
+        .execute(
+            r#"
+            UPDATE gail_llm_interactions
+            SET next_validation_at = now(), validation_status = 'snapshot_changed'
+            WHERE COALESCE(response_text, '') <> ''
+            "#,
+            &[],
+        )
+        .await
 }
 
 pub async fn fetch_pending_training(
@@ -494,6 +584,9 @@ pub async fn fetch_pending_training(
                 .and_then(|value| value.try_into().ok()),
             usage: row.get("usage"),
             raw: row.get("raw"),
+            metadata: None,
+            mirror_status: None,
+            validation_status: None,
         })
         .collect())
 }

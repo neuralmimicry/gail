@@ -314,6 +314,32 @@ impl AarnnMirrorClient {
         promoted
     }
 
+    /// Validate one response before using a durably admitted AARNN decoder.
+    /// Durable admission supplies the sustained history; this check still
+    /// rejects a bad/empty response on the current request.
+    pub fn should_promote_admitted_candidate(
+        &self,
+        trace: &AarnnMirrorInvocationTrace,
+        llm_text: &str,
+        prompt_text: &str,
+    ) -> bool {
+        let evaluation = self.evaluate_candidate(trace, llm_text, prompt_text);
+        let Some(candidate) = trace.candidate.as_ref() else {
+            return false;
+        };
+        let Some(reply) = candidate.reply_text.as_deref().map(str::trim) else {
+            return false;
+        };
+        candidate.usable
+            && trace.accepted
+            && trace.error.is_none()
+            && candidate.source.as_deref() == Some("network_output_decoder")
+            && reply.chars().count() >= self.candidate_min_reply_chars
+            && evaluation.quality_score >= 0.5
+            && (evaluation.agreement_score >= 0.35 || evaluation.quality_score >= 0.80)
+            && normalise_for_compare(reply) != normalise_for_compare(llm_text)
+    }
+
     pub fn evaluate_candidate(
         &self,
         trace: &AarnnMirrorInvocationTrace,

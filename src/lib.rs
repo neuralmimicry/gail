@@ -15,6 +15,7 @@ pub mod models;
 pub mod nmc_telemetry;
 pub mod orchestration;
 pub mod prompt_budget;
+pub mod provider_admission;
 pub mod providers;
 pub mod redaction;
 pub mod routing;

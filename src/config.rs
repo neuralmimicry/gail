@@ -28,6 +28,39 @@ pub struct GailConfig {
     pub specialists: Vec<SpecialistProfile>,
     pub storage: StorageConfig,
     pub trading: TradingConfig,
+    pub comparative_validation: ComparativeValidationConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ComparativeValidationConfig {
+    pub enabled: bool,
+    pub retain_content_for_validation: bool,
+    pub sample_interval_seconds: u64,
+    pub minimum_samples: usize,
+    pub minimum_useful_rate: f64,
+    pub minimum_candidate_quality: f64,
+    pub minimum_similarity: f64,
+    pub quality_tolerance: f64,
+    pub minimum_quality_improvement: f64,
+    pub admission_ttl_seconds: u64,
+}
+
+impl Default for ComparativeValidationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retain_content_for_validation: true,
+            sample_interval_seconds: 300,
+            minimum_samples: 20,
+            minimum_useful_rate: 0.75,
+            minimum_candidate_quality: 0.5,
+            minimum_similarity: 0.35,
+            quality_tolerance: 0.08,
+            minimum_quality_improvement: 0.05,
+            admission_ttl_seconds: 3600,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -625,6 +658,36 @@ impl GailConfig {
         if self.orchestration.solver_model_floor_b < self.orchestration.interactive_model_floor_b {
             self.orchestration.solver_model_floor_b = self.orchestration.interactive_model_floor_b;
         }
+        self.comparative_validation.sample_interval_seconds = self
+            .comparative_validation
+            .sample_interval_seconds
+            .clamp(10, 86_400);
+        self.comparative_validation.minimum_samples =
+            self.comparative_validation.minimum_samples.clamp(1, 10_000);
+        self.comparative_validation.minimum_useful_rate = self
+            .comparative_validation
+            .minimum_useful_rate
+            .clamp(0.0, 1.0);
+        self.comparative_validation.minimum_candidate_quality = self
+            .comparative_validation
+            .minimum_candidate_quality
+            .clamp(0.0, 1.0);
+        self.comparative_validation.minimum_similarity = self
+            .comparative_validation
+            .minimum_similarity
+            .clamp(0.0, 1.0);
+        self.comparative_validation.quality_tolerance = self
+            .comparative_validation
+            .quality_tolerance
+            .clamp(0.0, 1.0);
+        self.comparative_validation.minimum_quality_improvement = self
+            .comparative_validation
+            .minimum_quality_improvement
+            .clamp(0.0, 1.0);
+        self.comparative_validation.admission_ttl_seconds = self
+            .comparative_validation
+            .admission_ttl_seconds
+            .clamp(10, 604_800);
         self.aarnn_bridge.endpoint = normalize_optional_url(self.aarnn_bridge.endpoint.as_deref());
         self.aarnn_bridge.access_token =
             normalize_optional_string(self.aarnn_bridge.access_token.as_deref());

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{env, path::PathBuf, time::Duration};
 
 use reqwest::Client;
 
@@ -8,7 +8,12 @@ use crate::{
     errors::{GailError, Result},
     hardware::{detect_hardware, log_hardware_profile},
     llm_ledger,
-    models::AarnnMirrorDirection,
+    models::{AarnnMirrorDirection, ChatMessage, MessageContent, ProviderCompletionRequest},
+    provider_admission::{
+        AdmissionObservation, admission_endpoint_matches, record_observation, response_quality,
+        token_similarity,
+    },
+    providers::build_adapter,
     specialists::build_specialist_engines,
 };
 
@@ -30,7 +35,7 @@ pub async fn run(config: GailConfig) -> Result<()> {
         .build()?;
     let specialists = build_specialist_engines(&config, client.clone());
     let bridge =
-        AarnnMirrorClient::from_config(&config, client, &specialists).ok_or_else(|| {
+        AarnnMirrorClient::from_config(&config, client.clone(), &specialists).ok_or_else(|| {
             GailError::invalid_config(
                 "mirror worker requires aarnn_bridge.enabled=true and a valid bridge endpoint",
             )
@@ -72,9 +77,16 @@ pub async fn run(config: GailConfig) -> Result<()> {
         );
         for entry in entries {
             let mut errors = Vec::new();
+            let mirror_pending = !matches!(
+                entry.mirror_status.as_deref(),
+                Some("mirrored") | Some("failed")
+            );
             // Replay prompt-side stimulation for durability/recovery, even when
             // inline mirroring was skipped or timed out on the request path.
-            if bridge.should_mirror_input() && !entry.prompt_text.trim().is_empty() {
+            if mirror_pending
+                && bridge.should_mirror_input()
+                && !entry.prompt_text.trim().is_empty()
+            {
                 let trace = bridge
                     .mirror(build_exchange(
                         &entry,
@@ -90,6 +102,7 @@ pub async fn run(config: GailConfig) -> Result<()> {
             }
             // Replay response-side stimulation and candidate request flow using
             // the resolved provider/model when available.
+            let mut aarnn_trace = None;
             if bridge.should_mirror_output()
                 && let Some(response_text) = entry.response_text.as_deref()
                 && !response_text.trim().is_empty()
@@ -109,9 +122,26 @@ pub async fn run(config: GailConfig) -> Result<()> {
                         response_text,
                     ))
                     .await;
-                if let Some(error) = mirror_semantic_error(&trace) {
+                aarnn_trace = Some(trace.clone());
+                if mirror_pending && let Some(error) = mirror_semantic_error(&trace) {
                     errors.push(format!("output mirror: {error}"));
                 }
+            }
+            let validation_error = validate_and_record(
+                &config,
+                &client,
+                &dsn,
+                &bridge,
+                &entry,
+                aarnn_trace.as_ref(),
+            )
+            .await;
+            if let Err(error) = validation_error {
+                tracing::warn!(
+                    ledger_id = entry.id,
+                    error = %error,
+                    "comparative validation failed; the next scheduled sample will retry"
+                );
             }
             if errors.is_empty() {
                 if let Err(error) =
@@ -150,6 +180,281 @@ pub async fn run(config: GailConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn validate_and_record(
+    config: &GailConfig,
+    client: &Client,
+    dsn: &str,
+    bridge: &AarnnMirrorClient,
+    entry: &llm_ledger::LedgerInteraction,
+    aarnn_trace: Option<&crate::models::AarnnMirrorInvocationTrace>,
+) -> std::result::Result<(), String> {
+    if !config.comparative_validation.enabled {
+        llm_ledger::mark_validation(
+            dsn,
+            entry.id,
+            "disabled",
+            None,
+            config
+                .comparative_validation
+                .sample_interval_seconds
+                .max(60),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    let Some(baseline) = entry
+        .response_text
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    if baseline.starts_with("<redacted chars=") {
+        llm_ledger::mark_validation(
+            dsn,
+            entry.id,
+            "skipped_no_content",
+            Some("ledger response content is redacted; enable retain_content_for_validation"),
+            config.comparative_validation.sample_interval_seconds,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    let prompt = entry.prompt_text.trim();
+    if prompt.is_empty() || prompt.starts_with("<redacted chars=") {
+        llm_ledger::mark_validation(
+            dsn,
+            entry.id,
+            "skipped_no_content",
+            Some("ledger prompt content is redacted or empty"),
+            config.comparative_validation.sample_interval_seconds,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    let expected_json = entry
+        .request_category
+        .as_deref()
+        .is_some_and(|value| value.to_ascii_lowercase().contains("json"));
+    let max_tokens = entry
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("request_max_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value.clamp(1, 4096) as u32)
+        .unwrap_or(512);
+    let temperature = entry
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("request_temperature"))
+        .and_then(serde_json::Value::as_f64)
+        .map(|value| value.clamp(0.0, 2.0) as f32)
+        .unwrap_or(0.2);
+    let baseline_quality = response_quality(baseline, expected_json);
+    let mut sampled = false;
+    let mut errors = Vec::new();
+
+    if let Some((model_version, endpoint, model, api_key)) = active_trained_target(config) {
+        let profile = crate::config::ProviderProfile {
+            name: "comparative-trained".to_string(),
+            provider_type: "openai".to_string(),
+            model: Some(model.clone()),
+            api_key,
+            base_url: Some(endpoint.clone()),
+            source: Some("comparative_validation_trained".to_string()),
+            ..crate::config::ProviderProfile::default()
+        };
+        let adapter = build_adapter(client.clone(), &profile).map_err(|error| error.to_string())?;
+        let request = ProviderCompletionRequest {
+            provider: "openai".to_string(),
+            model: Some(model.clone()),
+            api_key: profile.api_key.clone(),
+            access_token: None,
+            base_url: Some(endpoint.clone()),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: MessageContent::Text(prompt.to_string()),
+            }],
+            system: entry.system_prompt.clone(),
+            max_tokens: Some(max_tokens),
+            temperature: Some(temperature),
+            timeout_seconds: Some(90),
+            reasoning_effort: None,
+            request_category: entry.request_category.clone(),
+            workflow: Some(entry.workflow.clone()),
+            role: Some(entry.role.clone()),
+            min_model_size_b: None,
+            strict_no_downgrade: Some(false),
+            source: Some("comparative_validation".to_string()),
+            request_profile: None,
+        };
+        sampled = true;
+        match adapter.complete(&request).await {
+            Ok(response) => {
+                let candidate_quality = response_quality(&response.text, expected_json);
+                let similarity = token_similarity(&response.text, baseline);
+                let useful =
+                    candidate_quality >= config.comparative_validation.minimum_candidate_quality;
+                let decision = record_observation(
+                    dsn,
+                    &AdmissionObservation {
+                        kind: "trained".to_string(),
+                        endpoint,
+                        model,
+                        model_version,
+                        useful,
+                        candidate_quality,
+                        baseline_quality,
+                        similarity,
+                        latency_ms: Some(response.latency_ms),
+                        error: (!useful)
+                            .then(|| "candidate response failed usefulness gate".to_string()),
+                    },
+                    &config.comparative_validation,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                tracing::info!(
+                    ledger_id = entry.id,
+                    admitted = decision.admitted,
+                    samples = decision.sample_count,
+                    candidate_quality,
+                    baseline_quality,
+                    similarity,
+                    "recorded trained-model comparative validation"
+                );
+            }
+            Err(error) => {
+                let (model_version, endpoint, model, _) = active_trained_target(config).unwrap();
+                record_observation(
+                    dsn,
+                    &AdmissionObservation {
+                        kind: "trained".to_string(),
+                        endpoint,
+                        model,
+                        model_version,
+                        useful: false,
+                        candidate_quality: 0.0,
+                        baseline_quality,
+                        similarity: 0.0,
+                        latency_ms: None,
+                        error: Some(error.to_string()),
+                    },
+                    &config.comparative_validation,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                errors.push(error.to_string());
+            }
+        }
+    }
+
+    if let Some(trace) = aarnn_trace {
+        sampled = true;
+        let evaluation = bridge.evaluate_candidate(trace, baseline, prompt);
+        let candidate_text = trace
+            .candidate
+            .as_ref()
+            .and_then(|candidate| candidate.reply_text.as_deref())
+            .unwrap_or("");
+        let useful = trace.accepted
+            && trace.error.is_none()
+            && trace
+                .candidate
+                .as_ref()
+                .is_some_and(|candidate| candidate.usable)
+            && response_quality(candidate_text, expected_json)
+                >= config.comparative_validation.minimum_candidate_quality;
+        let decision = record_observation(
+            dsn,
+            &AdmissionObservation {
+                kind: "aarnn".to_string(),
+                endpoint: trace.endpoint.clone(),
+                model: bridge.response_model().to_string(),
+                model_version: format!("decoder-{}", evaluation.decoder_version),
+                useful,
+                candidate_quality: evaluation.quality_score,
+                baseline_quality,
+                similarity: evaluation.agreement_score,
+                latency_ms: Some(trace.latency_ms),
+                error: trace.error.clone(),
+            },
+            &config.comparative_validation,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        tracing::info!(
+            ledger_id = entry.id,
+            admitted = decision.admitted,
+            samples = decision.sample_count,
+            quality = evaluation.quality_score,
+            similarity = evaluation.agreement_score,
+            "recorded AARNN comparative validation"
+        );
+    }
+
+    let status = if sampled {
+        "sampled"
+    } else {
+        "skipped_no_target"
+    };
+    llm_ledger::mark_validation(
+        dsn,
+        entry.id,
+        status,
+        (!errors.is_empty()).then(|| errors.join(" | ")).as_deref(),
+        config.comparative_validation.sample_interval_seconds,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn active_trained_target(config: &GailConfig) -> Option<(String, String, String, Option<String>)> {
+    let path = PathBuf::from(&config.trainer.output_root).join("active_snapshot.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let pointer: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let version = pointer.get("snapshot_id")?.as_str()?.trim();
+    let target = pointer.get("serving_target")?.as_object()?;
+    let endpoint = target.get("endpoint")?.as_str()?.trim();
+    let model = target
+        .get("model_alias")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            pointer
+                .get("model_alias")
+                .and_then(serde_json::Value::as_str)
+        })?
+        .trim();
+    if version.is_empty() || endpoint.is_empty() || model.is_empty() {
+        return None;
+    }
+    let api_key = config
+        .providers
+        .iter()
+        .find(|profile| {
+            profile
+                .base_url
+                .as_deref()
+                .is_some_and(|base| admission_endpoint_matches(base, endpoint))
+                && profile
+                    .api_key
+                    .as_deref()
+                    .is_some_and(|key| !key.trim().is_empty())
+        })
+        .and_then(|profile| profile.api_key.clone())
+        .or_else(|| env::var("GAIL_LLAMACPP_API_KEY").ok());
+    Some((
+        version.to_string(),
+        endpoint.to_string(),
+        model.to_string(),
+        api_key,
+    ))
 }
 
 /// Transport acceptance is not semantic success.  In particular, AARNN can

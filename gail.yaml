@@ -204,6 +204,18 @@ audit_logging:
   log_aer_payloads: true
   max_chars: 65536
 
+comparative_validation:
+  enabled: true
+  retain_content_for_validation: true
+  sample_interval_seconds: 300
+  minimum_samples: 20
+  minimum_useful_rate: 0.75
+  minimum_candidate_quality: 0.5
+  minimum_similarity: 0.35
+  quality_tolerance: 0.08
+  minimum_quality_improvement: 0.05
+  admission_ttl_seconds: 3600
+
 mirror_worker:
   enabled: true
   poll_interval_ms: 2000
