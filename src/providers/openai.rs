@@ -620,6 +620,7 @@ impl OpenAIProvider {
         let timeout = Duration::from_secs(timeout_seconds.unwrap_or(60).max(1));
         let started = Instant::now();
         let models_url = endpoint(&self.base_url, "models");
+        let local_llamacpp_endpoint = is_local_llamacpp_endpoint(&self.base_url);
         let response = get_with_retries(
             self.provider_name.as_str(),
             &self.client,
@@ -630,7 +631,12 @@ impl OpenAIProvider {
         )
         .await?;
         let latency_ms = started.elapsed().as_millis() as u64;
-        if response.status().is_success() {
+        // A llama.cpp /v1/models response only proves that the HTTP process is
+        // alive.  It does not prove that the configured model can complete a
+        // request (and Qwen can return HTTP 200 with only reasoning_content
+        // when the output budget is exhausted).  Keep cloud OpenAI health
+        // cheap, but make native local endpoints application-ready.
+        if response.status().is_success() && !local_llamacpp_endpoint {
             return Ok(ProviderHealth {
                 ok: true,
                 status_code: Some(response.status().as_u16()),
@@ -639,14 +645,17 @@ impl OpenAIProvider {
                 mode: Some("http".to_string()),
             });
         }
-        if self.provider_name != "openai" {
+        if self.provider_name != "openai" || local_llamacpp_endpoint {
             let chat_url = endpoint(&self.base_url, "chat/completions");
-            let payload = json!({
+            let mut payload = json!({
                 "model": self.model,
                 "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 1,
+                "max_tokens": 8,
                 "temperature": 0.0,
             });
+            if local_llamacpp_endpoint {
+                payload["chat_template_kwargs"] = json!({"enable_thinking": false});
+            }
             let started = Instant::now();
             let response = post_json_with_retries(
                 self.provider_name.as_str(),
@@ -688,12 +697,17 @@ impl OpenAIProvider {
                     mode: Some("http".to_string()),
                 });
             }
+            let response_text = extract_openai_response_text(&data);
+            let response_ok = status.is_success()
+                && (!local_llamacpp_endpoint || !response_text.trim().is_empty());
             return Ok(ProviderHealth {
-                ok: status.is_success(),
+                ok: response_ok,
                 status_code: Some(status.as_u16()),
                 latency_ms: Some(latency_ms),
-                message: Some(if status.is_success() {
+                message: Some(if response_ok {
                     "ok".to_string()
+                } else if status.is_success() && local_llamacpp_endpoint {
+                    "local llama.cpp completion returned no usable content".to_string()
                 } else {
                     error_message(&data)
                 }),
