@@ -393,11 +393,6 @@ async fn active_training_snapshot(trainer: &TrainerConfig, dsn: &str) -> Result<
         .and_then(Value::as_f64)
         .or_else(|| value.get("started_ts").and_then(Value::as_f64))
         .unwrap_or(0.0);
-    let stale_after = trainer.command_timeout_seconds.max(60) as f64;
-    if heartbeat > 0.0 && now_ts() - heartbeat <= stale_after {
-        return Ok(true);
-    }
-
     let snapshot_id = value
         .get("snapshot_id")
         .and_then(Value::as_str)
@@ -412,6 +407,12 @@ async fn active_training_snapshot(trainer: &TrainerConfig, dsn: &str) -> Result<
         {
             return Ok(false);
         }
+    }
+    let stale_after = trainer.command_timeout_seconds.max(60) as f64;
+    if heartbeat > 0.0 && now_ts() - heartbeat <= stale_after {
+        return Ok(true);
+    }
+    if let Some(spool) = env_string("GAIL_TRAIN_SLURM_SPOOL") {
         let request = Path::new(&spool)
             .join("queue")
             .join(format!("{snapshot_id}.request"));
