@@ -666,6 +666,11 @@ impl OpenAIProvider {
                 "messages": [{"role": "user", "content": "Reply with OK only."}],
                 "max_tokens": 24,
                 "temperature": 0.0,
+                // Keep readiness probes bounded to a single JSON response.
+                // llama.cpp may otherwise use its default streaming path,
+                // which can leave a healthy endpoint waiting past Gail's
+                // short health timeout on a cold or busy GPU.
+                "stream": false,
             });
             if requires_completion_probe {
                 payload["chat_template_kwargs"] = json!({"enable_thinking": false});
