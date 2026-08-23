@@ -4601,6 +4601,8 @@ fn ranked_candidate_is_in_provider_backoff(item: &RankedCandidate) -> bool {
                 [
                     "upstream",
                     "timeout",
+                    "error",
+                    "runtime_error",
                     "ollama_saturated",
                     "resource_saturated",
                     "nmc_constrained",
@@ -6853,6 +6855,25 @@ Return only a JSON data instance that satisfies this schema:
             }),
         };
         assert!(ranked_candidate_is_in_quota_backoff(&candidate));
+        assert!(ranked_candidate_is_in_provider_backoff(&candidate));
+    }
+
+    #[test]
+    fn ranked_candidate_health_error_enters_provider_backoff() {
+        let candidate = RankedCandidate {
+            score: 1.0,
+            health_ok: false,
+            health_mode: Some("error".to_string()),
+            generation_tokens_per_second: None,
+            candidate: ProviderCandidate::from_profile(ProviderProfile {
+                provider_type: "openai".to_string(),
+                model: Some("gail-inhouse:latest".to_string()),
+                base_url: Some("http://192.168.1.66:18081/v1".to_string()),
+                api_key: Some("token".to_string()),
+                source: Some("ansible_llamacpp_trained".to_string()),
+                ..ProviderProfile::default()
+            }),
+        };
         assert!(ranked_candidate_is_in_provider_backoff(&candidate));
     }
 
