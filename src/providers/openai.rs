@@ -725,8 +725,18 @@ impl OpenAIProvider {
                 });
             }
             let response_text = extract_openai_response_text(&data);
+            // A local llama.cpp `/v1/models` response only proves that the
+            // process is listening.  The completion probe is the
+            // application-readiness gate, so accept it only when the model
+            // returned the marker requested above.  In particular, a short
+            // reasoning-only, refusal, or placeholder response must not make
+            // an endpoint eligible for routing after a reboot.
             let response_ok = status.is_success()
-                && (!local_llamacpp_endpoint || !response_text.trim().is_empty());
+                && if local_llamacpp_endpoint {
+                    response_text.trim().eq_ignore_ascii_case("OK")
+                } else {
+                    true
+                };
             return Ok(ProviderHealth {
                 ok: response_ok,
                 status_code: Some(status.as_u16()),
@@ -734,7 +744,7 @@ impl OpenAIProvider {
                 message: Some(if response_ok {
                     "ok".to_string()
                 } else if status.is_success() && local_llamacpp_endpoint {
-                    "local llama.cpp completion returned no usable content".to_string()
+                    "local llama.cpp readiness probe did not return OK".to_string()
                 } else {
                     error_message(&data)
                 }),
