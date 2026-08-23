@@ -658,8 +658,13 @@ impl OpenAIProvider {
             let chat_url = endpoint(&self.base_url, "chat/completions");
             let mut payload = json!({
                 "model": self.model,
-                "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 8,
+                // Qwen can spend a short budget emitting reasoning_content
+                // even when the request is otherwise successful.  A health
+                // probe must exercise the same usable-content contract as a
+                // real request, so make the no-thinking instruction explicit
+                // and leave enough budget for the one-word answer.
+                "messages": [{"role": "user", "content": "Reply with OK only."}],
+                "max_tokens": 24,
                 "temperature": 0.0,
             });
             if requires_completion_probe {
