@@ -621,6 +621,10 @@ impl OpenAIProvider {
         let started = Instant::now();
         let models_url = endpoint(&self.base_url, "models");
         let local_llamacpp_endpoint = is_local_llamacpp_endpoint(&self.base_url);
+        // Wiremock and other test proxies use loopback URLs, but NVIDIA's
+        // adapter is still a cloud provider in that case. Only OpenAI-style
+        // local profiles need the completion probe for application readiness.
+        let requires_completion_probe = local_llamacpp_endpoint && self.provider_name != "nvidia";
         let response = get_with_retries(
             self.provider_name.as_str(),
             &self.client,
@@ -636,7 +640,7 @@ impl OpenAIProvider {
         // request (and Qwen can return HTTP 200 with only reasoning_content
         // when the output budget is exhausted).  Keep cloud OpenAI health
         // cheap, but make native local endpoints application-ready.
-        if response.status().is_success() && !local_llamacpp_endpoint {
+        if response.status().is_success() && !requires_completion_probe {
             return Ok(ProviderHealth {
                 ok: true,
                 status_code: Some(response.status().as_u16()),
@@ -645,7 +649,12 @@ impl OpenAIProvider {
                 mode: Some("http".to_string()),
             });
         }
-        if self.provider_name != "openai" || local_llamacpp_endpoint {
+        // Cloud-compatible providers such as NVIDIA expose the same models
+        // endpoint as OpenAI; probing chat during health checks adds latency
+        // and can consume provider quota. Native llama.cpp is different: its
+        // model list only proves that the process is alive, so it still gets
+        // the application-readiness completion probe below.
+        if requires_completion_probe {
             let chat_url = endpoint(&self.base_url, "chat/completions");
             let mut payload = json!({
                 "model": self.model,
@@ -653,7 +662,7 @@ impl OpenAIProvider {
                 "max_tokens": 8,
                 "temperature": 0.0,
             });
-            if local_llamacpp_endpoint {
+            if requires_completion_probe {
                 payload["chat_template_kwargs"] = json!({"enable_thinking": false});
             }
             let started = Instant::now();

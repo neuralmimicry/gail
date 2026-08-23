@@ -5875,7 +5875,7 @@ mod tests {
             model: Some("moonshotai/kimi-k2-instruct-0905".to_string()),
             api_key: Some("nvapi-test".to_string()),
             base_url: Some(format!("{}/v1", nvidia.uri())),
-            roles: vec!["assistant".to_string()],
+            roles: vec!["general".to_string(), "assistant".to_string()],
             specialties: vec!["reasoning".to_string()],
             weight: 10.0,
             preferred: true,

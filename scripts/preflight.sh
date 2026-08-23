@@ -61,6 +61,10 @@ if [[ "$MODE" == ci ]]; then
 
   if (( ! SKIP_TESTS )); then
     nm_log 'running Rust tests'
-    nm_run cargo test --locked --all-targets
+    # Several provider/orchestration tests exercise process-wide adaptive
+    # health/backoff state and wiremock servers. Running them concurrently
+    # makes the assertions order-dependent (and can hide the fallback trace
+    # that the test is meant to verify), especially on the ARM runner.
+    nm_run cargo test --locked --all-targets -- --test-threads=1
   fi
 fi
