@@ -1421,19 +1421,9 @@ fn build_completion_request(
                 base_url.as_deref(),
             );
             // A profile endpoint is an implicit routing detail, not a caller
-            // override.  Do not carry it into an explicit request when the
-            // requested model differs from the profile model: otherwise the
-            // orchestration layer can mistake a configured 4B Ollama profile
-            // for a valid endpoint for an unconfigured larger model.
-            let profile_base_url = profile.as_ref().and_then(|item| {
-                let configured_model = item.model.as_deref();
-                let requested_model = model.as_deref();
-                let model_matches = configured_model.is_none_or(|configured| {
-                    requested_model
-                        .is_none_or(|requested| configured.eq_ignore_ascii_case(requested))
-                });
-                model_matches.then(|| item.base_url.clone()).flatten()
-            });
+            // override.  Leave it to the configured endpoint pool so an
+            // explicit model request cannot probe whichever profile happens
+            // to be returned first (for example an inactive trained replica).
             CompletionRequest {
                 request_id: None,
                 workflow,
@@ -1449,7 +1439,7 @@ fn build_completion_request(
                 fallback_model: None,
                 fallback_api_key: None,
                 fallback_access_token: None,
-                base_url: base_url.or(profile_base_url),
+                base_url,
                 include_configured: if explicit_provider_override {
                     Some(false)
                 } else {
