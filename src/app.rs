@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
+    env,
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -1517,6 +1518,22 @@ fn resolve_openai_route(
         });
     }
 
+    // Refiner and older OpenAI-compatible clients can retain a historical
+    // local model name after the estate has moved to a different model pool.
+    // Treat an unavailable Qwen/local model as an orchestration request when
+    // no explicit endpoint was supplied. This preserves the public model name
+    // for tracing while letting Gail select a live, qualified local provider.
+    if env_flag("GAIL_FALLBACK_UNAVAILABLE_LOCAL_MODELS", false)
+        && is_local_model_name(&lowered)
+        && find_profile_for_model(service, model).is_none()
+    {
+        return Ok(OpenAIResolvedRoute::Orchestrated {
+            public_model: model.to_string(),
+            request_category: None,
+            system_suffix: None,
+        });
+    }
+
     if let Some((prefix, routed_model)) = split_routed_model(model) {
         if matches!(prefix.as_str(), "gail" | "gateway") {
             if is_gail_auto_model(&routed_model.to_ascii_lowercase()) {
@@ -1598,6 +1615,46 @@ fn resolve_openai_route(
     Err(GailError::bad_request(format!(
         "unable to route OpenAI model `{model}`. Use `gail-auto` for orchestration or `provider/model` for an explicit backend"
     )))
+}
+
+fn is_local_model_name(model: &str) -> bool {
+    [
+        "qwen",
+        "llama",
+        "mistral",
+        "mixtral",
+        "phi",
+        "gemma",
+        "deepseek",
+        "codellama",
+        "dolphin",
+        "orca",
+        "nous",
+    ]
+    .iter()
+    .any(|prefix| model.starts_with(prefix))
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    match env::var(name).ok().as_deref().map(str::trim) {
+        Some(value)
+            if matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            ) =>
+        {
+            true
+        }
+        Some(value)
+            if matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            ) =>
+        {
+            false
+        }
+        _ => default,
+    }
 }
 
 fn split_system_messages(messages: Vec<ChatMessage>) -> (Option<String>, Vec<ChatMessage>) {
