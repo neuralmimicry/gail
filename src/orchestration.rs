@@ -4498,7 +4498,14 @@ fn local_llamacpp_health_ttl_seconds() -> f64 {
 }
 
 fn is_local_llamacpp_candidate(candidate: &ProviderCandidate) -> bool {
-    candidate.source.eq_ignore_ascii_case("ansible_llamacpp")
+    // Both the primary and optional trained llama.cpp profiles are managed
+    // by Ansible.  Treat the trained source as local too; otherwise it falls
+    // back to the general provider TTL and a stale positive snapshot can
+    // keep routing requests to an endpoint that is no longer listening.
+    candidate
+        .source
+        .to_ascii_lowercase()
+        .starts_with("ansible_llamacpp")
 }
 
 fn cached_health_ttl_seconds(
@@ -6980,6 +6987,23 @@ Return only a JSON data instance that satisfies this schema:
         assert_eq!(
             cached_health_ttl_seconds(false, true, Some("upstream"), default_ttl),
             local_ttl
+        );
+    }
+
+    #[test]
+    fn trained_ansible_llamacpp_profiles_use_short_health_ttl() {
+        let candidate = ProviderCandidate::from_profile(ProviderProfile {
+            source: Some("ansible_llamacpp_trained".to_string()),
+            provider_type: "openai".to_string(),
+            model: Some("gail-inhouse:latest".to_string()),
+            base_url: Some("http://127.0.0.1:18081/v1".to_string()),
+            ..ProviderProfile::default()
+        });
+
+        assert!(is_local_llamacpp_candidate(&candidate));
+        assert!(
+            cached_health_ttl_seconds(false, is_local_llamacpp_candidate(&candidate), None, 1800.0,)
+                <= 120.0
         );
     }
 
