@@ -2798,6 +2798,14 @@ impl GailService {
                             });
                         !(skip_configured_ollama_profiles
                             && normalize_provider_type(profile.provider_type.as_str()) == "ollama")
+                            // The trained llama.cpp model is an explicit
+                            // secondary model. Keep it available when a
+                            // caller names that model, but do not let a
+                            // generic gail-auto request spend fallback waves
+                            // on an inactive or reasoning-only trained
+                            // endpoint before trying the primary qwen pool.
+                            && (requested_model.is_some()
+                                || !is_trained_llamacpp_profile(profile))
                             && provider_matches
                             && model_matches
                     })
@@ -5852,6 +5860,13 @@ fn request_candidate_model_allowed_with_policy(
     configured_ollama_models.contains(&requested_model)
 }
 
+fn is_trained_llamacpp_profile(profile: &ProviderProfile) -> bool {
+    profile
+        .source
+        .as_deref()
+        .is_some_and(|source| source.eq_ignore_ascii_case("ansible_llamacpp_trained"))
+}
+
 fn should_return_degraded_fallback(
     request: &CompletionRequest,
     include_configured: bool,
@@ -7535,6 +7550,26 @@ Return only a JSON data instance that satisfies this schema:
             }),
         };
         assert!(ranked_candidate_is_in_provider_backoff(&candidate));
+    }
+
+    #[test]
+    fn trained_llamacpp_profiles_are_secondary_to_generic_routing() {
+        let trained = ProviderProfile {
+            provider_type: "openai".to_string(),
+            model: Some("gail-inhouse:latest".to_string()),
+            source: Some("ansible_llamacpp_trained".to_string()),
+            ..ProviderProfile::default()
+        };
+        let primary = ProviderProfile {
+            provider_type: "openai".to_string(),
+            model: Some("qwen3.5:9b".to_string()),
+            source: Some("ansible_llamacpp".to_string()),
+            ..ProviderProfile::default()
+        };
+
+        assert!(is_trained_llamacpp_profile(&trained));
+        assert!(!is_trained_llamacpp_profile(&primary));
+        assert!(!is_trained_llamacpp_profile(&ProviderProfile::default()));
     }
 
     #[test]
