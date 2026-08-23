@@ -1127,9 +1127,22 @@ fn extract_openai_response_text(data: &Value) -> String {
                 if let Some(content) = map.get("content") {
                     extract(content, chunks);
                 }
+                if let Some(message) = map.get("message") {
+                    extract(message, chunks);
+                }
             }
             _ => {}
         }
+    }
+    // Chat Completions responses put usable assistant text under
+    // choices[].message.content (or choices[].text for legacy completions).
+    // Read that shape before falling back to the Responses API output shape;
+    // native llama.cpp readiness uses the same Chat Completions transport.
+    if let Some(choices) = data.get("choices") {
+        extract(choices, &mut chunks);
+    }
+    if !chunks.is_empty() {
+        return chunks.join("\n");
     }
     if let Some(output) = data.get("output") {
         extract(output, &mut chunks);
@@ -1166,4 +1179,27 @@ fn extract_openai_usage(data: &Value) -> Option<TokenUsage> {
         cached,
         cost: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_chat_completion_message_content() {
+        let response = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "OK"}
+            }]
+        });
+
+        assert_eq!(extract_openai_response_text(&response), "OK");
+    }
+
+    #[test]
+    fn extracts_legacy_chat_completion_text() {
+        let response = json!({"choices": [{"text": "OK"}]});
+
+        assert_eq!(extract_openai_response_text(&response), "OK");
+    }
 }
