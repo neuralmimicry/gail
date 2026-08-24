@@ -131,13 +131,32 @@ pub async fn run(config: GailConfig) -> Result<()> {
             }
         }
         match active_training_snapshot(&trainer, &dsn).await {
-            Ok(true) => {
+            Ok(ActiveTrainingSnapshot::TerminalSuccess(recovered)) => {
+                let snapshot_root = PathBuf::from(trainer.output_root.clone());
+                let dataset_path = snapshot_root
+                    .join("datasets")
+                    .join(format!("{}.jsonl", recovered.snapshot_id));
+                let snapshot_dir = snapshot_root.join("snapshots").join(&recovered.snapshot_id);
+                process_training_snapshot(
+                    &trainer,
+                    &hardware,
+                    &recovered.snapshot_id,
+                    dataset_path.as_path(),
+                    snapshot_dir.as_path(),
+                    recovered.ledger_ids.as_slice(),
+                    config.storage.metrics_path.as_str(),
+                    dsn.as_str(),
+                )
+                .await?;
+                continue;
+            }
+            Ok(ActiveTrainingSnapshot::Active) => {
                 tracing::info!(
                     "trainer worker is waiting for the unresolved snapshot lifecycle to finish"
                 );
                 continue;
             }
-            Ok(false) => {}
+            Ok(ActiveTrainingSnapshot::None) => {}
             Err(error) => {
                 tracing::warn!(error = %error, "trainer worker could not inspect active snapshot lifecycle");
                 continue;
@@ -203,7 +222,7 @@ pub async fn run(config: GailConfig) -> Result<()> {
             tracing::warn!(error = %error, snapshot = %snapshot_id, "failed to persist active training lifecycle marker");
             continue;
         }
-        let train_outcome = run_training_pipeline(
+        process_training_snapshot(
             &trainer,
             &hardware,
             &snapshot_id,
@@ -213,63 +232,89 @@ pub async fn run(config: GailConfig) -> Result<()> {
             config.storage.metrics_path.as_str(),
             dsn.as_str(),
         )
-        .await;
-        if let Err(error) = remove_active_training_marker(&trainer).await {
-            tracing::warn!(error = %error, snapshot = %snapshot_id, "failed to clear active training lifecycle marker");
-        }
-        let training_error = train_outcome.as_ref().err().map(ToString::to_string);
-        if let Err(error) = record_training_observation(
-            &trainer,
-            &snapshot_id,
-            snapshot_dir.as_path(),
-            train_outcome
-                .as_ref()
-                .ok()
-                .map(|outcome| outcome.status.as_str()),
-            training_error.as_deref(),
-        )
-        .await
-        {
-            tracing::warn!(error = %error, snapshot = %snapshot_id, "failed to persist training metrics");
-        }
-        match train_outcome {
-            Ok(outcome) => {
-                if let Err(error) = llm_ledger::mark_training_success(
-                    &dsn,
-                    ids.as_slice(),
-                    outcome.snapshot_tag.as_str(),
-                    outcome.status.as_str(),
-                )
-                .await
-                {
-                    tracing::warn!(
-                        error = %error,
-                        snapshot = %outcome.snapshot_tag,
-                        "trainer worker failed to mark ledger rows as trained"
-                    );
-                }
+        .await?;
+    }
+    Ok(())
+}
+
+/// Consume one training snapshot, including a Slurm result recovered after a
+/// trainer-worker restart. A completed distributed job must still pass the
+/// normal qualification, registration, readiness, and promotion gates.
+async fn process_training_snapshot(
+    trainer: &TrainerConfig,
+    hardware: &HardwareProfile,
+    snapshot_id: &str,
+    dataset_path: &Path,
+    snapshot_dir: &Path,
+    ids: &[i64],
+    metrics_path: &str,
+    postgres_dsn: &str,
+) -> Result<()> {
+    let train_outcome = run_training_pipeline(
+        trainer,
+        hardware,
+        snapshot_id,
+        dataset_path,
+        snapshot_dir,
+        ids,
+        metrics_path,
+        postgres_dsn,
+    )
+    .await;
+    if let Err(error) = remove_active_training_marker(trainer).await {
+        tracing::warn!(error = %error, snapshot = %snapshot_id, "failed to clear active training lifecycle marker");
+    }
+    let training_error = train_outcome.as_ref().err().map(ToString::to_string);
+    if let Err(error) = record_training_observation(
+        trainer,
+        snapshot_id,
+        snapshot_dir,
+        train_outcome
+            .as_ref()
+            .ok()
+            .map(|outcome| outcome.status.as_str()),
+        training_error.as_deref(),
+    )
+    .await
+    {
+        tracing::warn!(error = %error, snapshot = %snapshot_id, "failed to persist training metrics");
+    }
+    match train_outcome {
+        Ok(outcome) => {
+            if let Err(error) = llm_ledger::mark_training_success(
+                postgres_dsn,
+                ids,
+                outcome.snapshot_tag.as_str(),
+                outcome.status.as_str(),
+            )
+            .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    snapshot = %outcome.snapshot_tag,
+                    "trainer worker failed to mark ledger rows as trained"
+                );
             }
-            Err(error) => {
-                let error_text = error.to_string();
-                tracing::warn!(error = %error_text, "trainer worker snapshot failed");
-                // An incompatible serving artifact is deterministic. Retrying
-                // it burns the same training work every poll and obscures the
-                // actual remediation (a real model export or GGUF converter).
-                let max_attempts = if is_non_retryable_training_error(&error_text) {
-                    1
-                } else {
-                    trainer.max_attempts
-                };
-                for id in ids {
-                    let _ = llm_ledger::mark_training_retry(
-                        &dsn,
-                        id,
-                        error_text.as_str(),
-                        max_attempts,
-                        trainer.retry_backoff_seconds,
-                    )
-                    .await;
-                }
+        }
+        Err(error) => {
+            let error_text = error.to_string();
+            tracing::warn!(error = %error_text, snapshot = %snapshot_id, "trainer worker snapshot failed");
+            // An incompatible serving artifact is deterministic. Retrying it
+            // burns the same training work and obscures the remediation.
+            let max_attempts = if is_non_retryable_training_error(&error_text) {
+                1
+            } else {
+                trainer.max_attempts
+            };
+            for id in ids {
+                let _ = llm_ledger::mark_training_retry(
+                    postgres_dsn,
+                    *id,
+                    error_text.as_str(),
+                    max_attempts,
+                    trainer.retry_backoff_seconds,
+                )
+                .await;
             }
         }
     }
@@ -357,29 +402,41 @@ fn terminal_slurm_result_exit_code(raw: &str) -> Option<i32> {
         .and_then(|value| i32::try_from(value).ok())
 }
 
-/// Release an active marker when the dispatcher has already written a
-/// terminal result. This can happen when the trainer pod is restarted after
-/// Slurm finished but before the worker consumed the result. The result is
-/// intentionally retained for auditability; snapshot ids are unique, so it
-/// cannot be mistaken for a newly submitted request.
+#[derive(Debug)]
+struct RecoveredTrainingSnapshot {
+    snapshot_id: String,
+    ledger_ids: Vec<i64>,
+}
+
+/// Inspect a terminal Slurm result left behind by a trainer-worker restart.
+/// Successful results are returned to the normal snapshot consumer; failed
+/// results are requeued and discarded from the active lifecycle.
 async fn recover_terminal_slurm_result(
     trainer: &TrainerConfig,
     dsn: &str,
     spool: &Path,
     snapshot_id: &str,
     ledger_ids: &[i64],
-) -> Result<bool> {
+) -> Result<Option<RecoveredTrainingSnapshot>> {
     let result_path = spool.join("results").join(format!("{snapshot_id}.result"));
     let raw = match fs::read_to_string(&result_path).await {
         Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    if terminal_slurm_result_exit_code(&raw) == Some(0) {
+        tracing::info!(
+            snapshot = snapshot_id,
+            result = %result_path.display(),
+            "resuming completed Slurm training snapshot after trainer restart"
+        );
+        return Ok(Some(RecoveredTrainingSnapshot {
+            snapshot_id: snapshot_id.to_string(),
+            ledger_ids: ledger_ids.to_vec(),
+        }));
+    }
     let exit_code = terminal_slurm_result_exit_code(&raw);
     let reason = match exit_code {
-        Some(0) => {
-            "terminal Slurm result was written before trainer restart; snapshot will be retried"
-        }
         Some(code) => {
             tracing::warn!(
                 snapshot = snapshot_id,
@@ -406,17 +463,28 @@ async fn recover_terminal_slurm_result(
         result = %result_path.display(),
         "released active training lifecycle after terminal Slurm result"
     );
-    Ok(true)
+    Ok(None)
+}
+
+enum ActiveTrainingSnapshot {
+    None,
+    Active,
+    TerminalSuccess(RecoveredTrainingSnapshot),
 }
 
 /// Return true while a previous snapshot is still unresolved.  A stale
 /// marker is recovered explicitly so a worker restart cannot create a second
 /// snapshot for the same ledger rows or leave a dead queue request forever.
-async fn active_training_snapshot(trainer: &TrainerConfig, dsn: &str) -> Result<bool> {
+async fn active_training_snapshot(
+    trainer: &TrainerConfig,
+    dsn: &str,
+) -> Result<ActiveTrainingSnapshot> {
     let path = active_training_marker_path(trainer);
     let raw = match fs::read_to_string(&path).await {
         Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ActiveTrainingSnapshot::None);
+        }
         Err(error) => return Err(error.into()),
     };
     let value: Value = serde_json::from_str(&raw).map_err(|error| {
@@ -437,9 +505,11 @@ async fn active_training_snapshot(trainer: &TrainerConfig, dsn: &str) -> Result<
         .map(|items| items.iter().filter_map(Value::as_i64).collect::<Vec<_>>())
         .unwrap_or_default();
     if let Some(spool) = env_string("GAIL_TRAIN_SLURM_SPOOL") {
-        if recover_terminal_slurm_result(trainer, dsn, Path::new(&spool), snapshot_id, &ids).await?
+        if let Some(recovered) =
+            recover_terminal_slurm_result(trainer, dsn, Path::new(&spool), snapshot_id, &ids)
+                .await?
         {
-            return Ok(false);
+            return Ok(ActiveTrainingSnapshot::TerminalSuccess(recovered));
         }
 
         // A request can legitimately wait behind another Slurm allocation for
@@ -451,12 +521,12 @@ async fn active_training_snapshot(trainer: &TrainerConfig, dsn: &str) -> Result<
         let queue_request = spool.join("queue").join(format!("{snapshot_id}.request"));
         let running_request = spool.join("running").join(format!("{snapshot_id}.request"));
         if queue_request.exists() || running_request.exists() {
-            return Ok(true);
+            return Ok(ActiveTrainingSnapshot::Active);
         }
     }
     let stale_after = trainer.command_timeout_seconds.max(60) as f64;
     if heartbeat > 0.0 && now_ts() - heartbeat <= stale_after {
-        return Ok(true);
+        return Ok(ActiveTrainingSnapshot::Active);
     }
     if let Some(spool) = env_string("GAIL_TRAIN_SLURM_SPOOL") {
         let request = Path::new(&spool)
@@ -483,7 +553,7 @@ async fn active_training_snapshot(trainer: &TrainerConfig, dsn: &str) -> Result<
         snapshot = snapshot_id,
         "recovered stale unresolved training lifecycle"
     );
-    Ok(false)
+    Ok(ActiveTrainingSnapshot::None)
 }
 
 async fn requeue_stale_slurm_requests(
@@ -1584,6 +1654,42 @@ async fn execute_slurm_training_request(
     let result_path = results.join(format!("{snapshot_id}.result"));
     let status_path = results.join(format!("{snapshot_id}.status"));
     let heartbeat_path = results.join(format!("{snapshot_id}.heartbeat"));
+    // A worker restart can resume a completed request. Do not publish a new
+    // queue item in that case: the dispatcher must not execute the same
+    // snapshot twice while the existing result is being consumed.
+    if result_path.exists() {
+        let body = fs::read_to_string(&result_path).await.map_err(|error| {
+            GailError::invalid_config(format!("failed to read Slurm training result: {error}"))
+        })?;
+        let result: SlurmTrainingResult = serde_json::from_str(&body).map_err(|error| {
+            GailError::invalid_config(format!("invalid Slurm training result: {error}"))
+        })?;
+        if result.exit_code != 0 {
+            return Err(GailError::invalid_config(format!(
+                "Slurm training exited with status {}: {}",
+                result.exit_code,
+                result.message.unwrap_or_default()
+            )));
+        }
+        return Ok(CommandOutcome {
+            stdout: String::new(),
+            stderr: result.message.unwrap_or_default(),
+            exit_code: result.exit_code,
+            runtime_seconds: result.runtime_seconds,
+            backend_job_id: result.slurm_job_id.or_else(|| {
+                std::fs::read_to_string(&status_path)
+                    .ok()
+                    .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+                    .and_then(|value| {
+                        value
+                            .get("slurm_job_id")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })
+            }),
+            heartbeat_ts: result.heartbeat_ts,
+        });
+    }
     let request = json!({
         "version": 1,
         "snapshot_id": snapshot_id,
