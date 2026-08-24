@@ -555,8 +555,19 @@ def train(cfg: TrainingConfig) -> None:
     output_root = Path(cfg.output)
     rank_root = distributed_rank_output(output_root, rank, world_size)
     rank_root.mkdir(parents=True, exist_ok=True)
+    # A Slurm retry reuses the snapshot directory so valid checkpoints can be
+    # resumed.  Completion markers and reports are attempt-scoped, however:
+    # retaining them lets rank zero mistake an earlier attempt for a rank
+    # which has completed the current attempt and aggregate mixed adapters.
+    for stale_path in (
+        rank_root / "_SUCCESS",
+        rank_root / "training_report.json",
+        rank_root / "progress.json",
+    ):
+        stale_path.unlink(missing_ok=True)
     if rank == 0:
         (output_root / "_SUCCESS").unlink(missing_ok=True)
+        (output_root / "training_report.json").unlink(missing_ok=True)
     started_ts = time.time()
     progress_path = (output_root if rank == 0 else rank_root) / "progress.json"
     adapter_dir = output_root / "adapter"
