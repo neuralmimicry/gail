@@ -324,11 +324,11 @@ impl GailService {
         let hardware = detect_hardware().await;
         log_hardware_profile("api_service", &hardware);
         let llm_ledger = LlmLedger::from_config(&config).await;
-        if let Some(dsn) = config.storage.postgres_dsn.as_deref()
-            && let Err(error) = crate::llm_ledger::initialize_schema(dsn).await
-        {
-            tracing::warn!(error = %error, "failed to initialise comparative validation schema");
-        }
+        // LlmLedger::from_config performs the shared schema migration when
+        // the ledger is enabled.  Do not run the same DDL a second time here:
+        // on a fresh rollout that duplicated migration can deadlock against
+        // the mirror/trainer workers.  Comparative validation uses the same
+        // tables, so it does not need a separate migration.
         let metrics = MetricsStore::new(config.storage.metrics_path.clone()).await?;
         let specialists = build_specialist_engines(&config, client.clone());
         let aarnn_bridge = AarnnMirrorClient::from_config(&config, client.clone(), &specialists);

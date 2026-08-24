@@ -235,7 +235,13 @@ impl LlmLedger {
 
 pub async fn initialize_schema(dsn: &str) -> Result<(), tokio_postgres::Error> {
     let client = connect_client(dsn).await?;
-    client
+    // Every Gail role starts independently and may arrive during the same
+    // rollout.  Serialize the DDL so concurrent ALTER/CREATE statements do
+    // not deadlock on the shared ledger tables.
+    let lock_sql = "SELECT pg_advisory_lock(hashtextextended('gail_llm_schema', 0));";
+    let unlock_sql = "SELECT pg_advisory_unlock(hashtextextended('gail_llm_schema', 0));";
+    client.batch_execute(lock_sql).await?;
+    let schema_result = client
         .batch_execute(
             r#"
             SET client_min_messages TO WARNING;
@@ -316,7 +322,13 @@ pub async fn initialize_schema(dsn: &str) -> Result<(), tokio_postgres::Error> {
                 ON gail_provider_admissions (admitted, model_version, last_sample_at);
             "#,
         )
-        .await
+        .await;
+    let unlock_result = client.batch_execute(unlock_sql).await;
+    match (schema_result, unlock_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 pub async fn fetch_pending_mirror(
