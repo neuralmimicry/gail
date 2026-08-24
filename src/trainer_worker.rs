@@ -3,7 +3,7 @@ use std::{
     env,
     path::{Component, Path, PathBuf},
     process::Stdio,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::Client;
@@ -1299,7 +1299,7 @@ async fn select_serving_target(
         .iter()
         .filter(|target| target.enabled && target.base_model == trainer.ollama_base_model)
     {
-        if !target.endpoint.trim().is_empty() && target_is_ready(target).await {
+        if !target.endpoint.trim().is_empty() && target_is_launchable(target).await {
             let throughput = summaries
                 .iter()
                 .filter(|summary| {
@@ -1404,20 +1404,74 @@ async fn target_is_ready(target: &TrainerServingTarget) -> bool {
         })
 }
 
+/// A target is normally already serving the trained alias.  During a
+/// promotion, however, the native selector deliberately stops that service
+/// everywhere except the currently selected host.  Treat the target as
+/// launchable when its exact base model is present in the host's Ollama model
+/// store; the post-publication readiness check below still requires the
+/// trained llama.cpp endpoint and alias to answer successfully.
+async fn target_is_launchable(target: &TrainerServingTarget) -> bool {
+    if target_is_ready(target).await {
+        return true;
+    }
+    let Ok(endpoint) = reqwest::Url::parse(target.endpoint.trim_end_matches('/')) else {
+        return false;
+    };
+    let Some(host) = endpoint.host_str() else {
+        return false;
+    };
+    let ollama_url = format!("{}://{}:11434/api/tags", endpoint.scheme(), host);
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(6))
+        .build()
+        .unwrap_or_else(|_| Client::new());
+    let Ok(response) = client.get(ollama_url).send().await else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    let Ok(body) = response.json::<Value>().await else {
+        return false;
+    };
+    body.get("models")
+        .and_then(Value::as_array)
+        .is_some_and(|models| {
+            models.iter().any(|model| {
+                model
+                    .get("name")
+                    .or_else(|| model.get("model"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name == target.base_model)
+            })
+        })
+}
+
 async fn health_check_serving_target(selection: &ServingTargetSelection) -> Result<()> {
-    if target_is_ready(&selection.target).await {
-        tracing::info!(
-            host = %selection.target.host_id,
-            vram_mb = selection.target.vram_mb,
-            throughput_tokens_per_second = selection.throughput_tokens_per_second,
-            "promoted trained model serving target is ready"
-        );
-        Ok(())
-    } else {
-        Err(GailError::invalid_config(format!(
-            "serving target {} is not ready for base model {}",
-            selection.target.host_id, selection.target.base_model
-        )))
+    let timeout_seconds = env::var("GAIL_TRAIN_SERVING_READINESS_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(300)
+        .clamp(30, 900);
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    loop {
+        if target_is_ready(&selection.target).await {
+            tracing::info!(
+                host = %selection.target.host_id,
+                vram_mb = selection.target.vram_mb,
+                throughput_tokens_per_second = selection.throughput_tokens_per_second,
+                "promoted trained model serving target is ready"
+            );
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(GailError::invalid_config(format!(
+                "serving target {} did not become ready for base model {} within {} seconds",
+                selection.target.host_id, selection.target.base_model, timeout_seconds
+            )));
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
