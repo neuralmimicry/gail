@@ -1830,6 +1830,20 @@ impl GailService {
                 .await;
                 successful.push(candidate_summary);
             } else {
+                // A dispatch-time reservation race means another request won
+                // the slot between ranking and invocation.  It is normal
+                // scheduler contention, not evidence that the endpoint is
+                // unhealthy.  Keep it in orchestration telemetry so capacity
+                // tuning can see it, but do not count it as a provider
+                // failure or overwrite a healthy endpoint's health bucket.
+                if is_dispatch_capacity_race(result.error.as_deref()) {
+                    let _ = self
+                        .inner
+                        .metrics
+                        .record_orchestration_event("capacity_race", None)
+                        .await;
+                    continue;
+                }
                 let health_bucket =
                     runtime_failure_health_bucket(result.error.as_deref(), result.latency_ms);
                 if result
@@ -5462,6 +5476,14 @@ fn runtime_failure_health_bucket(error: Option<&str>, latency_ms: Option<u64>) -
     }
 }
 
+fn is_dispatch_capacity_race(error: Option<&str>) -> bool {
+    error.is_some_and(|message| {
+        message
+            .to_ascii_lowercase()
+            .contains("capacity was unavailable at dispatch (reservation race;")
+    })
+}
+
 fn severity_for_issue_category(category: &str) -> &'static str {
     match category {
         "quota" | "upstream" | "timeout" => "warning",
@@ -7888,6 +7910,17 @@ Return only a JSON data instance that satisfies this schema:
         let bucket = runtime_failure_health_bucket(Some(message), Some(7));
         assert_eq!(bucket.mode.as_deref(), Some("nmc_constrained"));
         assert!(message_indicates_provider_backoff(message));
+    }
+
+    #[test]
+    fn dispatch_capacity_race_is_not_provider_failure() {
+        assert!(is_dispatch_capacity_race(Some(
+            "candidate capacity was unavailable at dispatch (reservation race; trying fallback candidates)"
+        )));
+        assert!(!is_dispatch_capacity_race(Some(
+            "candidate capacity was unavailable at dispatch after 250ms of queue waiting"
+        )));
+        assert!(!is_dispatch_capacity_race(Some("connection refused")));
     }
 
     #[test]
