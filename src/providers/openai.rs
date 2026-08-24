@@ -661,18 +661,17 @@ impl OpenAIProvider {
                 // Qwen can spend a short budget emitting reasoning_content
                 // even when the request is otherwise successful.  A health
                 // probe must exercise the same usable-content contract as a
-                // real request, so make the no-thinking instruction explicit
-                // and leave enough budget for the one-word answer.
-                // Keep the no-thinking marker in the prompt as well as the
-                // llama.cpp extension.  Some compatible builds accept the
-                // extension but do not apply it when the request is made
-                // through their OpenAI adapter; the marker makes the probe
-                // deterministic across both implementations.
+                // real request.  Use a separate system instruction and a
+                // concrete marker: this is more reliable across llama.cpp
+                // chat-template versions than putting /no_think next to the
+                // user text, which can produce reasoning-only output.
                 "messages": [
-                    {"role": "system", "content": "Readiness check. Reply with OK only. /no_think"},
-                    {"role": "user", "content": "Reply with OK only."}
+                    {"role": "system", "content": "You are a readiness probe. Return the exact token READY and nothing else."},
+                    {"role": "user", "content": "READY"}
                 ],
-                "max_tokens": 64,
+                // Leave enough room for a compatible model to finish its
+                // internal reasoning before returning the marker.
+                "max_tokens": 256,
                 "temperature": 0.0,
                 // Keep readiness probes bounded to a single JSON response.
                 // llama.cpp may otherwise use its default streaming path,
@@ -733,7 +732,7 @@ impl OpenAIProvider {
             // an endpoint eligible for routing after a reboot.
             let response_ok = status.is_success()
                 && if local_llamacpp_endpoint {
-                    response_text.trim().eq_ignore_ascii_case("OK")
+                    response_text.trim().eq_ignore_ascii_case("READY")
                 } else {
                     true
                 };
@@ -744,7 +743,7 @@ impl OpenAIProvider {
                 message: Some(if response_ok {
                     "ok".to_string()
                 } else if status.is_success() && local_llamacpp_endpoint {
-                    "local llama.cpp readiness probe did not return OK".to_string()
+                    "local llama.cpp readiness probe did not return READY".to_string()
                 } else {
                     error_message(&data)
                 }),
