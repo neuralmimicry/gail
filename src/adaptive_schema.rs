@@ -6,13 +6,13 @@
 //! logs/errors, and bounded numeric hints so call sites can adapt without each
 //! integration growing its own schema cache.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::{fs, sync::Mutex};
+use tokio::{fs, sync::Mutex, time::timeout};
 use url::Url;
 
 const MAX_RECENT_ADJUSTMENTS: usize = 100;
@@ -21,6 +21,7 @@ const RATE_LIMIT_SKIP_SECONDS: f64 = 2.0 * 60.0;
 const TRANSIENT_SKIP_SECONDS: f64 = 60.0;
 const SAVE_MIN_INTERVAL_SECONDS: f64 = 5.0;
 const SAVE_MAX_DIRTY_OBSERVATIONS: u64 = 25;
+const PERSISTENCE_READ_TIMEOUT_SECONDS: u64 = 5;
 
 // A saturated counter is not useful evidence.  It can only be produced by a
 // previous saturating increment, and retaining it makes every future merge
@@ -472,9 +473,22 @@ impl AdaptiveEndpointSchema {
 
 pub async fn configure_persistence(path: impl Into<PathBuf>) {
     let path = path.into();
-    let loaded = match fs::read_to_string(&path).await {
-        Ok(raw) => serde_json::from_str::<AdaptiveApiRegistry>(&raw).ok(),
-        Err(_) => None,
+    let loaded = match timeout(
+        Duration::from_secs(PERSISTENCE_READ_TIMEOUT_SECONDS),
+        fs::read_to_string(&path),
+    )
+    .await
+    {
+        Ok(Ok(raw)) => serde_json::from_str::<AdaptiveApiRegistry>(&raw).ok(),
+        Ok(Err(_)) => None,
+        Err(_) => {
+            tracing::warn!(
+                path = %path.display(),
+                timeout_seconds = PERSISTENCE_READ_TIMEOUT_SECONDS,
+                "timed out loading adaptive API persistence; starting with in-memory state"
+            );
+            None
+        }
     };
     let mut store = GLOBAL_STORE.lock().await;
     store.path = Some(path);
