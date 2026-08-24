@@ -54,7 +54,22 @@ use crate::{
     trading::{TradingBridge, TradingBridgeHandle},
 };
 
-const PROVIDER_HEALTH_TIMEOUT_SECONDS: u64 = 4;
+const DEFAULT_PROVIDER_HEALTH_TIMEOUT_SECONDS: u64 = 8;
+
+/// Native llama.cpp readiness includes a real completion request.  A fixed
+/// four-second deadline is too short for the CPU-only 4B endpoint while it is
+/// loading or draining a previous request, so make the deadline configurable
+/// and keep a bounded safe default for deployments that do not set it.
+fn provider_health_timeout_seconds() -> u64 {
+    env_int_any(
+        &[
+            "GAIL_PROVIDER_HEALTH_TIMEOUT_SECONDS",
+            "REFINER_AI_PROVIDER_HEALTH_TIMEOUT_SECONDS",
+        ],
+        DEFAULT_PROVIDER_HEALTH_TIMEOUT_SECONDS,
+    )
+    .clamp(4, 60)
+}
 
 fn completion_metric_source(response: &CompletionResponse) -> &'static str {
     if response
@@ -2392,7 +2407,7 @@ impl GailService {
                 let health = if probe_health {
                     match build_adapter(client, &profile) {
                         Ok(adapter) => {
-                            match adapter.health(Some(PROVIDER_HEALTH_TIMEOUT_SECONDS)).await {
+                            match adapter.health(Some(provider_health_timeout_seconds())).await {
                                 Ok(status) => {
                                     probed_health = Some(status.clone());
                                     json!(status)
@@ -3265,7 +3280,7 @@ impl GailService {
 
         let health = match build_adapter(self.inner.client.clone(), &candidate.profile) {
             Ok(adapter) => adapter
-                .health(Some(PROVIDER_HEALTH_TIMEOUT_SECONDS))
+                .health(Some(provider_health_timeout_seconds()))
                 .await
                 .unwrap_or_else(|error| ProviderHealth {
                     ok: false,
