@@ -1470,10 +1470,16 @@ impl GailService {
                 requested_output_tokens,
             )
             .await;
+        // Routing tags describe provider specialities; they are not a response
+        // contract.  In particular, the assistant_requirements profile carries
+        // a `json` speciality so structured requirements prompts can find the
+        // right providers, but Refiner's normal assistant request is still
+        // conversational.  Only an explicit prompt/system instruction should
+        // activate the JSON quality gate.
         let expected_json = expected_json(
             &provider_request.messages,
             provider_request.system.as_deref(),
-        ) || task_tags_expect_json(&task_tags);
+        );
         let timeout_cap = self.candidate_timeout_cap(
             workload_class,
             &workflow,
@@ -5577,12 +5583,6 @@ fn expected_json(messages: &[crate::models::ChatMessage], system: Option<&str>) 
     .any(|hint| text.contains(hint))
 }
 
-fn task_tags_expect_json(task_tags: &HashSet<String>) -> bool {
-    task_tags
-        .iter()
-        .any(|tag| matches!(tag.as_str(), "json" | "structured_data"))
-}
-
 fn try_parse_json(text: &str) -> Option<Value> {
     let payload = text.trim();
     if payload.is_empty() {
@@ -6766,6 +6766,27 @@ mod tests {
             content: MessageContent::Text("Return only valid JSON with keys: summary".to_string()),
         }];
         assert!(expected_json(&messages, None));
+    }
+
+    #[test]
+    fn conversational_assistant_output_is_not_json_gated_by_routing_profile() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: MessageContent::Text(
+                "Please explain the requirements in plain language and suggest next steps."
+                    .to_string(),
+            ),
+        }];
+        let tags = workflow_tags("assistant_requirements", "assistant", "requirements");
+
+        assert!(tags.contains("json"));
+        assert!(!expected_json(&messages, None));
+        assert!(
+            quality_score(
+                "The requirements are clear. Start by validating the input, then run the review.",
+                false,
+            ) >= 0.5
+        );
     }
 
     #[test]
