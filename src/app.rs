@@ -1039,13 +1039,16 @@ async fn trading_evaluate(State(service): State<GailService>, headers: HeaderMap
     match service.trading_bridge() {
         None => trading_unavailable(),
         Some(bridge) => {
-            // We can't directly trigger the loop, but we can log it.
-            // A full implementation would use a channel; for now return status.
+            let requested = bridge.request_evaluation();
             let state = bridge.state.0.lock().await;
             let snapshot = state.status_snapshot(bridge.is_enabled());
             Json(json!({
-                "ok": true,
-                "message": "evaluation will occur at next scheduled interval",
+                "ok": requested,
+                "message": if requested {
+                    "evaluation requested"
+                } else {
+                    "evaluation request queue is full"
+                },
                 "status": snapshot
             }))
             .into_response()
