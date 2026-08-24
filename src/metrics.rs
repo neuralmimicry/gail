@@ -908,9 +908,16 @@ impl MetricsStore {
         }
         // Queue and in-progress gauges describe this Gail process, not
         // historical work from a previous process lifetime. Avoid exposing
-        // stale values after a restart while retaining terminal counters.
+        // stale values after a restart. Request-flow counters are reset along
+        // with routing observations when explicitly requested: older Gail
+        // versions did not record terminal outcomes for every received HTTP
+        // request, so carrying those counters forward would create a
+        // permanently false unaccounted backlog and invalid success rate.
         data.request_flow.queued = 0;
         data.request_flow.in_progress = 0;
+        if reset_routing {
+            data.request_flow = RequestFlowMetrics::default();
+        }
         let store = Self {
             path,
             inner: Arc::new(Mutex::new(data)),
