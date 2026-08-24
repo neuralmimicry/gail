@@ -606,6 +606,17 @@ def train(cfg: TrainingConfig) -> None:
             str(resume_adapter),
             is_trainable=True,
         )
+    # CPU Slurm ranks train the full 4B base weights in float32. Keep the
+    # model KV cache disabled and checkpoint activations so backward does not
+    # exceed the 40 GiB per-node allocation. This trades compute for a bounded
+    # memory footprint; serving keeps its normal generation cache.
+    if device == "cpu":
+        if getattr(model, "config", None) is not None:
+            model.config.use_cache = False
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
 
     all_texts = load_training_texts(dataset_path, tokenizer)
     texts, evaluation_texts = held_out_split(all_texts)
@@ -644,6 +655,8 @@ def train(cfg: TrainingConfig) -> None:
         dataloader_pin_memory=device == "cuda",
     )
     training_parameters = inspect.signature(TrainingArguments).parameters
+    if "gradient_checkpointing" in training_parameters:
+        training_kwargs["gradient_checkpointing"] = device == "cpu"
     if "warmup_ratio" in training_parameters:
         training_kwargs["warmup_ratio"] = cfg.warmup_ratio
     else:
