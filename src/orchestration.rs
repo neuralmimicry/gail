@@ -503,8 +503,56 @@ impl GailService {
         profile.api_key = request.api_key.clone().or(profile.api_key);
         profile.access_token = request.access_token.clone().or(profile.access_token);
         profile.base_url = request.base_url.clone().or(profile.base_url);
-        profile.source = Some("request_direct".to_string());
+        // Keep the configured source when the request names a configured
+        // endpoint.  Direct callers (notably trading) still need the trained
+        // model admission/readiness policy; replacing this with
+        // `request_direct` made a stale replica indistinguishable from a
+        // normal provider at this boundary.
+        if profile.source.is_none() {
+            profile.source = Some("request_direct".to_string());
+        }
         profile
+    }
+
+    async fn trained_candidate_is_admitted(&self, profile: &ProviderProfile) -> bool {
+        if !is_trained_llamacpp_profile(profile) {
+            return true;
+        }
+        if !self.inner.config.comparative_validation.enabled {
+            return true;
+        }
+        let Some(dsn) = self.inner.postgres_dsn.as_deref() else {
+            return false;
+        };
+        let Some(model_version) = active_snapshot_id_for_routing(&self.inner.config) else {
+            return false;
+        };
+        let Some(endpoint) = profile.base_url.as_deref() else {
+            return false;
+        };
+        let Some(model) = profile.model.as_deref() else {
+            return false;
+        };
+        match admitted_for_model(
+            dsn,
+            model_version.as_str(),
+            self.inner
+                .config
+                .comparative_validation
+                .admission_ttl_seconds,
+        )
+        .await
+        {
+            Ok(admissions) => admissions.iter().any(|admission| {
+                admission.kind == "trained"
+                    && admission_model_matches(admission.model.as_str(), model)
+                    && admission_endpoint_matches(admission.endpoint.as_str(), endpoint)
+            }),
+            Err(error) => {
+                tracing::debug!(error = %error, "direct trained-provider admission lookup failed");
+                false
+            }
+        }
     }
 
     /// Apply the provider-specific prompt budget before queueing network work.
@@ -836,6 +884,17 @@ impl GailService {
         info!(request_id = %request_id, workflow = ?effective_request.workflow, role = ?effective_request.role, request_category = ?effective_request.request_category, source = ?effective_request.source, lifecycle = "received", "GAIL_ORCHESTRATION_LIFECYCLE");
         info!(request_id = %request_id, lifecycle = "queued", "GAIL_ORCHESTRATION_LIFECYCLE");
         let profile = self.direct_provider_profile(&effective_request);
+        if !self.trained_candidate_is_admitted(&profile).await {
+            return Err(GailError::upstream(
+                profile.provider_type.as_str(),
+                Some(StatusCode::SERVICE_UNAVAILABLE),
+                format!(
+                    "trained provider {}/{} is not currently admitted for the active snapshot",
+                    profile.model.as_deref().unwrap_or("unknown"),
+                    profile.base_url.as_deref().unwrap_or("unknown endpoint")
+                ),
+            ));
+        }
         self.prepare_provider_request(&profile, &mut effective_request);
         if !effective_request.messages.iter().any(|message| {
             message.role.eq_ignore_ascii_case("user") && !message.flattened_text().trim().is_empty()
