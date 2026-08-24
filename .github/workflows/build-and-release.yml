@@ -669,6 +669,8 @@ jobs:
           echo "repo=${image_repo}" >> "${GITHUB_OUTPUT}"
           echo "arch_tag=${image_repo}:${BUILD_VERSION}-${{ matrix.variant }}" >> "${GITHUB_OUTPUT}"
           echo "created=${created}" >> "${GITHUB_OUTPUT}"
+          echo "source_tree=$(git rev-parse HEAD^{tree})" >> "${GITHUB_OUTPUT}"
+          echo "source_dirty=false" >> "${GITHUB_OUTPUT}"
 
       - name: Validate container tooling
         shell: bash
@@ -723,6 +725,8 @@ jobs:
           IMAGE_REPO: ${{ steps.image.outputs.repo }}
           ARCH_TAG: ${{ steps.image.outputs.arch_tag }}
           IMAGE_CREATED: ${{ steps.image.outputs.created }}
+          SOURCE_TREE: ${{ steps.image.outputs.source_tree }}
+          SOURCE_DIRTY: ${{ steps.image.outputs.source_dirty }}
           MATRIX_ARCH: ${{ matrix.arch }}
           MATRIX_PLATFORM: ${{ matrix.platform }}
           MATRIX_PYTORCH_JOBS_DEFAULT: ${{ matrix.pytorch_jobs_default }}
@@ -849,6 +853,8 @@ jobs:
             --build-arg TARGET_PAGE_SIZE="${{ matrix.page_size }}" \
             --build-arg BUILD_VERSION="${BUILD_VERSION}" \
             --build-arg VCS_REF="${GITHUB_SHA}" \
+            --build-arg SOURCE_TREE="${SOURCE_TREE}" \
+            --build-arg SOURCE_DIRTY="${SOURCE_DIRTY}" \
             --build-arg GITHUB_REPOSITORY="${GITHUB_REPOSITORY}" \
             --build-arg IMAGE_CREATED="${IMAGE_CREATED}" \
             --build-arg LIBTORCH_SEED_IMAGE="${libtorch_seed_image}" \
