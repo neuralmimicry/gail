@@ -2407,7 +2407,10 @@ impl GailService {
                 let health = if probe_health {
                     match build_adapter(client, &profile) {
                         Ok(adapter) => {
-                            match adapter.health(Some(provider_health_timeout_seconds())).await {
+                            match adapter
+                                .health(Some(provider_health_timeout_seconds()))
+                                .await
+                            {
                                 Ok(status) => {
                                     probed_health = Some(status.clone());
                                     json!(status)
