@@ -316,6 +316,22 @@ def aggregate_distributed_snapshot(
         float(record["loss"]) * int(record["tokens"])
         for record in baseline_records
     ) / baseline_tokens
+    rank_metrics = [report.get("metrics", {}) for report in reports]
+    training_runtime_seconds = max(
+        (float(metrics.get("runtime_seconds", 0.0)) for metrics in rank_metrics),
+        default=0.0,
+    )
+    total_training_tokens = sum(
+        int(metrics.get("total_tokens", 0)) for metrics in rank_metrics
+    )
+    total_non_padding_tokens = sum(
+        int(metrics.get("non_padding_tokens", 0)) for metrics in rank_metrics
+    )
+    total_optimizer_steps = max(
+        (int(metrics.get("total_optimizer_steps", 0)) for metrics in rank_metrics),
+        default=0,
+    )
+    slurm_nodelist = os.getenv("SLURM_JOB_NODELIST")
     report = {
         "algorithm": cfg.algorithm,
         "base_model": cfg.base_model,
@@ -327,7 +343,29 @@ def aggregate_distributed_snapshot(
             "strategy": "deterministic_sharded_federated_average",
             "sample_weights": sample_counts,
             "total_samples": total_samples,
+            "total_tokens": total_training_tokens,
+            "non_padding_tokens": total_non_padding_tokens,
+            "slurm_nodelist": slurm_nodelist,
         },
+        "metrics": {
+            "samples": total_samples,
+            "total_tokens": total_training_tokens,
+            "non_padding_tokens": total_non_padding_tokens,
+            "total_optimizer_steps": total_optimizer_steps,
+            "runtime_seconds": training_runtime_seconds,
+            "aggregate_tokens_per_second": (
+                total_training_tokens / training_runtime_seconds
+                if training_runtime_seconds > 0
+                else 0.0
+            ),
+            "non_padding_tokens_per_second": (
+                total_non_padding_tokens / training_runtime_seconds
+                if training_runtime_seconds > 0
+                else 0.0
+            ),
+        },
+        "training_runtime_seconds": training_runtime_seconds,
+        "slurm_nodelist": slurm_nodelist,
         "rank_reports": reports,
         "adapter_dir": str(adapter_dir.resolve()),
         "evaluation": {
@@ -704,7 +742,23 @@ def train(cfg: TrainingConfig) -> None:
         TrainingProgressCallback(progress_path, output_root.name, started_ts, rank, world_size, job_id)
     )
     checkpoint = latest_valid_checkpoint(rank_root / "checkpoints")
+    training_started = time.monotonic()
     train_result = trainer.train(resume_from_checkpoint=str(checkpoint) if checkpoint else None)
+    training_runtime_seconds = float(
+        train_result.metrics.get("train_runtime", time.monotonic() - training_started)
+    )
+    # Keep a deterministic token count in the report. The SFT trainer may
+    # pack examples internally, so this is the truncated, non-padded token
+    # workload represented by the rank's input shard.
+    encoded_training_texts = tokenizer(
+        texts,
+        truncation=True,
+        max_length=cfg.max_seq_len,
+        padding=False,
+        add_special_tokens=True,
+    )
+    training_tokens = sum(len(ids) for ids in encoded_training_texts["input_ids"])
+    optimizer_steps = int(getattr(trainer.state, "global_step", 0))
 
     candidate_loss, candidate_tokens = evaluate_causal_lm_loss(
         trainer.model, tokenizer, evaluation_texts, cfg.max_seq_len
@@ -782,6 +836,24 @@ def train(cfg: TrainingConfig) -> None:
         "cpu_fallback": cpu_fallback,
         "tokenizer_metadata": tokenizer_metadata,
         "samples": len(texts),
+        "metrics": {
+            "samples": len(texts),
+            "total_tokens": training_tokens,
+            "non_padding_tokens": training_tokens,
+            "total_optimizer_steps": optimizer_steps,
+            "runtime_seconds": training_runtime_seconds,
+            "tokens_per_second": (
+                training_tokens / training_runtime_seconds
+                if training_runtime_seconds > 0
+                else 0.0
+            ),
+            "non_padding_tokens_per_second": (
+                training_tokens / training_runtime_seconds
+                if training_runtime_seconds > 0
+                else 0.0
+            ),
+        },
+        "training_runtime_seconds": training_runtime_seconds,
         "target_modules": target_modules,
         "training_loss": float(train_result.training_loss)
         if train_result.training_loss is not None

@@ -692,7 +692,12 @@ async fn record_training_observation(
         if let (Some(metrics), Some(pipeline_object)) = (report.as_mut(), pipeline.as_object())
             && let Some(metrics_object) = metrics.as_object_mut()
         {
-            for key in ["started_ts", "finished_ts", "cumulative_training"] {
+            for key in [
+                "started_ts",
+                "finished_ts",
+                "cumulative_training",
+                "training_runtime_seconds",
+            ] {
                 if let Some(value) = pipeline_object.get(key) {
                     metrics_object.insert(key.to_string(), value.clone());
                 }

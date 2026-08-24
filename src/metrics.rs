@@ -154,22 +154,78 @@ impl TrainingRunObservation {
     ) -> Self {
         let metrics = report.get("metrics").cloned().unwrap_or(Value::Null);
         let distributed = report.get("distributed");
+        let rank_reports = report
+            .get("rank_reports")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let rank_metric = |key: &str| {
+            rank_reports
+                .iter()
+                .filter_map(|rank| {
+                    rank.get("metrics")
+                        .and_then(|value| value.get(key))
+                        .and_then(Value::as_u64)
+                        .or_else(|| rank.get(key).and_then(Value::as_u64))
+                })
+                .sum::<u64>()
+        };
+        let rank_metric_max = |key: &str| {
+            rank_reports
+                .iter()
+                .filter_map(|rank| {
+                    rank.get("metrics")
+                        .and_then(|value| value.get(key))
+                        .and_then(Value::as_f64)
+                        .or_else(|| rank.get(key).and_then(Value::as_f64))
+                })
+                .fold(0.0, f64::max)
+        };
         let runtime_seconds = metrics
             .get("runtime_seconds")
             .and_then(Value::as_f64)
+            .or_else(|| report.get("runtime_seconds").and_then(Value::as_f64))
             .or_else(|| {
                 report
                     .get("training_runtime_seconds")
                     .and_then(Value::as_f64)
             })
-            .unwrap_or(0.0);
+            .unwrap_or_else(|| rank_metric_max("runtime_seconds"));
         let total_tokens = metrics
             .get("total_tokens")
             .and_then(Value::as_u64)
+            .or_else(|| {
+                distributed
+                    .and_then(|value| value.get("total_tokens"))
+                    .and_then(Value::as_u64)
+            })
+            .or_else(|| {
+                let total = rank_metric("total_tokens");
+                (total > 0).then_some(total)
+            })
+            // Older distributed Python reports only recorded evaluation
+            // tokens. Keep the fallback bounded while old snapshots are
+            // being backfilled, rather than leaving dashboards blank.
+            .or_else(|| {
+                report
+                    .get("evaluation")
+                    .and_then(|value| value.get("tokens"))
+                    .and_then(Value::as_u64)
+                    .map(|value| value.min(10_000_000))
+            })
             .unwrap_or(0);
         let non_padding_tokens = metrics
             .get("non_padding_tokens")
             .and_then(Value::as_u64)
+            .or_else(|| {
+                distributed
+                    .and_then(|value| value.get("non_padding_tokens"))
+                    .and_then(Value::as_u64)
+            })
+            .or_else(|| {
+                let total = rank_metric("non_padding_tokens");
+                (total > 0).then_some(total)
+            })
             .unwrap_or(0);
         let tokens_per_second = metrics
             .get("aggregate_tokens_per_second")
@@ -216,12 +272,29 @@ impl TrainingRunObservation {
             world_size: distributed
                 .and_then(|value| value.get("world_size"))
                 .and_then(Value::as_u64),
-            samples: metrics.get("samples").and_then(Value::as_u64).unwrap_or(0),
+            samples: metrics
+                .get("samples")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    distributed
+                        .and_then(|value| value.get("total_samples"))
+                        .and_then(Value::as_u64)
+                })
+                .or_else(|| {
+                    let total = rank_metric("samples");
+                    (total > 0).then_some(total)
+                })
+                .or_else(|| report.get("samples").and_then(Value::as_u64))
+                .unwrap_or(0),
             total_tokens,
             non_padding_tokens,
             optimizer_steps: metrics
                 .get("total_optimizer_steps")
                 .and_then(Value::as_u64)
+                .or_else(|| {
+                    let total = rank_metric("total_optimizer_steps");
+                    (total > 0).then_some(total)
+                })
                 .unwrap_or(0),
             runtime_seconds,
             tokens_per_second,
@@ -670,7 +743,13 @@ async fn merge_pipeline_provenance(pipeline_path: PathBuf, mut report: Value) ->
     let Some(pipeline_object) = pipeline.as_object() else {
         return report;
     };
-    for key in ["started_ts", "finished_ts", "cumulative_training"] {
+    for key in [
+        "started_ts",
+        "finished_ts",
+        "cumulative_training",
+        "training_runtime_seconds",
+        "slurm_job_id",
+    ] {
         if let Some(value) = pipeline_object.get(key) {
             report_object.insert(key.to_string(), value.clone());
         }
@@ -2972,6 +3051,38 @@ mod tests {
 
         assert_eq!(observation.finished_ts, None);
         assert!(observation.cumulative_training);
+    }
+
+    #[test]
+    fn training_report_conversion_supports_legacy_distributed_python_reports() {
+        let report = serde_json::json!({
+            "backend": "slurm_distributed_peft",
+            "base_model": "qwen3.5:4b",
+            "distributed": {
+                "world_size": 2,
+                "slurm_job_id": "326",
+                "total_samples": 204
+            },
+            "evaluation": { "tokens": 11826 },
+            "rank_reports": [
+                { "samples": 102, "runtime_seconds": 200.0 },
+                { "samples": 102, "runtime_seconds": 210.0 }
+            ],
+            "training_runtime_seconds": 4083.0
+        });
+        let observation = TrainingRunObservation::from_report(
+            "1787592446830",
+            &report,
+            "historical_completed",
+            "fallback-model",
+        );
+
+        assert_eq!(observation.samples, 204);
+        assert_eq!(observation.total_tokens, 11826);
+        assert_eq!(observation.runtime_seconds, 4083.0);
+        assert_eq!(observation.tokens_per_second, 11826.0 / 4083.0);
+        assert_eq!(observation.slurm_job_id.as_deref(), Some("326"));
+        assert_eq!(observation.world_size, Some(2));
     }
 
     #[tokio::test]
