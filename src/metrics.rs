@@ -742,10 +742,77 @@ pub async fn backfill_training_observations(
 }
 
 async fn discover_training_progress(snapshot_root: PathBuf) -> Vec<TrainingProgressObservation> {
+    let training_root = snapshot_root.parent().map(Path::to_path_buf);
+    let slurm_results_root = training_root
+        .as_ref()
+        .map(|root| root.join("slurm").join("spool").join("results"));
+
+    // Slurm is the normal production backend.  There can be thousands of
+    // historical snapshot directories on the shared filesystem, so scanning
+    // every one of them for progress on every Prometheus scrape makes
+    // `/metrics` block long enough for Prometheus to mark Gail down.  The
+    // trainer already maintains one active lifecycle marker and the Slurm
+    // dispatcher maintains one status file per active request; use those
+    // bounded files as the authoritative active-task index.
+    if let Some(training_root) = training_root.as_ref() {
+        let active_marker = training_root.join("active_training.json");
+        if let Ok(raw) = fs::read_to_string(&active_marker).await {
+            if let Ok(marker) = serde_json::from_str::<Value>(&raw) {
+                if let Some(snapshot_id) = marker.get("snapshot_id").and_then(Value::as_str) {
+                    if let Some(results_root) = slurm_results_root.as_ref() {
+                        let status_path = results_root.join(format!("{snapshot_id}.status"));
+                        if let Ok(raw_status) = fs::read_to_string(status_path).await
+                            && let Ok(status) = serde_json::from_str::<Value>(&raw_status)
+                            && let Some(progress) =
+                                slurm_progress_from_status(&snapshot_root, snapshot_id, &status)
+                                    .await
+                        {
+                            return vec![progress];
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(results_root) = slurm_results_root.as_ref()
+            && fs::metadata(results_root).await.is_ok()
+        {
+            // Recover gracefully if the marker was lost during a trainer pod
+            // restart. This scans status files, not the historical snapshot
+            // tree, and therefore remains bounded by the Slurm spool.
+            if let Ok(mut entries) = fs::read_dir(results_root).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let path = entry.path();
+                    if path.extension().and_then(|value| value.to_str()) != Some("status") {
+                        continue;
+                    }
+                    let Some(snapshot_id) = path
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .filter(|value| !value.is_empty())
+                    else {
+                        continue;
+                    };
+                    let Ok(raw_status) = fs::read_to_string(&path).await else {
+                        continue;
+                    };
+                    let Ok(status) = serde_json::from_str::<Value>(&raw_status) else {
+                        continue;
+                    };
+                    if let Some(progress) =
+                        slurm_progress_from_status(&snapshot_root, snapshot_id, &status).await
+                    {
+                        return vec![progress];
+                    }
+                }
+            }
+            return Vec::new();
+        }
+    }
+
+    // Local-development fallback: retain the previous directory scan when
+    // no Slurm spool is present.
     let mut observations = Vec::new();
-    let slurm_results_root = snapshot_root
-        .parent()
-        .map(|parent| parent.join("slurm").join("spool").join("results"));
     let Ok(mut entries) = fs::read_dir(snapshot_root).await else {
         return observations;
     };
@@ -820,6 +887,56 @@ async fn discover_training_progress(snapshot_root: PathBuf) -> Vec<TrainingProgr
         }
     }
     observations
+}
+
+async fn slurm_progress_from_status(
+    snapshot_root: &Path,
+    snapshot_id: &str,
+    status: &Value,
+) -> Option<TrainingProgressObservation> {
+    let state_is_running = status
+        .get("state")
+        .and_then(Value::as_str)
+        .is_some_and(|state| state.eq_ignore_ascii_case("running"));
+    let heartbeat = status
+        .get("heartbeat_ts")
+        .and_then(Value::as_f64)
+        .and_then(|value| valid_unix_timestamp(Some(value)));
+    let raw_progress = fs::read_to_string(snapshot_root.join(snapshot_id).join("progress.json"))
+        .await
+        .ok()?;
+    let mut progress = serde_json::from_str::<TrainingProgressObservation>(&raw_progress).ok()?;
+    let progress_fresh = progress
+        .updated_ts
+        .and_then(|updated| valid_unix_timestamp(Some(updated)))
+        .is_some_and(|updated| now_ts() - updated <= 900.0);
+    if !progress_fresh && state_is_running {
+        progress.updated_ts = heartbeat;
+        if progress.slurm_job_id.is_none() {
+            progress.slurm_job_id = status
+                .get("slurm_job_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+        }
+    }
+    let still_active = progress_fresh
+        || (state_is_running
+            && heartbeat
+                .is_some_and(|value| now_ts() - value <= training_heartbeat_stale_seconds()));
+    if !still_active
+        || progress.snapshot_id.is_empty()
+        || progress.status == "completed"
+        || progress.status == "failed"
+    {
+        return None;
+    }
+    progress.progress_ratio = progress.progress_ratio.clamp(0.0, 1.0);
+    progress.progress_per_hour = progress.progress_per_hour.max(0.0);
+    progress.eta_seconds = progress.eta_seconds.max(0.0);
+    progress.elapsed_seconds = progress.elapsed_seconds.max(0.0);
+    progress.started_ts = valid_unix_timestamp(progress.started_ts);
+    progress.updated_ts = valid_unix_timestamp(progress.updated_ts);
+    Some(progress)
 }
 
 fn training_heartbeat_stale_seconds() -> f64 {
