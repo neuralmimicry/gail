@@ -5617,6 +5617,27 @@ fn local_usage_telemetry(response: &ProviderInvocationResponse) -> LocalUsageTel
                     .map(|value| value as u32)
             });
     }
+    // Native llama.cpp exposes decode-only timing in its OpenAI-compatible
+    // `timings` object. Prefer it over end-to-end latency when present so the
+    // routing metric describes sustained generation throughput rather than
+    // queue wait, mirroring, and HTTP overhead. This is especially important
+    // for short readiness probes, which otherwise make a healthy GPU appear
+    // to produce only a few tokens per second.
+    if let Some(timings) = response.raw.as_ref().and_then(|raw| raw.get("timings")) {
+        if telemetry.inference_ms.is_none() {
+            telemetry.inference_ms = timings
+                .get("predicted_ms")
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .map(|value| value.round() as u64);
+        }
+        if telemetry.completion_tokens_estimate.is_none() {
+            telemetry.completion_tokens_estimate = timings
+                .get("predicted_n")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32);
+        }
+    }
     if telemetry.total_tokens_estimate.is_none() {
         telemetry.total_tokens_estimate = response.usage.as_ref().and_then(|usage| {
             usage.total.or_else(|| {
