@@ -1474,12 +1474,12 @@ impl GailService {
         // contract.  In particular, the assistant_requirements profile carries
         // a `json` speciality so structured requirements prompts can find the
         // right providers, but Refiner's normal assistant request is still
-        // conversational.  Only an explicit prompt/system instruction should
-        // activate the JSON quality gate.
+        // conversational.  An explicit prompt/system instruction, or an
+        // explicit `json` request category, activates the JSON quality gate.
         let expected_json = expected_json(
             &provider_request.messages,
             provider_request.system.as_deref(),
-        );
+        ) || request_category_expects_json(request.request_category.as_deref());
         let timeout_cap = self.candidate_timeout_cap(
             workload_class,
             &workflow,
@@ -5583,6 +5583,14 @@ fn expected_json(messages: &[crate::models::ChatMessage], system: Option<&str>) 
     .any(|hint| text.contains(hint))
 }
 
+fn request_category_expects_json(request_category: Option<&str>) -> bool {
+    request_category
+        .unwrap_or_default()
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .map(|part| part.trim().to_ascii_lowercase())
+        .any(|part| matches!(part.as_str(), "json" | "structured_data"))
+}
+
 fn try_parse_json(text: &str) -> Option<Value> {
     let payload = text.trim();
     if payload.is_empty() {
@@ -6766,6 +6774,15 @@ mod tests {
             content: MessageContent::Text("Return only valid JSON with keys: summary".to_string()),
         }];
         assert!(expected_json(&messages, None));
+    }
+
+    #[test]
+    fn explicit_json_request_category_keeps_json_contract() {
+        assert!(request_category_expects_json(Some("json")));
+        assert!(request_category_expects_json(Some("structured_data")));
+        assert!(!request_category_expects_json(Some(
+            "assistant_requirements"
+        )));
     }
 
     #[test]
