@@ -2907,14 +2907,39 @@ impl GailService {
         request: &CompletionRequest,
         candidates: &mut Vec<ProviderCandidate>,
     ) {
-        if !self.inner.config.comparative_validation.enabled || request.preferred_model.is_some() {
+        // Explicit model requests still need the same comparative admission
+        // and readiness gate as implicit routing when they name the trained
+        // model.  Otherwise the configured replica list can send the request
+        // to a stale/unavailable endpoint (for example SM00:18081) before it
+        // ever reaches the currently promoted target.  Keep the historical
+        // test/dev behaviour for requests without a durable active snapshot:
+        // there is no admission record to consult in that case.
+        let explicit_trained_request = request.preferred_model.as_deref().is_some_and(|model| {
+            candidates.iter().any(|candidate| {
+                is_trained_llamacpp_profile(&candidate.profile)
+                    && candidate
+                        .profile
+                        .model
+                        .as_deref()
+                        .is_some_and(|configured| configured.eq_ignore_ascii_case(model))
+            })
+        });
+        if !self.inner.config.comparative_validation.enabled
+            || (request.preferred_model.is_some() && !explicit_trained_request)
+        {
             return;
         }
         let Some(dsn) = self.inner.postgres_dsn.as_deref() else {
+            if explicit_trained_request {
+                return;
+            }
             candidates.retain(|candidate| !is_trained_llamacpp_profile(&candidate.profile));
             return;
         };
         let Some(model_version) = active_snapshot_id_for_routing(&self.inner.config) else {
+            if explicit_trained_request {
+                return;
+            }
             candidates.retain(|candidate| !is_trained_llamacpp_profile(&candidate.profile));
             return;
         };
