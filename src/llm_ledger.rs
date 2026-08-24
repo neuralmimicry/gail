@@ -24,6 +24,7 @@ use crate::config::GailConfig;
 const POSTGRES_PERSIST_FAILURE_BASE_BACKOFF_SECONDS: f64 = 5.0;
 const POSTGRES_PERSIST_FAILURE_MAX_BACKOFF_SECONDS: f64 = 180.0;
 const POSTGRES_PERSIST_TOO_MANY_CLIENTS_BACKOFF_SECONDS: f64 = 30.0;
+const POSTGRES_SCHEMA_INIT_TIMEOUT_SECONDS: u64 = 20;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -121,13 +122,23 @@ impl LlmLedger {
         }
         let path = PathBuf::from(config.storage.llm_ledger_path.clone());
         let postgres_dsn = config.storage.postgres_dsn.clone();
-        if let Some(dsn) = postgres_dsn.as_deref()
-            && let Err(error) = initialize_schema(dsn).await
-        {
-            tracing::warn!(
-                error = %error,
-                "failed to initialise Postgres LLM ledger schema; Gail will continue with file-only ledger"
-            );
+        if let Some(dsn) = postgres_dsn.as_deref() {
+            match timeout(
+                Duration::from_secs(POSTGRES_SCHEMA_INIT_TIMEOUT_SECONDS),
+                initialize_schema(dsn),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(
+                    error = %error,
+                    "failed to initialise Postgres LLM ledger schema; Gail will continue with file-only ledger"
+                ),
+                Err(_) => tracing::warn!(
+                    timeout_seconds = POSTGRES_SCHEMA_INIT_TIMEOUT_SECONDS,
+                    "timed out initialising Postgres LLM ledger schema; Gail will continue with file-only ledger"
+                ),
+            }
         }
         let queue_capacity = config.llm_ledger.queue_capacity;
         let queue_timeout = Duration::from_millis(config.llm_ledger.enqueue_timeout_ms);
