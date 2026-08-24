@@ -1104,7 +1104,15 @@ async fn run_training_pipeline(
                         Some(format!("active snapshot publication failed: {error}"));
                     pipeline_report["ollama_registration"] = json!("rolled_back");
                     pipeline_report["ollama_registration_error"] = json!(error.to_string());
-                } else if let Err(error) = health_check_promoted_model(trainer).await {
+                // Ollama is the registration/control plane. When a native
+                // llama.cpp serving target is configured, that runtime must
+                // prove application readiness. Requiring an Ollama
+                // generation can reject a valid promotion while a CPU-only
+                // registration host is still cold-loading the model, and it
+                // does not prove that the selected target can answer.
+                } else if serving_target.is_none()
+                    && let Err(error) = health_check_promoted_model(trainer).await
+                {
                     if let Err(rollback_error) =
                         rollback_ollama_alias(trainer, previous_snapshot.as_deref()).await
                     {
@@ -1526,7 +1534,7 @@ async fn health_check_serving_target(selection: &ServingTargetSelection) -> Resu
         .clamp(30, 900);
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
     loop {
-        if target_is_ready(&selection.target).await {
+        if target_application_is_ready(&selection.target).await {
             tracing::info!(
                 host = %selection.target.host_id,
                 vram_mb = selection.target.vram_mb,
@@ -1543,6 +1551,57 @@ async fn health_check_serving_target(selection: &ServingTargetSelection) -> Resu
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+/// Prove that a promoted llama.cpp target can complete a useful request, not
+/// merely that its HTTP process advertises a model. This mirrors the native
+/// provider readiness contract and avoids admitting a cold or broken
+/// application after model publication.
+async fn target_application_is_ready(target: &TrainerServingTarget) -> bool {
+    if !target_is_ready(target).await {
+        return false;
+    }
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| Client::new());
+    let url = format!("{}/chat/completions", target.endpoint.trim_end_matches('/'));
+    let payload = json!({
+        "model": target.model_alias.as_deref().unwrap_or(target.base_model.as_str()),
+        "messages": [
+            {"role": "system", "content": "You are a readiness probe. Return the exact token READY and nothing else."},
+            {"role": "user", "content": "READY"}
+        ],
+        "max_tokens": 256,
+        "temperature": 0.0,
+        "stream": false,
+        "chat_template_kwargs": {"enable_thinking": false}
+    });
+    let mut request = client.post(url).json(&payload);
+    if let Ok(token) = env::var("GAIL_LLAMACPP_API_KEY")
+        && !token.trim().is_empty()
+    {
+        request = request.bearer_auth(token);
+    }
+    let Ok(response) = request.send().await else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    let Ok(body) = response.json::<Value>().await else {
+        return false;
+    };
+    let content = body
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    content.trim().eq_ignore_ascii_case("READY")
 }
 
 async fn ensure_active_serving_target(trainer: &TrainerConfig, metrics_path: &str) -> Result<()> {
