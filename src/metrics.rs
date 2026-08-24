@@ -877,6 +877,15 @@ async fn discover_training_progress(snapshot_root: PathBuf) -> Vec<TrainingProgr
             && progress.status != "completed"
             && progress.status != "failed"
         {
+            // progress.json is written at optimizer-step boundaries.  A
+            // long CPU step can therefore leave its persisted elapsed value
+            // at the initial value for many minutes even while the Slurm
+            // heartbeat proves the task is alive.  Export wall-clock elapsed
+            // time from the task start so Grafana reflects the real run.
+            if let Some(started) = valid_unix_timestamp(progress.started_ts) {
+                progress.elapsed_seconds =
+                    progress.elapsed_seconds.max((now_ts() - started).max(0.0));
+            }
             progress.progress_ratio = progress.progress_ratio.clamp(0.0, 1.0);
             progress.progress_per_hour = progress.progress_per_hour.max(0.0);
             progress.eta_seconds = progress.eta_seconds.max(0.0);
@@ -929,6 +938,9 @@ async fn slurm_progress_from_status(
         || progress.status == "failed"
     {
         return None;
+    }
+    if let Some(started) = valid_unix_timestamp(progress.started_ts) {
+        progress.elapsed_seconds = progress.elapsed_seconds.max((now_ts() - started).max(0.0));
     }
     progress.progress_ratio = progress.progress_ratio.clamp(0.0, 1.0);
     progress.progress_per_hour = progress.progress_per_hour.max(0.0);
