@@ -157,6 +157,7 @@ static EXECUTION_PLAN_CACHE: Lazy<Mutex<HashMap<String, Value>>> =
 pub fn build_router(service: GailService) -> Router {
     Router::new()
         .route("/healthz", get(health))
+        .route("/readyz", get(readiness))
         .route("/v1/models", get(openai_models))
         .route("/v1/chat/completions", post(openai_chat_completions))
         .route("/v1/responses", post(openai_responses))
@@ -207,6 +208,21 @@ async fn health(
         let _ = service.authorize(&headers, "health")?;
     }
     Ok(Json(service.health().await))
+}
+
+async fn readiness(State(service): State<GailService>, headers: HeaderMap) -> Response {
+    if !service.can_access_health_unauthenticated()
+        && let Err(error) = service.authorize(&headers, "health")
+    {
+        return error.into_response();
+    }
+    let readiness = service.readiness().await;
+    let status = if readiness.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(readiness)).into_response()
 }
 
 async fn openai_models(State(service): State<GailService>, headers: HeaderMap) -> Response {
@@ -3924,6 +3940,41 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readiness_requires_auth_when_configured() {
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn readiness_returns_service_unavailable_without_configured_providers() {
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .header("authorization", "Bearer secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let (status, payload) = read_response_json(response).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(payload["ready"], false);
+        assert_eq!(payload["providers_checked"], 0);
+        assert_eq!(payload["reason"], "no_configured_providers");
     }
 
     #[tokio::test]

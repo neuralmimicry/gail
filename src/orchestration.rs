@@ -34,7 +34,7 @@ use crate::{
         AerEncodeResponse, AuthContext, CandidateInvocationSummary, CandidateSummary,
         CompletionRequest, CompletionResponse, CompletionTrace, HealthResponse,
         NeuromorphicAnalyzeRequest, NeuromorphicPredictRequest, NeuromorphicPredictResponse,
-        ProviderCompletionRequest, SelectionMode, SpecialistAnalysisResponse,
+        ProviderCompletionRequest, ReadinessResponse, SelectionMode, SpecialistAnalysisResponse,
         TranscriptionResponse,
     },
     nmc_telemetry::{NmcAgentSignal, NmcTelemetryClient},
@@ -782,6 +782,40 @@ impl GailService {
             service: "gail".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             build: crate::build_info::current(),
+        }
+    }
+
+    /// Probe configured providers concurrently and require at least one
+    /// application-ready provider. Provider adapters perform the appropriate
+    /// check for their protocol; native llama.cpp profiles include a bounded
+    /// completion probe, so `/readyz` cannot be satisfied by an HTTP process
+    /// that only advertises a model but cannot generate usable output.
+    pub async fn readiness(&self) -> ReadinessResponse {
+        let providers = self.provider_summaries(true).await;
+        let providers_checked = providers.len();
+        let providers_ready = providers
+            .iter()
+            .filter(|provider| provider["health"]["ok"].as_bool() == Some(true))
+            .count();
+        let ready =
+            self.inner.config.orchestration.enabled && providers_checked > 0 && providers_ready > 0;
+        let reason = if !self.inner.config.orchestration.enabled {
+            "orchestration_disabled".to_string()
+        } else if providers_checked == 0 {
+            "no_configured_providers".to_string()
+        } else if providers_ready == 0 {
+            "no_application_ready_providers".to_string()
+        } else {
+            "application_ready".to_string()
+        };
+        ReadinessResponse {
+            ready,
+            service: "gail".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            build: crate::build_info::current(),
+            providers_checked,
+            providers_ready,
+            reason,
         }
     }
 

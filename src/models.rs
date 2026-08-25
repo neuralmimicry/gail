@@ -518,6 +518,21 @@ pub struct HealthResponse {
     pub build: crate::build_info::BuildInfo,
 }
 
+/// Application-level readiness is deliberately separate from process health.
+/// A Gail process can be alive while every configured model endpoint is cold,
+/// unavailable, or returning unusable output.  Kubernetes and upstream
+/// callers use this response to avoid sending traffic into that state.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReadinessResponse {
+    pub ready: bool,
+    pub service: String,
+    pub version: String,
+    pub build: crate::build_info::BuildInfo,
+    pub providers_checked: usize,
+    pub providers_ready: usize,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuthContext {
     pub client_id: Option<String>,
