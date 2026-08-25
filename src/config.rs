@@ -251,6 +251,10 @@ pub struct TrainerConfig {
     pub model_alias: String,
     pub ollama_base_model: String,
     pub rotate_keep: usize,
+    /// Number of completed on-disk training snapshots to retain.  The active
+    /// snapshot and any in-progress snapshot are retained in addition to this
+    /// rolling history so a restart cannot delete the model it must resume.
+    pub snapshot_retention: usize,
     pub register_with_ollama: bool,
     pub ollama_cli: String,
     pub ollama_host: Option<String>,
@@ -451,6 +455,7 @@ impl Default for TrainerConfig {
             model_alias: "gail-inhouse:latest".to_string(),
             ollama_base_model: "qwen2.5-coder:1.5b".to_string(),
             rotate_keep: 6,
+            snapshot_retention: 6,
             register_with_ollama: true,
             ollama_cli: "ollama".to_string(),
             ollama_host: None,
@@ -784,6 +789,7 @@ impl GailConfig {
             normalize_optional_string(Some(self.trainer.ollama_base_model.as_str()))
                 .unwrap_or_else(|| "qwen2.5-coder:1.5b".to_string());
         self.trainer.rotate_keep = self.trainer.rotate_keep.clamp(1, 128);
+        self.trainer.snapshot_retention = self.trainer.snapshot_retention.clamp(2, 128);
         self.trainer.ollama_cli = normalize_optional_string(Some(self.trainer.ollama_cli.as_str()))
             .unwrap_or_else(|| "ollama".to_string());
         self.trainer.ollama_host = normalize_optional_url(

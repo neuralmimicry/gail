@@ -1189,6 +1189,16 @@ async fn run_training_pipeline(
                     );
                     pipeline_report["ollama_rotation_error"] = json!(error.to_string());
                 }
+                if registration_succeeded
+                    && let Err(error) = prune_training_snapshots(trainer, snapshot_id).await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        snapshot = snapshot_id,
+                        "trained snapshot registered, but old snapshot artifact pruning failed"
+                    );
+                    pipeline_report["snapshot_prune_error"] = json!(error.to_string());
+                }
             }
             Err(error) => {
                 if let Err(rollback_error) =
@@ -3295,6 +3305,76 @@ async fn rotate_ollama_models(trainer: &TrainerConfig) -> Result<()> {
         if let Err(error) = ollama_api_delete(&client, trainer, model.as_str()).await {
             tracing::warn!(model = %model, error = %error, "failed to delete stale Ollama snapshot model");
         }
+    }
+    Ok(())
+}
+
+/// Keep a bounded rollback history without ever removing an active or
+/// incomplete lifecycle.  Training snapshots contain large optimizer and
+/// checkpoint trees; retaining every historical directory eventually fills
+/// the shared PVC and makes an otherwise healthy Slurm run fail at promotion.
+async fn prune_training_snapshots(trainer: &TrainerConfig, current_snapshot: &str) -> Result<()> {
+    let root = PathBuf::from(&trainer.output_root).join("snapshots");
+    let mut entries = fs::read_dir(&root).await.map_err(|error| {
+        GailError::invalid_config(format!("failed to read training snapshot root: {error}"))
+    })?;
+    let active_snapshot = active_snapshot_id(trainer)?.unwrap_or_default();
+    let mut completed = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let file_type = entry.file_type().await?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let snapshot_id = entry.file_name().to_string_lossy().to_string();
+        if snapshot_id.is_empty()
+            || !snapshot_id
+                .chars()
+                .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_'))
+        {
+            continue;
+        }
+        let path = entry.path();
+        // A directory without a terminal report is still owned by the active
+        // Slurm/worker lifecycle and must remain resumable.
+        let has_terminal_report = fs::metadata(path.join("training_report.json"))
+            .await
+            .is_ok()
+            || fs::metadata(path.join("pipeline.json")).await.is_ok();
+        if has_terminal_report {
+            completed.push((snapshot_id, path));
+        }
+    }
+    completed.sort_by(|left, right| right.0.cmp(&left.0));
+    let mut keep = completed
+        .iter()
+        .take(trainer.snapshot_retention.max(2))
+        .map(|(snapshot_id, _)| snapshot_id.clone())
+        .collect::<HashSet<_>>();
+    if !current_snapshot.is_empty() {
+        keep.insert(current_snapshot.to_string());
+    }
+    if !active_snapshot.is_empty() {
+        keep.insert(active_snapshot);
+    }
+    let mut removed = 0usize;
+    for (snapshot_id, path) in completed {
+        if keep.contains(&snapshot_id) {
+            continue;
+        }
+        fs::remove_dir_all(&path).await.map_err(|error| {
+            GailError::invalid_config(format!(
+                "failed to remove stale training snapshot {}: {error}",
+                path.display()
+            ))
+        })?;
+        removed += 1;
+    }
+    if removed > 0 {
+        tracing::info!(
+            removed,
+            retained_completed = trainer.snapshot_retention.max(2),
+            "pruned stale completed training snapshot artifacts"
+        );
     }
     Ok(())
 }

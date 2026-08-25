@@ -240,6 +240,7 @@ trainer:
   model_alias: "gail-inhouse:latest"
   ollama_base_model: "${GAIL_OLLAMA_MODEL}"
   rotate_keep: 6
+  snapshot_retention: 6
   register_with_ollama: true
   ollama_cli: "ollama"
   ollama_host: "${OLLAMA_HOST}"
