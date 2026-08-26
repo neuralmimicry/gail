@@ -55,6 +55,7 @@ use crate::{
 };
 
 const DEFAULT_PROVIDER_HEALTH_TIMEOUT_SECONDS: u64 = 8;
+const DEFAULT_READINESS_CACHE_TTL_SECONDS: u64 = 15;
 
 /// Native llama.cpp readiness includes a real completion request.  A fixed
 /// four-second deadline is too short for the CPU-only 4B endpoint while it is
@@ -69,6 +70,24 @@ fn provider_health_timeout_seconds() -> u64 {
         DEFAULT_PROVIDER_HEALTH_TIMEOUT_SECONDS,
     )
     .clamp(4, 60)
+}
+
+/// `/readyz` is called by both Kubernetes and external monitors.  Provider
+/// readiness includes a real completion probe for native llama.cpp endpoints,
+/// so it must not run inline for every kubelet request.  Keep the cache short
+/// enough to notice a reboot or a failed model, while allowing the probe to
+/// complete without making the Gail Service flap between ready and not-ready.
+fn readiness_cache_ttl() -> Duration {
+    Duration::from_secs(
+        env_int_any(
+            &[
+                "GAIL_READINESS_CACHE_TTL_SECONDS",
+                "REFINER_AI_READINESS_CACHE_TTL_SECONDS",
+            ],
+            DEFAULT_READINESS_CACHE_TTL_SECONDS,
+        )
+        .clamp(1, 120),
+    )
 }
 
 fn completion_metric_source(response: &CompletionResponse) -> &'static str {
@@ -112,6 +131,24 @@ struct GailServiceInner {
     solver_pool: Arc<Semaphore>,
     trading_pool: Arc<Semaphore>,
     postgres_dsn: Option<String>,
+    readiness_cache: ReadinessCache,
+}
+
+#[derive(Default)]
+struct ReadinessCache {
+    state: Mutex<ReadinessCacheState>,
+    refresh_finished: Notify,
+}
+
+#[derive(Default)]
+struct ReadinessCacheState {
+    value: Option<CachedReadiness>,
+    refresh_in_progress: bool,
+}
+
+struct CachedReadiness {
+    response: ReadinessResponse,
+    refreshed_at: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -415,6 +452,7 @@ impl GailService {
                 solver_pool: solver_pool.clone(),
                 trading_pool: trading_pool.clone(),
                 postgres_dsn: postgres_dsn.clone(),
+                readiness_cache: ReadinessCache::default(),
             }),
         };
 
@@ -446,6 +484,7 @@ impl GailService {
                 solver_pool,
                 trading_pool,
                 postgres_dsn,
+                readiness_cache: ReadinessCache::default(),
             }),
         })
     }
@@ -785,12 +824,48 @@ impl GailService {
         }
     }
 
-    /// Probe configured providers concurrently and require at least one
-    /// application-ready provider. Provider adapters perform the appropriate
-    /// check for their protocol; native llama.cpp profiles include a bounded
-    /// completion probe, so `/readyz` cannot be satisfied by an HTTP process
-    /// that only advertises a model but cannot generate usable output.
+    /// Return application readiness without allowing slow provider probes to
+    /// make the Kubernetes Service flap. The first request after startup
+    /// performs a real provider probe. Once a result exists, callers receive
+    /// the bounded snapshot immediately; expiry starts one background refresh
+    /// and callers continue to receive the last result until that refresh
+    /// completes. Concurrent cold-start callers coalesce behind one probe.
     pub async fn readiness(&self) -> ReadinessResponse {
+        let ttl = readiness_cache_ttl();
+        loop {
+            let mut state = self.inner.readiness_cache.state.lock().await;
+            if let Some(cached) = state.value.as_ref() {
+                let response = cached.response.clone();
+                if cached.refreshed_at.elapsed() < ttl {
+                    return response;
+                }
+
+                if !state.refresh_in_progress {
+                    state.refresh_in_progress = true;
+                    let service = self.clone();
+                    tokio::spawn(async move {
+                        let _ = service.refresh_readiness().await;
+                    });
+                }
+                return response;
+            }
+
+            if state.refresh_in_progress {
+                // Register before releasing the mutex so a completion cannot
+                // notify between the state check and waiter registration.
+                let notified = self.inner.readiness_cache.refresh_finished.notified();
+                drop(state);
+                notified.await;
+                continue;
+            }
+
+            state.refresh_in_progress = true;
+            drop(state);
+            return self.refresh_readiness().await;
+        }
+    }
+
+    async fn refresh_readiness(&self) -> ReadinessResponse {
         let providers = self.provider_summaries(true).await;
         let providers_checked = providers.len();
         let providers_ready = providers
@@ -808,7 +883,7 @@ impl GailService {
         } else {
             "application_ready".to_string()
         };
-        ReadinessResponse {
+        let response = ReadinessResponse {
             ready,
             service: "gail".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -816,7 +891,17 @@ impl GailService {
             providers_checked,
             providers_ready,
             reason,
-        }
+        };
+
+        let mut state = self.inner.readiness_cache.state.lock().await;
+        state.value = Some(CachedReadiness {
+            response: response.clone(),
+            refreshed_at: Instant::now(),
+        });
+        state.refresh_in_progress = false;
+        drop(state);
+        self.inner.readiness_cache.refresh_finished.notify_waiters();
+        response
     }
 
     pub async fn provider_prometheus_metrics(&self) -> String {
@@ -6867,6 +6952,98 @@ mod tests {
             content: MessageContent::Text("Return only valid JSON with keys: summary".to_string()),
         }];
         assert!(expected_json(&messages, None));
+    }
+
+    #[tokio::test]
+    async fn readiness_performs_initial_probe_and_caches_all_unavailable_result() {
+        let service = GailService::new(GailConfig::default())
+            .await
+            .expect("service should initialise");
+
+        let first = service.readiness().await;
+        assert!(!first.ready);
+        assert_eq!(first.reason, "no_configured_providers");
+        {
+            let state = service.inner.readiness_cache.state.lock().await;
+            assert!(state.value.is_some());
+            assert!(!state.refresh_in_progress);
+        }
+
+        // A second call is served from the snapshot and does not invalidate
+        // the result merely because the endpoint is polled again.
+        assert_eq!(service.readiness().await.reason, first.reason);
+    }
+
+    #[tokio::test]
+    async fn readiness_coalesces_concurrent_cold_start_callers() {
+        let service = GailService::new(GailConfig::default())
+            .await
+            .expect("service should initialise");
+        let cache = &service.inner.readiness_cache;
+        {
+            let mut state = cache.state.lock().await;
+            state.refresh_in_progress = true;
+        }
+
+        let notify_service = service.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(10)).await;
+            let notify_cache = &notify_service.inner.readiness_cache;
+            let mut state = notify_cache.state.lock().await;
+            state.value = Some(CachedReadiness {
+                response: ReadinessResponse {
+                    ready: false,
+                    service: "gail".to_string(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    build: crate::build_info::current(),
+                    providers_checked: 1,
+                    providers_ready: 0,
+                    reason: "no_application_ready_providers".to_string(),
+                },
+                refreshed_at: Instant::now(),
+            });
+            state.refresh_in_progress = false;
+            drop(state);
+            notify_cache.refresh_finished.notify_waiters();
+        });
+
+        let response = service.readiness().await;
+        assert_eq!(response.reason, "no_application_ready_providers");
+    }
+
+    #[tokio::test]
+    async fn readiness_expiry_returns_snapshot_while_refreshing() {
+        let service = GailService::new(GailConfig::default())
+            .await
+            .expect("service should initialise");
+        let initial = service.readiness().await;
+        {
+            let mut state = service.inner.readiness_cache.state.lock().await;
+            state
+                .value
+                .as_mut()
+                .expect("initial readiness should be cached")
+                .refreshed_at = Instant::now() - Duration::from_secs(121);
+        }
+
+        // The expired value remains available while one refresh runs. This
+        // is what keeps kubelet from treating a slow probe as process failure.
+        let response = service.readiness().await;
+        assert_eq!(response.reason, initial.reason);
+        for _ in 0..20 {
+            if !service
+                .inner
+                .readiness_cache
+                .state
+                .lock()
+                .await
+                .refresh_in_progress
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("readiness refresh did not finish");
     }
 
     #[test]
