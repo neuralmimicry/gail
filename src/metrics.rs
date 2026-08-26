@@ -1945,6 +1945,19 @@ impl MetricsStore {
             .or_else(|| bucket.roles.get(&legacy_key))
             .filter(|stats| stats.total > 0)
             .unwrap_or(&bucket.stats);
+        // A request profile can contain failures before it contains a single
+        // successful completion (for example immediately after a node
+        // reboot).  Do not turn that sparse failure-only profile into the
+        // optimistic default service time below.  Keep its success/quality
+        // values for the useful-rate penalty, but borrow measured performance
+        // from the candidate-wide bucket until this profile has a successful
+        // sample.  Otherwise a known-slow endpoint can beat a known-fast
+        // endpoint simply because its profile has not succeeded yet.
+        let performance_stats = if stats.successes == 0 && bucket.stats.successes > 0 {
+            &bucket.stats
+        } else {
+            stats
+        };
         let samples = stats.total;
         let success_rate = if samples == 0 {
             0.75
@@ -1958,11 +1971,15 @@ impl MetricsStore {
         };
         let quality_factor = ((quality + 1.0) / 2.0).clamp(0.1, 1.0);
         let useful_rate = (success_rate * quality_factor).clamp(0.0, 1.0);
-        let queue_wait_ms = stats.ewma_queue_wait_ms.filter(|value| value.is_finite());
-        let inference_ms = stats.ewma_inference_ms.filter(|value| value.is_finite());
-        let observed_latency_ms = stats
+        let queue_wait_ms = performance_stats
+            .ewma_queue_wait_ms
+            .filter(|value| value.is_finite());
+        let inference_ms = performance_stats
+            .ewma_inference_ms
+            .filter(|value| value.is_finite());
+        let observed_latency_ms = performance_stats
             .successful_latency_ewma_ms
-            .or(stats.ewma_latency_ms)
+            .or(performance_stats.ewma_latency_ms)
             .filter(|value| value.is_finite());
         // Provider inference timing excludes the provider queue. When only
         // end-to-end latency is available, remove the learned queue portion
@@ -1970,10 +1987,10 @@ impl MetricsStore {
         let service_base_ms = inference_ms.or_else(|| {
             observed_latency_ms.map(|latency| (latency - queue_wait_ms.unwrap_or(0.0)).max(0.0))
         });
-        let generation_tokens_per_second = stats
+        let generation_tokens_per_second = performance_stats
             .generation_tokens_per_second_ewma
             .filter(|value| value.is_finite() && *value > 0.0);
-        let completion_tokens = stats
+        let completion_tokens = performance_stats
             .ewma_completion_tokens
             .filter(|value| value.is_finite() && *value > 0.0);
         let requested_output_tokens = requested_output_tokens.max(1) as f64;
@@ -3325,6 +3342,70 @@ mod tests {
         assert_eq!(estimate.queue_wait_ms, Some(200.0));
         assert!(estimate.useful_rate > 0.8);
         assert_eq!(estimate.service_time_ms, Some(1_600.0));
+    }
+
+    #[tokio::test]
+    async fn candidate_capacity_uses_global_performance_for_failure_only_profile() {
+        let path = tempfile::NamedTempFile::new()
+            .expect("temp file")
+            .into_temp_path();
+        let store = MetricsStore::new(path.to_path_buf()).await.expect("store");
+        let candidate = summary("openai", "qwen3.5:9b");
+
+        // The endpoint has a measured successful history, but this newly
+        // introduced request profile has only observed failures so far.
+        store
+            .record_result(
+                &candidate,
+                "project_solver",
+                "planner",
+                true,
+                Some(1_200),
+                Some(LocalUsageTelemetry {
+                    queue_wait_ms: Some(200),
+                    inference_ms: Some(1_000),
+                    completion_tokens_estimate: Some(100),
+                    ..LocalUsageTelemetry::default()
+                }),
+                1.0,
+                None,
+            )
+            .await
+            .expect("record global success");
+        store
+            .record_result_with_context(
+                &candidate,
+                "refiner",
+                "code",
+                "project_solver",
+                "general",
+                None,
+                false,
+                Some(30_000),
+                None,
+                -1.0,
+                Some("profile-only failure"),
+            )
+            .await
+            .expect("record profile failure");
+
+        let estimate = store
+            .candidate_capacity_estimate_for_context(
+                &candidate.candidate_id,
+                "refiner",
+                "code",
+                "project_solver",
+                "general",
+                None,
+                200,
+            )
+            .await;
+
+        assert_eq!(estimate.samples, 1);
+        assert_eq!(estimate.generation_tokens_per_second, Some(100.0));
+        assert_eq!(estimate.queue_wait_ms, Some(200.0));
+        assert_eq!(estimate.service_time_ms, Some(2_000.0));
+        assert!(estimate.useful_rate < 0.1 + f64::EPSILON);
     }
 
     #[tokio::test]
