@@ -487,6 +487,15 @@ async fn active_training_snapshot(
         }
         Err(error) => return Err(error.into()),
     };
+    // A previous worker version could leave an empty marker behind if it was
+    // interrupted during an atomic write.  An empty marker cannot describe an
+    // active lifecycle, so remove it and continue as if no run were active.
+    // This also prevents a harmless stale file from generating a warning on
+    // every trainer poll.
+    if raw.trim().is_empty() {
+        remove_active_training_marker(trainer).await?;
+        return Ok(ActiveTrainingSnapshot::None);
+    }
     let value: Value = serde_json::from_str(&raw).map_err(|error| {
         GailError::invalid_config(format!("invalid active training marker: {error}"))
     })?;
@@ -4042,6 +4051,23 @@ mod tests {
             after["heartbeat_ts"].as_f64().unwrap_or(0.0)
                 >= before["heartbeat_ts"].as_f64().unwrap_or(0.0)
         );
+    }
+
+    #[tokio::test]
+    async fn empty_active_training_marker_is_removed_and_treated_as_none() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let trainer = TrainerConfig {
+            output_root: temporary.path().display().to_string(),
+            ..TrainerConfig::default()
+        };
+        let marker = active_training_marker_path(&trainer);
+        std::fs::write(&marker, b"\n").expect("write empty marker");
+
+        assert!(matches!(
+            active_training_snapshot(&trainer, "postgres://unused").await,
+            Ok(ActiveTrainingSnapshot::None)
+        ));
+        assert!(!marker.exists());
     }
 
     #[tokio::test]
