@@ -1681,7 +1681,46 @@ impl GailService {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            let remaining = unattempted
+            // Do not spend a request's entire timeout budget on a candidate
+            // whose queue-adjusted useful ETA is already beyond that budget.
+            // Keep the old fallback behaviour when every candidate is over
+            // budget, since a degraded response is preferable to rejecting a
+            // request with no available provider.  This is especially
+            // important for solver JSON requests: a single saturated native
+            // llama.cpp host must not block all subsequent fallback waves.
+            let budgeted_unattempted = timeout_cap
+                .map(|seconds| {
+                    let budget_ms = seconds.saturating_mul(1_000) as f64;
+                    unattempted
+                        .iter()
+                        .filter(|item| {
+                            dispatch_estimates
+                                .get(&item.candidate.candidate_id())
+                                .map(|estimate| {
+                                    estimate.estimated_useful_completion_ms <= budget_ms
+                                })
+                                .unwrap_or(true)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| unattempted.clone());
+            let selection_pool = if budgeted_unattempted.is_empty() {
+                unattempted.clone()
+            } else {
+                if budgeted_unattempted.len() < unattempted.len() {
+                    info!(
+                        request_id = %request_id,
+                        workflow = %workflow,
+                        role = %role,
+                        timeout_cap_seconds = ?timeout_cap,
+                        skipped_candidates = unattempted.len() - budgeted_unattempted.len(),
+                        "excluding candidates whose useful dispatch ETA exceeds the request timeout"
+                    );
+                }
+                budgeted_unattempted
+            };
+            let remaining = selection_pool
                 .iter()
                 .filter(|item| !ranked_candidate_is_in_provider_backoff(item))
                 .cloned()
