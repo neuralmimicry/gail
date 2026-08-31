@@ -2987,8 +2987,15 @@ impl GailService {
                 has_usable_value(request.preferred_api_key.as_deref())
                     || has_usable_value(request.preferred_access_token.as_deref())
                     || has_usable_value(request.base_url.as_deref());
-            let skip_implicit_configured_request_candidate = include_configured
-                && !has_request_endpoint_override
+            let configured_pool_requested =
+                should_include_configured_candidates(include_configured, request, true);
+            let skip_implicit_configured_request_candidate = configured_pool_requested
+                // Credentials supplied by an OpenAI-compatible client are
+                // often generic gateway credentials (Refiner does this for
+                // local models).  An explicit base URL is the actual
+                // endpoint override; keep the configured model contract when
+                // only those credentials are present.
+                && !has_usable_value(request.base_url.as_deref())
                 && configured_model_matches_request(
                     &self.inner.config,
                     provider,
