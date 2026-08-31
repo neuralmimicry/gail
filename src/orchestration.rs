@@ -2987,6 +2987,13 @@ impl GailService {
                 has_usable_value(request.preferred_api_key.as_deref())
                     || has_usable_value(request.preferred_access_token.as_deref())
                     || has_usable_value(request.base_url.as_deref());
+            let skip_implicit_configured_request_candidate = include_configured
+                && !has_request_endpoint_override
+                && configured_model_matches_request(
+                    &self.inner.config,
+                    provider,
+                    request.preferred_model.as_deref(),
+                );
             let skip_implicit_ollama_request_candidate = include_configured
                 && normalized_provider == "ollama"
                 && !has_request_endpoint_override;
@@ -2995,7 +3002,10 @@ impl GailService {
                 provider,
                 request.preferred_model.as_deref(),
             );
-            if request_model_allowed && !skip_implicit_ollama_request_candidate {
+            if request_model_allowed
+                && !skip_implicit_ollama_request_candidate
+                && !skip_implicit_configured_request_candidate
+            {
                 candidates.push(self.request_candidate(
                     provider,
                     request.preferred_model.clone(),
@@ -3018,7 +3028,8 @@ impl GailService {
                 tracing::debug!(
                     provider = %provider,
                     requested_model = ?request.preferred_model,
-                    "skipping implicit Ollama request model candidate in configured-pool mode"
+                    configured_match = skip_implicit_configured_request_candidate,
+                    "skipping implicit request model candidate in configured-pool mode"
                 );
             }
         }
@@ -6227,6 +6238,27 @@ fn request_candidate_model_allowed(
     )
 }
 
+fn configured_model_matches_request(
+    config: &GailConfig,
+    provider: &str,
+    model: Option<&str>,
+) -> bool {
+    let Some(requested_model) = model
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"))
+    else {
+        return false;
+    };
+    let normalized_provider = normalize_provider_type(provider);
+    config.providers.iter().any(|profile| {
+        normalize_provider_type(profile.provider_type.as_str()) == normalized_provider
+            && profile
+                .model
+                .as_deref()
+                .is_some_and(|configured| configured.trim().eq_ignore_ascii_case(requested_model))
+    })
+}
+
 fn request_candidate_model_allowed_with_policy(
     config: &GailConfig,
     provider: &str,
@@ -8510,6 +8542,36 @@ Return only a JSON data instance that satisfies this schema:
             "openai",
             Some("gpt-5.3-codex"),
             false,
+        ));
+    }
+
+    #[test]
+    fn configured_model_matches_request_for_exact_provider_and_model() {
+        let config = GailConfig {
+            providers: vec![ProviderProfile {
+                name: "trained".to_string(),
+                provider_type: "openai".to_string(),
+                model: Some("gail-inhouse:latest".to_string()),
+                base_url: Some("http://sm00:18081/v1".to_string()),
+                ..ProviderProfile::default()
+            }],
+            ..GailConfig::default()
+        };
+
+        assert!(configured_model_matches_request(
+            &config,
+            "OPENAI",
+            Some("GAIL-INHOUSE:LATEST"),
+        ));
+        assert!(!configured_model_matches_request(
+            &config,
+            "openai",
+            Some("other-model"),
+        ));
+        assert!(!configured_model_matches_request(
+            &config,
+            "ollama",
+            Some("gail-inhouse:latest"),
         ));
     }
 
