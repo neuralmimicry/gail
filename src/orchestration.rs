@@ -1705,7 +1705,23 @@ impl GailService {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_else(|| unattempted.clone());
-            let selection_pool = if budgeted_unattempted.is_empty() {
+            let all_candidates_over_budget =
+                timeout_cap.is_some() && !unattempted.is_empty() && budgeted_unattempted.is_empty();
+            let selection_pool = if all_candidates_over_budget {
+                // Learned latency can be stale or contaminated by a transient
+                // host failure. Once every remaining estimate exceeds the
+                // request budget, do not let the ETA ordering select a
+                // pathological outlier as the next blocking fallback. Use the
+                // normal health/throughput ranking for one bounded probe; the
+                // invocation timeout still protects the request if the pool
+                // is genuinely degraded.
+                info!(
+                    request_id = %request_id,
+                    workflow = %workflow,
+                    role = %role,
+                    timeout_cap_seconds = ?timeout_cap,
+                    "all remaining candidates exceed the useful dispatch budget; using a ranked bounded fallback"
+                );
                 unattempted.clone()
             } else {
                 if budgeted_unattempted.len() < unattempted.len() {
@@ -1836,6 +1852,8 @@ impl GailService {
             }
             let selected = if let Some(forced) = forced_selected {
                 forced
+            } else if all_candidates_over_budget {
+                select_ranked_candidates(remaining, wave_size.min(1), deduplicate_wave_models)
             } else if selection_mode == SelectionMode::RoundRobin {
                 self.select_round_robin_candidates(
                     remaining,
