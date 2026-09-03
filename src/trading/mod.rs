@@ -356,6 +356,49 @@ async fn run_evaluation_loop(
     } else {
         None
     };
+
+    // Keep the OctoBot history catalog on a wall-clock schedule independent
+    // of the advisory/evaluation loop.  A slow provider round must not defer
+    // the refresh indefinitely: native replay reads Gail's datalake, while
+    // the catalog drives compatibility replay selection and stale-history
+    // collection requests.
+    let _backtest_catalog_refresh_task = if config.backtesting_enabled {
+        let refresh_config = config.clone();
+        let refresh_engine = BacktestEngine::new(
+            OctobotClient::new(
+                &config.octobot_base_url,
+                config.octobot_password.as_deref(),
+                config.octobot_timeout_seconds,
+            ),
+            config.backtest_profitability_threshold,
+        );
+        Some(tokio::spawn(async move {
+            let mut refresh_tick = interval(Duration::from_secs(
+                refresh_config.backtest_data_catalog_refresh_seconds,
+            ));
+            loop {
+                refresh_tick.tick().await;
+                match refresh_engine.refresh_data_catalog(&refresh_config).await {
+                    Ok(file_count) => {
+                        info!(
+                            file_count,
+                            refresh_seconds = refresh_config.backtest_data_catalog_refresh_seconds,
+                            "trading: scheduled backtest data catalog refreshed"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            refresh_seconds = refresh_config.backtest_data_catalog_refresh_seconds,
+                            "trading: scheduled backtest data catalog refresh failed"
+                        );
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
     let mut last_backtest_ts: f64 = 0.0;
     let mut last_discovery_ts: f64 = 0.0;
     let mut last_pruning_ts: f64 = 0.0;
