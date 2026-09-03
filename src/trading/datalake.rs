@@ -528,14 +528,13 @@ impl MarketDataLake {
             }
         }
 
-        let loaded = dedupe_samples(loaded);
+        let loaded = dedupe_samples_by_symbol(loaded);
         if !loaded.is_empty() {
             self.merge_samples_into_cache(&loaded).await;
             debug!(
-                exchange = %exchange,
-                symbol = %symbol,
+                symbols = targets.len(),
                 samples = loaded.len(),
-                "trading: loaded market datalake history for symbol"
+                "trading: loaded market datalake history for symbols"
             );
         }
     }
@@ -950,6 +949,37 @@ fn dedupe_samples(samples: Vec<MarketSample>) -> Vec<MarketSample> {
     deduped.sort_by(|left, right| {
         left.captured_bucket
             .cmp(&right.captured_bucket)
+            .then_with(|| {
+                left.captured_ts
+                    .partial_cmp(&right.captured_ts)
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
+    deduped
+}
+
+fn dedupe_samples_by_symbol(samples: Vec<MarketSample>) -> Vec<MarketSample> {
+    if samples.is_empty() {
+        return samples;
+    }
+    let mut by_symbol_bucket: HashMap<(String, i64), MarketSample> = HashMap::new();
+    for sample in samples {
+        let key = (
+            market_feature_key(&sample.exchange, &sample.symbol),
+            sample.captured_bucket,
+        );
+        match by_symbol_bucket.get(&key) {
+            Some(previous) if previous.captured_ts >= sample.captured_ts => {}
+            _ => {
+                by_symbol_bucket.insert(key, sample);
+            }
+        }
+    }
+    let mut deduped = by_symbol_bucket.into_values().collect::<Vec<_>>();
+    deduped.sort_by(|left, right| {
+        market_feature_key(&left.exchange, &left.symbol)
+            .cmp(&market_feature_key(&right.exchange, &right.symbol))
+            .then_with(|| left.captured_bucket.cmp(&right.captured_bucket))
             .then_with(|| {
                 left.captured_ts
                     .partial_cmp(&right.captured_ts)
