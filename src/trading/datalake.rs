@@ -31,6 +31,11 @@ use super::{
 
 const POSTGRES_PRUNE_INTERVAL_SECONDS: f64 = 3_600.0;
 const MARKET_DATALAKE_SCHEMA_VERSION: u32 = 2;
+// Postgres is an optional mirror for the append-only file lake.  DDL and
+// metadata queries can be held behind an unrelated long-running backup/COPY;
+// they must never prevent Gail from starting its trading scheduler.
+const MARKET_DATALAKE_POSTGRES_STARTUP_TIMEOUT_SECONDS: u64 = 20;
+const MARKET_DATALAKE_POSTGRES_OPERATION_TIMEOUT_SECONDS: u64 = 30;
 
 fn now_ts() -> f64 {
     SystemTime::now()
@@ -228,16 +233,48 @@ impl MarketDataLake {
             trading_config,
             postgres_dsn,
         ));
-        if let Some(dsn) = config.postgres_dsn.as_deref()
-            && let Err(error) = initialize_postgres_schema(dsn).await
-        {
-            warn!(
-                error = %error,
-                "trading: market datalake Postgres schema init failed; continuing with file persistence"
-            );
+        if let Some(dsn) = config.postgres_dsn.as_deref() {
+            match tokio::time::timeout(
+                Duration::from_secs(MARKET_DATALAKE_POSTGRES_STARTUP_TIMEOUT_SECONDS),
+                initialize_postgres_schema(dsn),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    warn!(
+                        error = %error,
+                        "trading: market datalake Postgres schema init failed; continuing with file persistence"
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        timeout_seconds = MARKET_DATALAKE_POSTGRES_STARTUP_TIMEOUT_SECONDS,
+                        "trading: market datalake Postgres schema init timed out; continuing with file persistence"
+                    );
+                }
+            }
         }
         let current_build_id = current_build_id();
-        let metadata = load_metadata(&config).await.unwrap_or_default();
+        let metadata = if config.postgres_dsn.is_some() {
+            match tokio::time::timeout(
+                Duration::from_secs(MARKET_DATALAKE_POSTGRES_STARTUP_TIMEOUT_SECONDS),
+                load_metadata(&config),
+            )
+            .await
+            {
+                Ok(metadata) => metadata.unwrap_or_default(),
+                Err(_) => {
+                    warn!(
+                        timeout_seconds = MARKET_DATALAKE_POSTGRES_STARTUP_TIMEOUT_SECONDS,
+                        "trading: market datalake Postgres metadata load timed out; using file metadata"
+                    );
+                    load_metadata_from_file(&config).await.unwrap_or_default()
+                }
+            }
+        } else {
+            load_metadata(&config).await.unwrap_or_default()
+        };
         let bootstrap_reason = compute_bootstrap_reason(&metadata, &current_build_id);
         Self {
             config,
@@ -501,14 +538,27 @@ impl MarketDataLake {
 
         if let Some(dsn) = self.config.postgres_dsn.as_deref() {
             for (exchange, symbol) in targets.values() {
-                match load_samples_from_postgres(dsn, exchange, symbol, since_ts).await {
-                    Ok(samples) => loaded.extend(samples),
-                    Err(error) => {
+                match tokio::time::timeout(
+                    Duration::from_secs(MARKET_DATALAKE_POSTGRES_OPERATION_TIMEOUT_SECONDS),
+                    load_samples_from_postgres(dsn, exchange, symbol, since_ts),
+                )
+                .await
+                {
+                    Ok(Ok(samples)) => loaded.extend(samples),
+                    Ok(Err(error)) => {
                         warn!(
                             error = %error,
                             exchange = %exchange,
                             symbol = %symbol,
                             "trading: failed to load market history from Postgres"
+                        );
+                    }
+                    Err(_) => {
+                        warn!(
+                            exchange = %exchange,
+                            symbol = %symbol,
+                            timeout_seconds = MARKET_DATALAKE_POSTGRES_OPERATION_TIMEOUT_SECONDS,
+                            "trading: timed out loading market history from Postgres; using file lake"
                         );
                     }
                 }
@@ -599,11 +649,25 @@ impl MarketDataLake {
         if !should_prune {
             return;
         }
-        if let Err(error) = prune_postgres_retention(dsn, self.config.retention_days).await {
-            warn!(
-                error = %error,
-                "trading: failed to prune old market datalake rows from Postgres"
-            );
+        match tokio::time::timeout(
+            Duration::from_secs(MARKET_DATALAKE_POSTGRES_OPERATION_TIMEOUT_SECONDS),
+            prune_postgres_retention(dsn, self.config.retention_days),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!(
+                    error = %error,
+                    "trading: failed to prune old market datalake rows from Postgres"
+                );
+            }
+            Err(_) => {
+                warn!(
+                    timeout_seconds = MARKET_DATALAKE_POSTGRES_OPERATION_TIMEOUT_SECONDS,
+                    "trading: timed out pruning old market datalake rows from Postgres"
+                );
+            }
         }
     }
 }
@@ -1237,6 +1301,10 @@ async fn load_metadata(config: &MarketDataLakeConfig) -> Option<MarketDataLakeMe
         }
     }
 
+    load_metadata_from_file(config).await
+}
+
+async fn load_metadata_from_file(config: &MarketDataLakeConfig) -> Option<MarketDataLakeMetadata> {
     match fs::read_to_string(&config.metadata_path).await {
         Ok(raw) => serde_json::from_str::<MarketDataLakeMetadata>(&raw).ok(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -1257,7 +1325,17 @@ async fn persist_metadata(
 ) -> Result<(), String> {
     persist_metadata_file(&config.metadata_path, metadata).await?;
     if let Some(dsn) = config.postgres_dsn.as_deref() {
-        persist_metadata_postgres(dsn, metadata).await?;
+        tokio::time::timeout(
+            Duration::from_secs(MARKET_DATALAKE_POSTGRES_OPERATION_TIMEOUT_SECONDS),
+            persist_metadata_postgres(dsn, metadata),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "market datalake Postgres metadata persistence exceeded {} second deadline",
+                MARKET_DATALAKE_POSTGRES_OPERATION_TIMEOUT_SECONDS
+            )
+        })??;
     }
     Ok(())
 }
