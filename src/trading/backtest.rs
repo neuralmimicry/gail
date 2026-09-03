@@ -267,7 +267,52 @@ impl BacktestEngine {
     /// Keep this operation separate from `run_with_config` so native replay
     /// does not accidentally start a second backtest.
     pub async fn refresh_data_catalog(&self, config: &TradingConfig) -> Result<usize, String> {
-        let selected = self.resolve_backtest_files(config).await?;
+        if !config.backtest_data_files.is_empty() {
+            return Ok(config.backtest_data_files.len());
+        }
+
+        // A scheduled refresh must actively ask OctoBot for its current file
+        // list.  Going through `resolve_backtest_files` alone can treat the
+        // catalog as fresh based on its timestamp while OctoBot has finished
+        // writing newer collector files since the previous discovery.  That
+        // leaves the next compatibility replay pinned to the old file set.
+        let catalog_path = resolve_backtest_catalog_path(config);
+        let mut catalog = load_backtest_data_catalog(&catalog_path).await;
+        let available = self.octobot.list_backtest_data_files().await?;
+        let available = dedupe_backtest_data_files(available);
+        let selected = select_backtest_data_files(available.clone(), &config.backtest_symbols);
+
+        if !available.is_empty() {
+            catalog.files = available;
+            catalog.updated_at = now_ts();
+            persist_backtest_data_catalog(&catalog_path, &catalog).await;
+        }
+
+        if selected.is_empty() {
+            // Preserve the existing bootstrap/collection behaviour when
+            // OctoBot has no files yet (or when the endpoint returned an
+            // empty list during startup).
+            return Ok(self.resolve_backtest_files(config).await?.len());
+        }
+
+        if config.backtest_data_collection_enabled {
+            let now = now_ts();
+            let selected_data_age =
+                selected_backtest_data_age_seconds(&selected, catalog.updated_at, now);
+            let data_is_stale = selected_data_age
+                .map(|age| age >= config.backtest_data_collection_cooldown_seconds as f64)
+                .unwrap_or(true);
+            if data_is_stale {
+                // Keep the collector request on the same cooldown ledger as
+                // compatibility replays.  The refresh remains successful if
+                // the collector is already running or cooling down; its
+                // output will be picked up on the next scheduled discovery.
+                let _ = self
+                    .maybe_request_data_collection(config, &catalog_path, &mut catalog, now)
+                    .await;
+            }
+        }
+
         Ok(selected.len())
     }
 
