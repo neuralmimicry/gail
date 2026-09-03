@@ -472,8 +472,11 @@ ARG BUILD_JOBS=auto
 ARG CARGO_BUILD_JOBS=auto
 ARG CMAKE_BUILD_PARALLEL_LEVEL=auto
 
+# Keep the release selector separate from the build provenance label.  A
+# source build commonly uses a commit-derived BUILD_VERSION, which is not a
+# Cargo SemVer and must not be fed to set-release-version.sh.
 ENV DEBIAN_FRONTEND=noninteractive \
-    GAIL_VERSION=${BUILD_VERSION} \
+    GAIL_VERSION=${GAIL_VERSION} \
     GAIL_GIT_COMMIT=${VCS_REF} \
     GAIL_SOURCE_TREE=${SOURCE_TREE} \
     GAIL_SOURCE_DIRTY=${SOURCE_DIRTY} \

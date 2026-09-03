@@ -10,7 +10,7 @@ use std::{
     env,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rayon::prelude::*;
@@ -373,14 +373,31 @@ impl MarketDataLake {
         }
 
         if let Some(dsn) = self.config.postgres_dsn.as_deref() {
-            if let Err(error) = persist_samples_postgres(dsn, &samples).await {
-                warn!(
-                    error = %error,
-                    "trading: failed to persist market datalake records to Postgres"
-                );
-                summary.postgres_error = Some(error);
-            } else {
-                self.maybe_prune_postgres().await;
+            // The append-only file is the durable bootstrap source.  Keep a
+            // slow/unavailable Postgres mirror from holding the bootstrap
+            // past its deadline and leaving the refresh marker failed.
+            match tokio::time::timeout(
+                Duration::from_secs(30),
+                persist_samples_postgres(dsn, &samples),
+            )
+            .await
+            {
+                Ok(Ok(())) => self.maybe_prune_postgres().await,
+                Ok(Err(error)) => {
+                    warn!(
+                        error = %error,
+                        "trading: failed to persist market datalake records to Postgres"
+                    );
+                    summary.postgres_error = Some(error);
+                }
+                Err(_) => {
+                    let error = format!(
+                        "market datalake Postgres persistence exceeded 30 second deadline for {} samples",
+                        samples.len()
+                    );
+                    warn!(error = %error);
+                    summary.postgres_error = Some(error);
+                }
             }
         }
 
@@ -391,16 +408,26 @@ impl MarketDataLake {
         &self,
         snapshots: &[MarketSnapshot],
     ) -> HashMap<String, MarketHistoricalFeatures> {
+        let symbols = snapshots
+            .iter()
+            .map(|snapshot| (snapshot.exchange.clone(), snapshot.symbol.clone()))
+            .collect::<Vec<_>>();
+        self.ensure_symbols_loaded(&symbols).await;
+
         let mut out = HashMap::new();
         for snapshot in snapshots {
-            if let Some(features) = self
-                .features_for_symbol(&snapshot.exchange, &snapshot.symbol)
-                .await
+            let key = market_feature_key(&snapshot.exchange, &snapshot.symbol);
+            let samples = {
+                let state = self.state.lock().await;
+                state
+                    .samples_by_symbol
+                    .get(&key)
+                    .map(|items| items.iter().cloned().collect::<Vec<_>>())
+            };
+            if let Some(samples) = samples
+                && let Some(features) = compute_features(&samples, now_ts(), &self.config)
             {
-                out.insert(
-                    market_feature_key(&snapshot.exchange, &snapshot.symbol),
-                    features,
-                );
+                out.insert(key, features);
             }
         }
         out
@@ -439,7 +466,8 @@ impl MarketDataLake {
         exchange: &str,
         symbol: &str,
     ) -> Option<MarketHistoricalFeatures> {
-        self.ensure_symbol_loaded(exchange, symbol).await;
+        self.ensure_symbols_loaded(&[(exchange.to_string(), symbol.to_string())])
+            .await;
         let key = market_feature_key(exchange, symbol);
         let samples = {
             let state = self.state.lock().await;
@@ -451,13 +479,20 @@ impl MarketDataLake {
         compute_features(&samples, now_ts(), &self.config)
     }
 
-    async fn ensure_symbol_loaded(&self, exchange: &str, symbol: &str) {
-        let key = market_feature_key(exchange, symbol);
-        let should_load = {
+    async fn ensure_symbols_loaded(&self, symbols: &[(String, String)]) {
+        let mut targets = HashMap::<String, (String, String)>::new();
+        {
             let mut state = self.state.lock().await;
-            state.loaded_symbols.insert(key.clone())
-        };
-        if !should_load {
+            for (exchange, symbol) in symbols {
+                let exchange = normalize_exchange(exchange);
+                let symbol = normalize_symbol(symbol);
+                let key = market_feature_key(&exchange, &symbol);
+                if state.loaded_symbols.insert(key.clone()) {
+                    targets.insert(key, (exchange, symbol));
+                }
+            }
+        }
+        if targets.is_empty() {
             return;
         }
 
@@ -465,27 +500,29 @@ impl MarketDataLake {
         let mut loaded = Vec::new();
 
         if let Some(dsn) = self.config.postgres_dsn.as_deref() {
-            match load_samples_from_postgres(dsn, exchange, symbol, since_ts).await {
-                Ok(samples) => loaded.extend(samples),
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        exchange = %exchange,
-                        symbol = %symbol,
-                        "trading: failed to load market history from Postgres"
-                    );
+            for (exchange, symbol) in targets.values() {
+                match load_samples_from_postgres(dsn, exchange, symbol, since_ts).await {
+                    Ok(samples) => loaded.extend(samples),
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            exchange = %exchange,
+                            symbol = %symbol,
+                            "trading: failed to load market history from Postgres"
+                        );
+                    }
                 }
             }
         }
 
-        match load_samples_from_file(&self.config.file_path, exchange, symbol, since_ts).await {
+        let target_keys = targets.keys().cloned().collect::<HashSet<_>>();
+        match load_samples_from_file(&self.config.file_path, &target_keys, since_ts).await {
             Ok(samples) => loaded.extend(samples),
             Err(error) => {
                 warn!(
                     error = %error,
                     path = %self.config.file_path.display(),
-                    exchange = %exchange,
-                    symbol = %symbol,
+                    symbols = target_keys.len(),
                     "trading: failed to load market history from file"
                 );
             }
@@ -857,8 +894,7 @@ async fn append_samples_to_file(path: &Path, samples: &[MarketSample]) -> Result
 
 async fn load_samples_from_file(
     path: &Path,
-    exchange: &str,
-    symbol: &str,
+    target_keys: &HashSet<String>,
     since_ts: f64,
 ) -> Result<Vec<MarketSample>, String> {
     let file = match fs::File::open(path).await {
@@ -871,7 +907,6 @@ async fn load_samples_from_file(
             ));
         }
     };
-    let target_key = market_feature_key(exchange, symbol);
     let mut reader = BufReader::new(file).lines();
     let mut loaded = Vec::new();
     while let Some(line) = reader.next_line().await.map_err(|error| {
@@ -891,7 +926,7 @@ async fn load_samples_from_file(
         if sample.captured_ts + f64::EPSILON < since_ts {
             continue;
         }
-        if market_feature_key(&sample.exchange, &sample.symbol) == target_key {
+        if target_keys.contains(&market_feature_key(&sample.exchange, &sample.symbol)) {
             loaded.push(sample);
         }
     }
@@ -1147,6 +1182,13 @@ fn compute_bootstrap_reason(
     }
     if metadata.last_bootstrap_status.as_deref() == Some("failed") {
         return Some("retry_failed_bootstrap".to_string());
+    }
+    // A process restart can interrupt a bootstrap after it has persisted the
+    // `running` marker.  There is no live task associated with that marker
+    // after restart, so treat it as retryable instead of leaving the lake
+    // permanently stale.
+    if metadata.last_bootstrap_status.as_deref() == Some("running") {
+        return Some("retry_interrupted_bootstrap".to_string());
     }
     None
 }

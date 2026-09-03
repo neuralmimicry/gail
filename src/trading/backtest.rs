@@ -258,6 +258,19 @@ impl BacktestEngine {
         }
     }
 
+    /// Refresh the persisted OctoBot history catalog for scheduled runs.
+    ///
+    /// Gail's native replay uses the market datalake rather than OctoBot's
+    /// compatibility backtest runner, but the OctoBot history catalog still
+    /// needs to be maintained: it is the source used for compatibility
+    /// replays and the trigger for requesting missing/stale collector data.
+    /// Keep this operation separate from `run_with_config` so native replay
+    /// does not accidentally start a second backtest.
+    pub async fn refresh_data_catalog(&self, config: &TradingConfig) -> Result<usize, String> {
+        let selected = self.resolve_backtest_files(config).await?;
+        Ok(selected.len())
+    }
+
     /// Run a complete backtesting cycle using explicit parameters.
     pub async fn run(&self, request: &BacktestStartRequest) -> BacktestSummary {
         debug!(

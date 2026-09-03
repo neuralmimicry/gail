@@ -77,6 +77,10 @@ fn now_ts() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Keep bootstrap latency bounded without serialising every symbol/time-frame
+/// request behind the slowest OctoBot dashboard response.
+const MARKET_DATALAKE_BOOTSTRAP_MAX_PARALLEL_HISTORY_REQUESTS: usize = 8;
+
 fn filter_fresh_market_snapshots(
     snapshots: Vec<MarketSnapshot>,
     ttl_seconds: f64,
@@ -497,6 +501,29 @@ async fn run_evaluation_loop(
                     let native_enabled =
                         config.quantitative.enabled && config.quantitative.native_backtest_enabled;
                     if native_enabled {
+                        // Native replay reads Gail's market datalake, but keep
+                        // OctoBot's historical-data catalog and collector
+                        // state fresh as well.  Without this maintenance call
+                        // the native branch bypasses `resolve_backtest_files`
+                        // entirely, leaving the compatibility catalog stale
+                        // indefinitely and preventing scheduled collection
+                        // from repairing missing history.
+                        if let Some(engine) = backtest_engine.as_ref() {
+                            match engine.refresh_data_catalog(&config).await {
+                                Ok(file_count) => {
+                                    info!(
+                                        file_count,
+                                        "trading: scheduled backtest data catalog refreshed"
+                                    );
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        error = %error,
+                                        "trading: scheduled backtest data catalog refresh failed"
+                                    );
+                                }
+                            }
+                        }
                         if let Some(lake) = market_data_lake.as_ref() {
                             let mut native_config = config.quantitative.native_backtest.clone();
                             // Live fee assumptions are the single source of truth for
@@ -1636,34 +1663,52 @@ async fn run_market_datalake_bootstrap(
         return false;
     }
 
+    let history_requests = seed_snapshots
+        .iter()
+        .flat_map(|snapshot| {
+            config
+                .market_datalake_bootstrap_time_frames
+                .iter()
+                .map(move |time_frame| {
+                    (
+                        snapshot.exchange.clone(),
+                        snapshot.symbol.clone(),
+                        time_frame.clone(),
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    let history_results = stream::iter(history_requests.into_iter().map(
+        |(exchange, symbol, time_frame)| async move {
+            let result = octobot
+                .get_market_snapshot_history(&exchange, &symbol, &time_frame)
+                .await;
+            (exchange, symbol, time_frame, result)
+        },
+    ))
+    .buffer_unordered(MARKET_DATALAKE_BOOTSTRAP_MAX_PARALLEL_HISTORY_REQUESTS)
+    .collect::<Vec<_>>()
+    .await;
+
     let mut historical_snapshots = Vec::new();
-    let mut symbols_with_history = 0usize;
-    for snapshot in &seed_snapshots {
-        let mut symbol_has_history = false;
-        for time_frame in &config.market_datalake_bootstrap_time_frames {
-            match octobot
-                .get_market_snapshot_history(&snapshot.exchange, &snapshot.symbol, time_frame)
-                .await
-            {
-                Ok(history) => {
-                    if !history.is_empty() {
-                        symbol_has_history = true;
-                        historical_snapshots.extend(history);
-                    }
-                }
-                Err(error) => {
-                    debug!(
-                        exchange = %snapshot.exchange,
-                        symbol = %snapshot.symbol,
-                        time_frame = %time_frame,
-                        error = %error,
-                        "trading: bootstrap history request failed for symbol"
-                    );
+    let mut symbols_with_history = HashSet::new();
+    for (exchange, symbol, time_frame, result) in history_results {
+        match result {
+            Ok(history) => {
+                if !history.is_empty() {
+                    symbols_with_history.insert((exchange, symbol));
+                    historical_snapshots.extend(history);
                 }
             }
-        }
-        if symbol_has_history {
-            symbols_with_history += 1;
+            Err(error) => {
+                debug!(
+                    exchange = %exchange,
+                    symbol = %symbol,
+                    time_frame = %time_frame,
+                    error = %error,
+                    "trading: bootstrap history request failed for symbol"
+                );
+            }
         }
     }
 
@@ -1693,7 +1738,7 @@ async fn run_market_datalake_bootstrap(
     let report = MarketDataLakeBootstrapReport {
         reason: reason.to_string(),
         symbols_attempted: seed_snapshots.len(),
-        symbols_with_history,
+        symbols_with_history: symbols_with_history.len(),
         time_frames: config.market_datalake_bootstrap_time_frames.clone(),
         snapshots_received: historical_snapshots.len(),
         snapshots_persisted: ingest.persisted,
