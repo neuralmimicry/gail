@@ -655,7 +655,7 @@ impl MarketDataLake {
         )
         .await
         {
-            Ok(Ok(())) => {}
+            Ok(Ok(_)) => {}
             Ok(Err(error)) => {
                 warn!(
                     error = %error,
