@@ -81,7 +81,9 @@ pub struct TradingConfig {
     /// Max symbols requested from OctoBot per discovery/pruning scan.
     pub token_discovery_snapshot_limit: usize,
 
-    /// Number of top market-ranked non-portfolio symbols to score with AI+Fuzzy.
+    /// Number of market-ranked symbols to score with AI+Fuzzy during each
+    /// rolling discovery scan. The OctoBot client rotates through the full
+    /// exchange-listed universe between scans.
     pub token_discovery_candidate_pool_size: usize,
 
     /// Minimum composite score required before auto-buying a discovered symbol.
@@ -95,6 +97,11 @@ pub struct TradingConfig {
 
     /// Minimum holding USD value required for a symbol to be considered in pruning.
     pub portfolio_pruning_min_holding_usd: f64,
+
+    /// Include positive non-stable balances below the pruning value floor in
+    /// review. These balances may be dust, but can still identify a symbol
+    /// worth topping up or exiting when a valid market exists.
+    pub portfolio_pruning_include_dust: bool,
 
     /// Number of held symbols to score with AI+Fuzzy in each pruning cycle.
     pub portfolio_pruning_candidate_pool_size: usize,
@@ -413,13 +420,14 @@ impl Default for TradingConfig {
             target_currencies: Vec::new(),
             token_discovery_enabled: true,
             token_discovery_interval_seconds: 1_800,
-            token_discovery_snapshot_limit: 250,
-            token_discovery_candidate_pool_size: 12,
+            token_discovery_snapshot_limit: 20,
+            token_discovery_candidate_pool_size: 20,
             token_discovery_min_composite_score: 0.55,
             portfolio_pruning_enabled: true,
             portfolio_pruning_interval_seconds: 1_800,
-            portfolio_pruning_min_holding_usd: 20.0,
-            portfolio_pruning_candidate_pool_size: 12,
+            portfolio_pruning_min_holding_usd: 0.0,
+            portfolio_pruning_include_dust: true,
+            portfolio_pruning_candidate_pool_size: 64,
             portfolio_pruning_min_composite_score: 0.55,
             fuzzy_confidence_threshold: 0.65,
             market_snapshot_ttl_seconds: 1_200.0,

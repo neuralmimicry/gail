@@ -273,6 +273,19 @@ trading:
   min_trade_interval_seconds: 120
   target_exchanges: []
   target_currencies: []
+  # Discovery uses a rolling scan: OctoBot rotates through all stable-quote
+  # exchange-listed symbols, including symbols not currently in the portfolio.
+  token_discovery_enabled: true
+  token_discovery_interval_seconds: 1800
+  token_discovery_snapshot_limit: 20
+  token_discovery_candidate_pool_size: 20
+  token_discovery_min_composite_score: 0.55
+  portfolio_pruning_enabled: true
+  portfolio_pruning_interval_seconds: 1800
+  portfolio_pruning_min_holding_usd: 0
+  portfolio_pruning_include_dust: true
+  portfolio_pruning_candidate_pool_size: 64
+  portfolio_pruning_min_composite_score: 0.55
   fuzzy_confidence_threshold: ${GAIL_TRADING_CONFIDENCE_THRESHOLD}
   # Cost-aware execution and stale-signal protection. Values are basis points
   # (1bp = 0.01%) and model a complete enter/exit lifecycle.

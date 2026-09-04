@@ -695,7 +695,7 @@ The Ansible role (`roles/continuum_tenant_gail`) exposes the following defaults 
 | `continuum_tenant_gail_trading_paper_qualification_required` | `true` | Require current-build paper evidence before live orders |
 | `continuum_tenant_gail_trading_micro_trade_max_usd` | `25.0` | Per-trade ceiling (USD) |
 | `continuum_tenant_gail_trading_micro_trade_min_usd` | `1.0` | Per-trade floor (USD) |
-| `continuum_tenant_gail_trading_max_open_positions` | `5` | Max simultaneous positions |
+| `continuum_tenant_gail_trading_max_open_positions` | `40` | Max simultaneous positions |
 | `continuum_tenant_gail_trading_fuzzy_confidence_threshold` | `0.65` | Minimum trade confidence |
 | `continuum_tenant_gail_trading_admin_client_ids` | `["pbisaacs"]` | Admin client list |
 

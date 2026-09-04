@@ -9,17 +9,18 @@
 /// - Pipeline integration: end-to-end signal flow from raw inputs to trade decision
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{collections::HashMap, path::PathBuf};
 
     use serde_json::json;
 
     use crate::trading::advisor::{AiAdvice, AiConsensus};
     use crate::trading::config::{TradingConfig, TradingConfigOverride};
+    use crate::trading::datalake::{MarketHistoricalFeatures, market_feature_key};
     use crate::trading::decision::{DecisionEngine, TradeDecision};
     use crate::trading::degraded_live_execution_reason;
     use crate::trading::fuzzy::{FuzzyEngine, FuzzyInputs};
     use crate::trading::octobot::{
-        CurrencyBalance, MarketSnapshot, OctobotExchange, OctobotPortfolio,
+        CurrencyBalance, ExchangeCircuitState, MarketSnapshot, OctobotExchange, OctobotPortfolio,
     };
     use crate::trading::outcomes::TradeMarkout;
     use crate::trading::state::{
@@ -301,10 +302,14 @@ mod tests {
         decision.confidence = confidence;
         decision.blended_signal = blended_signal;
         decision.amount_usd = amount_usd;
+        let composite_score_reason =
+            super::super::composite_score_reason(composite_score, &decision.action);
         crate::trading::DecisionCandidate {
             decision,
             market_history: None,
             composite_score,
+            composite_score_reason,
+            market_opportunity_score: 0.0,
         }
     }
 
@@ -349,13 +354,14 @@ mod tests {
         assert_eq!(cfg.research_max_parallel_queries, 3);
         assert!(cfg.token_discovery_enabled);
         assert_eq!(cfg.token_discovery_interval_seconds, 1_800);
-        assert_eq!(cfg.token_discovery_snapshot_limit, 250);
-        assert_eq!(cfg.token_discovery_candidate_pool_size, 12);
+        assert_eq!(cfg.token_discovery_snapshot_limit, 20);
+        assert_eq!(cfg.token_discovery_candidate_pool_size, 20);
         assert_eq!(cfg.token_discovery_min_composite_score, 0.55);
         assert!(cfg.portfolio_pruning_enabled);
         assert_eq!(cfg.portfolio_pruning_interval_seconds, 1_800);
-        assert_eq!(cfg.portfolio_pruning_min_holding_usd, 20.0);
-        assert_eq!(cfg.portfolio_pruning_candidate_pool_size, 12);
+        assert_eq!(cfg.portfolio_pruning_min_holding_usd, 0.0);
+        assert!(cfg.portfolio_pruning_include_dust);
+        assert_eq!(cfg.portfolio_pruning_candidate_pool_size, 64);
         assert_eq!(cfg.portfolio_pruning_min_composite_score, 0.55);
         assert!(!cfg.live_execution_enabled);
         assert!(cfg.live_execution_auto_gate_enabled);
@@ -688,6 +694,10 @@ mod tests {
                 .unwrap_or(config.micro_trade_max_usd)
                 <= config.micro_trade_max_usd,
             "expected reduced risk sizing"
+        );
+        assert_eq!(
+            overrides.max_open_positions, None,
+            "backtest auto-tuning must not override the 40-position operator policy"
         );
     }
 
@@ -2332,6 +2342,90 @@ mod tests {
     }
 
     #[test]
+    fn market_evidence_uses_history_when_live_momentum_is_missing() {
+        let snapshot = MarketSnapshot {
+            exchange: "binance".to_string(),
+            symbol: "BNB/USDT".to_string(),
+            price: 650.0,
+            price_change_pct_1h: None,
+            price_change_pct_24h: None,
+            volume_24h: Some(5_000_000.0),
+            ..MarketSnapshot::default()
+        };
+        let no_history = crate::trading::market_evidence_score(&snapshot, None, 0.0);
+        let history = MarketHistoricalFeatures {
+            momentum_short_pct: Some(12.0),
+            momentum_mid_pct: Some(9.0),
+            momentum_long_pct: Some(6.0),
+            ..MarketHistoricalFeatures::default()
+        };
+        let with_history = crate::trading::market_evidence_score(&snapshot, Some(&history), 0.0);
+
+        assert_eq!(
+            no_history, 0.0,
+            "no evidence should remain zero, not fake a signal"
+        );
+        assert!(
+            with_history > 0.0,
+            "historical momentum must keep a valid market from becoming an artificial zero"
+        );
+    }
+
+    #[test]
+    fn decision_market_selection_prefers_strongest_historical_evidence_without_target() {
+        let snapshots = vec![
+            make_snapshot("binance", "ADA/USDT", 0.42, 8.0, 20_000_000.0),
+            make_snapshot("binance", "BNB/USDT", 650.0, 0.0, 5_000_000.0),
+            make_snapshot("binance", "BTC/USDT", 68_000.0, 1.0, 4_000_000.0),
+        ];
+        let fallback = crate::trading::select_best_market_candidate(&snapshots)
+            .expect("legacy fallback market candidate");
+        assert_eq!(fallback.symbol, "ADA/USDT");
+
+        let mut hold_one = make_advice("hold", 0.55, 1.0);
+        hold_one.target_symbol = None;
+        let consensus = consensus_from_advices(vec![hold_one], 0);
+        let history = HashMap::from([(
+            market_feature_key("binance", "BNB/USDT"),
+            MarketHistoricalFeatures {
+                momentum_short_pct: Some(30.0),
+                momentum_mid_pct: Some(30.0),
+                momentum_long_pct: Some(30.0),
+                ..MarketHistoricalFeatures::default()
+            },
+        )]);
+        let portfolio = make_portfolio(1_000.0);
+        let regime = crate::trading::compute_market_regime_contagion(&snapshots);
+        assert!(
+            crate::trading::market_evidence_score(
+                &snapshots[1],
+                history.get(&market_feature_key("binance", "BNB/USDT")),
+                0.0,
+            ) > crate::trading::market_evidence_score(&snapshots[0], None, 0.0),
+            "BNB evidence should exceed ADA evidence"
+        );
+        let selection = crate::trading::choose_decision_market_candidate_with_regime_and_history(
+            &snapshots,
+            &consensus,
+            Some(&fallback),
+            &portfolio,
+            12.0,
+            &regime,
+            &history,
+        );
+
+        assert_eq!(
+            selection
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.symbol.as_str()),
+            Some("BNB/USDT"),
+            "neutral AI output must not let an ADA-style fallback hide stronger historical evidence"
+        );
+        assert!(!selection.used_target_signal);
+    }
+
+    #[test]
     fn decision_market_selection_locks_high_confidence_target_symbol() {
         let snapshots = vec![
             make_snapshot("binance", "ETH/USDT", 3000.0, 12.0, 9_000_000.0),
@@ -2666,7 +2760,13 @@ mod tests {
             make_snapshot("binance", "ETH/USDT", 3_500.0, 4.0, 6_000_000.0),
             make_snapshot("binance", "XRP/BTC", 0.00001, 6.0, 2_500_000.0),
         ];
-        let selected = crate::trading::select_non_portfolio_candidates(&snapshots, &portfolio, 10);
+        let selected = crate::trading::select_non_portfolio_candidates_with_evidence(
+            &snapshots,
+            &portfolio,
+            10,
+            12.0,
+            &HashMap::new(),
+        );
 
         assert!(
             !selected.iter().any(|snap| snap.symbol == "BTC/USDT"),
@@ -2727,8 +2827,9 @@ mod tests {
             make_snapshot("binance", "BNB/USDT", 600.0, -4.5, 3_000_000.0),
             make_snapshot("binance", "DOGE/USDT", 0.2, -10.0, 12_000_000.0),
         ];
-        let selected =
-            crate::trading::select_portfolio_pruning_candidates(&snapshots, &portfolio, 20.0, 10);
+        let selected = crate::trading::select_portfolio_pruning_candidates(
+            &snapshots, &portfolio, 20.0, 10, true,
+        );
         let selected_symbols = selected
             .iter()
             .map(|snap| snap.symbol.as_str())
@@ -2749,6 +2850,127 @@ mod tests {
         assert!(
             !selected_symbols.contains(&"ETH/BTC"),
             "non-stable quote pairs should not be selected for pruning"
+        );
+    }
+
+    #[test]
+    fn discovery_candidates_include_sub_floor_holdings_but_only_stable_quotes() {
+        let portfolio = make_portfolio_with_balances(
+            &[
+                ("ETH", 0.001, 0.001, Some(5.0)),
+                ("USDT", 100.0, 100.0, Some(100.0)),
+            ],
+            Some(105.0),
+        );
+        let snapshots = vec![
+            make_snapshot("binance", "ETH/USDT", 3500.0, 8.0, 8_000_000.0),
+            make_snapshot("binance", "ETH/BTC", 0.05, 20.0, 20_000_000.0),
+            make_snapshot("binance", "SOL/USDT", 150.0, 7.0, 7_000_000.0),
+        ];
+
+        let selected = crate::trading::select_non_portfolio_candidates_with_evidence(
+            &snapshots,
+            &portfolio,
+            20,
+            12.0,
+            &HashMap::new(),
+        );
+        let symbols = selected
+            .iter()
+            .map(|snapshot| snapshot.symbol.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            symbols.contains(&"ETH/USDT"),
+            "a held balance below the executable floor must be reviewed for a top-up"
+        );
+        assert!(
+            symbols.contains(&"SOL/USDT"),
+            "a non-portfolio stable-quote market must remain discoverable"
+        );
+        assert!(
+            !symbols.contains(&"ETH/BTC"),
+            "non-stable quote pairs must not enter discovery"
+        );
+    }
+
+    #[test]
+    fn discovery_uses_market_price_to_classify_unvalued_holdings_and_dust() {
+        let portfolio = make_portfolio_with_balances(
+            &[
+                // OctoBot's JSON portfolio route omits value_usd.  This
+                // holding is dust by its live market value and should be
+                // reviewed for a possible top-up.
+                ("DUST", 0.001, 0.001, None),
+                // This holding is valuable despite having no value_usd field;
+                // it must not be mistaken for a new discovery candidate.
+                ("ETH", 1.0, 1.0, None),
+                ("USDT", 100.0, 100.0, Some(100.0)),
+            ],
+            Some(100.0),
+        );
+        let snapshots = vec![
+            make_snapshot("bitget", "DUST/USDT", 2.0, 8.0, 8_000_000.0),
+            make_snapshot("bitget", "ETH/USDT", 3_500.0, 7.0, 7_000_000.0),
+            make_snapshot("bitget", "SOL/USDT", 150.0, 6.0, 6_000_000.0),
+        ];
+
+        let selected = crate::trading::select_non_portfolio_candidates_with_evidence(
+            &snapshots,
+            &portfolio,
+            20,
+            12.0,
+            &HashMap::new(),
+        );
+        let symbols = selected
+            .iter()
+            .map(|snapshot| snapshot.symbol.as_str())
+            .collect::<Vec<_>>();
+        assert!(symbols.contains(&"DUST/USDT"));
+        assert!(symbols.contains(&"SOL/USDT"));
+        assert!(!symbols.contains(&"ETH/USDT"));
+    }
+
+    #[test]
+    fn pruning_candidates_include_dust_when_enabled_and_respect_opt_out() {
+        let portfolio = make_portfolio_with_balances(
+            &[
+                ("DUST", 0.001, 0.001, Some(0.16)),
+                ("ETH", 1.0, 1.0, Some(3500.0)),
+                ("USDT", 100.0, 100.0, Some(100.0)),
+            ],
+            Some(3600.16),
+        );
+        let snapshots = vec![
+            make_snapshot("binance", "DUST/USDT", 160.0, -8.0, 4_000_000.0),
+            make_snapshot("binance", "DUST/BTC", 0.000002, -20.0, 20_000_000.0),
+            make_snapshot("binance", "ETH/USDT", 3500.0, -3.0, 8_000_000.0),
+        ];
+
+        let included = crate::trading::select_portfolio_pruning_candidates(
+            &snapshots, &portfolio, 20.0, 20, true,
+        );
+        assert!(
+            included
+                .iter()
+                .any(|snapshot| snapshot.symbol == "DUST/USDT"),
+            "dust holdings must be reviewed when dust inclusion is enabled"
+        );
+        assert!(
+            !included
+                .iter()
+                .any(|snapshot| snapshot.symbol == "DUST/BTC"),
+            "pruning must continue to require a stable quote"
+        );
+
+        let excluded = crate::trading::select_portfolio_pruning_candidates(
+            &snapshots, &portfolio, 20.0, 20, false,
+        );
+        assert!(
+            !excluded
+                .iter()
+                .any(|snapshot| snapshot.symbol == "DUST/USDT"),
+            "dust holdings must honor the configured opt-out"
         );
     }
 
@@ -3405,6 +3627,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn octobot_metadata_success_clears_stale_exchange_breaker() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/first_exchange_details"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exchange_name": "binance",
+                "exchange_id": "binance-id"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/get_config_currency"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Bitcoin": {"enabled": true, "pairs": ["BTC/USDT"]}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        client
+            .restore_exchange_circuit(HashMap::from([(
+                "binance".to_string(),
+                ExchangeCircuitState {
+                    consecutive_failures: 5,
+                    opened_until: Some(f64::MAX),
+                    last_success_at: None,
+                    last_error: Some("startup race".to_string()),
+                },
+            )]))
+            .await;
+
+        let exchanges = client.get_exchange_info().await.unwrap();
+        assert_eq!(exchanges.len(), 1);
+        let state = client
+            .exchange_circuit_snapshot()
+            .await
+            .remove("binance")
+            .expect("metadata success should retain a reset state");
+        assert_eq!(state.consecutive_failures, 0);
+        assert!(state.opened_until.is_none());
+        assert!(state.last_success_at.is_some());
+        assert!(state.last_error.is_none());
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn octobot_client_get_exchange_info_enriches_configured_symbols_with_exchange_symbols() {
         let server = MockServer::start().await;
 
@@ -3457,6 +3726,48 @@ mod tests {
                 "LINK/USDT".to_string(),
             ]
         );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_ignores_stale_trading_page_symbols_when_exchange_universe_is_available()
+    {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/first_exchange_details"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exchange_name": "binance",
+                "exchange_id": "binance-id"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/get_config_currency"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Bitcoin": {"enabled": true, "pairs": ["BTC/USDT"]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/get_all_symbols/binance"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!(["BTC/USDT"])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/trading"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<a href="/symbol_market_status?exchange_id=binance-id&amp;symbol=BTC%2FUSDT">Binance : NEUTRAL (Indexing 6 coins)</a>
+                   <a href="/symbol_market_status?exchange_id=binance-id&amp;symbol=OGLG%2FUSDT">Binance : NEUTRAL (Indexing 6 coins)</a>"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let exchanges = client.get_exchange_info().await.unwrap();
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(exchanges[0].market_status_symbols, vec!["BTC/USDT"]);
+        assert_eq!(exchanges[0].symbols, vec!["BTC/USDT"]);
         server.verify().await;
     }
 
@@ -3555,9 +3866,9 @@ mod tests {
                 r"^/api/get_all_symbols/(binance|bitget|kucoin|xt)$",
             ))
             .respond_with(
-                ResponseTemplate::new(500).set_body_string("should not query exchange universe"),
+                ResponseTemplate::new(500).set_body_string("exchange universe unavailable"),
             )
-            .expect(0)
+            .expect(4)
             .mount(&server)
             .await;
 
@@ -3633,7 +3944,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(500).set_body_string("should not query exchange universe"),
             )
-            .expect(0)
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -3999,6 +4310,67 @@ mod tests {
         assert_eq!(doge.free, 821.0);
         assert_eq!(doge.total, 821.0);
         assert_eq!(doge.value_usd, Some(68.14));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_client_enriches_balance_only_json_portfolio_from_html() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/portfolio"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "DUST": {
+                    "free": 0.001,
+                    "locked": 0.0,
+                    "total": 0.001,
+                    "exchanges": {
+                        "bitget": {"free": 0.001, "locked": 0.0, "total": 0.001}
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/portfolio"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"
+                <html><body>
+                  <h2>Portfolio: <span>0.16</span> USDT</h2>
+                  <table>
+                    <tr>
+                      <th>Asset</th><th>Total</th><th>Value in USDT</th><th>Available</th><th>Locked in orders</th>
+                    </tr>
+                    <tr>
+                      <td>DUST</td>
+                      <td data-toggle="tooltip" title="Bitget: 0.001">0.001</td>
+                      <td data-toggle="tooltip" title="Bitget: 0.16">0.16</td>
+                      <td data-toggle="tooltip" title="Bitget: 0.001">0.001</td>
+                      <td data-toggle="tooltip" title="Bitget: 0.0">0.0</td>
+                    </tr>
+                  </table>
+                </body></html>
+                "#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/historical_portfolio_value"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let portfolio = client.get_portfolio().await.unwrap();
+        assert_eq!(portfolio.total_value_usd, Some(0.16));
+        assert_eq!(portfolio.currencies["DUST"].value_usd, Some(0.16));
+        assert_eq!(
+            portfolio.exchange_currencies["bitget"]["DUST"].value_usd,
+            Some(0.16)
+        );
         server.verify().await;
     }
 
@@ -4658,7 +5030,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(500).set_body_string("should not query exchange universe"),
             )
-            .expect(0)
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -4666,7 +5038,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(500).set_body_string("should not query exchange universe"),
             )
-            .expect(0)
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -5102,7 +5474,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(500).set_body_string("should not query exchange universe"),
             )
-            .expect(0)
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -5205,8 +5577,10 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/api/get_all_symbols/binance"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("should not be queried"))
-            .expect(0)
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string("exchange universe unavailable"),
+            )
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("GET"))

@@ -167,7 +167,11 @@ impl TradingAdvisor {
             .map(provider_model_identity)
             .collect::<HashSet<_>>();
 
-        let ranked_snapshots = rank_advisory_candidates(market_snapshots, self.candidate_limit);
+        let ranked_snapshots = rank_advisory_candidates_with_history(
+            market_snapshots,
+            historical_features,
+            self.candidate_limit,
+        );
         let prompt =
             build_advisory_prompt(&ranked_snapshots, historical_features, research, portfolio);
         let system = advisory_system_prompt();
@@ -264,7 +268,35 @@ impl TradingAdvisor {
             "trading: advisor round completed"
         );
 
-        aggregate_consensus(advices, failures)
+        let mut consensus = aggregate_consensus(advices, failures);
+        // Discovery and pruning deliberately ask the advisor about one
+        // market at a time. Some otherwise valid providers return null for
+        // target_symbol in that shape because the target is unambiguous from
+        // the prompt. Preserve that target in the consensus so diagnostics
+        // and downstream selection do not report a misleading empty target
+        // set. Multi-market advisories still require an explicit provider
+        // target or use deterministic market ranking below.
+        if ranked_snapshots.len() == 1 {
+            let target = ranked_snapshots[0].symbol.clone();
+            let mut inferred = false;
+            for advice in &mut consensus.advices {
+                if advice.parsed_ok
+                    && advice.target_symbol.is_none()
+                    && action_to_signal(&advice.action).abs() > f64::EPSILON
+                {
+                    advice.target_symbol = Some(target.clone());
+                    inferred = true;
+                }
+            }
+            if inferred {
+                let failures = consensus.failures;
+                consensus = aggregate_consensus(consensus.advices, failures);
+                if let Some(object) = consensus.vote_distribution.as_object_mut() {
+                    object.insert("single_market_target_inferred".to_string(), json!(true));
+                }
+            }
+        }
+        consensus
     }
 
     /// Pick providers to consult, up to max_advisors, ordered by quality weight.
@@ -344,6 +376,14 @@ async fn collect_advice_wave(
 /// exchange/symbol duplicates are collapsed, and the strongest liquid movers
 /// are retained with stable lexical tie-breaking.
 fn rank_advisory_candidates(snapshots: &[MarketSnapshot], limit: usize) -> Vec<MarketSnapshot> {
+    rank_advisory_candidates_with_history(snapshots, &HashMap::new(), limit)
+}
+
+fn rank_advisory_candidates_with_history(
+    snapshots: &[MarketSnapshot],
+    historical_features: &HashMap<String, MarketHistoricalFeatures>,
+    limit: usize,
+) -> Vec<MarketSnapshot> {
     let mut ranked = snapshots
         .iter()
         .filter(|snapshot| snapshot.price.is_finite() && snapshot.price > 0.0)
@@ -351,10 +391,33 @@ fn rank_advisory_candidates(snapshots: &[MarketSnapshot], limit: usize) -> Vec<M
         .collect::<Vec<_>>();
     ranked.sort_by(|left, right| {
         let score = |snapshot: &MarketSnapshot| {
-            let movement = snapshot.price_change_pct_24h.unwrap_or(0.0).abs().min(30.0) / 30.0;
+            let movement = snapshot
+                .price_change_pct_24h
+                .or(snapshot.price_change_pct_1h)
+                .unwrap_or(0.0)
+                .abs()
+                .min(30.0)
+                / 30.0;
+            let history = historical_features
+                .get(&market_feature_key(&snapshot.exchange, &snapshot.symbol))
+                .map(|features| {
+                    [
+                        (features.momentum_short_pct, 0.45),
+                        (features.momentum_mid_pct, 0.35),
+                        (features.momentum_long_pct, 0.20),
+                    ]
+                    .into_iter()
+                    .filter_map(|(value, weight)| {
+                        value.map(|value| value.abs().min(100.0) * weight)
+                    })
+                    .sum::<f64>()
+                        / 30.0
+                })
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
             let liquidity =
                 ((snapshot.volume_24h.unwrap_or(0.0) + 1.0).ln() / 20.0).clamp(0.0, 1.0);
-            movement * 0.55 + liquidity * 0.45
+            (movement * 0.40 + history * 0.35 + liquidity * 0.25).clamp(0.0, 1.0)
         };
         score(right)
             .total_cmp(&score(left))
@@ -816,13 +879,16 @@ CRITICAL: Your response MUST be valid JSON only, with NO additional text before 
   "suggested_amount_usd": <float or null>,
   "risk_score": <float 0.0 to 1.0>,
   "risk_flags": ["<short risk or uncertainty labels>"],
-  "target_symbol": "<symbol from MARKET DATA or null>"
+  "target_symbol": "<exact symbol from MARKET DATA, or null only for hold>"
 }
 
 Rules:
 - confidence 0.0 means complete uncertainty; 1.0 means absolute certainty
 - If signals conflict or data is insufficient, recommend "hold" with low confidence
 - Be conservative: only recommend strong_buy/strong_sell with confidence > 0.75 and risk_score < 0.45
+- For any buy or sell recommendation, target_symbol is REQUIRED and must be the exact
+  symbol from the strongest supporting MARKET DATA row. Never leave it null for an
+  actionable recommendation. If only one market row is present, use that row.
 - Micro-trade context: position sizes are small (< $25 USD), but do not force trades when evidence is weak
 - Consider portfolio exposure to avoid over-concentration
 - Treat unvalued or illiquid portfolio assets as risk flags, not as trade targets
@@ -843,7 +909,8 @@ fn build_advisory_prompt(
         let lines: Vec<String> = snapshots
             .iter()
             .take(10)
-            .map(|s| {
+            .enumerate()
+            .map(|(index, s)| {
                 let trend = match s.price_change_pct_24h {
                     Some(p) if p > 3.0 => "↑↑",
                     Some(p) if p > 0.5 => "↑",
@@ -866,7 +933,8 @@ fn build_advisory_prompt(
                     })
                     .unwrap_or_default();
                 format!(
-                    "  {}/{}: price={:.4}, 24h_chg={:.2}% {}, vol24h={:.2}{}",
+                    "  rank={}: {}/{}: price={:.4}, 24h_chg={:.2}% {}, vol24h={:.2}{}",
+                    index + 1,
                     s.exchange,
                     s.symbol,
                     s.price,

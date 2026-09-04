@@ -669,6 +669,15 @@ impl OctobotClient {
         if let Some(body) = api_portfolio {
             let mut portfolio = parse_portfolio_json(&body);
             if portfolio.total_value_usd.is_none() {
+                // The JSON portfolio route in OctoBot 3.0 exposes balances
+                // but omits both per-asset USD values and the total.  The
+                // HTML route still contains the authoritative rendered
+                // values, so use it to enrich the JSON result before trying
+                // the historical endpoint (whose legacy values can be
+                // malformed strings such as "4.16279.83").
+                self.enrich_portfolio_from_html(&mut portfolio).await?;
+            }
+            if portfolio.total_value_usd.is_none() {
                 self.enrich_portfolio_total_from_history(&mut portfolio)
                     .await?;
             }
@@ -693,6 +702,55 @@ impl OctobotClient {
         self.enrich_portfolio_total_from_history(&mut portfolio)
             .await?;
         Ok(portfolio)
+    }
+
+    async fn enrich_portfolio_from_html(
+        &self,
+        portfolio: &mut OctobotPortfolio,
+    ) -> Result<(), String> {
+        let Some(page) = self
+            .get_optional_text("/portfolio", "portfolio page enrichment")
+            .await?
+        else {
+            return Ok(());
+        };
+        let Some(rendered) = parse_portfolio_html(&page) else {
+            return Ok(());
+        };
+
+        if portfolio.total_value_usd.is_none() {
+            portfolio.total_value_usd = rendered.total_value_usd;
+        }
+        for (symbol, rendered_balance) in rendered.currencies {
+            let Some((_, balance)) = portfolio
+                .currencies
+                .iter_mut()
+                .find(|(asset, _)| asset.eq_ignore_ascii_case(&symbol))
+            else {
+                portfolio.currencies.insert(symbol, rendered_balance);
+                continue;
+            };
+            if balance.value_usd.is_none() {
+                balance.value_usd = rendered_balance.value_usd;
+            }
+        }
+        for (exchange, rendered_balances) in rendered.exchange_currencies {
+            let balances = portfolio.exchange_currencies.entry(exchange).or_default();
+            for (symbol, rendered_balance) in rendered_balances {
+                if let Some(balance) = balances
+                    .iter_mut()
+                    .find(|(asset, _)| asset.eq_ignore_ascii_case(&symbol))
+                    .map(|(_, balance)| balance)
+                {
+                    if balance.value_usd.is_none() {
+                        balance.value_usd = rendered_balance.value_usd;
+                    }
+                } else {
+                    balances.insert(symbol, rendered_balance);
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn enrich_portfolio_total_from_history(
@@ -1600,15 +1658,20 @@ impl OctobotClient {
         }
 
         for exchange in exchanges_by_key.values_mut() {
-            let has_market_status_symbols = trading_symbols_by_exchange
-                .get(&exchange.name)
-                .is_some_and(|symbols| !symbols.is_empty());
-            let mut configured_symbols = self
-                .configured_symbols(Some(exchange.name.as_str()), !has_market_status_symbols)
+            let (mut configured_symbols, exchange_universe_available) = self
+                // Always enrich the configured/status surface with the
+                // exchange-listed universe. New listings are not guaranteed
+                // to appear in OctoBot's trading-status table yet.
+                .configured_symbols(Some(exchange.name.as_str()), true)
                 .await
                 .unwrap_or_default();
             configured_symbols.sort();
             configured_symbols.dedup();
+
+            let configured_symbol_keys = configured_symbols
+                .iter()
+                .map(|symbol| symbol.to_ascii_uppercase())
+                .collect::<HashSet<_>>();
 
             let mut prioritized_trading_symbols = trading_symbols_by_exchange
                 .get(&exchange.name)
@@ -1616,6 +1679,15 @@ impl OctobotClient {
                 .unwrap_or_default();
             prioritized_trading_symbols.sort();
             prioritized_trading_symbols.dedup();
+            // Trading-page rows can outlive an exchange listing (and can
+            // contain an asset that was returned by another exchange). Once
+            // the current exchange universe is available, it is the source
+            // of truth for snapshot requests. Keep status-only rows only
+            // during an unavailable-universe fallback.
+            if exchange_universe_available {
+                prioritized_trading_symbols
+                    .retain(|symbol| configured_symbol_keys.contains(&symbol.to_ascii_uppercase()));
+            }
             exchange.market_status_symbols = prioritized_trading_symbols.clone();
 
             let mut symbols = Vec::new();
@@ -1641,6 +1713,17 @@ impl OctobotClient {
 
         let mut exchanges = exchanges_by_key.into_values().collect::<Vec<_>>();
         exchanges.sort_by(|left, right| left.name.cmp(&right.name));
+        // Exchange metadata is an independent health signal.  A restart can
+        // leave a durable breaker open after OctoBot was temporarily
+        // unavailable; in that state market requests are skipped before a
+        // ticker can prove recovery.  Successful metadata discovery is
+        // sufficient to reopen the polling path, while ticker failures still
+        // trip the breaker again when the venue is genuinely unhealthy.
+        for exchange in &exchanges {
+            if exchange.enabled {
+                self.record_exchange_success(&exchange.name).await;
+            }
+        }
         Ok(exchanges)
     }
 
@@ -1648,7 +1731,7 @@ impl OctobotClient {
         &self,
         exchange_name: Option<&str>,
         enrich_with_exchange_symbols: bool,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<(Vec<String>, bool), String> {
         let body = self
             .get_optional_json("/api/get_config_currency", "configured currencies")
             .await?
@@ -1679,6 +1762,7 @@ impl OctobotClient {
 
         // Enrich configured pairs with exchange-listed symbols to broaden
         // candidate discovery beyond the currently watched subset.
+        let mut exchange_universe_available = false;
         if enrich_with_exchange_symbols && let Some(exchange_name) = exchange_name {
             let configured_quotes: HashSet<String> = symbols
                 .iter()
@@ -1687,7 +1771,10 @@ impl OctobotClient {
                 .collect();
 
             let mut discovered_symbols = match self.exchange_symbols(exchange_name).await {
-                Ok(symbols) => symbols,
+                Ok(symbols) => {
+                    exchange_universe_available = !symbols.is_empty();
+                    symbols
+                }
                 Err(err) => {
                     debug!(
                         "trading: exchange symbol enrichment failed for {}: {}",
@@ -1737,7 +1824,7 @@ impl OctobotClient {
         {
             symbols.push(symbol);
         }
-        Ok(symbols)
+        Ok((symbols, exchange_universe_available))
     }
 
     async fn exchange_symbols(&self, exchange_name: &str) -> Result<Vec<String>, String> {
@@ -3859,19 +3946,6 @@ impl OctobotClient {
                 warn!(exchange = %exchange.name, "trading: exchange circuit breaker open; skipping market requests");
                 continue;
             }
-            let mut market_status_symbols = exchange
-                .market_status_symbols
-                .iter()
-                .filter(|symbol| {
-                    target_currencies.is_empty()
-                        || target_currencies
-                            .iter()
-                            .any(|candidate| candidate.eq_ignore_ascii_case(symbol))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            market_status_symbols = dedupe_symbols_preserving_order(market_status_symbols);
-
             let mut symbols = exchange
                 .symbols
                 .iter()
@@ -3906,38 +3980,39 @@ impl OctobotClient {
             if symbols.is_empty() {
                 continue;
             }
-            let has_market_status_symbols = !market_status_symbols.is_empty();
-            if has_market_status_symbols {
-                symbols = market_status_symbols;
-            }
             let rotation_span = symbols.len();
             let base_offset =
                 offset_snapshot.get(&exchange_key).copied().unwrap_or(0) % rotation_span;
 
-            let selected = if has_market_status_symbols {
-                (0..rotation_span)
-                    .map(|index| symbols[(base_offset + index) % rotation_span].clone())
-                    .collect::<Vec<_>>()
-            } else {
-                let mut selected = Vec::new();
-                let mut unknown_probe_count = 0usize;
-                for index in 0..rotation_span {
-                    let symbol = symbols[(base_offset + index) % rotation_span].clone();
-                    if market_snapshot_is_known_available(
-                        &available_snapshot,
-                        &exchange_key,
-                        &symbol,
-                    ) {
-                        selected.push(symbol);
-                        continue;
-                    }
-                    if unknown_probe_count < MARKET_SNAPSHOT_UNKNOWN_PROBE_LIMIT_PER_EXCHANGE {
-                        selected.push(symbol);
-                        unknown_probe_count += 1;
-                    }
+            // Status-listed symbols are already known to OctoBot, while
+            // exchange-listed additions may be unknown to Gail. Probe a
+            // bounded number of unknown additions per exchange and rotate the
+            // offset so the whole universe is eventually covered.
+            let mut selected = Vec::new();
+            let mut unknown_probe_count = 0usize;
+            let market_status_symbols = exchange
+                .market_status_symbols
+                .iter()
+                .map(|symbol| symbol.to_ascii_uppercase())
+                .collect::<HashSet<_>>();
+            for index in 0..rotation_span {
+                let symbol = symbols[(base_offset + index) % rotation_span].clone();
+                if market_status_symbols.contains(&symbol.to_ascii_uppercase()) {
+                    // OctoBot's trading page has already established that
+                    // this pair is active. It does not need the bounded
+                    // unknown-symbol probe used for exchange-only additions.
+                    selected.push(symbol);
+                    continue;
                 }
-                selected
-            };
+                if market_snapshot_is_known_available(&available_snapshot, &exchange_key, &symbol) {
+                    selected.push(symbol);
+                    continue;
+                }
+                if unknown_probe_count < MARKET_SNAPSHOT_UNKNOWN_PROBE_LIMIT_PER_EXCHANGE {
+                    selected.push(symbol);
+                    unknown_probe_count += 1;
+                }
+            }
             if selected.is_empty() {
                 continue;
             }
@@ -4106,6 +4181,116 @@ impl OctobotClient {
             }
         }
 
+        snapshots
+    }
+
+    /// Fetch explicitly required market snapshots without consuming the
+    /// rolling universe cursor.  Portfolio review uses this for held assets,
+    /// including dust balances that may not be inside the current broad-market
+    /// sample window.
+    pub async fn get_market_snapshots_for_targets(
+        &self,
+        targets: &[(String, String)],
+    ) -> Vec<MarketSnapshot> {
+        // Portfolio balances can contain dust from delisted markets. Do not
+        // probe those symbols through the dashboard compatibility route: the
+        // route intentionally creates an in-memory OctoBot symbol object for
+        // valid exchange-listed discovery candidates, and doing that for a
+        // stale balance makes the active exchange price worker repeatedly
+        // request an unsupported pair.
+        let listed_symbols_by_exchange = self
+            .get_exchange_info()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|exchange| {
+                (
+                    exchange.name.to_ascii_lowercase(),
+                    exchange
+                        .symbols
+                        .into_iter()
+                        .map(|symbol| symbol.to_ascii_uppercase())
+                        .collect::<HashSet<_>>(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut unique_targets = HashSet::new();
+        let mut pending = Vec::new();
+        for (exchange, symbol) in targets {
+            let Some(symbol) = normalize_trading_symbol(symbol) else {
+                continue;
+            };
+            let exchange = exchange.trim();
+            if exchange.is_empty() {
+                continue;
+            }
+            if let Some(listed_symbols) =
+                listed_symbols_by_exchange.get(&exchange.to_ascii_lowercase())
+                && !listed_symbols.is_empty()
+                && !listed_symbols.contains(&symbol.to_ascii_uppercase())
+            {
+                debug!(
+                    exchange,
+                    symbol, "trading: skipping required portfolio snapshot for unlisted market"
+                );
+                continue;
+            }
+            let key = format!(
+                "{}|{}",
+                exchange.to_ascii_lowercase(),
+                symbol.to_ascii_uppercase()
+            );
+            if unique_targets.insert(key) {
+                pending.push((exchange.to_string(), symbol));
+            }
+        }
+        if pending.is_empty() {
+            return Vec::new();
+        }
+
+        let mut join_set = JoinSet::new();
+        let mut pending = pending.into_iter();
+        let max_parallel = MAX_PARALLEL_MARKET_SNAPSHOT_REQUESTS.max(1);
+        for _ in 0..max_parallel {
+            let Some((exchange, symbol)) = pending.next() else {
+                break;
+            };
+            let client = self.clone();
+            join_set.spawn(async move {
+                let result = client
+                    .get_market_snapshot_with_resilience(&exchange, &symbol)
+                    .await;
+                (exchange, symbol, result)
+            });
+        }
+
+        let mut snapshots = Vec::new();
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok((_exchange, _symbol, Ok(snapshot))) => snapshots.push(snapshot),
+                Ok((exchange, symbol, Err(error))) => {
+                    debug!(
+                        "trading: required portfolio snapshot unavailable for {}/{}: {}",
+                        exchange, symbol, error
+                    );
+                }
+                Err(error) => {
+                    debug!(
+                        "trading: required portfolio snapshot task failed: {}",
+                        error
+                    );
+                }
+            }
+            if let Some((exchange, symbol)) = pending.next() {
+                let client = self.clone();
+                join_set.spawn(async move {
+                    let result = client
+                        .get_market_snapshot_with_resilience(&exchange, &symbol)
+                        .await;
+                    (exchange, symbol, result)
+                });
+            }
+        }
         snapshots
     }
 

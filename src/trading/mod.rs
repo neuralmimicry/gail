@@ -859,7 +859,12 @@ async fn run_single_evaluation(
 
     // --- 2. Build research query ---
     // Keep pre-consensus market ranking for research context only.
-    let research_snapshot = select_best_market_candidate(&market_snapshots);
+    let research_snapshot = select_best_market_candidate_with_evidence(
+        &market_snapshots,
+        &historical_features,
+        |_| true,
+        0.0,
+    );
     let research_query = build_research_query(config, research_snapshot.as_ref());
 
     // Run remaining service calls in parallel so one slow dependency
@@ -1176,13 +1181,14 @@ async fn run_single_evaluation(
             effective_trade_floor,
         )
     } else {
-        choose_decision_market_candidate_with_regime(
+        choose_decision_market_candidate_with_regime_and_history(
             &market_snapshots,
             &consensus,
             research_snapshot.as_ref(),
             &portfolio,
             effective_trade_floor,
             &market_regime,
+            &historical_features,
         )
     };
     record_quant_evaluation(
@@ -1277,6 +1283,20 @@ async fn run_single_evaluation(
         let composite_score = snapshot
             .map(|target| composite_symbol_score(target, &decision))
             .unwrap_or(0.0);
+        let composite_score_reason = composite_score_reason(composite_score, &decision.action);
+        let market_opportunity_score = snapshot
+            .map(|target| {
+                market_evidence_score(
+                    target,
+                    snapshot_history.as_ref(),
+                    if decision_is_actionable(&decision.action) {
+                        action_direction_multiplier(&decision.action)
+                    } else {
+                        0.0
+                    },
+                )
+            })
+            .unwrap_or(0.0);
         info!(
             "trading: decision = {:?} exchange={} symbol={} amount=${:.2} confidence={:.2}",
             decision.action,
@@ -1290,6 +1310,8 @@ async fn run_single_evaluation(
             decision,
             market_history: snapshot_history,
             composite_score,
+            composite_score_reason,
+            market_opportunity_score,
         });
 
         // Operator overrides should only be evaluated and executed once.
@@ -1344,6 +1366,8 @@ async fn run_single_evaluation(
                 "confidence": candidate.decision.confidence,
                 "blended_signal": candidate.decision.blended_signal,
                 "composite_score": candidate.composite_score,
+                "composite_score_reason": candidate.composite_score_reason,
+                "market_opportunity_score": candidate.market_opportunity_score,
                 "fuzzy_signal": candidate.decision.fuzzy_signal,
                 "fuzzy_confidence": candidate.decision.fuzzy_confidence,
                 "rationale": truncate_message(&candidate.decision.rationale, 240),
@@ -1828,6 +1852,10 @@ struct SymbolScorecard {
     symbol: String,
     in_portfolio: bool,
     market_score: f64,
+    /// Evidence-only opportunity score. Unlike composite_score, this remains
+    /// non-zero for a hold so a valid market move is not hidden by a neutral
+    /// trade decision.
+    market_opportunity_score: f64,
     price_change_pct_24h: Option<f64>,
     volume_24h: Option<f64>,
     history_momentum_short_pct: Option<f64>,
@@ -1844,6 +1872,7 @@ struct SymbolScorecard {
     blended_confidence: f64,
     action: String,
     composite_score: f64,
+    composite_score_reason: String,
     amount_usd: f64,
     rationale: String,
 }
@@ -1859,6 +1888,8 @@ struct DecisionCandidate {
     decision: TradeDecision,
     market_history: Option<MarketHistoricalFeatures>,
     composite_score: f64,
+    composite_score_reason: String,
+    market_opportunity_score: f64,
 }
 
 fn decision_is_actionable(action: &TradeAction) -> bool {
@@ -1974,13 +2005,20 @@ async fn run_non_portfolio_discovery_cycle(
     };
 
     let (target_exchanges, target_currencies) = resolve_target_market_filters(config, state).await;
-    let snapshots = octobot
+    let sampled_snapshots = octobot
         .get_all_market_snapshots(
             &target_exchanges,
             &target_currencies,
             config.token_discovery_snapshot_limit,
         )
         .await;
+    let required_portfolio_snapshots = octobot
+        .get_market_snapshots_for_targets(&portfolio_snapshot_targets(
+            &portfolio,
+            &target_exchanges,
+        ))
+        .await;
+    let snapshots = merge_market_snapshots(sampled_snapshots, required_portfolio_snapshots);
     resolve_trade_markouts(state, &snapshots, config).await;
     let historical_features = if let Some(lake) = market_data_lake {
         let ingest_summary = lake.ingest_snapshots(&snapshots).await;
@@ -2015,10 +2053,16 @@ async fn run_non_portfolio_discovery_cycle(
     }
     let market_regime = compute_market_regime_contagion(&snapshots);
 
-    let candidates = select_non_portfolio_candidates(
+    // A balance below the executable buy floor is still a meaningful
+    // discovery candidate: Gail may decide to top it up after evaluating the
+    // same market evidence used for a new portfolio entry.
+    let dust_investment_threshold_usd = effective_micro_trade_floor_usd(state, config).await;
+    let candidates = select_non_portfolio_candidates_with_evidence(
         &snapshots,
         &portfolio,
         config.token_discovery_candidate_pool_size,
+        dust_investment_threshold_usd,
+        &historical_features,
     );
     if candidates.is_empty() {
         state
@@ -2061,11 +2105,16 @@ async fn run_non_portfolio_discovery_cycle(
             "info",
             "discovery",
             format!(
-                "Scored {} non-portfolio symbols; top composite={:.3}",
+                "Scored {} non-portfolio symbols; top composite={:.3}; top market opportunity={:.3}",
                 scorecards.len(),
                 scorecards
                     .first()
                     .map(|entry| entry.composite_score)
+                    .unwrap_or(0.0),
+                scorecards
+                    .iter()
+                    .map(|entry| entry.market_opportunity_score)
+                    .max_by(f64::total_cmp)
                     .unwrap_or(0.0)
             ),
             json!({ "scorecards": scorecards }),
@@ -2158,13 +2207,20 @@ async fn run_portfolio_pruning_cycle(
     };
 
     let (target_exchanges, target_currencies) = resolve_target_market_filters(config, state).await;
-    let snapshots = octobot
+    let sampled_snapshots = octobot
         .get_all_market_snapshots(
             &target_exchanges,
             &target_currencies,
             config.token_discovery_snapshot_limit,
         )
         .await;
+    let required_portfolio_snapshots = octobot
+        .get_market_snapshots_for_targets(&portfolio_snapshot_targets(
+            &portfolio,
+            &target_exchanges,
+        ))
+        .await;
+    let snapshots = merge_market_snapshots(sampled_snapshots, required_portfolio_snapshots);
     resolve_trade_markouts(state, &snapshots, config).await;
     let historical_features = if let Some(lake) = market_data_lake {
         let ingest_summary = lake.ingest_snapshots(&snapshots).await;
@@ -2204,6 +2260,7 @@ async fn run_portfolio_pruning_cycle(
         &portfolio,
         config.portfolio_pruning_min_holding_usd,
         config.portfolio_pruning_candidate_pool_size,
+        config.portfolio_pruning_include_dust,
     );
     if candidates.is_empty() {
         state
@@ -2294,7 +2351,15 @@ async fn run_portfolio_pruning_cycle(
         return;
     }
 
+    let snapshot_value = snapshots
+        .iter()
+        .find(|snapshot| {
+            snapshot.exchange.eq_ignore_ascii_case(&decision.exchange)
+                && snapshot.symbol.eq_ignore_ascii_case(&decision.symbol)
+        })
+        .and_then(|snapshot| sellable_value_usd_for_snapshot(&portfolio, snapshot));
     if let Some(holding_usd) = holding_value_usd_for_symbol(&portfolio, &decision.symbol)
+        .or(snapshot_value)
         .filter(|value| value.is_finite() && *value > 0.0)
     {
         decision.amount_usd = holding_usd.max(0.01);
@@ -2404,12 +2469,23 @@ async fn evaluate_symbol_candidate(
         decision_engine.decide(&fuzzy, &consensus, Some(snapshot), &s, config)
     };
     let composite_score = composite_symbol_score(snapshot, &decision);
+    let market_opportunity_score = market_evidence_score(
+        snapshot,
+        historical_features,
+        if decision_is_actionable(&decision.action) {
+            action_direction_multiplier(&decision.action)
+        } else {
+            0.0
+        },
+    );
+    let composite_score_reason = composite_score_reason(composite_score, &decision.action);
     let scorecard = SymbolScorecard {
         at: now_ts(),
         exchange: snapshot.exchange.clone(),
         symbol: snapshot.symbol.clone(),
         in_portfolio,
         market_score: market_score(snapshot),
+        market_opportunity_score,
         price_change_pct_24h: snapshot.price_change_pct_24h,
         volume_24h: snapshot.volume_24h,
         history_momentum_short_pct: historical_features
@@ -2429,6 +2505,7 @@ async fn evaluate_symbol_candidate(
         blended_confidence: decision.confidence,
         action: decision.action.to_string(),
         composite_score,
+        composite_score_reason,
         amount_usd: decision.amount_usd,
         rationale: truncate_message(&decision.rationale, 220),
     };
@@ -2463,6 +2540,8 @@ async fn evaluate_symbol_candidates_parallel(
             let historical = historical_features
                 .get(&market_feature_key(&snapshot.exchange, &snapshot.symbol))
                 .cloned();
+            let candidate_in_portfolio =
+                in_portfolio || snapshot_in_portfolio(&snapshot, portfolio);
             async move {
                 evaluate_symbol_candidate(
                     config,
@@ -2473,7 +2552,7 @@ async fn evaluate_symbol_candidates_parallel(
                     decision_engine,
                     portfolio,
                     &snapshot,
-                    in_portfolio,
+                    candidate_in_portfolio,
                     historical.as_ref(),
                     Some(market_regime),
                 )
@@ -2499,22 +2578,41 @@ fn historical_features_map(
     map
 }
 
-fn select_non_portfolio_candidates(
+fn select_non_portfolio_candidates_with_evidence(
     snapshots: &[MarketSnapshot],
     portfolio: &OctobotPortfolio,
     pool_size: usize,
+    dust_investment_threshold_usd: f64,
+    historical_features: &HashMap<String, MarketHistoricalFeatures>,
 ) -> Vec<MarketSnapshot> {
     let mut ranked = snapshots
         .iter()
         .filter(|snapshot| snapshot.price.is_finite() && snapshot.price > 0.0)
         .filter(|snapshot| snapshot_has_stable_quote(snapshot))
-        .filter(|snapshot| !snapshot_in_portfolio(snapshot, portfolio))
+        .filter(|snapshot| {
+            !snapshot_in_portfolio(snapshot, portfolio)
+                || sellable_value_usd_for_snapshot(portfolio, snapshot).is_some_and(|value| {
+                    value.is_finite()
+                        && value > 0.0
+                        && value < dust_investment_threshold_usd.max(0.01)
+                })
+        })
         .cloned()
         .collect::<Vec<_>>();
     ranked.sort_by(|left, right| {
-        market_score(right)
-            .partial_cmp(&market_score(left))
-            .unwrap_or(Ordering::Equal)
+        market_evidence_score(
+            right,
+            historical_features.get(&market_feature_key(&right.exchange, &right.symbol)),
+            0.0,
+        )
+        .total_cmp(&market_evidence_score(
+            left,
+            historical_features.get(&market_feature_key(&left.exchange, &left.symbol)),
+            0.0,
+        ))
+        .then_with(|| market_score(right).total_cmp(&market_score(left)))
+        .then_with(|| right.exchange.cmp(&left.exchange))
+        .then_with(|| right.symbol.cmp(&left.symbol))
     });
 
     let mut seen_assets = HashSet::new();
@@ -2533,6 +2631,7 @@ fn select_portfolio_pruning_candidates(
     portfolio: &OctobotPortfolio,
     min_holding_usd: f64,
     pool_size: usize,
+    include_dust: bool,
 ) -> Vec<MarketSnapshot> {
     let held_assets = portfolio
         .currencies
@@ -2540,9 +2639,10 @@ fn select_portfolio_pruning_candidates(
         .filter(|(asset, balance)| {
             !is_stablecoin(asset)
                 && (balance.free > 0.0 || balance.total > 0.0)
-                && balance
-                    .value_usd
-                    .is_some_and(|value| value.is_finite() && value >= min_holding_usd)
+                && (include_dust
+                    || balance
+                        .value_usd
+                        .is_some_and(|value| value.is_finite() && value >= min_holding_usd))
         })
         .map(|(asset, _)| asset.to_ascii_uppercase())
         .collect::<HashSet<_>>();
@@ -2598,11 +2698,82 @@ fn snapshot_in_portfolio(snapshot: &MarketSnapshot, portfolio: &OctobotPortfolio
         return false;
     };
     portfolio.currencies.get(base_asset).is_some_and(|balance| {
-        (balance.free > 0.0 || balance.total > 0.0)
-            && balance
-                .value_usd
-                .is_some_and(|value| value.is_finite() && value > 0.01)
+        balance.free.is_finite()
+            && balance.total.is_finite()
+            && (balance.free > 0.0 || balance.total > 0.0)
     })
+}
+
+fn portfolio_snapshot_targets(
+    portfolio: &OctobotPortfolio,
+    target_exchanges: &[String],
+) -> Vec<(String, String)> {
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    let add_target = |targets: &mut Vec<(String, String)>,
+                      seen: &mut HashSet<String>,
+                      exchange: &str,
+                      asset: &str| {
+        if is_stablecoin(asset) || asset.trim().is_empty() {
+            return;
+        }
+        let symbol = format!("{}/USDT", asset.trim().to_ascii_uppercase());
+        let key = format!("{}|{}", exchange.to_ascii_lowercase(), symbol);
+        if seen.insert(key) {
+            targets.push((exchange.to_string(), symbol));
+        }
+    };
+
+    for (exchange, balances) in &portfolio.exchange_currencies {
+        if !target_exchanges.is_empty()
+            && !target_exchanges
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(exchange))
+        {
+            continue;
+        }
+        for (asset, balance) in balances {
+            if balance.free.is_finite()
+                && balance.total.is_finite()
+                && (balance.free > 0.0 || balance.total > 0.0)
+            {
+                add_target(&mut targets, &mut seen, exchange, asset);
+            }
+        }
+    }
+
+    // Older OctoBot API shapes may not include exchange-scoped holdings. In
+    // that case, ask each configured venue for the stable-quote market so
+    // dust can still be valued and reviewed.
+    if targets.is_empty() && !target_exchanges.is_empty() {
+        for exchange in target_exchanges {
+            for (asset, balance) in &portfolio.currencies {
+                if balance.free.is_finite()
+                    && balance.total.is_finite()
+                    && (balance.free > 0.0 || balance.total > 0.0)
+                {
+                    add_target(&mut targets, &mut seen, exchange, asset);
+                }
+            }
+        }
+    }
+    targets
+}
+
+fn merge_market_snapshots(
+    sampled: Vec<MarketSnapshot>,
+    required: Vec<MarketSnapshot>,
+) -> Vec<MarketSnapshot> {
+    let mut merged = HashMap::new();
+    for snapshot in sampled.into_iter().chain(required) {
+        let key = format!(
+            "{}|{}",
+            snapshot.exchange.to_ascii_lowercase(),
+            snapshot.symbol.to_ascii_uppercase()
+        );
+        merged.insert(key, snapshot);
+    }
+    merged.into_values().collect()
 }
 
 fn holding_value_usd_for_symbol(portfolio: &OctobotPortfolio, symbol: &str) -> Option<f64> {
@@ -2692,6 +2863,17 @@ fn composite_symbol_score(snapshot: &MarketSnapshot, decision: &TradeDecision) -
         * decision.confidence.clamp(0.0, 1.0)
         * decision.blended_signal.abs().clamp(0.0, 1.0)
         * (0.7 + 0.3 * market_quality)
+}
+
+fn composite_score_reason(score: f64, action: &TradeAction) -> String {
+    if score.abs() > f64::EPSILON {
+        "actionable decision weighted by confidence, signal, trend and liquidity".to_string()
+    } else if matches!(action, TradeAction::Hold) {
+        "zero is expected: decision is hold; see market_opportunity_score for market evidence"
+            .to_string()
+    } else {
+        "zero requires review: non-hold decision had no usable directional signal".to_string()
+    }
 }
 
 fn truncate_message(value: &str, max_chars: usize) -> String {
@@ -2853,10 +3035,6 @@ fn propose_backtest_tuning_candidate(
     let current_threshold = candidate
         .fuzzy_confidence_threshold
         .unwrap_or(config.fuzzy_confidence_threshold);
-    let current_max_positions = candidate
-        .max_open_positions
-        .unwrap_or(config.max_open_positions)
-        .max(1);
     let current_min_usd = candidate
         .micro_trade_min_usd
         .unwrap_or(config.micro_trade_min_usd)
@@ -2873,12 +3051,12 @@ fn propose_backtest_tuning_candidate(
         .decision_roi_feedback_max_signal_adjustment
         .unwrap_or(config.decision_roi_feedback_max_signal_adjustment);
 
-    let (threshold_step, size_scale, weight_step, reduce_positions) = match assessment {
+    let (threshold_step, size_scale, weight_step) = match assessment {
         backtest::ApproachAssessment::Marginal => {
             let scale = if latest_profit_pct < 0.0 { 0.95 } else { 0.98 };
-            (0.02, scale, -0.03, latest_profit_pct < 0.0)
+            (0.02, scale, -0.03)
         }
-        backtest::ApproachAssessment::Unprofitable => (0.05, 0.88, -0.06, true),
+        backtest::ApproachAssessment::Unprofitable => (0.05, 0.88, -0.06),
         _ => return None,
     };
 
@@ -2913,16 +3091,10 @@ fn propose_backtest_tuning_candidate(
         ));
     }
 
-    if reduce_positions && current_max_positions > 1 {
-        let new_max_positions = current_max_positions.saturating_sub(1).max(1);
-        if new_max_positions < current_max_positions {
-            candidate.max_open_positions = Some(new_max_positions);
-            reasons.push(format!(
-                "reduce max positions {}→{}",
-                current_max_positions, new_max_positions
-            ));
-        }
-    }
+    // Position capacity is an operator/build policy, not a backtest tuning
+    // parameter. Reducing it after a poor replay can permanently strand
+    // otherwise valid opportunities behind a runtime override. Keep the
+    // configured default (40) stable and tune only signal quality and sizing.
 
     if latest_profit_pct < 0.0 {
         let penalty_step = if matches!(assessment, backtest::ApproachAssessment::Unprofitable) {
@@ -4706,6 +4878,26 @@ fn choose_decision_market_candidate_with_regime(
     min_sellable_usd: f64,
     market_regime: &MarketRegimeContagion,
 ) -> DecisionMarketSelection {
+    choose_decision_market_candidate_with_regime_and_history(
+        snapshots,
+        consensus,
+        fallback_snapshot,
+        portfolio,
+        min_sellable_usd,
+        market_regime,
+        &HashMap::new(),
+    )
+}
+
+fn choose_decision_market_candidate_with_regime_and_history(
+    snapshots: &[MarketSnapshot],
+    consensus: &advisor::AiConsensus,
+    fallback_snapshot: Option<&MarketSnapshot>,
+    portfolio: &OctobotPortfolio,
+    min_sellable_usd: f64,
+    market_regime: &MarketRegimeContagion,
+    historical_features: &HashMap<String, MarketHistoricalFeatures>,
+) -> DecisionMarketSelection {
     if snapshots.is_empty() {
         return DecisionMarketSelection {
             snapshot: None,
@@ -4728,12 +4920,26 @@ fn choose_decision_market_candidate_with_regime(
     let fallback = if enforce_sell_floor {
         select_dynamic_sell_market_candidate(snapshots, portfolio, min_sellable_usd, market_regime)
             .or_else(|| fallback_snapshot.cloned().filter(snapshot_allowed))
-            .or_else(|| select_best_market_candidate_with_filter(snapshots, snapshot_allowed))
+            .or_else(|| {
+                select_best_market_candidate_with_evidence(
+                    snapshots,
+                    historical_features,
+                    snapshot_allowed,
+                    -1.0,
+                )
+            })
     } else {
-        fallback_snapshot
-            .cloned()
-            .filter(snapshot_allowed)
-            .or_else(|| select_best_market_candidate_with_filter(snapshots, snapshot_allowed))
+        // When the advisors do not provide a target, rank the complete live
+        // universe using the same current and historical evidence shown to
+        // them. Do not let the research fallback (often the first configured
+        // asset) silently win over a stronger market.
+        select_best_market_candidate_with_evidence(
+            snapshots,
+            historical_features,
+            snapshot_allowed,
+            if consensus_direction > 0.0 { 1.0 } else { 0.0 },
+        )
+        .or_else(|| fallback_snapshot.cloned().filter(snapshot_allowed))
     };
     let fallback_label = fallback
         .as_ref()
@@ -5038,6 +5244,44 @@ where
     best.cloned()
 }
 
+/// Select a market using both the live snapshot and the historical feature
+/// set that is sent to the advisor. `direction` is positive for entry
+/// selection, negative for exit selection, and zero for strongest-move
+/// ranking. This prevents a missing ticker percentage from turning a market
+/// with valid historical momentum into an artificial zero-score tie.
+fn select_best_market_candidate_with_evidence<F>(
+    snapshots: &[MarketSnapshot],
+    historical_features: &HashMap<String, MarketHistoricalFeatures>,
+    predicate: F,
+    direction: f64,
+) -> Option<MarketSnapshot>
+where
+    F: Fn(&MarketSnapshot) -> bool,
+{
+    snapshots
+        .iter()
+        .filter(|snapshot| predicate(snapshot))
+        .filter(|snapshot| snapshot_is_usable(snapshot))
+        .max_by(|left, right| {
+            let left_score = market_evidence_score(
+                left,
+                historical_features.get(&market_feature_key(&left.exchange, &left.symbol)),
+                direction,
+            );
+            let right_score = market_evidence_score(
+                right,
+                historical_features.get(&market_feature_key(&right.exchange, &right.symbol)),
+                direction,
+            );
+            left_score
+                .total_cmp(&right_score)
+                .then_with(|| market_score(left).total_cmp(&market_score(right)))
+                .then_with(|| right.exchange.cmp(&left.exchange))
+                .then_with(|| right.symbol.cmp(&left.symbol))
+        })
+        .cloned()
+}
+
 fn compute_market_regime_contagion(snapshots: &[MarketSnapshot]) -> MarketRegimeContagion {
     if snapshots.is_empty() {
         return MarketRegimeContagion::neutral();
@@ -5281,6 +5525,61 @@ fn market_score(snap: &MarketSnapshot) -> f64 {
     let change_abs = snap.price_change_pct_24h.unwrap_or(0.0).abs();
     let vol = snap.volume_24h.unwrap_or(0.0);
     change_abs * (vol + 1.0).ln()
+}
+
+fn market_evidence_momentum_pct(
+    snapshot: &MarketSnapshot,
+    historical: Option<&MarketHistoricalFeatures>,
+) -> Option<f64> {
+    let live = snapshot
+        .price_change_pct_24h
+        .or(snapshot.price_change_pct_1h)
+        .filter(|value| value.is_finite());
+    let historical = historical.and_then(|features| {
+        let weighted = [
+            (features.momentum_short_pct, 0.45),
+            (features.momentum_mid_pct, 0.35),
+            (features.momentum_long_pct, 0.20),
+        ];
+        let (sum, weight) =
+            weighted
+                .into_iter()
+                .fold((0.0, 0.0), |(sum, weight), (value, factor)| {
+                    if let Some(value) = value.filter(|value| value.is_finite()) {
+                        (sum + value * factor, weight + factor)
+                    } else {
+                        (sum, weight)
+                    }
+                });
+        (weight > f64::EPSILON).then_some(sum / weight)
+    });
+
+    match (live, historical) {
+        (Some(live), Some(historical)) => Some(live * 0.45 + historical * 0.55),
+        (Some(live), None) => Some(live),
+        (None, Some(historical)) => Some(historical),
+        (None, None) => None,
+    }
+}
+
+fn market_evidence_score(
+    snapshot: &MarketSnapshot,
+    historical: Option<&MarketHistoricalFeatures>,
+    direction: f64,
+) -> f64 {
+    let Some(momentum) = market_evidence_momentum_pct(snapshot, historical) else {
+        return 0.0;
+    };
+    let directional_momentum = if direction < 0.0 {
+        (-momentum).max(0.0)
+    } else if direction > 0.0 {
+        momentum.max(0.0)
+    } else {
+        momentum.abs()
+    };
+    let movement = (directional_momentum / 30.0).clamp(0.0, 1.0);
+    let liquidity = normalized_snapshot_liquidity(snapshot);
+    (movement * 0.70 + liquidity * 0.30).clamp(0.0, 1.0)
 }
 
 fn build_research_query(config: &TradingConfig, snap: Option<&MarketSnapshot>) -> String {

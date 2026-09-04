@@ -6886,6 +6886,16 @@ fn classify_workload_with_context(
     }) {
         return WorkloadClass::Trading;
     }
+    // Policy approval is a short, bounded control-plane request. Keep it in
+    // the interactive lane even when the workflow name contains "conductor"
+    // or the response is JSON-shaped; routing it to the solver lane makes the
+    // approval gate wait behind long Refiner/project-solver work and causes
+    // callers with short request budgets to time out.
+    if category_lower.contains("approval")
+        || (workflow_lower.contains("approval") && role_lower == "reviewer")
+    {
+        return WorkloadClass::Interactive;
+    }
     // Long-running solver/research traffic must not consume the interactive
     // pool merely because its caller uses a generic direct/assistant route.
     // The prompt is intentionally a secondary signal: explicit trading
@@ -8463,6 +8473,21 @@ Return only a JSON data instance that satisfies this schema:
                 Some("Create an execution plan for the planner."),
             ),
             WorkloadClass::Solver
+        );
+    }
+
+    #[test]
+    fn classify_workload_routes_approval_reviews_to_interactive_pool() {
+        assert_eq!(
+            classify_workload_with_context(
+                "conductor_safe_approval",
+                "reviewer",
+                Some("approval_review"),
+                None,
+                Some("conductor"),
+                Some("Return a safe JSON approval verdict."),
+            ),
+            WorkloadClass::Interactive
         );
     }
 

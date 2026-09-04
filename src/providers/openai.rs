@@ -18,8 +18,8 @@ use crate::{
 
 use super::{
     ProviderHealth, ProviderInvocationResponse, TranscriptionInput, auth_headers, env_bool,
-    env_int, error_message, get_with_retries, is_model_not_found, post_json_with_retries,
-    prompt_cache_key, response_with_usage, total_input_chars,
+    env_int, error_message, get_with_retries, is_model_not_found, looks_like_json_request,
+    post_json_with_retries, prompt_cache_key, response_with_usage, total_input_chars,
 };
 
 #[derive(Clone)]
@@ -130,11 +130,17 @@ impl OpenAIProvider {
             .unwrap_or_else(|| self.api_key.clone());
         let mut model = request.model.clone().unwrap_or_else(|| self.model.clone());
         let base_url = self.resolve_base_url(request.base_url.as_deref());
+        let local_llamacpp_request = is_local_llamacpp_endpoint(&base_url);
         let headers = auth_headers(&api_key);
         let effective_effort = request.reasoning_effort.clone().filter(|effort| {
             openai_model_supports_reasoning_effort(&model) && !effort.trim().is_empty()
         });
+        // Local llama.cpp/OpenAI-compatible servers implement chat completions
+        // consistently, but may expose only a partial Responses API. Keep
+        // reviewer/automation requests on the chat path so the local JSON
+        // response contract and disabled-thinking controls are enforced.
         let use_responses = self.supports_responses
+            && !local_llamacpp_request
             && (env_bool("OPENAI_USE_RESPONSES", false) || effective_effort.is_some());
         let temperature = request.temperature.unwrap_or(0.2);
         let base_timeout = request.timeout_seconds.unwrap_or(env_int(
@@ -295,8 +301,9 @@ impl OpenAIProvider {
         }
 
         let url = endpoint(&base_url, "chat/completions");
-        let local_llamacpp_request = is_local_llamacpp_endpoint(&base_url);
         let local_trading_request = is_local_trading_request(request, &base_url);
+        let local_json_request = local_llamacpp_request
+            && looks_like_json_request(&request.messages, request.system.as_deref());
         for attempt in 0..2 {
             let mut messages = Vec::new();
             if let Some(system) = request.system.as_ref() {
@@ -321,7 +328,7 @@ impl OpenAIProvider {
             if let Some(max_tokens) = request.max_tokens {
                 payload["max_tokens"] = json!(max_tokens);
             }
-            if local_trading_request {
+            if local_trading_request || local_json_request {
                 // llama.cpp accepts this OpenAI-compatible extension and
                 // avoids spending the output budget on a reasoning channel.
                 payload["chat_template_kwargs"] = json!({"enable_thinking": false});
