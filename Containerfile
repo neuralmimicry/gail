@@ -606,6 +606,7 @@ RUN --mount=type=secret,id=gail_release_token set -eu; \
         ca-certificates \
         clinfo \
         curl \
+        git \
         jq \
         kmod \
         libgomp1 \
