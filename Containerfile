@@ -432,7 +432,10 @@ COPY --from=libtorch /opt/libtorch /opt/libtorch
 # revision so trainer promotion is deterministic and does not depend on a
 # mutable host checkout or an internet connection at promotion time.
 FROM docker.io/library/debian:bookworm-slim AS llama-converter
-ARG LLAMA_CPP_COMMIT=6a32c29a746a2e44de463de647f9f6661eb5086b
+# Qwen3.5 support landed after the previous pinned converter revision. Keep
+# the moving upstream branch out of production while pinning a known commit
+# that understands the qwen3_5 checkpoint and its LoRA tensor layout.
+ARG LLAMA_CPP_COMMIT=df03399b885831b2a1603b3abb0d8c156808e363
 RUN set -eu; \
     apt-get -o Acquire::ForceIPv4=true update; \
     apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends ca-certificates curl tar; \
@@ -698,7 +701,7 @@ RUN --mount=type=secret,id=gail_release_token set -eu; \
     python3 -m venv /opt/gail-python; \
     /opt/gail-python/bin/python -m pip install --no-cache-dir --upgrade pip setuptools wheel; \
     { \
-        printf '%s\n' 'transformers>=4.46,<5'; \
+        printf '%s\n' 'transformers @ git+https://github.com/huggingface/transformers.git@606e6e8bb5081de4deac86e18b5751b88b4a78c0'; \
         printf '%s\n' 'accelerate>=1,<2'; \
         printf '%s\n' 'datasets>=3,<4'; \
         printf '%s\n' 'peft>=0.13,<1'; \

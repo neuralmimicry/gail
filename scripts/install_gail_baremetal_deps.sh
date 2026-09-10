@@ -339,7 +339,7 @@ install_python_training_env() {
     fi
   fi
   as_root tee "${GAIL_PYTHON_DIR}/requirements-trainer.txt" >/dev/null <<'REQS_EOF'
-transformers>=4.46,<5
+transformers @ git+https://github.com/huggingface/transformers.git@606e6e8bb5081de4deac86e18b5751b88b4a78c0
 accelerate>=1,<2
 datasets>=3,<4
 peft>=0.13,<1
