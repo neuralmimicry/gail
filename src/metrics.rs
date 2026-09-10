@@ -1011,12 +1011,22 @@ async fn slurm_progress_from_status(
         || (state_is_running
             && heartbeat
                 .is_some_and(|value| now_ts() - value <= training_heartbeat_stale_seconds()));
+    // A distributed rank can finish its local optimizer work before the
+    // Slurm allocation has completed the remaining ranks and aggregation.
+    // While Slurm is still RUNNING, its heartbeat is the authoritative
+    // lifecycle signal, so keep exporting the task even if that rank's
+    // progress file already says completed.
     if !still_active
         || progress.snapshot_id.is_empty()
-        || progress.status == "completed"
         || progress.status == "failed"
+        || (progress.status == "completed" && !state_is_running)
     {
         return None;
+    }
+    if state_is_running && progress.status == "completed" {
+        progress.status = "running".to_string();
+        progress.progress_ratio = progress.progress_ratio.min(0.999);
+        progress.eta_seconds = progress.eta_seconds.max(1.0);
     }
     if let Some(started) = valid_unix_timestamp(progress.started_ts) {
         progress.elapsed_seconds = progress.elapsed_seconds.max((now_ts() - started).max(0.0));
