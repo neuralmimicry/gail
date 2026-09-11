@@ -458,7 +458,7 @@ impl OllamaProvider {
         if local_trading_request {
             prompt.push_str("\n/no_think");
         }
-        let configured_max_predict = env_int("GAIL_OLLAMA_MAX_PREDICT", 512).max(1) as u32;
+        let configured_max_predict = env_int("GAIL_OLLAMA_MAX_PREDICT", 16_384).max(1) as u32;
         let max_predict = if local_trading_request {
             configured_max_predict.max(16_384)
         } else {
