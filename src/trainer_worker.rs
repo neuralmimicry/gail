@@ -480,15 +480,18 @@ async fn recover_completed_snapshot_artifacts(
         .join(snapshot_id);
     let success = snapshot_dir.join("_SUCCESS");
     let report = snapshot_dir.join("training_report.json");
-    let adapter = snapshot_dir.join("adapter");
-    if fs::metadata(&success).await.is_err()
-        || fs::metadata(&report).await.is_err()
-        || fs::metadata(&adapter).await.is_err()
-    {
+    if fs::metadata(&success).await.is_err() || fs::metadata(&report).await.is_err() {
         return Ok(None);
     }
-    let adapter_weights = adapter.join("adapter_model.safetensors");
-    if fs::metadata(&adapter_weights).await.is_err() {
+    // New PEFT runs retain Safetensors under `adapter/`, while the completed
+    // distributed run format used by the Slurm workers emits the converted
+    // `adapter.gguf` at the snapshot root. Both are qualified artifacts and
+    // must be recoverable when only the terminal Slurm result is missing.
+    let safetensors = snapshot_dir
+        .join("adapter")
+        .join("adapter_model.safetensors");
+    let gguf = snapshot_dir.join("adapter.gguf");
+    if fs::metadata(&safetensors).await.is_err() && fs::metadata(&gguf).await.is_err() {
         return Ok(None);
     }
     tracing::info!(
@@ -4111,6 +4114,28 @@ mod tests {
             Ok(ActiveTrainingSnapshot::None)
         ));
         assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn completed_snapshot_recovery_accepts_slurm_gguf_artifact() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let trainer = TrainerConfig {
+            output_root: temporary.path().display().to_string(),
+            ..TrainerConfig::default()
+        };
+        let snapshot = temporary.path().join("snapshots/1789108281632");
+        std::fs::create_dir_all(&snapshot).expect("snapshot directory");
+        std::fs::write(snapshot.join("_SUCCESS"), b"").expect("success marker");
+        std::fs::write(snapshot.join("training_report.json"), b"{}").expect("report");
+        std::fs::write(snapshot.join("adapter.gguf"), b"weights").expect("adapter");
+
+        let recovered = recover_completed_snapshot_artifacts(&trainer, "1789108281632")
+            .await
+            .expect("recovery inspection");
+        assert_eq!(
+            recovered.map(|value| value.snapshot_id),
+            Some("1789108281632".to_string())
+        );
     }
 
     #[tokio::test]
