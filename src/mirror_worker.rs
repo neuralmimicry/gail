@@ -246,8 +246,8 @@ async fn validate_and_record(
         .as_ref()
         .and_then(|metadata| metadata.get("request_max_tokens"))
         .and_then(serde_json::Value::as_u64)
-        .map(|value| value.clamp(1, 4096) as u32)
-        .unwrap_or(512);
+        .map(|value| value.clamp(1, 16_384) as u32)
+        .unwrap_or(16_384);
     let temperature = entry
         .metadata
         .as_ref()

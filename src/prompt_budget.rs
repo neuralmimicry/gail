@@ -44,7 +44,7 @@ pub fn compact_provider_request(
 ) -> Option<PromptCompactionReport> {
     let context_window_tokens = context_window_tokens.max(MIN_CONTEXT_WINDOW_TOKENS);
     let chars_per_token = chars_per_token.max(1);
-    let requested_output_tokens = request.max_tokens.unwrap_or(512) as usize;
+    let requested_output_tokens = request.max_tokens.unwrap_or(16_384) as usize;
     let effective_safety_margin = safety_margin_tokens.min(context_window_tokens / 4);
     let maximum_output_tokens = context_window_tokens
         .saturating_sub(effective_safety_margin)

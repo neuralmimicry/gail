@@ -1495,7 +1495,10 @@ impl GailService {
             request.request_category.as_deref(),
             &task_tags,
         );
-        let requested_output_tokens = request.max_tokens.unwrap_or(512).max(1);
+        // Keep the platform default large enough for current planning and
+        // review workloads. Provider/context compaction still reduces this
+        // value when a selected model cannot accept the full budget.
+        let requested_output_tokens = request.max_tokens.unwrap_or(16_384).max(1);
         let mut specialist_meta = None;
         if !self.inner.specialists.is_empty()
             && (task_tags.contains("neuromorphic") || self.always_route_specialists())
