@@ -4561,6 +4561,14 @@ impl GailService {
             default.max(0) as u64,
         );
         let base = (value > 0).then(|| value.max(1));
+        // Approval reviews are deliberately small control-plane verdicts.
+        // Keep them inside the interactive request window even when the
+        // deployment sets a larger general candidate cap for solver work.
+        // This preserves the 16,384-token general default while preventing a
+        // policy gate from waiting behind a long generation.
+        if task_tags.contains("approval") {
+            return Some(base.unwrap_or(45).min(45));
+        }
         if expected_json
             && (prompt_requests_execution_plan(prompt_text)
                 || prompt_requests_manager_tool_call(prompt_text)
