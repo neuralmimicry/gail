@@ -690,7 +690,7 @@ async fn query_provider(
         system: Some(system),
         // Reserve only the output space an advisory needs. The provider
         // context remains 16,384 tokens; reserving the entire context here
-        // would leave only Gail's 256-token compaction floor for the prompt.
+        // would leave only Gail's small compaction floor for the prompt.
         // Larger prompts receive a larger bounded response allowance, while
         // ordinary structured advisories stay well below the context limit.
         max_tokens: Some(output_tokens),
@@ -782,7 +782,7 @@ fn split_advisory_prompt(prompt: &str, system: &str) -> Vec<AdvisoryPromptChunk>
     let input_tokens = TRADING_CONTEXT_WINDOW_TOKENS
         .saturating_sub(output_tokens)
         .saturating_sub(TRADING_PROMPT_SAFETY_MARGIN_TOKENS)
-        .max(256);
+        .max(2_048);
     let max_prompt_chars = input_tokens
         .saturating_mul(TRADING_CHARS_PER_TOKEN)
         .saturating_sub(system.chars().count())

@@ -15,7 +15,11 @@ use std::collections::BTreeMap;
 use crate::models::{ChatMessage, ContentPart, MessageContent, ProviderCompletionRequest};
 
 const MIN_CONTEXT_WINDOW_TOKENS: usize = 1_024;
-const MIN_INPUT_BUDGET_TOKENS: usize = 256;
+// Keep enough context for a real task when a provider advertises a 16,384
+// token window.  The normal generation default remains 16,384 and is retained
+// automatically for providers with a larger context window; smaller windows
+// are capped after reserving this input budget.
+const MIN_INPUT_BUDGET_TOKENS: usize = 2_048;
 const COMPACTION_MARKER_BUDGET_CHARS: usize = 512;
 const MIN_USER_QUERY_CHARS: usize = 64;
 
@@ -46,9 +50,11 @@ pub fn compact_provider_request(
     let chars_per_token = chars_per_token.max(1);
     let requested_output_tokens = request.max_tokens.unwrap_or(16_384) as usize;
     let effective_safety_margin = safety_margin_tokens.min(context_window_tokens / 4);
+    let available_input_tokens = context_window_tokens.saturating_sub(effective_safety_margin);
+    let input_floor_tokens = MIN_INPUT_BUDGET_TOKENS.min(available_input_tokens).max(1);
     let maximum_output_tokens = context_window_tokens
         .saturating_sub(effective_safety_margin)
-        .saturating_sub(MIN_INPUT_BUDGET_TOKENS)
+        .saturating_sub(input_floor_tokens)
         .max(1);
     let output_tokens = requested_output_tokens.min(maximum_output_tokens);
     if requested_output_tokens > maximum_output_tokens {
@@ -57,7 +63,8 @@ pub fn compact_provider_request(
     let input_budget_tokens = context_window_tokens
         .saturating_sub(output_tokens)
         .saturating_sub(effective_safety_margin)
-        .max(MIN_INPUT_BUDGET_TOKENS);
+        .max(input_floor_tokens)
+        .min(available_input_tokens.max(1));
     let input_budget_chars = input_budget_tokens.saturating_mul(chars_per_token);
     let before_chars = request_char_count(request);
     let estimated_tokens_before = estimate_tokens(before_chars, chars_per_token);
@@ -312,6 +319,16 @@ mod tests {
         let original = request.messages[0].flattened_text();
         assert!(compact_provider_request(&mut request, 16_384, 4, 1_024).is_none());
         assert_eq!(request.messages[0].flattened_text(), original);
+    }
+
+    #[test]
+    fn normal_generation_default_keeps_a_useful_input_budget() {
+        let mut request = request(vec![message("user", "context ".repeat(2_000))]);
+        request.max_tokens = None;
+        let report = compact_provider_request(&mut request, 16_384, 3, 1_024)
+            .expect("large prompt should be compacted");
+        assert!(report.input_budget_tokens >= MIN_INPUT_BUDGET_TOKENS);
+        assert_eq!(request.max_tokens, Some(13_312));
     }
 
     #[test]

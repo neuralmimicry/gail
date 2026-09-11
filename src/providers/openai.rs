@@ -22,6 +22,8 @@ use super::{
     post_json_with_retries, prompt_cache_key, response_with_usage, total_input_chars,
 };
 
+const DEFAULT_GENERATION_BUDGET_TOKENS: u32 = 16_384;
+
 #[derive(Clone)]
 pub struct OpenAIProvider {
     client: Client,
@@ -263,7 +265,12 @@ impl OpenAIProvider {
                     && attempt < 2
                     && responses_max_output_replay_enabled(&base_url)
                 {
-                    max_tokens = Some(max_tokens.unwrap_or(1024).saturating_mul(2).max(1024));
+                    max_tokens = Some(
+                        max_tokens
+                            .unwrap_or(DEFAULT_GENERATION_BUDGET_TOKENS)
+                            .saturating_mul(2)
+                            .max(DEFAULT_GENERATION_BUDGET_TOKENS),
+                    );
                     replay_response_id = data
                         .get("id")
                         .and_then(Value::as_str)
