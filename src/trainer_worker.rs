@@ -466,6 +466,41 @@ async fn recover_terminal_slurm_result(
     Ok(None)
 }
 
+/// A Slurm result can be lost after the training process has durably written
+/// its output.  Treat the output as terminal only when the trainer's own
+/// completion marker, report, and adapter weights are all present.  This lets
+/// a restarted worker finish qualification and promotion without rerunning a
+/// costly snapshot or leaving its ledger rows locked forever.
+async fn recover_completed_snapshot_artifacts(
+    trainer: &TrainerConfig,
+    snapshot_id: &str,
+) -> Result<Option<RecoveredTrainingSnapshot>> {
+    let snapshot_dir = PathBuf::from(&trainer.output_root)
+        .join("snapshots")
+        .join(snapshot_id);
+    let success = snapshot_dir.join("_SUCCESS");
+    let report = snapshot_dir.join("training_report.json");
+    let adapter = snapshot_dir.join("adapter");
+    if fs::metadata(&success).await.is_err()
+        || fs::metadata(&report).await.is_err()
+        || fs::metadata(&adapter).await.is_err()
+    {
+        return Ok(None);
+    }
+    let adapter_weights = adapter.join("adapter_model.safetensors");
+    if fs::metadata(&adapter_weights).await.is_err() {
+        return Ok(None);
+    }
+    tracing::info!(
+        snapshot = snapshot_id,
+        "recovering completed training artifacts after missing Slurm terminal result"
+    );
+    Ok(Some(RecoveredTrainingSnapshot {
+        snapshot_id: snapshot_id.to_string(),
+        ledger_ids: Vec::new(),
+    }))
+}
+
 enum ActiveTrainingSnapshot {
     None,
     Active,
@@ -514,6 +549,14 @@ async fn active_training_snapshot(
         .map(|items| items.iter().filter_map(Value::as_i64).collect::<Vec<_>>())
         .unwrap_or_default();
     if let Some(spool) = env_string("GAIL_TRAIN_SLURM_SPOOL") {
+        if let Some(recovered) = recover_completed_snapshot_artifacts(trainer, snapshot_id).await? {
+            return Ok(ActiveTrainingSnapshot::TerminalSuccess(
+                RecoveredTrainingSnapshot {
+                    ledger_ids: ids,
+                    ..recovered
+                },
+            ));
+        }
         if let Some(recovered) =
             recover_terminal_slurm_result(trainer, dsn, Path::new(&spool), snapshot_id, &ids)
                 .await?
