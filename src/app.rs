@@ -158,7 +158,10 @@ pub fn build_router(service: GailService) -> Router {
     let governance_state = (service.clone(), service.governance().clone());
     Router::new()
         .route("/v1/internal/aria/assess", post(crate::governance::assess))
-        .route("/v1/internal/aria/status", get(crate::governance::assessment_status))
+        .route(
+            "/v1/internal/aria/status",
+            get(crate::governance::assessment_status),
+        )
         .route("/v1/status/governance", get(crate::governance::status))
         .route("/healthz", get(health))
         .route("/readyz", get(readiness))
