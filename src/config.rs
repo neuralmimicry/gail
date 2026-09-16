@@ -15,6 +15,7 @@ pub const MAX_WORKLOAD_POOL_WAIT_TIMEOUT_MS: u64 = 1_200_000;
 #[serde(default)]
 #[derive(Default)]
 pub struct GailConfig {
+    pub governance: crate::governance::GovernanceConfig,
     pub server: ServerConfig,
     pub security: SecurityConfig,
     pub orchestration: OrchestrationConfig,

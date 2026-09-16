@@ -2,6 +2,10 @@ server:
   bind_addr: "0.0.0.0:8080"
   public_base_url: "${GAIL_PUBLIC_BASE_URL}"
 
+# See docs/aria.md for credentials, rollout modes and response inspection limits.
+governance:
+  mode: disabled
+
 security:
   allow_unauthenticated_health: true
   allow_unauthenticated_metrics: true

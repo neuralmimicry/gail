@@ -1,5 +1,7 @@
 # Gail
 
+Gail can enforce AI governance through [Aria](docs/aria.md), including request and response checks, incident monitoring and runtime policy controls. The integration uses HTTP and a dedicated assessment credential; no cyclic project dependency is introduced.
+
 ## Sponsor NeuralMimicry
 
 Gail is the open-source shared AI middleware for NeuralMimicry services — consolidating multi-provider LLM routing, neuromorphic specialist access, AER translation, continuous fine-tuning, and an autonomous crypto-trading bridge in a single non-blocking Rust service. NeuralMimicry is an independent open-source initiative and we rely on community support to sustain this work.

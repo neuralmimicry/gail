@@ -115,6 +115,7 @@ pub struct GailService {
 }
 
 struct GailServiceInner {
+    governance: crate::governance::Governance,
     config: GailConfig,
     client: Client,
     metrics: MetricsStore,
@@ -360,6 +361,7 @@ impl GailService {
         self.inner.metrics.clone()
     }
     pub async fn new(config: GailConfig) -> Result<Self> {
+        let governance = crate::governance::Governance::new(&config.governance, &config.security)?;
         adaptive_schema::configure_persistence(config.storage.adaptive_schema_path.clone()).await;
         api_issues::configure_persistence(
             config.storage.api_issues_path.clone(),
@@ -436,6 +438,7 @@ impl GailService {
         // Construct a preliminary service (without trading) to pass into the trading bridge.
         let preliminary = Self {
             inner: Arc::new(GailServiceInner {
+                governance: governance.clone(),
                 config: config.clone(),
                 client: client.clone(),
                 metrics: metrics.clone(),
@@ -468,6 +471,7 @@ impl GailService {
 
         Ok(Self {
             inner: Arc::new(GailServiceInner {
+                governance,
                 config,
                 client,
                 metrics,
@@ -491,6 +495,10 @@ impl GailService {
 
     pub fn config(&self) -> &GailConfig {
         &self.inner.config
+    }
+
+    pub fn governance(&self) -> &crate::governance::Governance {
+        &self.inner.governance
     }
 
     fn aarnn_bridge(&self) -> Option<&AarnnMirrorClient> {
@@ -911,6 +919,23 @@ impl GailService {
     }
 
     pub async fn direct_complete(
+        &self,
+        request: ProviderCompletionRequest,
+    ) -> Result<CompletionResponse> {
+        if !self.governance().checks_completion() {
+            return self.direct_complete_unguarded(request).await;
+        }
+        let source = request.source.clone();
+        self.governance()
+            .completion(
+                serde_json::to_value(&request)?,
+                source.as_deref(),
+                self.direct_complete_unguarded(request),
+            )
+            .await
+    }
+
+    async fn direct_complete_unguarded(
         &self,
         request: ProviderCompletionRequest,
     ) -> Result<CompletionResponse> {
@@ -1353,6 +1378,20 @@ impl GailService {
     }
 
     pub async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+        if !self.governance().checks_completion() {
+            return self.complete_unguarded(request).await;
+        }
+        let source = request.source.clone();
+        self.governance()
+            .completion(
+                serde_json::to_value(&request)?,
+                source.as_deref(),
+                self.complete_unguarded(request),
+            )
+            .await
+    }
+
+    async fn complete_unguarded(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         let _ = self.inner.metrics.record_request_received().await;
         let api_source = request
             .source
@@ -2781,6 +2820,10 @@ impl GailService {
         &self,
         exchange: AarnnMirrorExchange,
     ) -> Option<oneshot::Receiver<crate::models::AarnnMirrorInvocationTrace>> {
+        // Classifier examples may contain hostile material; never use them as learning input.
+        if crate::governance::is_assessment() {
+            return None;
+        }
         let bridge = self.inner.aarnn_bridge.clone()?;
         // Respect per-direction toggles so input/output mirroring can be tuned
         // independently without changing orchestration call sites.
@@ -2920,6 +2963,11 @@ impl GailService {
     }
 
     async fn record_llm_interaction(&self, mut record: LlmLedgerRecord) {
+        // Aria owns the redacted decision audit. Assessment prompts must not enter
+        // Gail's content logs, comparative validation or asynchronous training ledger.
+        if crate::governance::is_assessment() {
+            return;
+        }
         if !self.audit_logging().store_llm_content
             && !self
                 .inner

@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use crate::errors::{GailError, Result};
 
 pub const AER_MAGIC: &[u8; 4] = b"AER1";
+/// A sparse address or caller-supplied length must not trigger an unbounded
+/// dense allocation. Large neuromorphic workloads can retain sparse events.
+pub const MAX_DENSE_SPIKES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AerEvent {
@@ -138,6 +141,7 @@ pub fn apply_events_to_spikes(
 }
 
 pub fn decode_spikes(payload: &[u8], base_addr: u32, length: usize) -> Result<Vec<u8>> {
+    validate_dense_length(length)?;
     let events = decode_events(payload)?;
     let mut spikes = vec![0u8; length];
     apply_events_to_spikes(&events, base_addr, &mut spikes);
@@ -151,7 +155,9 @@ pub fn decode_spikes_auto(payload: &[u8], base_addr: u32) -> Result<Vec<u8>> {
         .map(|event| event.addr.saturating_sub(base_addr) as usize)
         .max()
         .unwrap_or(0);
-    let mut spikes = vec![0u8; max_index.saturating_add(1)];
+    let length = max_index.saturating_add(1);
+    validate_dense_length(length)?;
+    let mut spikes = vec![0u8; length];
     apply_events_to_spikes(&events, base_addr, &mut spikes);
     Ok(spikes)
 }
@@ -163,6 +169,15 @@ pub fn spikes_from_floats(values: &[f32], threshold: f64) -> Vec<u8> {
         .collect()
 }
 
+fn validate_dense_length(length: usize) -> Result<()> {
+    if length > MAX_DENSE_SPIKES {
+        return Err(GailError::bad_request(
+            "AER dense output exceeds the 16 MiB limit",
+        ));
+    }
+    Ok(())
+}
+
 pub fn payload_hex(payload: &[u8]) -> String {
     hex::encode(payload)
 }
@@ -170,6 +185,22 @@ pub fn payload_hex(payload: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_unbounded_requested_dense_output() {
+        assert!(decode_spikes(&[], 0, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn rejects_sparse_addresses_that_require_excessive_dense_output() {
+        let payload = encode_events(&[AerEvent {
+            ts_us: 1,
+            addr: u32::MAX,
+            value: 1,
+        }]);
+        assert!(decode_spikes_auto(&payload, 0).is_err());
+        assert_eq!(decode_spikes_auto(&payload, u32::MAX).unwrap(), vec![1]);
+    }
 
     #[test]
     fn aer_round_trip_preserves_events() {

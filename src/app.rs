@@ -155,7 +155,11 @@ static EXECUTION_PLAN_CACHE: Lazy<Mutex<HashMap<String, Value>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 pub fn build_router(service: GailService) -> Router {
+    let governance_state = (service.clone(), service.governance().clone());
     Router::new()
+        .route("/v1/internal/aria/assess", post(crate::governance::assess))
+        .route("/v1/internal/aria/status", get(crate::governance::assessment_status))
+        .route("/v1/status/governance", get(crate::governance::status))
         .route("/healthz", get(health))
         .route("/readyz", get(readiness))
         .route("/v1/models", get(openai_models))
@@ -197,6 +201,10 @@ pub fn build_router(service: GailService) -> Router {
             "/v1/trading/backtest",
             get(trading_backtest_result).post(trading_run_backtest),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            governance_state,
+            crate::governance::guard,
+        ))
         .with_state(service)
 }
 

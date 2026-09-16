@@ -8,6 +8,7 @@ pub mod client;
 pub mod config;
 pub mod errors;
 pub mod hardware;
+pub mod governance;
 pub mod llm_ledger;
 pub mod metrics;
 pub mod mirror_worker;
