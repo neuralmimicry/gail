@@ -792,8 +792,20 @@ async fn trading_history(
         Some(bridge) => {
             let limit = query.limit.unwrap_or(50).min(500);
             let state = bridge.state.0.lock().await;
-            let trades: Vec<_> = state.recent_trades.iter().rev().take(limit).collect();
-            Json(json!({ "trades": trades, "total": state.trade_count })).into_response()
+            // OctoBot is the execution venue and retains fills from before Gail
+            // took ownership. Gail imports that complete ledger at startup and
+            // periodically, then appends its own fills to the same durable
+            // history. The bounded response is only a presentation limit.
+            Json(json!({
+                "trades": state.trade_history.iter().rev().take(limit).collect::<Vec<_>>(),
+                "total": state.trade_history.len(),
+                "gail_trade_count": state.trade_count,
+                "source": "gail_unified_octobot_trade_history",
+                "execution_authority": "gail",
+                "venue": "octobot",
+                "includes_pre_gail_octobot_history": true
+            }))
+            .into_response()
         }
     }
 }

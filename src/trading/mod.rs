@@ -59,7 +59,7 @@ use economics::adverse_reprice_drift_bps;
 use fuzzy::{FuzzyEngine, FuzzyInputs};
 use octobot::{
     MarketSnapshot, OCTOBOT_MARKET_SNAPSHOT_HARD_LIMIT, OctobotClient, OctobotExchange,
-    OctobotLogEntry, OctobotPortfolio,
+    OctobotLogEntry, OctobotPortfolio, OctobotTrade,
 };
 use outcomes::TradeMarkout;
 use qualification::PaperQualificationPolicy;
@@ -68,7 +68,10 @@ use quantitative::backtest::{NativeBacktestReport, NativeQuantBacktester};
 use quantitative::sleeves::{evaluate_sleeves_async, market_key as sleeve_market_key};
 use quantitative::telemetry::reprice_net_edge;
 use refiner::RefinerClient;
-use state::{ExecutedTrade, ExecutionIntentClaim, SharedTradingState, TradeAction, TradingState};
+use state::{
+    ExecutedTrade, ExecutionIntentClaim, SharedTradingState, TradeAction, TradeRecordSource,
+    TradingState,
+};
 
 fn now_ts() -> f64 {
     SystemTime::now()
@@ -119,6 +122,79 @@ const BACKTEST_AUTOTUNE_MIN_MEAN_IMPROVEMENT_PCT: f64 = 0.35;
 const BACKTEST_AUTOTUNE_MAX_MEDIAN_REGRESSION_PCT: f64 = 0.25;
 const BACKTEST_AUTOTUNE_COOLDOWN_SECONDS: f64 = 3_600.0;
 const MAX_EXECUTIONS_PER_EVALUATION: usize = 8;
+
+fn imported_trade_from_octobot(trade: OctobotTrade) -> Option<ExecutedTrade> {
+    let ts = trade
+        .timestamp
+        .filter(|value| value.is_finite() && *value > 0.0)?;
+    let action = match trade.side.to_ascii_lowercase().as_str() {
+        "buy" => TradeAction::Buy,
+        "sell" => TradeAction::Sell,
+        _ => return None,
+    };
+    let price = trade
+        .price
+        .is_finite()
+        .then_some(trade.price)
+        .filter(|value| *value > 0.0);
+    let amount_usd = if trade.cost.is_finite() && trade.cost > 0.0 {
+        trade.cost
+    } else {
+        trade.amount * price.unwrap_or_default()
+    };
+    if !amount_usd.is_finite() || amount_usd <= 0.0 {
+        return None;
+    }
+    Some(ExecutedTrade {
+        ts,
+        exchange: trade.exchange,
+        symbol: trade.symbol,
+        action,
+        amount_usd,
+        price,
+        order_id: trade.id,
+        confidence: 0.0,
+        rationale: "Imported from OctoBot execution history".to_string(),
+        ai_votes: serde_json::Value::Null,
+        fuzzy_confidence: 0.0,
+        ai_confidence: 0.0,
+        source: TradeRecordSource::OctobotImported,
+    })
+}
+
+async fn sync_octobot_trade_history(
+    state: &SharedTradingState,
+    octobot: &OctobotClient,
+    data_path: &PathBuf,
+) -> Result<(usize, usize, usize), String> {
+    let octobot_trades = octobot.get_all_trade_history().await?;
+    let fetched = octobot_trades.len();
+    let imported_records = octobot_trades
+        .into_iter()
+        .filter_map(imported_trade_from_octobot)
+        .collect::<Vec<_>>();
+    let (imported, total) = {
+        let mut current = state.0.lock().await;
+        let imported = current.import_trade_history(imported_records);
+        let total = current.trade_history_len();
+        current.log(
+            "info",
+            "history",
+            "OCTOBOT_TRADE_HISTORY_SYNCED",
+            json!({
+                "octobot_rows": fetched,
+                "imported_rows": imported,
+                "unified_rows": total,
+                "includes_pre_gail_octobot_history": true,
+            }),
+        );
+        (imported, total)
+    };
+    if imported > 0 {
+        state.persist(data_path).await;
+    }
+    Ok((fetched, imported, total))
+}
 
 // ---------------------------------------------------------------------------
 // Handle for controlling the background task
@@ -253,6 +329,7 @@ async fn run_evaluation_loop(
     } else {
         None
     };
+    let mut last_trade_history_sync_ts = 0.0;
     let mut pending_datalake_bootstrap_reason = if config.market_datalake_bootstrap_enabled {
         if let Some(lake) = market_data_lake.as_ref() {
             lake.bootstrap_required_reason().await
@@ -325,6 +402,18 @@ async fn run_evaluation_loop(
                 }),
             )
             .await;
+        match sync_octobot_trade_history(&state, &octobot, &data_path).await {
+            Ok((fetched, imported, total)) => {
+                info!(
+                    fetched,
+                    imported, total, "trading: imported complete OctoBot trade history"
+                );
+            }
+            Err(err) => {
+                warn!("trading: OctoBot trade-history import failed at startup: {err}");
+            }
+        }
+        last_trade_history_sync_ts = now_ts();
     }
 
     if let Some(reason) = pending_datalake_bootstrap_reason.take()
@@ -419,6 +508,22 @@ async fn run_evaluation_loop(
             }
         };
         if should_evaluate {
+            if now_ts() - last_trade_history_sync_ts
+                >= config.trade_history_sync_interval_seconds as f64
+            {
+                match sync_octobot_trade_history(&state, &octobot, &data_path).await {
+                    Ok((fetched, imported, total)) => {
+                        info!(
+                            fetched,
+                            imported, total, "trading: refreshed complete OctoBot trade history"
+                        );
+                    }
+                    Err(err) => {
+                        warn!("trading: OctoBot trade-history refresh failed: {err}");
+                    }
+                }
+                last_trade_history_sync_ts = now_ts();
+            }
             if datalake_bootstrap_task
                 .as_ref()
                 .is_some_and(JoinHandle::is_finished)
@@ -4122,6 +4227,7 @@ async fn execute_if_warranted(
                 ai_votes: serde_json::Value::Null,
                 fuzzy_confidence: decision.fuzzy_confidence,
                 ai_confidence: decision.ai_confidence,
+                source: TradeRecordSource::Gail,
             };
             {
                 let mut s = state.0.lock().await;

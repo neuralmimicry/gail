@@ -1124,10 +1124,17 @@ impl OctobotClient {
     }
 
     pub async fn get_trade_history(&self, limit: usize) -> Result<Vec<OctobotTrade>, String> {
-        let body = self.get_json("/api/trades", "trade history").await?;
-        let mut trades = parse_trades_array(&body)?;
+        let mut trades = self.get_all_trade_history().await?;
         trades.truncate(limit);
         Ok(trades)
+    }
+
+    /// Fetch the complete OctoBot execution ledger.  The `/api/trades`
+    /// endpoint already returns the full persisted list; Gail applies limits
+    /// only to bounded UI/order-detection callers.
+    pub async fn get_all_trade_history(&self) -> Result<Vec<OctobotTrade>, String> {
+        let body = self.get_json("/api/trades", "trade history").await?;
+        parse_trades_array(&body)
     }
 
     pub async fn place_buy_order(
@@ -5228,7 +5235,7 @@ fn parse_orders_array(body: &Value) -> Result<Vec<OctobotOrder>, String> {
                     .unwrap_or("unknown")
                     .to_string(),
                 order_type,
-                amount: entry.get("amount").and_then(Value::as_f64).unwrap_or(0.0),
+                amount: entry.get("amount").and_then(json_f64).unwrap_or(0.0),
                 price: entry.get("price").and_then(Value::as_f64),
                 status: entry
                     .get("status")
@@ -5277,14 +5284,17 @@ fn parse_trades_array(body: &Value) -> Result<Vec<OctobotTrade>, String> {
                     .or_else(|| infer_side(trade_type))
                     .unwrap_or("unknown")
                     .to_string(),
-                amount: entry.get("amount").and_then(Value::as_f64).unwrap_or(0.0),
-                price: entry.get("price").and_then(Value::as_f64).unwrap_or(0.0),
-                cost: entry.get("cost").and_then(Value::as_f64).unwrap_or(0.0),
-                fee: entry.get("fee").and_then(Value::as_f64),
+                amount: entry.get("amount").and_then(json_f64).unwrap_or(0.0),
+                price: entry.get("price").and_then(json_f64).unwrap_or(0.0),
+                cost: entry.get("cost").and_then(json_f64).unwrap_or(0.0),
+                fee: entry
+                    .get("fee")
+                    .or_else(|| entry.get("fee_cost"))
+                    .and_then(json_f64),
                 timestamp: entry
                     .get("timestamp")
                     .or_else(|| entry.get("time"))
-                    .and_then(Value::as_f64),
+                    .and_then(json_f64),
             })
         })
         .collect())
@@ -5305,6 +5315,29 @@ fn infer_side(value: &str) -> Option<&'static str> {
 mod microstructure_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn trade_parser_accepts_octobot_string_valued_history_rows() {
+        let trades = parse_trades_array(&json!([{
+            "amount": "412.0",
+            "cost": "39.8404",
+            "fee_cost": "0.000097",
+            "exchange": "binance",
+            "id": "trade-1",
+            "price": "0.0967",
+            "symbol": "DOGE/USDT",
+            "time": 1680620258.831,
+            "type": "BUY MARKET"
+        }]))
+        .expect("trade history row should parse");
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].amount, 412.0);
+        assert_eq!(trades[0].cost, 39.8404);
+        assert_eq!(trades[0].fee, Some(0.000097));
+        assert_eq!(trades[0].price, 0.0967);
+        assert_eq!(trades[0].side, "buy");
+        assert_eq!(trades[0].timestamp, Some(1680620258.831));
+    }
 
     #[test]
     fn ticker_parser_accepts_string_numbers_and_microstructure_aliases() {

@@ -25,6 +25,7 @@ mod tests {
     use crate::trading::outcomes::TradeMarkout;
     use crate::trading::state::{
         ExecutedTrade, ExecutionIntentClaim, SharedTradingState, TradeAction, TradeOverride,
+        TradeRecordSource,
     };
 
     // -----------------------------------------------------------------------
@@ -804,6 +805,7 @@ mod tests {
                 ai_votes: serde_json::Value::Null,
                 fuzzy_confidence: 0.7,
                 ai_confidence: 0.9,
+                source: TradeRecordSource::Gail,
             });
         }
         assert_eq!(
@@ -815,6 +817,74 @@ mod tests {
             state.trade_count, 6,
             "trade_count must reflect all recorded trades"
         );
+    }
+
+    #[test]
+    fn state_imports_full_octobot_history_idempotently() {
+        use crate::trading::state::TradingState;
+        let mut state = TradingState::new(100, 2);
+        state.record_trade(ExecutedTrade {
+            ts: 30.0,
+            exchange: "binance".to_string(),
+            symbol: "BTC/USDT".to_string(),
+            action: TradeAction::Buy,
+            amount_usd: 5.0,
+            price: Some(100.0),
+            order_id: Some("gail-order".to_string()),
+            confidence: 0.8,
+            rationale: "gail".to_string(),
+            ai_votes: serde_json::Value::Null,
+            fuzzy_confidence: 0.7,
+            ai_confidence: 0.9,
+            source: TradeRecordSource::Gail,
+        });
+        let imported = || {
+            vec![
+                ExecutedTrade {
+                    ts: 10.0,
+                    exchange: "binance".to_string(),
+                    symbol: "ETH/USDT".to_string(),
+                    action: TradeAction::Sell,
+                    amount_usd: 4.0,
+                    price: Some(200.0),
+                    order_id: Some("octobot-order-1".to_string()),
+                    confidence: 0.0,
+                    rationale: "imported".to_string(),
+                    ai_votes: serde_json::Value::Null,
+                    fuzzy_confidence: 0.0,
+                    ai_confidence: 0.0,
+                    source: TradeRecordSource::OctobotImported,
+                },
+                ExecutedTrade {
+                    ts: 20.0,
+                    exchange: "binance".to_string(),
+                    symbol: "ETH/USDT".to_string(),
+                    action: TradeAction::Buy,
+                    amount_usd: 6.0,
+                    price: Some(210.0),
+                    order_id: Some("octobot-order-2".to_string()),
+                    confidence: 0.0,
+                    rationale: "imported".to_string(),
+                    ai_votes: serde_json::Value::Null,
+                    fuzzy_confidence: 0.0,
+                    ai_confidence: 0.0,
+                    source: TradeRecordSource::OctobotImported,
+                },
+            ]
+        };
+        assert_eq!(state.import_trade_history(imported()), 2);
+        assert_eq!(state.import_trade_history(imported()), 0);
+        assert_eq!(state.trade_history_len(), 3);
+        assert_eq!(state.recent_trades.len(), 2);
+        assert_eq!(
+            state.recent_trades[0].order_id.as_deref(),
+            Some("octobot-order-2")
+        );
+        assert_eq!(
+            state.recent_trades[1].order_id.as_deref(),
+            Some("gail-order")
+        );
+        assert_eq!(state.trade_count, 1);
     }
 
     #[test]
@@ -835,6 +905,7 @@ mod tests {
             ai_votes: serde_json::Value::Null,
             fuzzy_confidence: 0.6,
             ai_confidence: 0.8,
+            source: TradeRecordSource::Gail,
         });
         assert_eq!(state.last_trade_at, Some(12345.0));
     }
@@ -963,6 +1034,7 @@ mod tests {
                 ai_votes: serde_json::Value::Null,
                 fuzzy_confidence: 0.6,
                 ai_confidence: 0.9,
+                source: TradeRecordSource::Gail,
             });
             s.in_flight_order_intents.insert(
                 "BUY|ETH/USDT".to_string(),
@@ -4834,6 +4906,7 @@ mod tests {
                 ai_votes: json!({}),
                 fuzzy_confidence: 0.8,
                 ai_confidence: 0.8,
+                source: TradeRecordSource::Gail,
             });
         }
         assert!(

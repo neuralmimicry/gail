@@ -147,6 +147,9 @@ pub struct TradingConfig {
     /// Duration of a durable in-flight order intent lease.
     pub execution_lease_seconds: f64,
 
+    /// How often Gail refreshes its unified fill ledger from OctoBot.
+    pub trade_history_sync_interval_seconds: u64,
+
     // -----------------------------------------------------------------------
     // Fixed-horizon outcome calibration
     // -----------------------------------------------------------------------
@@ -440,6 +443,7 @@ impl Default for TradingConfig {
             strict_exchange_selection: true,
             execution_authority: "gail".to_string(),
             execution_lease_seconds: 180.0,
+            trade_history_sync_interval_seconds: 900,
             markout_horizon_seconds: 900,
             markout_ledger_size: 2_000,
             markout_calibration_min_samples: 8,
@@ -626,6 +630,8 @@ impl TradingConfig {
         self.log_ring_size = self.log_ring_size.clamp(10, 10_000);
         self.trade_ring_size = self.trade_ring_size.clamp(10, 5_000);
         self.octobot_timeout_seconds = self.octobot_timeout_seconds.max(1.0);
+        self.trade_history_sync_interval_seconds =
+            self.trade_history_sync_interval_seconds.clamp(60, 86_400);
         self.refiner_timeout_seconds = self.refiner_timeout_seconds.max(1.0);
         self.market_datalake_retention_days = self.market_datalake_retention_days.clamp(7, 3650);
         self.market_datalake_bucket_seconds = self.market_datalake_bucket_seconds.clamp(10, 3_600);

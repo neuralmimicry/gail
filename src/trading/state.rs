@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -119,6 +119,33 @@ pub struct ExecutedTrade {
     pub ai_votes: serde_json::Value,
     pub fuzzy_confidence: f64,
     pub ai_confidence: f64,
+    /// Provenance of the fill.  Older persisted Gail fills default to Gail
+    /// ownership; imported records are explicitly marked as OctoBot history.
+    #[serde(default)]
+    pub source: TradeRecordSource,
+}
+
+fn trade_identity(trade: &ExecutedTrade) -> String {
+    if let Some(order_id) = trade.order_id.as_deref().filter(|id| !id.trim().is_empty()) {
+        return format!("order:{}:{}", trade.exchange.to_ascii_lowercase(), order_id);
+    }
+    format!(
+        "fallback:{:.3}|{}|{}|{}|{:.8}|{:.8}",
+        trade.ts,
+        trade.exchange.to_ascii_lowercase(),
+        trade.symbol.to_ascii_uppercase(),
+        trade.action,
+        trade.amount_usd,
+        trade.price.unwrap_or_default()
+    )
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TradeRecordSource {
+    #[default]
+    Gail,
+    OctobotImported,
 }
 
 /// Durable ownership record for an economic order intent.
@@ -238,6 +265,9 @@ pub struct TradingState {
     #[serde(default)]
     pub exchange_circuit: HashMap<String, ExchangeCircuitState>,
     pub recent_trades: VecDeque<ExecutedTrade>,
+    /// Complete unified fill history, including pre-Gail OctoBot records.
+    #[serde(default)]
+    pub trade_history: VecDeque<ExecutedTrade>,
     pub activity_log: VecDeque<TradingLogEntry>,
     pub last_error: Option<String>,
     pub config_overrides: Option<TradingConfigOverride>,
@@ -330,6 +360,7 @@ impl TradingState {
             available_exchanges: Vec::new(),
             exchange_circuit: HashMap::new(),
             recent_trades: VecDeque::with_capacity(trade_ring_size),
+            trade_history: VecDeque::new(),
             activity_log: VecDeque::with_capacity(log_ring_size),
             last_error: None,
             config_overrides: None,
@@ -382,12 +413,82 @@ impl TradingState {
     }
 
     pub fn record_trade(&mut self, trade: ExecutedTrade) {
+        self.last_trade_at = Some(trade.ts);
+        self.trade_count += 1;
+        self.append_trade_history(trade.clone());
+        self.append_recent_trade(trade);
+    }
+
+    /// Merge OctoBot's complete execution history into Gail's durable ledger.
+    /// Stable OctoBot order IDs make repeated startup/periodic imports
+    /// idempotent, while the fallback fingerprint handles older rows without
+    /// an ID.  Imported rows do not increment Gail's own execution counter.
+    pub fn import_trade_history<I>(&mut self, trades: I) -> usize
+    where
+        I: IntoIterator<Item = ExecutedTrade>,
+    {
+        let mut seen = self
+            .trade_history
+            .iter()
+            .map(trade_identity)
+            .collect::<HashSet<_>>();
+        let mut imported = 0;
+        for trade in trades {
+            let identity = trade_identity(&trade);
+            if !seen.insert(identity) {
+                continue;
+            }
+            self.trade_history.push_back(trade);
+            imported += 1;
+        }
+        if imported > 0 {
+            let mut ordered = self.trade_history.drain(..).collect::<Vec<_>>();
+            ordered.sort_by(|left, right| left.ts.total_cmp(&right.ts));
+            self.trade_history = ordered.into_iter().collect();
+            self.rebuild_recent_trades();
+        }
+        imported
+    }
+
+    pub fn trade_history_len(&self) -> usize {
+        self.trade_history.len()
+    }
+
+    fn append_trade_history(&mut self, trade: ExecutedTrade) {
+        let identity = trade_identity(&trade);
+        if let Some(existing) = self
+            .trade_history
+            .iter_mut()
+            .find(|existing| trade_identity(existing) == identity)
+        {
+            if existing.source == TradeRecordSource::OctobotImported
+                && trade.source == TradeRecordSource::Gail
+            {
+                *existing = trade;
+            }
+        } else {
+            self.trade_history.push_back(trade);
+        }
+    }
+
+    fn append_recent_trade(&mut self, trade: ExecutedTrade) {
         if self.recent_trades.len() >= self.trade_ring_size {
             self.recent_trades.pop_front();
         }
-        self.last_trade_at = Some(trade.ts);
-        self.trade_count += 1;
         self.recent_trades.push_back(trade);
+    }
+
+    fn rebuild_recent_trades(&mut self) {
+        self.recent_trades = self
+            .trade_history
+            .iter()
+            .rev()
+            .take(self.trade_ring_size)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
     }
 
     pub fn status_snapshot(&self, enabled: bool) -> TradingStatusSnapshot {
@@ -606,7 +707,8 @@ impl SharedTradingState {
                     state.trade_count = restored.trade_count;
                     state.last_evaluation_at = restored.last_evaluation_at;
                     state.last_trade_at = restored.last_trade_at;
-                    state.recent_trades = restored.recent_trades;
+                    let restored_recent_trades = restored.recent_trades;
+                    state.recent_trades = restored_recent_trades.clone();
                     state.activity_log = restored.activity_log;
                     state.config_overrides = restored.config_overrides;
                     state.last_backtest = restored.last_backtest;
@@ -614,6 +716,12 @@ impl SharedTradingState {
                     state.backtest_auto_tune = restored.backtest_auto_tune;
                     state.api_schema = restored.api_schema;
                     state.exchange_circuit = restored.exchange_circuit;
+                    state.trade_history = if restored.trade_history.is_empty() {
+                        restored_recent_trades
+                    } else {
+                        restored.trade_history
+                    };
+                    state.rebuild_recent_trades();
                     state.observed_external_log_fingerprints =
                         restored.observed_external_log_fingerprints;
                     state.in_flight_order_intents = restored.in_flight_order_intents;
