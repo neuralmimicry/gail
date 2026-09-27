@@ -80,9 +80,6 @@ jobs:
             # Use the self-hosted Linux runner pool so release progress does not depend on
             # an intermittently registered local runner.
             runs_on: '["self-hosted","Linux","X64"]'
-          - arch: arm64
-            # Use the self-hosted Linux ARM64 runner for ARM release builds.
-            runs_on: '["self-hosted","Linux","ARM64"]'
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
