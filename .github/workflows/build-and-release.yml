@@ -48,7 +48,7 @@ concurrency:
 jobs:
   version:
     name: Version metadata
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     outputs:
       release_version: ${{ steps.version.outputs.release_version }}
       build_version: ${{ steps.version.outputs.build_version }}
@@ -77,12 +77,12 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            # Use GitHub-hosted runners so release progress does not depend on
+            # Use the self-hosted Linux runner pool so release progress does not depend on
             # an intermittently registered local runner.
-            runs_on: '["ubuntu-latest"]'
+            runs_on: '["self-hosted","Linux","X64"]'
           - arch: arm64
-            # Public repositories have access to the hosted ARM64 runner.
-            runs_on: '["ubuntu-24.04-arm"]'
+            # Use the self-hosted Linux ARM64 runner for ARM release builds.
+            runs_on: '["self-hosted","Linux","ARM64"]'
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -244,7 +244,7 @@ jobs:
         include:
           - os: linux
             arch: amd64
-            runs_on: '["ubuntu-latest"]'
+            runs_on: '["self-hosted","Linux","X64"]'
             rust_target: x86_64-unknown-linux-gnu
             platform: linux-amd64
             archive_format: tar.gz
@@ -253,7 +253,7 @@ jobs:
             can_execute: true
           - os: linux
             arch: arm64
-            runs_on: '["ubuntu-24.04-arm"]'
+            runs_on: '["self-hosted","Linux","ARM64"]'
             rust_target: aarch64-unknown-linux-gnu
             platform: linux-arm64
             archive_format: tar.gz
@@ -483,7 +483,7 @@ jobs:
         ) ||
         (github.event_name == 'workflow_dispatch' && inputs.publish_release)
       }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: write
     outputs:
@@ -539,7 +539,7 @@ jobs:
         ) ||
         (github.event_name == 'workflow_dispatch' && inputs.publish_release)
       }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: write
     steps:
@@ -618,19 +618,19 @@ jobs:
         include:
           - arch: amd64
             platform: linux/amd64
-            runs_on: '["ubuntu-latest"]'
+            runs_on: '["self-hosted","Linux","X64"]'
             variant: amd64
             page_size: 4k
             pytorch_jobs_default: auto
           - arch: arm64
             platform: linux/arm64
-            runs_on: '["ubuntu-24.04-arm"]'
+            runs_on: '["self-hosted","Linux","ARM64"]'
             variant: arm64-4k
             page_size: 4k
             pytorch_jobs_default: "2"
           - arch: arm64
             platform: linux/arm64
-            runs_on: '["ubuntu-24.04-arm"]'
+            runs_on: '["self-hosted","Linux","ARM64"]'
             variant: arm64-64k-hwe
             page_size: 64k-hwe
             pytorch_jobs_default: "2"
@@ -900,7 +900,7 @@ jobs:
         ) ||
         (github.event_name == 'workflow_dispatch' && inputs.publish_release)
       }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: read
       packages: write
