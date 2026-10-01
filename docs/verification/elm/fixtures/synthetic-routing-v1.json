@@ -1,0 +1,1954 @@
+{
+  "format_version": 1,
+  "dataset_id": "synthetic-routing-evaluation-v1",
+  "permitted": true,
+  "fixture_only": true,
+  "tenant_scope": "local",
+  "domain_scope": "synthetic-fixture",
+  "task_id": "routing_candidate_utility",
+  "task_kind": "regression",
+  "feature_schema": {
+    "id": "synthetic-routing-fixture:v1",
+    "version": 1,
+    "names": [
+      "trend",
+      "cycle"
+    ],
+    "units": [
+      "unitless",
+      "unitless"
+    ]
+  },
+  "target_schema_id": "synthetic-utility:v1",
+  "target_names": [
+    "utility"
+  ],
+  "target_units": [
+    "score"
+  ],
+  "class_mapping": [],
+  "horizon_seconds": null,
+  "provenance": "synthetic fixture generated for numerical and lifecycle verification only; no production data or permission implied",
+  "records": [
+    {
+      "record_id": "fixture-000",
+      "group_id": "group-000",
+      "subgroup_id": "regime-0",
+      "event_time": 1790827718,
+      "observation_time": 1790827719,
+      "decision_time": 1790827720,
+      "label_available_time": 1790827750,
+      "features": [
+        0.0,
+        0.0
+      ],
+      "target": [
+        0.1
+      ]
+    },
+    {
+      "record_id": "fixture-001",
+      "group_id": "group-001",
+      "subgroup_id": "regime-1",
+      "event_time": 1790827778,
+      "observation_time": 1790827779,
+      "decision_time": 1790827780,
+      "label_available_time": 1790827810,
+      "features": [
+        0.008333333333333333,
+        0.2279775235351884
+      ],
+      "target": [
+        0.1480955047070377
+      ]
+    },
+    {
+      "record_id": "fixture-002",
+      "group_id": "group-002",
+      "subgroup_id": "regime-2",
+      "event_time": 1790827838,
+      "observation_time": 1790827839,
+      "decision_time": 1790827840,
+      "label_available_time": 1790827870,
+      "features": [
+        0.016666666666666666,
+        0.4439481069655198
+      ],
+      "target": [
+        0.19378962139310396
+      ]
+    },
+    {
+      "record_id": "fixture-003",
+      "group_id": "group-003",
+      "subgroup_id": "regime-0",
+      "event_time": 1790827898,
+      "observation_time": 1790827899,
+      "decision_time": 1790827900,
+      "label_available_time": 1790827930,
+      "features": [
+        0.025,
+        0.636537182221968
+      ],
+      "target": [
+        0.2348074364443936
+      ]
+    },
+    {
+      "record_id": "fixture-004",
+      "group_id": "group-004",
+      "subgroup_id": "regime-1",
+      "event_time": 1790827958,
+      "observation_time": 1790827959,
+      "decision_time": 1790827960,
+      "label_available_time": 1790827990,
+      "features": [
+        0.03333333333333333,
+        0.795601620036366
+      ],
+      "target": [
+        0.26912032400727326
+      ]
+    },
+    {
+      "record_id": "fixture-005",
+      "group_id": "group-005",
+      "subgroup_id": "regime-2",
+      "event_time": 1790828018,
+      "observation_time": 1790828019,
+      "decision_time": 1790828020,
+      "label_available_time": 1790828050,
+      "features": [
+        0.041666666666666664,
+        0.9127639402605211
+      ],
+      "target": [
+        0.2950527880521042
+      ]
+    },
+    {
+      "record_id": "fixture-006",
+      "group_id": "group-006",
+      "subgroup_id": "regime-0",
+      "event_time": 1790828078,
+      "observation_time": 1790828079,
+      "decision_time": 1790828080,
+      "label_available_time": 1790828110,
+      "features": [
+        0.05,
+        0.9818535303723598
+      ],
+      "target": [
+        0.3113707060744719
+      ]
+    },
+    {
+      "record_id": "fixture-007",
+      "group_id": "group-007",
+      "subgroup_id": "regime-1",
+      "event_time": 1790828138,
+      "observation_time": 1790828139,
+      "decision_time": 1790828140,
+      "label_available_time": 1790828170,
+      "features": [
+        0.058333333333333334,
+        0.9992316344213905
+      ],
+      "target": [
+        0.3173463268842781
+      ]
+    },
+    {
+      "record_id": "fixture-008",
+      "group_id": "group-008",
+      "subgroup_id": "regime-2",
+      "event_time": 1790828198,
+      "observation_time": 1790828199,
+      "decision_time": 1790828200,
+      "label_available_time": 1790828230,
+      "features": [
+        0.06666666666666667,
+        0.9639829961524481
+      ],
+      "target": [
+        0.31279659923048964
+      ]
+    },
+    {
+      "record_id": "fixture-009",
+      "group_id": "group-009",
+      "subgroup_id": "regime-0",
+      "event_time": 1790828258,
+      "observation_time": 1790828259,
+      "decision_time": 1790828260,
+      "label_available_time": 1790828290,
+      "features": [
+        0.075,
+        0.8779640629990779
+      ],
+      "target": [
+        0.29809281259981557
+      ]
+    },
+    {
+      "record_id": "fixture-010",
+      "group_id": "group-010",
+      "subgroup_id": "regime-1",
+      "event_time": 1790828318,
+      "observation_time": 1790828319,
+      "decision_time": 1790828320,
+      "label_available_time": 1790828350,
+      "features": [
+        0.08333333333333333,
+        0.74570521217672
+      ],
+      "target": [
+        0.274141042435344
+      ]
+    },
+    {
+      "record_id": "fixture-011",
+      "group_id": "group-011",
+      "subgroup_id": "regime-2",
+      "event_time": 1790828378,
+      "observation_time": 1790828379,
+      "decision_time": 1790828380,
+      "label_available_time": 1790828410,
+      "features": [
+        0.09166666666666666,
+        0.5741721483545723
+      ],
+      "target": [
+        0.24233442967091448
+      ]
+    },
+    {
+      "record_id": "fixture-012",
+      "group_id": "group-012",
+      "subgroup_id": "regime-0",
+      "event_time": 1790828438,
+      "observation_time": 1790828439,
+      "decision_time": 1790828440,
+      "label_available_time": 1790828470,
+      "features": [
+        0.1,
+        0.3723990394250553
+      ],
+      "target": [
+        0.20447980788501108
+      ]
+    },
+    {
+      "record_id": "fixture-013",
+      "group_id": "group-013",
+      "subgroup_id": "regime-1",
+      "event_time": 1790828498,
+      "observation_time": 1790828499,
+      "decision_time": 1790828500,
+      "label_available_time": 1790828530,
+      "features": [
+        0.10833333333333334,
+        0.15101271208634384
+      ],
+      "target": [
+        0.16270254241726878
+      ]
+    },
+    {
+      "record_id": "fixture-014",
+      "group_id": "group-014",
+      "subgroup_id": "regime-2",
+      "event_time": 1790828558,
+      "observation_time": 1790828559,
+      "decision_time": 1790828560,
+      "label_available_time": 1790828590,
+      "features": [
+        0.11666666666666667,
+        -0.0783270334708653
+      ],
+      "target": [
+        0.11933459330582694
+      ]
+    },
+    {
+      "record_id": "fixture-015",
+      "group_id": "group-015",
+      "subgroup_id": "regime-0",
+      "event_time": 1790828618,
+      "observation_time": 1790828619,
+      "decision_time": 1790828620,
+      "label_available_time": 1790828650,
+      "features": [
+        0.125,
+        -0.30354151270842933
+      ],
+      "target": [
+        0.07679169745831413
+      ]
+    },
+    {
+      "record_id": "fixture-016",
+      "group_id": "group-016",
+      "subgroup_id": "regime-1",
+      "event_time": 1790828678,
+      "observation_time": 1790828679,
+      "decision_time": 1790828680,
+      "label_available_time": 1790828710,
+      "features": [
+        0.13333333333333333,
+        -0.5127693073557238
+      ],
+      "target": [
+        0.037446138528855255
+      ]
+    },
+    {
+      "record_id": "fixture-017",
+      "group_id": "group-017",
+      "subgroup_id": "regime-2",
+      "event_time": 1790828738,
+      "observation_time": 1790828739,
+      "decision_time": 1790828740,
+      "label_available_time": 1790828770,
+      "features": [
+        0.14166666666666666,
+        -0.694990973216472
+      ],
+      "target": [
+        0.0035018053567055923
+      ]
+    },
+    {
+      "record_id": "fixture-018",
+      "group_id": "group-018",
+      "subgroup_id": "regime-0",
+      "event_time": 1790828798,
+      "observation_time": 1790828799,
+      "decision_time": 1790828800,
+      "label_available_time": 1790828830,
+      "features": [
+        0.15,
+        -0.840609403550195
+      ],
+      "target": [
+        -0.023121880710038997
+      ]
+    },
+    {
+      "record_id": "fixture-019",
+      "group_id": "group-019",
+      "subgroup_id": "regime-1",
+      "event_time": 1790828858,
+      "observation_time": 1790828859,
+      "decision_time": 1790828860,
+      "label_available_time": 1790828890,
+      "features": [
+        0.15833333333333333,
+        -0.941955281908201
+      ],
+      "target": [
+        -0.04089105638164023
+      ]
+    },
+    {
+      "record_id": "fixture-020",
+      "group_id": "group-020",
+      "subgroup_id": "regime-2",
+      "event_time": 1790828918,
+      "observation_time": 1790828919,
+      "decision_time": 1790828920,
+      "label_available_time": 1790828950,
+      "features": [
+        0.16666666666666666,
+        -0.9936910036334645
+      ],
+      "target": [
+        -0.04873820072669291
+      ]
+    },
+    {
+      "record_id": "fixture-021",
+      "group_id": "group-021",
+      "subgroup_id": "regime-0",
+      "event_time": 1790828978,
+      "observation_time": 1790828979,
+      "decision_time": 1790828980,
+      "label_available_time": 1790829010,
+      "features": [
+        0.175,
+        -0.9930917926059354
+      ],
+      "target": [
+        -0.04611835852118709
+      ]
+    },
+    {
+      "record_id": "fixture-022",
+      "group_id": "group-022",
+      "subgroup_id": "regime-1",
+      "event_time": 1790829038,
+      "observation_time": 1790829039,
+      "decision_time": 1790829040,
+      "label_available_time": 1790829070,
+      "features": [
+        0.18333333333333332,
+        -0.9401892075986283
+      ],
+      "target": [
+        -0.03303784151972569
+      ]
+    },
+    {
+      "record_id": "fixture-023",
+      "group_id": "group-023",
+      "subgroup_id": "regime-2",
+      "event_time": 1790829098,
+      "observation_time": 1790829099,
+      "decision_time": 1790829100,
+      "label_available_time": 1790829130,
+      "features": [
+        0.19166666666666668,
+        -0.8377694801650978
+      ],
+      "target": [
+        -0.010053896033019566
+      ]
+    },
+    {
+      "record_id": "fixture-024",
+      "group_id": "group-024",
+      "subgroup_id": "regime-0",
+      "event_time": 1790829158,
+      "observation_time": 1790829159,
+      "decision_time": 1790829160,
+      "label_available_time": 1790829190,
+      "features": [
+        0.2,
+        -0.6912267715971264
+      ],
+      "target": [
+        0.021754645680574725
+      ]
+    },
+    {
+      "record_id": "fixture-025",
+      "group_id": "group-025",
+      "subgroup_id": "regime-1",
+      "event_time": 1790829218,
+      "observation_time": 1790829219,
+      "decision_time": 1790829220,
+      "label_available_time": 1790829250,
+      "features": [
+        0.20833333333333334,
+        -0.5082790774992584
+      ],
+      "target": [
+        0.06084418450014832
+      ]
+    },
+    {
+      "record_id": "fixture-026",
+      "group_id": "group-026",
+      "subgroup_id": "regime-2",
+      "event_time": 1790829278,
+      "observation_time": 1790829279,
+      "decision_time": 1790829280,
+      "label_available_time": 1790829310,
+      "features": [
+        0.21666666666666667,
+        -0.2985617424935936
+      ],
+      "target": [
+        0.10528765150128129
+      ]
+    },
+    {
+      "record_id": "fixture-027",
+      "group_id": "group-027",
+      "subgroup_id": "regime-0",
+      "event_time": 1790829338,
+      "observation_time": 1790829339,
+      "decision_time": 1790829340,
+      "label_available_time": 1790829370,
+      "features": [
+        0.225,
+        -0.07311999350126308
+      ],
+      "target": [
+        0.15287600129974738
+      ]
+    },
+    {
+      "record_id": "fixture-028",
+      "group_id": "group-028",
+      "subgroup_id": "regime-1",
+      "event_time": 1790829398,
+      "observation_time": 1790829399,
+      "decision_time": 1790829400,
+      "label_available_time": 1790829430,
+      "features": [
+        0.23333333333333334,
+        0.1561727815432119
+      ],
+      "target": [
+        0.2012345563086424
+      ]
+    },
+    {
+      "record_id": "fixture-029",
+      "group_id": "group-029",
+      "subgroup_id": "regime-2",
+      "event_time": 1790829458,
+      "observation_time": 1790829459,
+      "decision_time": 1790829460,
+      "label_available_time": 1790829490,
+      "features": [
+        0.24166666666666667,
+        0.3772403719075444
+      ],
+      "target": [
+        0.24794807438150887
+      ]
+    },
+    {
+      "record_id": "fixture-030",
+      "group_id": "group-030",
+      "subgroup_id": "regime-0",
+      "event_time": 1790829518,
+      "observation_time": 1790829519,
+      "decision_time": 1790829520,
+      "label_available_time": 1790829550,
+      "features": [
+        0.25,
+        0.5784397643882001
+      ],
+      "target": [
+        0.29068795287764004
+      ]
+    },
+    {
+      "record_id": "fixture-031",
+      "group_id": "group-031",
+      "subgroup_id": "regime-1",
+      "event_time": 1790829578,
+      "observation_time": 1790829579,
+      "decision_time": 1790829580,
+      "label_available_time": 1790829610,
+      "features": [
+        0.25833333333333336,
+        0.7491743483316894
+      ],
+      "target": [
+        0.32733486966633785
+      ]
+    },
+    {
+      "record_id": "fixture-032",
+      "group_id": "group-032",
+      "subgroup_id": "regime-2",
+      "event_time": 1790829638,
+      "observation_time": 1790829639,
+      "decision_time": 1790829640,
+      "label_available_time": 1790829670,
+      "features": [
+        0.26666666666666666,
+        0.8804520095530344
+      ],
+      "target": [
+        0.3560904019106069
+      ]
+    },
+    {
+      "record_id": "fixture-033",
+      "group_id": "group-033",
+      "subgroup_id": "regime-0",
+      "event_time": 1790829698,
+      "observation_time": 1790829699,
+      "decision_time": 1790829700,
+      "label_available_time": 1790829730,
+      "features": [
+        0.275,
+        0.965358719901792
+      ],
+      "target": [
+        0.3755717439803584
+      ]
+    },
+    {
+      "record_id": "fixture-034",
+      "group_id": "group-034",
+      "subgroup_id": "regime-1",
+      "event_time": 1790829758,
+      "observation_time": 1790829759,
+      "decision_time": 1790829760,
+      "label_available_time": 1790829790,
+      "features": [
+        0.2833333333333333,
+        0.9994226798345279
+      ],
+      "target": [
+        0.3848845359669055
+      ]
+    },
+    {
+      "record_id": "fixture-035",
+      "group_id": "group-035",
+      "subgroup_id": "regime-2",
+      "event_time": 1790829818,
+      "observation_time": 1790829819,
+      "decision_time": 1790829820,
+      "label_available_time": 1790829850,
+      "features": [
+        0.2916666666666667,
+        0.9808498356203995
+      ],
+      "target": [
+        0.38366996712407997
+      ]
+    },
+    {
+      "record_id": "fixture-036",
+      "group_id": "group-036",
+      "subgroup_id": "regime-0",
+      "event_time": 1790829878,
+      "observation_time": 1790829879,
+      "decision_time": 1790829880,
+      "label_available_time": 1790829910,
+      "features": [
+        0.3,
+        0.9106183671457296
+      ],
+      "target": [
+        0.3721236734291459
+      ]
+    },
+    {
+      "record_id": "fixture-037",
+      "group_id": "group-037",
+      "subgroup_id": "regime-1",
+      "event_time": 1790829938,
+      "observation_time": 1790829939,
+      "decision_time": 1790829940,
+      "label_available_time": 1790829970,
+      "features": [
+        0.30833333333333335,
+        0.7924271699085284
+      ],
+      "target": [
+        0.3509854339817057
+      ]
+    },
+    {
+      "record_id": "fixture-038",
+      "group_id": "group-038",
+      "subgroup_id": "regime-2",
+      "event_time": 1790829998,
+      "observation_time": 1790829999,
+      "decision_time": 1790830000,
+      "label_available_time": 1790830030,
+      "features": [
+        0.31666666666666665,
+        0.6325010445125663
+      ],
+      "target": [
+        0.3215002089025133
+      ]
+    },
+    {
+      "record_id": "fixture-039",
+      "group_id": "group-039",
+      "subgroup_id": "regime-0",
+      "event_time": 1790830058,
+      "observation_time": 1790830059,
+      "decision_time": 1790830060,
+      "label_available_time": 1790830090,
+      "features": [
+        0.325,
+        0.43926285378684055
+      ],
+      "target": [
+        0.2853525707573681
+      ]
+    },
+    {
+      "record_id": "fixture-040",
+      "group_id": "group-040",
+      "subgroup_id": "regime-1",
+      "event_time": 1790830118,
+      "observation_time": 1790830119,
+      "decision_time": 1790830120,
+      "label_available_time": 1790830150,
+      "features": [
+        0.3333333333333333,
+        0.22288991410024592
+      ],
+      "target": [
+        0.2445779828200492
+      ]
+    },
+    {
+      "record_id": "fixture-041",
+      "group_id": "group-041",
+      "subgroup_id": "regime-2",
+      "event_time": 1790830178,
+      "observation_time": 1790830179,
+      "decision_time": 1790830180,
+      "label_available_time": 1790830210,
+      "features": [
+        0.3416666666666667,
+        -0.005222015496750621
+      ],
+      "target": [
+        0.20145559690064987
+      ]
+    },
+    {
+      "record_id": "fixture-042",
+      "group_id": "group-042",
+      "subgroup_id": "regime-0",
+      "event_time": 1790830238,
+      "observation_time": 1790830239,
+      "decision_time": 1790830240,
+      "label_available_time": 1790830270,
+      "features": [
+        0.35,
+        -0.2330589161070144
+      ],
+      "target": [
+        0.1583882167785971
+      ]
+    },
+    {
+      "record_id": "fixture-043",
+      "group_id": "group-043",
+      "subgroup_id": "regime-1",
+      "event_time": 1790830298,
+      "observation_time": 1790830299,
+      "decision_time": 1790830300,
+      "label_available_time": 1790830330,
+      "features": [
+        0.35833333333333334,
+        -0.44862125384280294
+      ],
+      "target": [
+        0.11777574923143941
+      ]
+    },
+    {
+      "record_id": "fixture-044",
+      "group_id": "group-044",
+      "subgroup_id": "regime-2",
+      "event_time": 1790830358,
+      "observation_time": 1790830359,
+      "decision_time": 1790830360,
+      "label_available_time": 1790830390,
+      "features": [
+        0.36666666666666664,
+        -0.6405559617968117
+      ],
+      "target": [
+        0.08188880764063763
+      ]
+    },
+    {
+      "record_id": "fixture-045",
+      "group_id": "group-045",
+      "subgroup_id": "regime-0",
+      "event_time": 1790830418,
+      "observation_time": 1790830419,
+      "decision_time": 1790830420,
+      "label_available_time": 1790830450,
+      "features": [
+        0.375,
+        -0.7987543744010004
+      ],
+      "target": [
+        0.0527491251197999
+      ]
+    },
+    {
+      "record_id": "fixture-046",
+      "group_id": "group-046",
+      "subgroup_id": "regime-1",
+      "event_time": 1790830478,
+      "observation_time": 1790830479,
+      "decision_time": 1790830480,
+      "label_available_time": 1790830510,
+      "features": [
+        0.38333333333333336,
+        -0.9148846226387806
+      ],
+      "target": [
+        0.03202307547224388
+      ]
+    },
+    {
+      "record_id": "fixture-047",
+      "group_id": "group-047",
+      "subgroup_id": "regime-2",
+      "event_time": 1790830538,
+      "observation_time": 1790830539,
+      "decision_time": 1790830540,
+      "label_available_time": 1790830570,
+      "features": [
+        0.39166666666666666,
+        -0.9828304503401077
+      ],
+      "target": [
+        0.02093390993197844
+      ]
+    },
+    {
+      "record_id": "fixture-048",
+      "group_id": "group-048",
+      "subgroup_id": "regime-0",
+      "event_time": 1790830598,
+      "observation_time": 1790830599,
+      "decision_time": 1790830600,
+      "label_available_time": 1790830630,
+      "features": [
+        0.4,
+        -0.9990133403295429
+      ],
+      "target": [
+        0.0201973319340914
+      ]
+    },
+    {
+      "record_id": "fixture-049",
+      "group_id": "group-049",
+      "subgroup_id": "regime-1",
+      "event_time": 1790830658,
+      "observation_time": 1790830659,
+      "decision_time": 1790830660,
+      "label_available_time": 1790830690,
+      "features": [
+        0.4083333333333333,
+        -0.9625809849417795
+      ],
+      "target": [
+        0.029983803011644106
+      ]
+    },
+    {
+      "record_id": "fixture-050",
+      "group_id": "group-050",
+      "subgroup_id": "regime-2",
+      "event_time": 1790830718,
+      "observation_time": 1790830719,
+      "decision_time": 1790830720,
+      "label_available_time": 1790830750,
+      "features": [
+        0.4166666666666667,
+        -0.8754521746884285
+      ],
+      "target": [
+        0.04990956506231428
+      ]
+    },
+    {
+      "record_id": "fixture-051",
+      "group_id": "group-051",
+      "subgroup_id": "regime-0",
+      "event_time": 1790830778,
+      "observation_time": 1790830779,
+      "decision_time": 1790830780,
+      "label_available_time": 1790830810,
+      "features": [
+        0.425,
+        -0.7422157409152156
+      ],
+      "target": [
+        0.07905685181695687
+      ]
+    },
+    {
+      "record_id": "fixture-052",
+      "group_id": "group-052",
+      "subgroup_id": "regime-1",
+      "event_time": 1790830838,
+      "observation_time": 1790830839,
+      "decision_time": 1790830840,
+      "label_available_time": 1790830870,
+      "features": [
+        0.43333333333333335,
+        -0.5698888748578939
+      ],
+      "target": [
+        0.11602222502842123
+      ]
+    },
+    {
+      "record_id": "fixture-053",
+      "group_id": "group-053",
+      "subgroup_id": "regime-2",
+      "event_time": 1790830898,
+      "observation_time": 1790830899,
+      "decision_time": 1790830900,
+      "label_available_time": 1790830930,
+      "features": [
+        0.44166666666666665,
+        -0.3675475517578938
+      ],
+      "target": [
+        0.15899048964842122
+      ]
+    },
+    {
+      "record_id": "fixture-054",
+      "group_id": "group-054",
+      "subgroup_id": "regime-0",
+      "event_time": 1790830958,
+      "observation_time": 1790830959,
+      "decision_time": 1790830960,
+      "label_available_time": 1790830990,
+      "features": [
+        0.45,
+        -0.1458485245684275
+      ],
+      "target": [
+        0.2058302950863145
+      ]
+    },
+    {
+      "record_id": "fixture-055",
+      "group_id": "group-055",
+      "subgroup_id": "regime-1",
+      "event_time": 1790831018,
+      "observation_time": 1790831019,
+      "decision_time": 1790831020,
+      "label_available_time": 1790831050,
+      "features": [
+        0.4583333333333333,
+        0.08353193749110818
+      ],
+      "target": [
+        0.25420638749822166
+      ]
+    },
+    {
+      "record_id": "fixture-056",
+      "group_id": "group-056",
+      "subgroup_id": "regime-2",
+      "event_time": 1790831078,
+      "observation_time": 1790831079,
+      "decision_time": 1790831080,
+      "label_available_time": 1790831110,
+      "features": [
+        0.4666666666666667,
+        0.3085130054579907
+      ],
+      "target": [
+        0.30170260109159813
+      ]
+    },
+    {
+      "record_id": "fixture-057",
+      "group_id": "group-057",
+      "subgroup_id": "regime-0",
+      "event_time": 1790831138,
+      "observation_time": 1790831139,
+      "decision_time": 1790831140,
+      "label_available_time": 1790831170,
+      "features": [
+        0.475,
+        0.5172455541820025
+      ],
+      "target": [
+        0.34594911083640045
+      ]
+    },
+    {
+      "record_id": "fixture-058",
+      "group_id": "group-058",
+      "subgroup_id": "regime-1",
+      "event_time": 1790831198,
+      "observation_time": 1790831199,
+      "decision_time": 1790831200,
+      "label_available_time": 1790831230,
+      "features": [
+        0.48333333333333334,
+        0.6987362226879031
+      ],
+      "target": [
+        0.3847472445375806
+      ]
+    },
+    {
+      "record_id": "fixture-059",
+      "group_id": "group-059",
+      "subgroup_id": "regime-2",
+      "event_time": 1790831258,
+      "observation_time": 1790831259,
+      "decision_time": 1790831260,
+      "label_available_time": 1790831290,
+      "features": [
+        0.49166666666666664,
+        0.8434264038264059
+      ],
+      "target": [
+        0.41618528076528116
+      ]
+    },
+    {
+      "record_id": "fixture-060",
+      "group_id": "group-060",
+      "subgroup_id": "regime-0",
+      "event_time": 1790831318,
+      "observation_time": 1790831319,
+      "decision_time": 1790831320,
+      "label_available_time": 1790831350,
+      "features": [
+        0.5,
+        0.9436956694441048
+      ],
+      "target": [
+        0.4387391338888209
+      ]
+    },
+    {
+      "record_id": "fixture-061",
+      "group_id": "group-061",
+      "subgroup_id": "regime-1",
+      "event_time": 1790831378,
+      "observation_time": 1790831379,
+      "decision_time": 1790831380,
+      "label_available_time": 1790831410,
+      "features": [
+        0.5083333333333333,
+        0.9942631170732448
+      ],
+      "target": [
+        0.451352623414649
+      ]
+    },
+    {
+      "record_id": "fixture-062",
+      "group_id": "group-062",
+      "subgroup_id": "regime-2",
+      "event_time": 1790831438,
+      "observation_time": 1790831439,
+      "decision_time": 1790831440,
+      "label_available_time": 1790831470,
+      "features": [
+        0.5166666666666667,
+        0.9924655003309216
+      ],
+      "target": [
+        0.4534931000661844
+      ]
+    },
+    {
+      "record_id": "fixture-063",
+      "group_id": "group-063",
+      "subgroup_id": "regime-0",
+      "event_time": 1790831498,
+      "observation_time": 1790831499,
+      "decision_time": 1790831500,
+      "label_available_time": 1790831530,
+      "features": [
+        0.525,
+        0.9383974946755834
+      ],
+      "target": [
+        0.44517949893511666
+      ]
+    },
+    {
+      "record_id": "fixture-064",
+      "group_id": "group-064",
+      "subgroup_id": "regime-1",
+      "event_time": 1790831558,
+      "observation_time": 1790831559,
+      "decision_time": 1790831560,
+      "label_available_time": 1790831590,
+      "features": [
+        0.5333333333333333,
+        0.8349067111147797
+      ],
+      "target": [
+        0.4269813422229559
+      ]
+    },
+    {
+      "record_id": "fixture-065",
+      "group_id": "group-065",
+      "subgroup_id": "regime-2",
+      "event_time": 1790831618,
+      "observation_time": 1790831619,
+      "decision_time": 1790831620,
+      "label_available_time": 1790831650,
+      "features": [
+        0.5416666666666666,
+        0.6874437204782592
+      ],
+      "target": [
+        0.39998874409565177
+      ]
+    },
+    {
+      "record_id": "fixture-066",
+      "group_id": "group-066",
+      "subgroup_id": "regime-0",
+      "event_time": 1790831678,
+      "observation_time": 1790831679,
+      "decision_time": 1790831680,
+      "label_available_time": 1790831710,
+      "features": [
+        0.55,
+        0.5037749870595187
+      ],
+      "target": [
+        0.36575499741190376
+      ]
+    },
+    {
+      "record_id": "fixture-067",
+      "group_id": "group-067",
+      "subgroup_id": "regime-1",
+      "event_time": 1790831738,
+      "observation_time": 1790831739,
+      "decision_time": 1790831740,
+      "label_available_time": 1790831770,
+      "features": [
+        0.5583333333333333,
+        0.2935738306099843
+      ],
+      "target": [
+        0.32621476612199685
+      ]
+    },
+    {
+      "record_id": "fixture-068",
+      "group_id": "group-068",
+      "subgroup_id": "regime-2",
+      "event_time": 1790831798,
+      "observation_time": 1790831799,
+      "decision_time": 1790831800,
+      "label_available_time": 1790831830,
+      "features": [
+        0.5666666666666667,
+        0.06791095957636362
+      ],
+      "target": [
+        0.2835821919152727
+      ]
+    },
+    {
+      "record_id": "fixture-069",
+      "group_id": "group-069",
+      "subgroup_id": "regime-0",
+      "event_time": 1790831858,
+      "observation_time": 1790831859,
+      "decision_time": 1790831860,
+      "label_available_time": 1790831890,
+      "features": [
+        0.575,
+        -0.16132859222583693
+      ],
+      "target": [
+        0.2402342815548326
+      ]
+    },
+    {
+      "record_id": "fixture-070",
+      "group_id": "group-070",
+      "subgroup_id": "regime-1",
+      "event_time": 1790831918,
+      "observation_time": 1790831919,
+      "decision_time": 1790831920,
+      "label_available_time": 1790831950,
+      "features": [
+        0.5833333333333334,
+        -0.3820714171840091
+      ],
+      "target": [
+        0.19858571656319818
+      ]
+    },
+    {
+      "record_id": "fixture-071",
+      "group_id": "group-071",
+      "subgroup_id": "regime-2",
+      "event_time": 1790831978,
+      "observation_time": 1790831979,
+      "decision_time": 1790831980,
+      "label_available_time": 1790832010,
+      "features": [
+        0.5916666666666667,
+        -0.5826916065824606
+      ],
+      "target": [
+        0.16096167868350789
+      ]
+    },
+    {
+      "record_id": "fixture-072",
+      "group_id": "group-072",
+      "subgroup_id": "regime-0",
+      "event_time": 1790832038,
+      "observation_time": 1790832039,
+      "decision_time": 1790832040,
+      "label_available_time": 1790832070,
+      "features": [
+        0.6,
+        -0.7526230547780598
+      ],
+      "target": [
+        0.12947538904438802
+      ]
+    },
+    {
+      "record_id": "fixture-073",
+      "group_id": "group-073",
+      "subgroup_id": "regime-1",
+      "event_time": 1790832098,
+      "observation_time": 1790832099,
+      "decision_time": 1790832100,
+      "label_available_time": 1790832130,
+      "features": [
+        0.6083333333333333,
+        -0.8829159465049101
+      ],
+      "target": [
+        0.10591681069901793
+      ]
+    },
+    {
+      "record_id": "fixture-074",
+      "group_id": "group-074",
+      "subgroup_id": "regime-2",
+      "event_time": 1790832158,
+      "observation_time": 1790832159,
+      "decision_time": 1790832160,
+      "label_available_time": 1790832190,
+      "features": [
+        0.6166666666666667,
+        -0.9667081186743308
+      ],
+      "target": [
+        0.09165837626513382
+      ]
+    },
+    {
+      "record_id": "fixture-075",
+      "group_id": "group-075",
+      "subgroup_id": "regime-0",
+      "event_time": 1790832218,
+      "observation_time": 1790832219,
+      "decision_time": 1790832220,
+      "label_available_time": 1790832250,
+      "features": [
+        0.625,
+        -0.9995864713592172
+      ],
+      "target": [
+        0.08758270572815655
+      ]
+    },
+    {
+      "record_id": "fixture-076",
+      "group_id": "group-076",
+      "subgroup_id": "regime-1",
+      "event_time": 1790832278,
+      "observation_time": 1790832279,
+      "decision_time": 1790832280,
+      "label_available_time": 1790832310,
+      "features": [
+        0.6333333333333333,
+        -0.9798193934546138
+      ],
+      "target": [
+        0.09403612130907721
+      ]
+    },
+    {
+      "record_id": "fixture-077",
+      "group_id": "group-077",
+      "subgroup_id": "regime-2",
+      "event_time": 1790832338,
+      "observation_time": 1790832339,
+      "decision_time": 1790832340,
+      "label_available_time": 1790832370,
+      "features": [
+        0.6416666666666667,
+        -0.908447961803396
+      ],
+      "target": [
+        0.11081040763932079
+      ]
+    },
+    {
+      "record_id": "fixture-078",
+      "group_id": "group-078",
+      "subgroup_id": "regime-0",
+      "event_time": 1790832398,
+      "observation_time": 1790832399,
+      "decision_time": 1790832400,
+      "label_available_time": 1790832430,
+      "features": [
+        0.65,
+        -0.7892311105835723
+      ],
+      "target": [
+        0.13715377788328553
+      ]
+    },
+    {
+      "record_id": "fixture-079",
+      "group_id": "group-079",
+      "subgroup_id": "regime-1",
+      "event_time": 1790832458,
+      "observation_time": 1790832459,
+      "decision_time": 1790832460,
+      "label_available_time": 1790832490,
+      "features": [
+        0.6583333333333333,
+        -0.6284476587325941
+      ],
+      "target": [
+        0.17181046825348115
+      ]
+    },
+    {
+      "record_id": "fixture-080",
+      "group_id": "group-080",
+      "subgroup_id": "regime-2",
+      "event_time": 1790832518,
+      "observation_time": 1790832519,
+      "decision_time": 1790832520,
+      "label_available_time": 1790832550,
+      "features": [
+        0.6666666666666666,
+        -0.43456562207189353
+      ],
+      "target": [
+        0.21308687558562128
+      ]
+    },
+    {
+      "record_id": "fixture-081",
+      "group_id": "group-081",
+      "subgroup_id": "regime-0",
+      "event_time": 1790832578,
+      "observation_time": 1790832579,
+      "decision_time": 1790832580,
+      "label_available_time": 1790832610,
+      "features": [
+        0.675,
+        -0.21779622653942327
+      ],
+      "target": [
+        0.25894075469211536
+      ]
+    },
+    {
+      "record_id": "fixture-082",
+      "group_id": "group-082",
+      "subgroup_id": "regime-1",
+      "event_time": 1790832638,
+      "observation_time": 1790832639,
+      "decision_time": 1790832640,
+      "label_available_time": 1790832670,
+      "features": [
+        0.6833333333333333,
+        0.010443888591061618
+      ],
+      "target": [
+        0.3070887777182123
+      ]
+    },
+    {
+      "record_id": "fixture-083",
+      "group_id": "group-083",
+      "subgroup_id": "regime-2",
+      "event_time": 1790832698,
+      "observation_time": 1790832699,
+      "decision_time": 1790832700,
+      "label_available_time": 1790832730,
+      "features": [
+        0.6916666666666667,
+        0.2381339532480202
+      ],
+      "target": [
+        0.35512679064960406
+      ]
+    },
+    {
+      "record_id": "fixture-084",
+      "group_id": "group-084",
+      "subgroup_id": "regime-0",
+      "event_time": 1790832758,
+      "observation_time": 1790832759,
+      "decision_time": 1790832760,
+      "label_available_time": 1790832790,
+      "features": [
+        0.7,
+        0.45328216698369495
+      ],
+      "target": [
+        0.40065643339673895
+      ]
+    },
+    {
+      "record_id": "fixture-085",
+      "group_id": "group-085",
+      "subgroup_id": "regime-1",
+      "event_time": 1790832818,
+      "observation_time": 1790832819,
+      "decision_time": 1790832820,
+      "label_available_time": 1790832850,
+      "features": [
+        0.7083333333333334,
+        0.6445572736464569
+      ],
+      "target": [
+        0.44141145472929133
+      ]
+    },
+    {
+      "record_id": "fixture-086",
+      "group_id": "group-086",
+      "subgroup_id": "regime-2",
+      "event_time": 1790832878,
+      "observation_time": 1790832879,
+      "decision_time": 1790832880,
+      "label_available_time": 1790832910,
+      "features": [
+        0.7166666666666667,
+        0.8018853470279821
+      ],
+      "target": [
+        0.47537706940559643
+      ]
+    },
+    {
+      "record_id": "fixture-087",
+      "group_id": "group-087",
+      "subgroup_id": "regime-0",
+      "event_time": 1790832938,
+      "observation_time": 1790832939,
+      "decision_time": 1790832940,
+      "label_available_time": 1790832970,
+      "features": [
+        0.725,
+        0.9169803564502815
+      ],
+      "target": [
+        0.5008960712900563
+      ]
+    },
+    {
+      "record_id": "fixture-088",
+      "group_id": "group-088",
+      "subgroup_id": "regime-1",
+      "event_time": 1790832998,
+      "observation_time": 1790832999,
+      "decision_time": 1790833000,
+      "label_available_time": 1790833030,
+      "features": [
+        0.7333333333333333,
+        0.9837805688833962
+      ],
+      "target": [
+        0.5167561137766792
+      ]
+    },
+    {
+      "record_id": "fixture-089",
+      "group_id": "group-089",
+      "subgroup_id": "regime-2",
+      "event_time": 1790833058,
+      "observation_time": 1790833059,
+      "decision_time": 1790833060,
+      "label_available_time": 1790833090,
+      "features": [
+        0.7416666666666667,
+        0.9987678035117846
+      ],
+      "target": [
+        0.522253560702357
+      ]
+    },
+    {
+      "record_id": "fixture-090",
+      "group_id": "group-090",
+      "subgroup_id": "regime-0",
+      "event_time": 1790833118,
+      "observation_time": 1790833119,
+      "decision_time": 1790833120,
+      "label_available_time": 1790833150,
+      "features": [
+        0.75,
+        0.9611527245021165
+      ],
+      "target": [
+        0.5172305449004233
+      ]
+    },
+    {
+      "record_id": "fixture-091",
+      "group_id": "group-091",
+      "subgroup_id": "regime-1",
+      "event_time": 1790833178,
+      "observation_time": 1790833179,
+      "decision_time": 1790833180,
+      "label_available_time": 1790833210,
+      "features": [
+        0.7583333333333333,
+        0.8729164131193549
+      ],
+      "target": [
+        0.5020832826238709
+      ]
+    },
+    {
+      "record_id": "fixture-092",
+      "group_id": "group-092",
+      "subgroup_id": "regime-2",
+      "event_time": 1790833238,
+      "observation_time": 1790833239,
+      "decision_time": 1790833240,
+      "label_available_time": 1790833270,
+      "features": [
+        0.7666666666666667,
+        0.7387060297037729
+      ],
+      "target": [
+        0.47774120594075453
+      ]
+    },
+    {
+      "record_id": "fixture-093",
+      "group_id": "group-093",
+      "subgroup_id": "regime-0",
+      "event_time": 1790833298,
+      "observation_time": 1790833299,
+      "decision_time": 1790833300,
+      "label_available_time": 1790833330,
+      "features": [
+        0.775,
+        0.5655900607014568
+      ],
+      "target": [
+        0.4456180121402914
+      ]
+    },
+    {
+      "record_id": "fixture-094",
+      "group_id": "group-094",
+      "subgroup_id": "regime-1",
+      "event_time": 1790833358,
+      "observation_time": 1790833359,
+      "decision_time": 1790833360,
+      "label_available_time": 1790833390,
+      "features": [
+        0.7833333333333333,
+        0.36268604120434406
+      ],
+      "target": [
+        0.4075372082408688
+      ]
+    },
+    {
+      "record_id": "fixture-095",
+      "group_id": "group-095",
+      "subgroup_id": "regime-2",
+      "event_time": 1790833418,
+      "observation_time": 1790833419,
+      "decision_time": 1790833420,
+      "label_available_time": 1790833450,
+      "features": [
+        0.7916666666666666,
+        0.1406803598149522
+      ],
+      "target": [
+        0.3656360719629904
+      ]
+    },
+    {
+      "record_id": "fixture-096",
+      "group_id": "group-096",
+      "subgroup_id": "regime-0",
+      "event_time": 1790833478,
+      "observation_time": 1790833479,
+      "decision_time": 1790833480,
+      "label_available_time": 1790833510,
+      "features": [
+        0.8,
+        -0.0887345636261771
+      ],
+      "target": [
+        0.32225308727476454
+      ]
+    },
+    {
+      "record_id": "fixture-097",
+      "group_id": "group-097",
+      "subgroup_id": "regime-1",
+      "event_time": 1790833538,
+      "observation_time": 1790833539,
+      "decision_time": 1790833540,
+      "label_available_time": 1790833570,
+      "features": [
+        0.8083333333333333,
+        -0.313476085171502
+      ],
+      "target": [
+        0.27980478296569955
+      ]
+    },
+    {
+      "record_id": "fixture-098",
+      "group_id": "group-098",
+      "subgroup_id": "regime-2",
+      "event_time": 1790833598,
+      "observation_time": 1790833599,
+      "decision_time": 1790833600,
+      "label_available_time": 1790833630,
+      "features": [
+        0.8166666666666667,
+        -0.5217076959124912
+      ],
+      "target": [
+        0.24065846081750175
+      ]
+    },
+    {
+      "record_id": "fixture-099",
+      "group_id": "group-099",
+      "subgroup_id": "regime-0",
+      "event_time": 1790833658,
+      "observation_time": 1790833659,
+      "decision_time": 1790833660,
+      "label_available_time": 1790833690,
+      "features": [
+        0.825,
+        -0.7024624178798466
+      ],
+      "target": [
+        0.20700751642403065
+      ]
+    },
+    {
+      "record_id": "fixture-100",
+      "group_id": "group-100",
+      "subgroup_id": "regime-1",
+      "event_time": 1790833718,
+      "observation_time": 1790833719,
+      "decision_time": 1790833720,
+      "label_available_time": 1790833750,
+      "features": [
+        0.8333333333333334,
+        -0.8462204041751706
+      ],
+      "target": [
+        0.18075591916496586
+      ]
+    },
+    {
+      "record_id": "fixture-101",
+      "group_id": "group-101",
+      "subgroup_id": "regime-2",
+      "event_time": 1790833778,
+      "observation_time": 1790833779,
+      "decision_time": 1790833780,
+      "label_available_time": 1790833810,
+      "features": [
+        0.8416666666666667,
+        -0.9454103227466124
+      ],
+      "target": [
+        0.1634179354506775
+      ]
+    },
+    {
+      "record_id": "fixture-102",
+      "group_id": "group-102",
+      "subgroup_id": "regime-0",
+      "event_time": 1790833838,
+      "observation_time": 1790833839,
+      "decision_time": 1790833840,
+      "label_available_time": 1790833870,
+      "features": [
+        0.85,
+        -0.9948081173239532
+      ],
+      "target": [
+        0.15603837653520936
+      ]
+    },
+    {
+      "record_id": "fixture-103",
+      "group_id": "group-103",
+      "subgroup_id": "regime-1",
+      "event_time": 1790833898,
+      "observation_time": 1790833899,
+      "decision_time": 1790833900,
+      "label_available_time": 1790833930,
+      "features": [
+        0.8583333333333333,
+        -0.9918121438871825
+      ],
+      "target": [
+        0.15913757122256345
+      ]
+    },
+    {
+      "record_id": "fixture-104",
+      "group_id": "group-104",
+      "subgroup_id": "regime-2",
+      "event_time": 1790833958,
+      "observation_time": 1790833959,
+      "decision_time": 1790833960,
+      "label_available_time": 1790833990,
+      "features": [
+        0.8666666666666667,
+        -0.9365801919984168
+      ],
+      "target": [
+        0.17268396160031665
+      ]
+    },
+    {
+      "record_id": "fixture-105",
+      "group_id": "group-105",
+      "subgroup_id": "regime-0",
+      "event_time": 1790834018,
+      "observation_time": 1790834019,
+      "decision_time": 1790834020,
+      "label_available_time": 1790834050,
+      "features": [
+        0.875,
+        -0.8320211744658979
+      ],
+      "target": [
+        0.19609576510682045
+      ]
+    },
+    {
+      "record_id": "fixture-106",
+      "group_id": "group-106",
+      "subgroup_id": "regime-1",
+      "event_time": 1790834078,
+      "observation_time": 1790834079,
+      "decision_time": 1790834080,
+      "label_available_time": 1790834110,
+      "features": [
+        0.8833333333333333,
+        -0.6836419230222806
+      ],
+      "target": [
+        0.22827161539554386
+      ]
+    },
+    {
+      "record_id": "fixture-107",
+      "group_id": "group-107",
+      "subgroup_id": "regime-2",
+      "event_time": 1790834138,
+      "observation_time": 1790834139,
+      "decision_time": 1790834140,
+      "label_available_time": 1790834170,
+      "features": [
+        0.8916666666666667,
+        -0.499257158861397
+      ],
+      "target": [
+        0.26764856822772065
+      ]
+    },
+    {
+      "record_id": "fixture-108",
+      "group_id": "group-108",
+      "subgroup_id": "regime-0",
+      "event_time": 1790834198,
+      "observation_time": 1790834199,
+      "decision_time": 1790834200,
+      "label_available_time": 1790834230,
+      "features": [
+        0.9,
+        -0.2885779130761209
+      ],
+      "target": [
+        0.31228441738477586
+      ]
+    },
+    {
+      "record_id": "fixture-109",
+      "group_id": "group-109",
+      "subgroup_id": "regime-1",
+      "event_time": 1790834258,
+      "observation_time": 1790834259,
+      "decision_time": 1790834260,
+      "label_available_time": 1790834290,
+      "features": [
+        0.9083333333333333,
+        -0.06270007374460515
+      ],
+      "target": [
+        0.359959985251079
+      ]
+    },
+    {
+      "record_id": "fixture-110",
+      "group_id": "group-110",
+      "subgroup_id": "regime-2",
+      "event_time": 1790834318,
+      "observation_time": 1790834319,
+      "decision_time": 1790834320,
+      "label_available_time": 1790834350,
+      "features": [
+        0.9166666666666666,
+        0.16648000353715925
+      ],
+      "target": [
+        0.40829600070743177
+      ]
+    },
+    {
+      "record_id": "fixture-111",
+      "group_id": "group-111",
+      "subgroup_id": "regime-0",
+      "event_time": 1790834378,
+      "observation_time": 1790834379,
+      "decision_time": 1790834380,
+      "label_available_time": 1790834410,
+      "features": [
+        0.925,
+        0.3868920435136209
+      ],
+      "target": [
+        0.4548784087027242
+      ]
+    },
+    {
+      "record_id": "fixture-112",
+      "group_id": "group-112",
+      "subgroup_id": "regime-1",
+      "event_time": 1790834438,
+      "observation_time": 1790834439,
+      "decision_time": 1790834440,
+      "label_available_time": 1790834470,
+      "features": [
+        0.9333333333333333,
+        0.5869275589911804
+      ],
+      "target": [
+        0.4973855117982361
+      ]
+    },
+    {
+      "record_id": "fixture-113",
+      "group_id": "group-113",
+      "subgroup_id": "regime-2",
+      "event_time": 1790834498,
+      "observation_time": 1790834499,
+      "decision_time": 1790834500,
+      "label_available_time": 1790834530,
+      "features": [
+        0.9416666666666667,
+        0.7560512374708732
+      ],
+      "target": [
+        0.5337102474941746
+      ]
+    },
+    {
+      "record_id": "fixture-114",
+      "group_id": "group-114",
+      "subgroup_id": "regime-0",
+      "event_time": 1790834558,
+      "observation_time": 1790834559,
+      "decision_time": 1790834560,
+      "label_available_time": 1790834590,
+      "features": [
+        0.95,
+        0.8853558066640549
+      ],
+      "target": [
+        0.562071161332811
+      ]
+    },
+    {
+      "record_id": "fixture-115",
+      "group_id": "group-115",
+      "subgroup_id": "regime-1",
+      "event_time": 1790834618,
+      "observation_time": 1790834619,
+      "decision_time": 1790834620,
+      "label_available_time": 1790834650,
+      "features": [
+        0.9583333333333334,
+        0.9680311556724585
+      ],
+      "target": [
+        0.5811062311344917
+      ]
+    },
+    {
+      "record_id": "fixture-116",
+      "group_id": "group-116",
+      "subgroup_id": "regime-2",
+      "event_time": 1790834678,
+      "observation_time": 1790834679,
+      "decision_time": 1790834680,
+      "label_available_time": 1790834710,
+      "features": [
+        0.9666666666666667,
+        0.9997230045289237
+      ],
+      "target": [
+        0.5899446009057847
+      ]
+    },
+    {
+      "record_id": "fixture-117",
+      "group_id": "group-117",
+      "subgroup_id": "regime-0",
+      "event_time": 1790834738,
+      "observation_time": 1790834739,
+      "decision_time": 1790834740,
+      "label_available_time": 1790834770,
+      "features": [
+        0.975,
+        0.9787622319747805
+      ],
+      "target": [
+        0.5882524463949561
+      ]
+    },
+    {
+      "record_id": "fixture-118",
+      "group_id": "group-118",
+      "subgroup_id": "regime-1",
+      "event_time": 1790834798,
+      "observation_time": 1790834799,
+      "decision_time": 1790834800,
+      "label_available_time": 1790834830,
+      "features": [
+        0.9833333333333333,
+        0.9062527834196741
+      ],
+      "target": [
+        0.5762505566839348
+      ]
+    },
+    {
+      "record_id": "fixture-119",
+      "group_id": "group-119",
+      "subgroup_id": "regime-2",
+      "event_time": 1790834858,
+      "observation_time": 1790834859,
+      "decision_time": 1790834860,
+      "label_available_time": 1790834890,
+      "features": [
+        0.9916666666666667,
+        0.786013529216861
+      ],
+      "target": [
+        0.5547027058433722
+      ]
+    }
+  ]
+}

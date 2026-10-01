@@ -538,7 +538,7 @@ RUN set -eu; \
             bash scripts/set-release-version.sh "${release_version}"; \
         fi; \
     fi; \
-    cargo build --locked --release --bin gail --no-default-features -j "${CARGO_BUILD_JOBS}"; \
+    cargo build --locked --release --bin gail --no-default-features --features elm -j "${CARGO_BUILD_JOBS}"; \
     cargo build --locked --release --bin gail-qlora-sft --features training-libtorch -j "${CARGO_BUILD_JOBS}"; \
     package_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)"; \
     if [ -z "${package_version}" ]; then \

@@ -52,6 +52,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn paper_decision_fingerprint_tracks_model_and_risk_policy_changes() {
+        let config = TradingConfig::default();
+        let baseline = super::super::paper_decision_fingerprint("build-a".into(), None, &config);
+        let mut changed_risk = config.clone();
+        changed_risk.minimum_net_edge_bps += 1.0;
+        assert_ne!(
+            baseline,
+            super::super::paper_decision_fingerprint("build-a".into(), None, &changed_risk)
+        );
+        assert_ne!(
+            baseline,
+            super::super::paper_decision_fingerprint(
+                "build-a".into(),
+                Some("model-digest"),
+                &config
+            )
+        );
+        let mut rotated_secret = config.clone();
+        rotated_secret.refiner_api_token = Some("new-secret-value".into());
+        assert_eq!(
+            baseline,
+            super::super::paper_decision_fingerprint("build-a".into(), None, &rotated_secret)
+        );
+    }
+
+    #[test]
+    fn quant_elm_can_only_reduce_edge_and_invalid_output_keeps_the_baseline() {
+        let baseline = 12.0;
+        let lower = crate::trading::apply_elm_edge_veto(baseline, Some(20.0), Some(2.0), 0.5);
+        assert_eq!(lower, baseline);
+        let veto = crate::trading::apply_elm_edge_veto(baseline, Some(3.0), Some(2.0), 0.5);
+        assert_eq!(veto, 6.5);
+        assert!(veto <= baseline);
+        assert_eq!(
+            crate::trading::apply_elm_edge_veto(baseline, Some(f64::NAN), Some(1.0), 1.0),
+            baseline
+        );
+    }
+
+    #[test]
+    fn quant_net_edge_schema_matches_feature_vector_and_missingness_columns() {
+        let snapshot = make_snapshot("test", "BTC/USDT", 50_000.0, 0.5, 1_000_000.0);
+        let (features, _) = crate::trading::quant_net_edge_features(&snapshot, None);
+        let schema = crate::trading::quant_net_edge_feature_schema();
+        assert_eq!(features.len(), schema.names.len());
+        assert_eq!(features.len(), schema.units.len());
+        assert!(schema.names.contains(&"order_flow_imbalance".into()));
+        assert!(schema.names.contains(&"order_flow_missing".into()));
+    }
+
     fn make_advice(action: &str, confidence: f64, weight: f64) -> AiAdvice {
         AiAdvice {
             provider: "test".to_string(),

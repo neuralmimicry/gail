@@ -6,6 +6,9 @@ pub mod app;
 pub mod build_info;
 pub mod client;
 pub mod config;
+#[cfg(feature = "elm")]
+pub mod elm;
+pub mod elm_config;
 pub mod errors;
 pub mod governance;
 pub mod hardware;

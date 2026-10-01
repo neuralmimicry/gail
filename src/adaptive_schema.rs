@@ -294,7 +294,7 @@ impl AdaptiveApiSchema {
             let changed = hint.summary != summary || hint.evidence != evidence;
             hint.summary = summary.to_string();
             hint.evidence = evidence;
-            hint.count += 1;
+            hint.count = hint.count.saturating_add(1);
             hint.last_seen_at = Some(now);
             changed
         };
@@ -941,5 +941,33 @@ mod tests {
         let endpoint = &schema.endpoints["GET /api/ping"];
         assert_eq!(endpoint.success_count, 1);
         assert_eq!(endpoint.failure_count, 0);
+    }
+
+    #[test]
+    fn semantic_hint_observation_saturates_recovered_counter() {
+        let mut schema = AdaptiveApiSchema::default();
+        schema.semantic_hints.insert(
+            "manager_tool_call_shape".to_string(),
+            AdaptiveSemanticHint {
+                key: "manager_tool_call_shape".to_string(),
+                summary: "old summary".to_string(),
+                evidence: "old evidence".to_string(),
+                count: SATURATED_COUNTER,
+                first_seen_at: Some(now_ts()),
+                last_seen_at: None,
+            },
+        );
+
+        schema.upsert_semantic_hint(
+            "manager_tool_call_shape",
+            "current summary",
+            "test",
+            "current evidence",
+        );
+
+        assert_eq!(
+            schema.semantic_hints["manager_tool_call_shape"].count,
+            SATURATED_COUNTER
+        );
     }
 }

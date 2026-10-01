@@ -30,6 +30,8 @@ pub struct GailConfig {
     pub storage: StorageConfig,
     pub trading: TradingConfig,
     pub comparative_validation: ComparativeValidationConfig,
+    /// Optional native ELM capability. Old configuration files default to off.
+    pub elm: crate::elm_config::ElmConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -607,6 +609,7 @@ impl GailConfig {
         let ollama_host_env = std::env::var("OLLAMA_HOST")
             .ok()
             .filter(|value| !value.trim().is_empty());
+        self.elm.normalize()?;
         if self.server.bind_addr.trim().is_empty() {
             return Err(GailError::invalid_config(
                 "server.bind_addr must not be empty",

@@ -104,7 +104,9 @@ pub struct LedgerInteraction {
     pub raw: Option<Value>,
     pub metadata: Option<Value>,
     pub mirror_status: Option<String>,
+    pub mirror_attempts: u32,
     pub validation_status: Option<String>,
+    pub created_ts: f64,
 }
 
 #[derive(Clone)]
@@ -374,7 +376,9 @@ pub async fn fetch_pending_mirror(
                 raw,
                 metadata,
                 mirror_status,
-                validation_status
+                mirror_attempts,
+                validation_status,
+                created_ts
             FROM gail_llm_interactions
             WHERE (
                     (mirrored_at IS NULL AND (next_mirror_at IS NULL OR next_mirror_at <= now()))
@@ -413,7 +417,12 @@ pub async fn fetch_pending_mirror(
             raw: row.get("raw"),
             metadata: row.get("metadata"),
             mirror_status: row.get("mirror_status"),
+            mirror_attempts: row
+                .get::<_, i32>("mirror_attempts")
+                .try_into()
+                .unwrap_or(u32::MAX),
             validation_status: row.get("validation_status"),
+            created_ts: row.get("created_ts"),
         })
         .collect())
 }
@@ -609,7 +618,9 @@ pub async fn fetch_pending_training(
             raw: row.get("raw"),
             metadata: None,
             mirror_status: None,
+            mirror_attempts: 0,
             validation_status: None,
+            created_ts: 0.0,
         })
         .collect())
 }
