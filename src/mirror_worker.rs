@@ -40,6 +40,18 @@ pub async fn run(config: GailConfig) -> Result<()> {
                 "mirror worker requires aarnn_bridge.enabled=true and a valid bridge endpoint",
             )
         })?;
+    #[cfg(feature = "elm")]
+    let mirror_elm = match crate::elm::integrations::mirroring::MirrorPriorityAdvisor::open(
+        &config.elm,
+    )
+    .await
+    {
+        Ok(advisor) => advisor,
+        Err(error) => {
+            tracing::warn!(error = %error, "mirror ELM unavailable; preserving ledger order and required delivery");
+            None
+        }
+    };
     let hardware = detect_hardware().await;
     log_hardware_profile("mirror_worker", &hardware);
     tracing::info!(
@@ -71,6 +83,11 @@ pub async fn run(config: GailConfig) -> Result<()> {
         if entries.is_empty() {
             continue;
         }
+        #[cfg(feature = "elm")]
+        let entries = match mirror_elm.as_ref() {
+            Some(advisor) => advisor.order_batch(entries).await,
+            None => entries,
+        };
         tracing::info!(
             count = entries.len(),
             "mirror worker processing ledger batch"

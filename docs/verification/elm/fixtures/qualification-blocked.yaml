@@ -1,0 +1,38 @@
+elm:
+  mode: auto
+  registry_path: docs/verification/elm/fixture-registry
+  tasks:
+    routing_candidate_utility:
+      mode: auto
+      max_stage: qualified
+      promotion_policy: fixture_blocked
+      allowed: true
+      tenant_scope: local
+      rollout_fraction: 0.0
+      influence_cap: 0.0
+  promotion_policies:
+    fixture_blocked:
+      task_objective: mse
+      direction: lower
+      baseline: ridge
+      minimum_effective_samples: 1
+      minimum_subgroup_samples: 1
+      minimum_observation_seconds: 1
+      confidence_level: 0.95
+      minimum_practical_improvement: 0.001
+      non_inferiority_tolerance: 0.0
+      maximum_calibration_error: 1.0
+      minimum_interval_coverage: 0.1
+      maximum_p95_overhead_ms: 10.0
+      maximum_p99_overhead_ms: 50.0
+      maximum_input_age_seconds: 3600
+      maximum_label_age_seconds: 3600
+      maximum_drift_score: 10.0
+      maximum_ood_score: 10.0
+      canary_fraction: 0.0
+      canary_max_decisions: 1
+      expiry_seconds: 3600
+      rollback_regression: 0.1
+      cooldown_seconds: 60
+      retrain_budget_per_day: 1
+      authorised_influence: 0.0

@@ -415,10 +415,12 @@ impl SpecialistEngine {
     }
 
     async fn predict_inputs(&self, inputs: &[f32]) -> Result<AarnnPrediction> {
+        let mut transport_failure = None;
         if let Some(endpoint) = normalized_url(self.profile.endpoint.as_deref()) {
             match self.predict_http(&endpoint, inputs).await {
                 Ok(prediction) => return Ok(prediction),
                 Err(error) => {
+                    transport_failure = Some(error.to_string());
                     tracing::debug!(engine = %self.profile.name, error = %error, "specialist HTTP predict failed; falling back")
                 }
             }
@@ -427,11 +429,22 @@ impl SpecialistEngine {
             match self.predict_socket(socket_path.clone(), inputs).await {
                 Ok(prediction) => return Ok(prediction),
                 Err(error) => {
+                    transport_failure = Some(error.to_string());
                     tracing::debug!(engine = %self.profile.name, error = %error, "specialist UDS predict failed; falling back")
                 }
             }
         }
-        Ok(self.predict_heuristic(inputs))
+        if self.profile.allow_offline_heuristic {
+            return Ok(self.predict_heuristic(inputs));
+        }
+        Err(GailError::upstream(
+            self.profile.name.clone(),
+            None,
+            format!(
+                "specialist prediction unavailable and offline heuristic is disabled: {}",
+                transport_failure.unwrap_or_else(|| "no transport endpoint configured".into())
+            ),
+        ))
     }
 
     async fn predict_http(&self, endpoint: &str, inputs: &[f32]) -> Result<AarnnPrediction> {
@@ -1227,5 +1240,25 @@ mod tests {
         let context = engine.format_prompt_context(&analysis);
         assert!(context.contains("AER"));
         assert!(context.contains("AARNN"));
+    }
+
+    #[tokio::test]
+    async fn offline_heuristic_obeys_explicit_profile_configuration() {
+        let client = Client::new();
+        let mut profile = SpecialistProfile::default();
+        profile.name = "offline-disabled-test".into();
+        profile.allow_offline_heuristic = false;
+        let engine = SpecialistEngine::new(client.clone(), profile);
+        assert!(engine.predict_inputs(&[0.1, 0.2]).await.is_err());
+
+        let mut profile = SpecialistProfile::default();
+        profile.name = "offline-enabled-test".into();
+        profile.allow_offline_heuristic = true;
+        let engine = SpecialistEngine::new(client, profile);
+        let prediction = engine
+            .predict_inputs(&[0.1, 0.2])
+            .await
+            .expect("configured heuristic");
+        assert_eq!(prediction.mode, "offline_heuristic");
     }
 }

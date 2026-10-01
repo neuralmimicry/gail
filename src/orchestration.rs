@@ -114,6 +114,18 @@ pub struct GailService {
     inner: Arc<GailServiceInner>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ElmAdvisoryResult {
+    pub task_id: String,
+    pub model_digest: Option<String>,
+    pub proposal: Option<f64>,
+    pub uncertainty: Option<f64>,
+    pub applied: bool,
+    pub influence_cap: f64,
+    pub reason: Option<String>,
+    pub elapsed_ms: f64,
+}
+
 struct GailServiceInner {
     governance: crate::governance::Governance,
     config: GailConfig,
@@ -133,6 +145,16 @@ struct GailServiceInner {
     trading_pool: Arc<Semaphore>,
     postgres_dsn: Option<String>,
     readiness_cache: ReadinessCache,
+    #[cfg(feature = "elm")]
+    elm_runtime: Option<Arc<ElmRuntime>>,
+}
+
+#[cfg(feature = "elm")]
+struct ElmRuntime {
+    registry: Option<Arc<crate::elm::ModelRegistry>>,
+    inference: Option<crate::elm::executor::InferenceExecutor>,
+    inference_failures: Mutex<HashMap<String, u32>>,
+    error: Option<String>,
 }
 
 #[derive(Default)]
@@ -174,6 +196,76 @@ struct ProviderCandidate {
     host_vram_budget_mb: Option<u64>,
     nmc_agent_id: Option<String>,
     nmc_host: Option<String>,
+}
+
+#[cfg(feature = "elm")]
+fn routing_elm_feature_schema() -> crate::elm_config::FeatureSchema {
+    crate::elm_config::FeatureSchema {
+        id: "gail-routing-candidate-utility:v1".into(),
+        version: 1,
+        names: vec![
+            "baseline_score",
+            "configured_weight",
+            "priority_bias",
+            "specialty_overlap",
+            "role_fit",
+            "health_score",
+            "preferred",
+            "metrics_bonus",
+            "model_size_bonus",
+            "model_size_billions",
+            "usage_penalty",
+            "resource_penalty",
+            "nmc_pressure",
+            "candidate_pressure",
+            "host_pressure",
+            "queue_depth",
+            "latency_seconds",
+            "health_ok",
+            "tokens_per_second",
+            "throughput_missing",
+            "provider_openai",
+            "provider_gemini",
+            "provider_ollama",
+            "provider_nvidia",
+            "provider_other",
+            "nmc_constrained",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        units: vec![
+            "score",
+            "score",
+            "score",
+            "count",
+            "score",
+            "score",
+            "boolean",
+            "score",
+            "score",
+            "billions_of_parameters",
+            "score",
+            "score",
+            "ratio",
+            "ratio",
+            "ratio",
+            "requests",
+            "seconds",
+            "boolean",
+            "tokens_per_second",
+            "boolean",
+            "boolean",
+            "boolean",
+            "boolean",
+            "boolean",
+            "boolean",
+            "boolean",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+    }
 }
 
 #[derive(Debug)]
@@ -360,7 +452,50 @@ impl GailService {
     pub fn metrics(&self) -> MetricsStore {
         self.inner.metrics.clone()
     }
-    pub async fn new(config: GailConfig) -> Result<Self> {
+    pub async fn new(mut config: GailConfig) -> Result<Self> {
+        config.elm.normalize()?;
+        #[cfg(feature = "elm")]
+        let elm_runtime = if config.elm.enabled() {
+            let root = config.elm.registry_path.clone();
+            let max_bytes = config.elm.lifecycle.artifact_max_bytes;
+            match tokio::task::spawn_blocking(move || {
+                crate::elm::ModelRegistry::open(root, max_bytes)
+            })
+            .await
+            {
+                Ok(Ok(registry)) => match crate::elm::executor::InferenceExecutor::new(
+                    config.elm.budgets.max_training_threads.min(4),
+                    config.elm.budgets.max_inference_queue,
+                ) {
+                    Ok(inference) => Some(Arc::new(ElmRuntime {
+                        registry: Some(Arc::new(registry)),
+                        inference: Some(inference),
+                        inference_failures: Mutex::new(HashMap::new()),
+                        error: None,
+                    })),
+                    Err(error) => Some(Arc::new(ElmRuntime {
+                        registry: Some(Arc::new(registry)),
+                        inference: None,
+                        inference_failures: Mutex::new(HashMap::new()),
+                        error: Some(error.to_string()),
+                    })),
+                },
+                Ok(Err(error)) => Some(Arc::new(ElmRuntime {
+                    registry: None,
+                    inference: None,
+                    inference_failures: Mutex::new(HashMap::new()),
+                    error: Some(error.to_string()),
+                })),
+                Err(error) => Some(Arc::new(ElmRuntime {
+                    registry: None,
+                    inference: None,
+                    inference_failures: Mutex::new(HashMap::new()),
+                    error: Some(error.to_string()),
+                })),
+            }
+        } else {
+            None
+        };
         let governance = crate::governance::Governance::new(&config.governance, &config.security)?;
         adaptive_schema::configure_persistence(config.storage.adaptive_schema_path.clone()).await;
         api_issues::configure_persistence(
@@ -456,6 +591,8 @@ impl GailService {
                 trading_pool: trading_pool.clone(),
                 postgres_dsn: postgres_dsn.clone(),
                 readiness_cache: ReadinessCache::default(),
+                #[cfg(feature = "elm")]
+                elm_runtime: elm_runtime.clone(),
             }),
         };
 
@@ -469,7 +606,7 @@ impl GailService {
             (None, None)
         };
 
-        Ok(Self {
+        let service = Self {
             inner: Arc::new(GailServiceInner {
                 governance,
                 config,
@@ -489,8 +626,42 @@ impl GailService {
                 trading_pool,
                 postgres_dsn,
                 readiness_cache: ReadinessCache::default(),
+                #[cfg(feature = "elm")]
+                elm_runtime,
             }),
-        })
+        };
+        #[cfg(feature = "elm")]
+        if let Some(registry) = service
+            .inner
+            .elm_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.registry.as_ref())
+            .cloned()
+        {
+            tokio::spawn(async move {
+                let mut refresh_interval = tokio::time::interval(Duration::from_secs(2));
+                loop {
+                    refresh_interval.tick().await;
+                    let follower = registry.clone();
+                    match tokio::task::spawn_blocking(move || follower.refresh()).await {
+                        Ok(Ok(true)) => {
+                            info!(
+                                revision = registry.revision(),
+                                "ELM serving snapshot refreshed from the durable registry"
+                            )
+                        }
+                        Ok(Ok(false)) => {}
+                        Ok(Err(error)) => {
+                            warn!(error = %error, "ELM registry refresh failed; retaining the last complete serving snapshot")
+                        }
+                        Err(error) => {
+                            warn!(error = %error, "ELM registry refresh task failed")
+                        }
+                    }
+                }
+            });
+        }
+        Ok(service)
     }
 
     pub fn config(&self) -> &GailConfig {
@@ -499,6 +670,668 @@ impl GailService {
 
     pub fn governance(&self) -> &crate::governance::Governance {
         &self.inner.governance
+    }
+
+    pub(crate) fn elm_status_value(&self) -> Value {
+        let mut status = json!({
+            "build_supported": cfg!(feature = "elm"),
+            "enabled": self.inner.config.elm.enabled(),
+            "mode": self.inner.config.elm.mode,
+            "online_updates": false,
+            "effective_config": {
+                "tasks": self.inner.config.elm.tasks.iter().map(|(name, task)| (name.clone(), json!({
+                    "mode": task.mode,
+                    "allowed": task.allowed,
+                    "max_stage": task.max_stage,
+                    "promotion_policy": task.promotion_policy,
+                    "rollout_fraction": task.rollout_fraction,
+                    "influence_cap": task.influence_cap,
+                }))).collect::<serde_json::Map<_, _>>(),
+                "budgets": {
+                    "max_training_jobs": self.inner.config.elm.budgets.max_training_jobs,
+                    "max_training_threads": self.inner.config.elm.budgets.max_training_threads,
+                    "max_training_memory_mb": self.inner.config.elm.budgets.max_training_memory_mb,
+                    "max_inference_queue": self.inner.config.elm.budgets.max_inference_queue,
+                    "max_hidden_units": self.inner.config.elm.budgets.max_hidden_units,
+                    "inference_deadline_ms": self.inner.config.elm.budgets.inference_deadline_ms,
+                },
+                "authority": {
+                    "allow_live_influence": self.inner.config.elm.trading.allow_live_influence,
+                    "allow_raw_text": self.inner.config.elm.data.allow_raw_text,
+                    "allow_cross_tenant_training": self.inner.config.elm.data.allow_cross_tenant_training,
+                },
+            },
+        });
+        #[cfg(feature = "elm")]
+        if let Some(runtime) = self.inner.elm_runtime.as_ref() {
+            status["registry"] = runtime
+                .registry
+                .as_ref()
+                .map(|registry| registry.status_json())
+                .unwrap_or(Value::Null);
+            status["ready"] = json!(runtime.registry.is_some() && runtime.inference.is_some());
+            if let Some(error) = runtime.error.as_ref() {
+                status["error"] = json!(error);
+            }
+        } else {
+            status["ready"] = json!(!self.inner.config.elm.enabled());
+        }
+        #[cfg(not(feature = "elm"))]
+        {
+            status["ready"] = json!(!self.inner.config.elm.enabled());
+            if self.inner.config.elm.enabled() {
+                status["error"] = json!(
+                    "ELM is configured but this Gail binary was built without the `elm` feature"
+                );
+            }
+        }
+        status
+    }
+
+    /// Render bounded-cardinality ELM gate state for Grafana and Prometheus.
+    /// Model identifiers and tenant data remain in authorised status/log paths.
+    fn elm_prometheus_metrics(&self) -> String {
+        const TASKS: &[&str] = &[
+            "routing_candidate_utility",
+            "quant_net_edge",
+            "trading_advisory",
+            "training_resource_estimate",
+            "mirror_priority",
+            "aarnn_activity_readout",
+        ];
+        let mut output = String::from(
+            "# HELP gail_elm_task_gate_active Whether a named ELM decision gate is enabled for a task.\n# TYPE gail_elm_task_gate_active gauge\n",
+        );
+        output.push_str(
+            "# HELP gail_elm_gate_process_active Whether a named ELM or Gail authority gate process participates in a task's decision path.\n# TYPE gail_elm_gate_process_active gauge\n",
+        );
+        output.push_str(
+            "# HELP gail_elm_task_influence_cap Maximum effective ELM influence after configured authority caps.\n# TYPE gail_elm_task_influence_cap gauge\n",
+        );
+        output.push_str(
+            "# HELP gail_elm_canary_decisions_remaining Durable canary decision budget remaining for the current task model.\n# TYPE gail_elm_canary_decisions_remaining gauge\n",
+        );
+
+        for task_id in TASKS {
+            let mode = self.inner.config.elm.effective_mode(task_id);
+            let mode_name = match mode {
+                crate::elm_config::ElmMode::Off => "off",
+                crate::elm_config::ElmMode::Collect => "collect",
+                crate::elm_config::ElmMode::Shadow => "shadow",
+                crate::elm_config::ElmMode::Auto => "auto",
+            };
+            let task = self.inner.config.elm.tasks.get(*task_id);
+            let stage_ceiling = task.map_or("shadow", |task| match task.max_stage {
+                crate::elm_config::ModelStage::Candidate => "candidate",
+                crate::elm_config::ModelStage::Trained => "trained",
+                crate::elm_config::ModelStage::Evaluated => "evaluated",
+                crate::elm_config::ModelStage::Qualified => "qualified",
+                crate::elm_config::ModelStage::Shadow => "shadow",
+                crate::elm_config::ModelStage::Canary => "canary",
+                crate::elm_config::ModelStage::Active => "active",
+            });
+            let policy = task.and_then(|task| {
+                self.inner
+                    .config
+                    .elm
+                    .promotion_policies
+                    .get(&task.promotion_policy)
+            });
+            let (model_stage, model_qualified, inference_ready, canary_remaining) = {
+                #[cfg(feature = "elm")]
+                {
+                    let runtime = self.inner.elm_runtime.as_ref();
+                    let registry = runtime.and_then(|runtime| runtime.registry.as_ref());
+                    let artifact = registry.and_then(|registry| registry.champion(task_id));
+                    let record = artifact
+                        .as_ref()
+                        .and_then(|artifact| registry?.record(&artifact.metadata.model_id));
+                    let stage = record
+                        .as_ref()
+                        .map_or("none", |record| match &record.stage {
+                            crate::elm::LifecycleStage::Candidate => "candidate",
+                            crate::elm::LifecycleStage::Trained => "trained",
+                            crate::elm::LifecycleStage::Evaluated => "evaluated",
+                            crate::elm::LifecycleStage::Qualified => "qualified",
+                            crate::elm::LifecycleStage::Shadow => "shadow",
+                            crate::elm::LifecycleStage::Canary => "canary",
+                            crate::elm::LifecycleStage::Active => "active",
+                            crate::elm::LifecycleStage::Rejected => "rejected",
+                            crate::elm::LifecycleStage::Quarantined => "quarantined",
+                            crate::elm::LifecycleStage::Retired => "retired",
+                            crate::elm::LifecycleStage::RolledBack => "rolled_back",
+                        });
+                    let qualified = artifact.as_ref().is_some_and(|artifact| {
+                        !artifact.metadata.fixture_only
+                            && record.as_ref().is_some_and(|record| {
+                                matches!(
+                                    &record.stage,
+                                    crate::elm::LifecycleStage::Qualified
+                                        | crate::elm::LifecycleStage::Shadow
+                                        | crate::elm::LifecycleStage::Canary
+                                        | crate::elm::LifecycleStage::Active
+                                )
+                            })
+                    });
+                    let remaining = match (artifact.as_ref(), registry, policy) {
+                        (Some(artifact), Some(registry), Some(policy))
+                            if record.as_ref().is_some_and(|record| {
+                                record.stage == crate::elm::LifecycleStage::Canary
+                            }) =>
+                        {
+                            let maximum = policy.canary_max_decisions.unwrap_or(0) as u64;
+                            maximum.saturating_sub(
+                                registry.canary_decisions(&artifact.metadata.model_id),
+                            )
+                        }
+                        _ => 0,
+                    };
+                    (
+                        stage,
+                        qualified,
+                        runtime.is_some_and(|runtime| {
+                            runtime.registry.is_some() && runtime.inference.is_some()
+                        }),
+                        remaining,
+                    )
+                }
+                #[cfg(not(feature = "elm"))]
+                {
+                    ("unsupported", false, false, 0)
+                }
+            };
+            let task_allowed = task.is_some_and(|task| task.allowed);
+            let policy_complete = policy.is_some_and(|policy| policy.is_complete());
+            let rollout_within_policy = task.is_some_and(|task| {
+                task.rollout_fraction > 0.0
+                    && policy
+                        .and_then(|policy| policy.canary_fraction)
+                        .is_some_and(|limit| task.rollout_fraction <= limit)
+            });
+            let is_trading = matches!(*task_id, "quant_net_edge" | "trading_advisory");
+            let live_trading_authority = !is_trading
+                || (self.inner.config.trading.live_execution_enabled
+                    && self.inner.config.elm.trading.allow_live_influence);
+            let configured_cap = task.map_or(0.0, |task| {
+                task.influence_cap.min(
+                    policy
+                        .and_then(|policy| policy.authorised_influence)
+                        .unwrap_or(0.0),
+                )
+            });
+            let influence_cap = if is_trading {
+                self.inner.config.elm.trading.effective_influence_cap(
+                    configured_cap,
+                    self.inner.config.trading.live_execution_enabled,
+                )
+            } else {
+                configured_cap
+            };
+            let gates = [
+                ("build_feature_support", cfg!(feature = "elm")),
+                ("mode_auto", mode == crate::elm_config::ElmMode::Auto),
+                ("task_allowed", task_allowed),
+                (
+                    "automatic_training",
+                    self.inner.config.elm.lifecycle.automatic_training,
+                ),
+                (
+                    "automatic_promotion",
+                    self.inner.config.elm.lifecycle.automatic_promotion,
+                ),
+                ("promotion_policy_complete", policy_complete),
+                ("qualified_model_available", model_qualified),
+                ("canary_stage", model_stage == "canary"),
+                ("active_stage", model_stage == "active"),
+                ("inference_ready", inference_ready),
+                ("rollout_within_policy", rollout_within_policy),
+                ("canary_budget_available", canary_remaining > 0),
+                ("influence_authorised", influence_cap > 0.0),
+                ("live_trading_authority", live_trading_authority),
+            ];
+            for (gate, active) in gates {
+                output.push_str(&format!(
+                    "gail_elm_task_gate_active{{task=\"{task_id}\",gate=\"{gate}\",mode=\"{mode_name}\",model_stage=\"{model_stage}\",stage_ceiling=\"{stage_ceiling}\"}} {}\n",
+                    u8::from(active)
+                ));
+            }
+            #[cfg(feature = "elm")]
+            for process in crate::elm::gates::active_gate_processes(task_id) {
+                output.push_str(&format!(
+                    "gail_elm_gate_process_active{{task=\"{task_id}\",process=\"{process}\",mode=\"{mode_name}\",model_stage=\"{model_stage}\",stage_ceiling=\"{stage_ceiling}\"}} 1\n"
+                ));
+            }
+            output.push_str(&format!(
+                "gail_elm_task_influence_cap{{task=\"{task_id}\"}} {influence_cap}\n"
+            ));
+            output.push_str(&format!(
+                "gail_elm_canary_decisions_remaining{{task=\"{task_id}\",stage=\"{model_stage}\"}} {canary_remaining}\n"
+            ));
+        }
+        output
+    }
+
+    pub(crate) fn elm_models_value(&self) -> Value {
+        self.elm_status_value()
+            .get("registry")
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    pub(crate) fn elm_evaluation_value(&self, model_id: &str) -> Option<Value> {
+        #[cfg(feature = "elm")]
+        return self
+            .inner
+            .elm_runtime
+            .as_ref()?
+            .registry
+            .as_ref()?
+            .evaluation_json(model_id)
+            .ok();
+        #[cfg(not(feature = "elm"))]
+        {
+            let _ = model_id;
+            None
+        }
+    }
+
+    pub(crate) fn trading_elm_fingerprint(&self) -> Option<String> {
+        #[cfg(feature = "elm")]
+        {
+            let runtime = self.inner.elm_runtime.as_ref()?;
+            let registry = runtime.registry.as_ref()?;
+            if self.inner.config.trading.live_execution_enabled
+                && !self.inner.config.elm.trading.allow_live_influence
+            {
+                return None;
+            }
+            let tasks = [
+                "routing_candidate_utility",
+                "quant_net_edge",
+                "trading_advisory",
+            ];
+            let mut decision_models = Vec::new();
+            for task_id in tasks {
+                let Some(task) = self.inner.config.elm.tasks.get(task_id) else {
+                    continue;
+                };
+                if !task.allowed
+                    || task.max_stage < crate::elm_config::ModelStage::Canary
+                    || task.influence_cap <= 0.0
+                    || self.inner.config.elm.effective_mode(task_id)
+                        != crate::elm_config::ElmMode::Auto
+                {
+                    continue;
+                }
+                let Some(artifact) = registry.champion(task_id) else {
+                    continue;
+                };
+                let Some(record) = registry.record(&artifact.metadata.model_id) else {
+                    continue;
+                };
+                if matches!(
+                    record.stage,
+                    crate::elm::LifecycleStage::Canary | crate::elm::LifecycleStage::Active
+                ) && !artifact.metadata.fixture_only
+                {
+                    let policy = self
+                        .inner
+                        .config
+                        .elm
+                        .promotion_policies
+                        .get(&task.promotion_policy);
+                    let authorised_cap = policy
+                        .and_then(|value| value.authorised_influence)
+                        .unwrap_or(0.0)
+                        .min(task.influence_cap);
+                    if self.inner.config.elm.trading.effective_influence_cap(
+                        authorised_cap,
+                        self.inner.config.trading.live_execution_enabled,
+                    ) <= 0.0
+                    {
+                        continue;
+                    }
+                    decision_models.push((task_id, artifact.content_sha256.clone(), task, policy));
+                }
+            }
+            if decision_models.is_empty() {
+                return None;
+            }
+            let bytes = serde_json::to_vec(&decision_models).ok()?;
+            Some(hex::encode(Sha256::digest(bytes)))
+        }
+        #[cfg(not(feature = "elm"))]
+        {
+            None
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // The advisory keeps its data and policy context explicit.
+    pub(crate) async fn elm_advisory(
+        &self,
+        decision_id: &str,
+        task_id: &str,
+        tenant_scope: &str,
+        feature_schema: &crate::elm_config::FeatureSchema,
+        feature_values: &[f64],
+        feature_timestamp: u64,
+        target_unit: &str,
+        baseline_decision: Option<&str>,
+    ) -> Option<ElmAdvisoryResult> {
+        #[cfg(feature = "elm")]
+        {
+            use crate::elm::{
+                gates::{DecisionContext, admit},
+                model::TaskKind,
+            };
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            let task = self.inner.config.elm.effective_mode(task_id);
+            if task == crate::elm_config::ElmMode::Off
+                || task == crate::elm_config::ElmMode::Collect
+            {
+                return None;
+            }
+            let runtime = self.inner.elm_runtime.as_ref()?;
+            let registry = runtime.registry.as_ref()?;
+            let executor = runtime.inference.as_ref()?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |value| value.as_secs());
+            let context = DecisionContext {
+                decision_id,
+                task_id,
+                tenant_scope,
+                feature_schema,
+                feature_values,
+                feature_timestamp,
+                now,
+                remaining_deadline_ms: self.inner.config.elm.budgets.inference_deadline_ms,
+                baseline_decision,
+                hard_policy_eligible: true,
+                resource_available: true,
+                rollout_bucket: u64::from_le_bytes(
+                    sha2::Sha256::digest(decision_id.as_bytes())[..8]
+                        .try_into()
+                        .unwrap_or([0; 8]),
+                ),
+            };
+            let gated = admit(&self.inner.config.elm, registry, &context);
+            let is_trading_task = matches!(task_id, "quant_net_edge" | "trading_advisory");
+            let influence_cap = if is_trading_task {
+                self.inner.config.elm.trading.effective_influence_cap(
+                    gated.influence_cap,
+                    self.inner.config.trading.live_execution_enabled,
+                )
+            } else {
+                gated.influence_cap
+            };
+            let Some(artifact) = gated.artifact else {
+                tracing::info!(
+                    decision_id,
+                    task = task_id,
+                    mode = ?gated.mode,
+                    outcome = "baseline_selected",
+                    reason = ?gated.reason,
+                    model_stage = "unavailable",
+                    active_gate_processes = ?crate::elm::gates::active_gate_processes(task_id),
+                    model_called = false,
+                    "ELM advisory gate retained Gail's existing decision path"
+                );
+                return Some(ElmAdvisoryResult {
+                    task_id: task_id.into(),
+                    model_digest: None,
+                    proposal: None,
+                    uncertainty: None,
+                    applied: false,
+                    influence_cap: 0.0,
+                    reason: Some(format!(
+                        "{:?}",
+                        gated
+                            .reason
+                            .unwrap_or(crate::elm::gates::GateReason::QualifiedModelUnavailable)
+                    )),
+                    elapsed_ms: 0.0,
+                });
+            };
+            if artifact.task_kind != TaskKind::Regression
+                || artifact.metadata.target_units.first().map(String::as_str) != Some(target_unit)
+            {
+                return Some(ElmAdvisoryResult {
+                    task_id: task_id.into(),
+                    model_digest: Some(artifact.content_sha256.clone()),
+                    proposal: None,
+                    uncertainty: None,
+                    applied: false,
+                    influence_cap: 0.0,
+                    reason: Some("target_semantics_mismatch".into()),
+                    elapsed_ms: 0.0,
+                });
+            }
+            if !self.claim_elm_canary_decision(registry, &artifact).await {
+                return Some(ElmAdvisoryResult {
+                    task_id: task_id.into(),
+                    model_digest: Some(artifact.content_sha256.clone()),
+                    proposal: None,
+                    uncertainty: None,
+                    applied: false,
+                    influence_cap: 0.0,
+                    reason: Some("canary_budget_exhausted".into()),
+                    elapsed_ms: 0.0,
+                });
+            }
+            let started = std::time::Instant::now();
+            let model_stage = registry
+                .record(&artifact.metadata.model_id)
+                .map(|record| record.stage);
+            let result = executor
+                .predict(
+                    artifact.clone(),
+                    feature_values.to_vec(),
+                    Duration::from_millis(self.inner.config.elm.budgets.inference_deadline_ms),
+                )
+                .await;
+            match result {
+                Ok(prediction) => {
+                    let proposal = prediction.values.first().copied();
+                    let uncertainty = artifact
+                        .calibration
+                        .as_ref()
+                        .and_then(|item| item.residual_radius);
+                    let numerically_valid = proposal.is_some_and(f64::is_finite)
+                        && uncertainty.is_some_and(f64::is_finite);
+                    self.record_elm_inference_result(
+                        task_id,
+                        &artifact.content_sha256,
+                        numerically_valid,
+                        true,
+                    )
+                    .await;
+                    let applied = !gated.shadow
+                        && influence_cap > 0.0
+                        && gated.mode == crate::elm_config::ElmMode::Auto;
+                    let reason = if proposal.is_none_or(|value| !value.is_finite()) {
+                        Some("invalid_prediction".into())
+                    } else if uncertainty.is_none_or(|value| !value.is_finite()) {
+                        Some("uncertainty_unavailable".into())
+                    } else if is_trading_task && gated.influence_cap > 0.0 && influence_cap == 0.0 {
+                        Some("trading_influence_disabled".into())
+                    } else if !applied {
+                        Some("shadow_or_stage_ceiling".into())
+                    } else {
+                        None
+                    };
+                    tracing::info!(decision_id, task = task_id, mode = ?gated.mode, outcome = if applied && reason.is_none() { "applied" } else { "shadowed" }, reason = ?reason, model_stage = ?model_stage, active_gate_processes = ?crate::elm::gates::active_gate_processes(task_id), model_digest = %artifact.content_sha256, model_called = true, influence_cap = if applied && reason.is_none() { influence_cap } else { 0.0 }, elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0, "ELM advisory decision");
+                    Some(ElmAdvisoryResult {
+                        task_id: task_id.into(),
+                        model_digest: Some(artifact.content_sha256.clone()),
+                        proposal,
+                        uncertainty,
+                        applied: applied && reason.is_none(),
+                        influence_cap: if applied && reason.is_none() {
+                            influence_cap
+                        } else {
+                            0.0
+                        },
+                        reason,
+                        elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                    })
+                }
+                Err(error) => {
+                    self.record_elm_inference_result(
+                        task_id,
+                        &artifact.content_sha256,
+                        false,
+                        !matches!(error, crate::elm::ElmError::QueueFull),
+                    )
+                    .await;
+                    Some(ElmAdvisoryResult {
+                        task_id: task_id.into(),
+                        model_digest: Some(artifact.content_sha256.clone()),
+                        proposal: None,
+                        uncertainty: None,
+                        applied: false,
+                        influence_cap: 0.0,
+                        reason: Some(format!("inference_error:{error}")),
+                        elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                    })
+                }
+            }
+        }
+        #[cfg(not(feature = "elm"))]
+        {
+            let _ = (
+                decision_id,
+                task_id,
+                tenant_scope,
+                feature_schema,
+                feature_values,
+                feature_timestamp,
+                target_unit,
+                baseline_decision,
+            );
+            None
+        }
+    }
+
+    #[cfg(feature = "elm")]
+    async fn claim_elm_canary_decision(
+        &self,
+        registry: &Arc<crate::elm::ModelRegistry>,
+        artifact: &crate::elm::ElmArtifact,
+    ) -> bool {
+        let Some(record) = registry.record(&artifact.metadata.model_id) else {
+            return false;
+        };
+        if record.stage != crate::elm::LifecycleStage::Canary {
+            return true;
+        }
+        let maximum = self
+            .inner
+            .config
+            .elm
+            .tasks
+            .get(&record.task_id)
+            .and_then(|task| {
+                self.inner
+                    .config
+                    .elm
+                    .promotion_policies
+                    .get(&task.promotion_policy)
+            })
+            .and_then(|policy| policy.canary_max_decisions)
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(0);
+        let model_id = artifact.metadata.model_id.clone();
+        let registry = registry.clone();
+        match tokio::task::spawn_blocking(move || {
+            registry.claim_canary_decision(&model_id, maximum)
+        })
+        .await
+        {
+            Ok(Ok(claimed)) => claimed,
+            Ok(Err(error)) => {
+                warn!(model_id = %artifact.metadata.model_id, error = %error, "could not persist ELM canary decision claim");
+                false
+            }
+            Err(error) => {
+                warn!(model_id = %artifact.metadata.model_id, error = %error, "ELM canary decision claim task failed");
+                false
+            }
+        }
+    }
+
+    #[cfg(feature = "elm")]
+    async fn record_elm_inference_result(
+        &self,
+        task_id: &str,
+        model_digest: &str,
+        valid_result: bool,
+        count_failure: bool,
+    ) {
+        let Some(runtime) = self.inner.elm_runtime.as_ref() else {
+            return;
+        };
+        if valid_result {
+            runtime.inference_failures.lock().await.remove(task_id);
+            return;
+        }
+        if !count_failure || !self.inner.config.elm.lifecycle.automatic_rollback {
+            return;
+        }
+        let should_rollback = {
+            let mut failures = runtime.inference_failures.lock().await;
+            let count = failures.entry(task_id.to_string()).or_default();
+            *count = count.saturating_add(1);
+            if *count >= 3 {
+                *count = 0;
+                true
+            } else {
+                false
+            }
+        };
+        if !should_rollback {
+            return;
+        }
+        let Some(registry) = runtime.registry.as_ref().cloned() else {
+            return;
+        };
+        let task = task_id.to_string();
+        let digest = model_digest.to_string();
+        let idempotency_key = format!("inference-failure:{task}:{digest}");
+        tokio::task::spawn_blocking(move || {
+            let Some(champion) = registry.champion(&task) else {
+                return;
+            };
+            if champion.content_sha256 != digest {
+                return;
+            }
+            let Some(record) = registry.record(&champion.metadata.model_id) else {
+                return;
+            };
+            if !matches!(
+                record.stage,
+                crate::elm::LifecycleStage::Active | crate::elm::LifecycleStage::Canary
+            ) {
+                return;
+            }
+            match registry.rollback_champion(
+                &task,
+                &idempotency_key,
+                registry.revision(),
+                "three consecutive bounded inference failures",
+            ) {
+                Ok(event) => tracing::error!(
+                    task = %event.task_id,
+                    model_id = %event.rolled_back_model_id,
+                    fallback_model_id = ?event.fallback_model_id,
+                    "automatically rolled back an ELM after repeated inference failures"
+                ),
+                Err(error) => {
+                    tracing::warn!(task = %task, error = %error, "automatic ELM rollback did not commit")
+                }
+            }
+        });
     }
 
     fn aarnn_bridge(&self) -> Option<&AarnnMirrorClient> {
@@ -678,7 +1511,16 @@ impl GailService {
         let mut tags = workflow_tags(workflow, role, "");
         tags.insert(normalize_key(workflow, "general"));
         let ranked = self
-            .rank_candidate(candidate, "unknown", workflow, workflow, role, None, &tags)
+            .rank_candidate(
+                candidate,
+                Uuid::new_v4().to_string().as_str(),
+                "unknown",
+                workflow,
+                workflow,
+                role,
+                None,
+                &tags,
+            )
             .await;
         (profile, ranked.score, ranked.health_ok)
     }
@@ -915,6 +1757,7 @@ impl GailService {
     pub async fn provider_prometheus_metrics(&self) -> String {
         let mut rendered = self.inner.metrics.prometheus_metrics().await;
         rendered.push_str(&crate::aarnn_bridge::AarnnMirrorClient::evaluation_prometheus_metrics());
+        rendered.push_str(&self.elm_prometheus_metrics());
         rendered
     }
 
@@ -1651,10 +2494,12 @@ impl GailService {
             let role_clone = role.clone();
             let request_category_clone = request.request_category.clone();
             let task_tags_clone = task_tags.clone();
+            let request_id_clone = request_id.clone();
             rank_join_set.spawn(async move {
                 service
                     .rank_candidate(
                         candidate,
+                        &request_id_clone,
                         &api_source_clone,
                         &request_profile_clone,
                         &workflow_clone,
@@ -3365,9 +4210,11 @@ impl GailService {
         })
     }
 
+    #[allow(clippy::too_many_arguments)] // The router passes request identity and existing ranking context.
     async fn rank_candidate(
         &self,
         candidate: ProviderCandidate,
+        _request_id: &str,
         source: &str,
         request_profile: &str,
         workflow: &str,
@@ -3492,24 +4339,281 @@ impl GailService {
         let model_size_bonus = parse_model_size_billions(candidate.configured_model.as_str())
             .map(|size| (size.ln_1p() / 3.6).clamp(0.0, 1.0) * 0.65)
             .unwrap_or(0.0);
+        let base_score = candidate.weight
+            + candidate.priority_bias
+            + (overlap * 0.85)
+            + role_score
+            + health_score
+            + preferred_score
+            + metrics_bonus
+            + model_size_bonus
+            - usage_penalty
+            - resource_penalty
+            - hard_limit_penalty
+            - nmc_pressure_penalty
+            - nmc_hard_limit_penalty;
+        #[cfg(feature = "elm")]
+        let score = self
+            .routing_elm_score(
+                _request_id,
+                workflow.eq_ignore_ascii_case("trading")
+                    || request_profile.eq_ignore_ascii_case("trading")
+                    || source.eq_ignore_ascii_case("gail_trading")
+                    || request_category
+                        .is_some_and(|category| category.eq_ignore_ascii_case("trading_advisory")),
+                &candidate,
+                base_score,
+                overlap,
+                role_score,
+                health_score,
+                preferred_score,
+                metrics_bonus,
+                model_size_bonus,
+                usage_penalty,
+                resource_penalty,
+                nmc_pressure_penalty,
+                nmc_constrained,
+                load.candidate_limit_ratio,
+                load.host_budget_ratio,
+                load.candidate_in_flight
+                    .saturating_add(load.candidate_waiting),
+                health.latency_ms,
+                health_ok,
+                generation_tokens_per_second,
+            )
+            .await;
+        #[cfg(not(feature = "elm"))]
+        let score = base_score;
         RankedCandidate {
             health_ok,
             health_mode,
             generation_tokens_per_second,
-            score: candidate.weight
-                + candidate.priority_bias
-                + (overlap * 0.85)
-                + role_score
-                + health_score
-                + preferred_score
-                + metrics_bonus
-                + model_size_bonus
-                - usage_penalty
-                - resource_penalty
-                - hard_limit_penalty
-                - nmc_pressure_penalty
-                - nmc_hard_limit_penalty,
+            score,
             candidate,
+        }
+    }
+
+    #[cfg(feature = "elm")]
+    #[allow(clippy::too_many_arguments)]
+    async fn routing_elm_score(
+        &self,
+        request_id: &str,
+        trading_context: bool,
+        candidate: &ProviderCandidate,
+        base_score: f64,
+        overlap: f64,
+        role_score: f64,
+        health_score: f64,
+        preferred_score: f64,
+        metrics_bonus: f64,
+        model_size_bonus: f64,
+        usage_penalty: f64,
+        resource_penalty: f64,
+        nmc_pressure: f64,
+        nmc_constrained: bool,
+        candidate_pressure: f64,
+        host_pressure: f64,
+        queue_depth: usize,
+        latency_ms: Option<u64>,
+        health_ok: bool,
+        throughput: Option<f64>,
+    ) -> f64 {
+        use crate::elm::gates::{
+            DecisionAudit, DecisionContext, DecisionOutcome, GateReason, admit,
+        };
+        use crate::elm_config::ElmMode;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        const TASK: &str = "routing_candidate_utility";
+        let Some(runtime) = self.inner.elm_runtime.as_ref() else {
+            return base_score;
+        };
+        let (Some(registry), Some(executor)) =
+            (runtime.registry.as_ref(), runtime.inference.as_ref())
+        else {
+            return base_score;
+        };
+        let config = &self.inner.config.elm;
+        let mode = config.effective_mode(TASK);
+        if mode == ElmMode::Off {
+            return base_score;
+        }
+
+        let provider = candidate.provider_type.to_ascii_lowercase();
+        let known_provider = matches!(provider.as_str(), "openai" | "gemini" | "ollama" | "nvidia");
+        let model_size =
+            parse_model_size_billions(candidate.configured_model.as_str()).unwrap_or(0.0);
+        let values = vec![
+            base_score,
+            candidate.weight,
+            candidate.priority_bias,
+            overlap,
+            role_score,
+            health_score,
+            preferred_score,
+            metrics_bonus,
+            model_size_bonus,
+            model_size,
+            usage_penalty,
+            resource_penalty,
+            nmc_pressure,
+            candidate_pressure,
+            host_pressure,
+            queue_depth as f64,
+            latency_ms.unwrap_or_default() as f64 / 1_000.0,
+            f64::from(health_ok),
+            throughput.unwrap_or_default(),
+            f64::from(throughput.is_none()),
+            f64::from(provider == "openai"),
+            f64::from(provider == "gemini"),
+            f64::from(provider == "ollama"),
+            f64::from(provider == "nvidia"),
+            f64::from(!known_provider),
+            f64::from(nmc_constrained),
+        ];
+        let schema = routing_elm_feature_schema();
+        let candidate_id = candidate.candidate_id();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |value| value.as_secs());
+        let rollout = Sha256::digest(format!("{request_id}:{candidate_id}").as_bytes());
+        let rollout_bucket = u64::from_le_bytes(rollout[..8].try_into().unwrap_or([0; 8]));
+        let context = DecisionContext {
+            decision_id: request_id,
+            task_id: TASK,
+            tenant_scope: "local",
+            feature_schema: &schema,
+            feature_values: &values,
+            feature_timestamp: now,
+            now,
+            remaining_deadline_ms: config.budgets.inference_deadline_ms,
+            baseline_decision: Some(candidate_id.as_str()),
+            hard_policy_eligible: health_ok,
+            resource_available: health_ok,
+            rollout_bucket,
+        };
+        let gated = admit(config, registry, &context);
+        let influence_cap = if trading_context {
+            config.trading.effective_influence_cap(
+                gated.influence_cap,
+                self.inner.config.trading.live_execution_enabled,
+            )
+        } else {
+            gated.influence_cap
+        };
+        let Some(artifact) = gated.artifact else {
+            tracing::debug!(decision_id = request_id, task = TASK, mode = ?gated.mode, candidate = %candidate_id, outcome = "baseline_selected", reason = ?gated.reason, model_stage = "unavailable", active_gate_processes = ?crate::elm::gates::active_gate_processes(TASK), model_called = false, "ELM routing gate retained the existing ranking");
+            return base_score;
+        };
+        if !known_provider {
+            tracing::debug!(decision_id = request_id, task = TASK, candidate = %candidate_id, outcome = "abstained", reason = ?GateReason::OutOfDomain, model_called = false, "ELM routing abstained on an unseen provider category");
+            return base_score;
+        }
+        if !self.claim_elm_canary_decision(registry, &artifact).await {
+            tracing::info!(decision_id = request_id, task = TASK, model_digest = %artifact.content_sha256, outcome = "baseline_selected", reason = ?GateReason::CanaryBudgetExhausted, model_called = false, "ELM canary decision budget is unavailable; existing ranking retained");
+            return base_score;
+        }
+        let started = std::time::Instant::now();
+        match executor
+            .predict(
+                artifact.clone(),
+                values,
+                Duration::from_millis(config.budgets.inference_deadline_ms),
+            )
+            .await
+        {
+            Ok(result) => {
+                let Some(proposal) = result.values.first().copied() else {
+                    return base_score;
+                };
+                let radius = artifact
+                    .calibration
+                    .as_ref()
+                    .and_then(|item| item.residual_radius)
+                    .unwrap_or(f64::INFINITY);
+                let policy = config
+                    .tasks
+                    .get(TASK)
+                    .and_then(|task| config.promotion_policies.get(&task.promotion_policy));
+                let overhead_limit = policy
+                    .and_then(|value| value.maximum_p95_overhead_ms)
+                    .unwrap_or(0.0);
+                let mut reason = if !proposal.is_finite() || !radius.is_finite() {
+                    Some(GateReason::InferenceError)
+                } else if proposal.abs() > 1.0 {
+                    Some(GateReason::OutOfDomain)
+                } else if proposal.abs() <= radius {
+                    Some(GateReason::InsufficientMargin)
+                } else if result.elapsed.as_secs_f64() * 1_000.0 > overhead_limit {
+                    Some(GateReason::Deadline)
+                } else {
+                    None
+                };
+                if reason.is_none()
+                    && trading_context
+                    && gated.influence_cap > 0.0
+                    && influence_cap == 0.0
+                {
+                    reason = Some(GateReason::TradingInfluenceDisabled);
+                }
+                if reason.is_none() {
+                    self.record_elm_inference_result(TASK, &artifact.content_sha256, true, true)
+                        .await;
+                } else if matches!(
+                    reason,
+                    Some(GateReason::InferenceError | GateReason::Deadline)
+                ) {
+                    self.record_elm_inference_result(TASK, &artifact.content_sha256, false, true)
+                        .await;
+                }
+                let applied = reason.is_none()
+                    && !gated.shadow
+                    && gated.mode == ElmMode::Auto
+                    && influence_cap > 0.0;
+                let outcome = if applied {
+                    DecisionOutcome::Applied
+                } else if reason.is_some() {
+                    DecisionOutcome::Abstained
+                } else {
+                    DecisionOutcome::Shadowed
+                };
+                let audit = DecisionAudit {
+                    decision_id: request_id.to_string(),
+                    task_id: TASK.into(),
+                    outcome,
+                    reason,
+                    model_digest: Some(artifact.content_sha256.clone()),
+                    model_stage: registry
+                        .record(&artifact.metadata.model_id)
+                        .map(|record| record.stage),
+                    active_gate_processes: crate::elm::gates::active_gate_processes(TASK),
+                    policy_version: "elm-policy-v1".into(),
+                    feature_schema: Some(artifact.feature_schema.id.clone()),
+                    model_called: true,
+                    baseline_decision: Some(candidate_id.clone()),
+                    learned_proposal: Some(proposal.to_string()),
+                    actual_action: Some(candidate_id.clone()),
+                    influence_cap: if applied { influence_cap } else { 0.0 },
+                    elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                };
+                tracing::info!(decision_id = %audit.decision_id, task = %audit.task_id, candidate = %candidate_id, mode = ?gated.mode, outcome = ?audit.outcome, reason = ?audit.reason, model_stage = ?audit.model_stage, active_gate_processes = ?audit.active_gate_processes, model_digest = ?audit.model_digest, model_called = audit.model_called, influence_cap = audit.influence_cap, elapsed_ms = audit.elapsed_ms, "ELM routing decision");
+                if applied {
+                    base_score + proposal * influence_cap
+                } else {
+                    base_score
+                }
+            }
+            Err(error) => {
+                self.record_elm_inference_result(
+                    TASK,
+                    &artifact.content_sha256,
+                    false,
+                    !matches!(error, crate::elm::ElmError::QueueFull),
+                )
+                .await;
+                tracing::debug!(decision_id = request_id, task = TASK, candidate = %candidate_id, outcome = "abstained", reason = ?GateReason::InferenceError, error = %error, model_called = true, "ELM inference failed; existing ranking retained");
+                base_score
+            }
         }
     }
 
@@ -6903,6 +8007,7 @@ fn prompt_requests_signal_synthesis_output(prompt_text: &str) -> bool {
             && lowered.contains("summary"))
 }
 
+#[cfg(test)]
 fn classify_workload(workflow: &str, role: &str) -> WorkloadClass {
     classify_workload_with_context(workflow, role, None, None, None, None)
 }
@@ -7137,6 +8242,54 @@ mod tests {
         // A second call is served from the snapshot and does not invalidate
         // the result merely because the endpoint is polled again.
         assert_eq!(service.readiness().await.reason, first.reason);
+    }
+
+    #[cfg(feature = "elm")]
+    #[tokio::test]
+    async fn prometheus_exposes_effective_elm_gate_composition() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut config = GailConfig::default();
+        config.elm.mode = crate::elm_config::ElmMode::Auto;
+        config.elm.registry_path = directory.path().join("elm");
+        config.storage.metrics_path = directory.path().join("metrics.json").display().to_string();
+        config.storage.adaptive_schema_path =
+            directory.path().join("adaptive.json").display().to_string();
+        config.storage.api_issues_path = directory
+            .path()
+            .join("api-issues.json")
+            .display()
+            .to_string();
+        config.storage.llm_ledger_path = directory
+            .path()
+            .join("llm-ledger.jsonl")
+            .display()
+            .to_string();
+        config.storage.trainer_output_path =
+            directory.path().join("training").display().to_string();
+        let service = GailService::new(config)
+            .await
+            .expect("service should initialise");
+
+        let rendered = service.provider_prometheus_metrics().await;
+        assert!(rendered.contains(
+            "gail_elm_task_gate_active{task=\"quant_net_edge\",gate=\"mode_auto\",mode=\"auto\",model_stage=\"none\",stage_ceiling=\"shadow\"} 1"
+        ));
+        assert!(rendered.contains(
+            "gail_elm_task_gate_active{task=\"quant_net_edge\",gate=\"task_allowed\",mode=\"auto\",model_stage=\"none\",stage_ceiling=\"shadow\"} 0"
+        ));
+        assert!(rendered.contains(
+            "gail_elm_gate_process_active{task=\"quant_net_edge\",process=\"composite_paper_qualification\",mode=\"auto\",model_stage=\"none\",stage_ceiling=\"shadow\"} 1"
+        ));
+        assert!(rendered.contains(
+            "gail_elm_gate_process_active{task=\"quant_net_edge\",process=\"economics_risk_and_execution_recheck\",mode=\"auto\",model_stage=\"none\",stage_ceiling=\"shadow\"} 1"
+        ));
+        assert!(rendered.contains(
+            "gail_elm_gate_process_active{task=\"routing_candidate_utility\",process=\"provider_eligibility_and_admission_recheck\",mode=\"auto\",model_stage=\"none\",stage_ceiling=\"shadow\"} 1"
+        ));
+        assert!(rendered.contains(
+            "gail_elm_gate_process_active{task=\"mirror_priority\",process=\"required_mirror_delivery_and_acknowledgement\",mode=\"auto\",model_stage=\"none\",stage_ceiling=\"shadow\"} 1"
+        ));
+        assert!(rendered.contains("gail_elm_task_influence_cap{task=\"quant_net_edge\"} 0"));
     }
 
     #[tokio::test]

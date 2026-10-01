@@ -8,7 +8,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Multipart, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     response::{
         IntoResponse, Response,
@@ -182,6 +182,9 @@ pub fn build_router(service: GailService) -> Router {
         .route("/v1/status/orchestration", get(orchestration_status))
         .route("/v1/status/api-schema", get(adaptive_api_schema_status))
         .route("/v1/status/api-issues", get(api_issues_status))
+        .route("/v1/elm/status", get(elm_status))
+        .route("/v1/elm/models", get(elm_models))
+        .route("/v1/elm/models/{model_id}/evaluations", get(elm_evaluation))
         .route("/metrics", get(prometheus_metrics))
         // Trading bridge endpoints
         .route("/v1/trading/status", get(trading_status))
@@ -209,6 +212,38 @@ pub fn build_router(service: GailService) -> Router {
             crate::governance::guard,
         ))
         .with_state(service)
+}
+
+async fn elm_status(State(service): State<GailService>, headers: HeaderMap) -> Response {
+    if let Err(error) = service.authorize(&headers, "status") {
+        return openai_error_response(error);
+    }
+    Json(service.elm_status_value()).into_response()
+}
+
+async fn elm_models(State(service): State<GailService>, headers: HeaderMap) -> Response {
+    if let Err(error) = service.authorize(&headers, "status") {
+        return openai_error_response(error);
+    }
+    Json(service.elm_models_value()).into_response()
+}
+
+async fn elm_evaluation(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+    Path(model_id): Path<String>,
+) -> Response {
+    if let Err(error) = service.authorize(&headers, "status") {
+        return openai_error_response(error);
+    }
+    match service.elm_evaluation_value(model_id.as_str()) {
+        Some(value) => Json(value).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "model evaluation not found" })),
+        )
+            .into_response(),
+    }
 }
 
 async fn health(

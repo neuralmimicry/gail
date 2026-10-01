@@ -42,10 +42,12 @@ use std::{
 use futures::{StreamExt, stream};
 use serde::Serialize;
 use serde_json::json;
+use sha2::Digest;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::{adaptive_schema, orchestration::GailService};
 use advisor::TradingAdvisor;
@@ -1536,7 +1538,15 @@ async fn run_single_evaluation(
         .iter()
         .take(MAX_EXECUTIONS_PER_EVALUATION)
     {
-        execute_if_warranted(octobot, &candidate.decision, state, config).await;
+        let elm_fingerprint = advisor.qualification_fingerprint();
+        execute_if_warranted(
+            octobot,
+            &candidate.decision,
+            state,
+            config,
+            elm_fingerprint.as_deref(),
+        )
+        .await;
     }
 
     // Increment evaluation counter.
@@ -2282,7 +2292,15 @@ async fn run_non_portfolio_discovery_cycle(
             json!({ "scorecard": scorecard }),
         )
         .await;
-    execute_if_warranted(octobot, &decision, state, config).await;
+    let elm_fingerprint = advisor.qualification_fingerprint();
+    execute_if_warranted(
+        octobot,
+        &decision,
+        state,
+        config,
+        elm_fingerprint.as_deref(),
+    )
+    .await;
 }
 
 async fn run_portfolio_pruning_cycle(
@@ -2485,7 +2503,15 @@ async fn run_portfolio_pruning_cycle(
             json!({ "scorecard": scorecard, "amount_usd": decision.amount_usd }),
         )
         .await;
-    execute_if_warranted(octobot, &decision, state, config).await;
+    let elm_fingerprint = advisor.qualification_fingerprint();
+    execute_if_warranted(
+        octobot,
+        &decision,
+        state,
+        config,
+        elm_fingerprint.as_deref(),
+    )
+    .await;
 }
 
 async fn load_current_portfolio_snapshot(
@@ -2569,10 +2595,67 @@ async fn evaluate_symbol_candidate(
         config,
     );
     let fuzzy = fuzzy_engine.evaluate(&fuzzy_inputs);
-    let decision = {
+    let mut decision = {
         let s = state.0.lock().await;
         decision_engine.decide(&fuzzy, &consensus, Some(snapshot), &s, config)
     };
+    if !decision.override_applied {
+        let (elm_features, elm_feature_time) =
+            quant_net_edge_features(snapshot, historical_features);
+        let elm_schema = quant_net_edge_feature_schema();
+        let decision_id = Uuid::new_v4().to_string();
+        if let Some(advisory) = advisor
+            .elm_advisory(
+                &decision_id,
+                "quant_net_edge",
+                &elm_schema,
+                &elm_features,
+                elm_feature_time,
+                "bps",
+                Some(decision.action.to_string().as_str()),
+            )
+            .await
+        {
+            let baseline_edge = decision.economics.expected_net_edge_bps;
+            let bounded_edge = apply_elm_edge_veto(
+                baseline_edge,
+                advisory.proposal,
+                advisory.uncertainty,
+                advisory.influence_cap,
+            );
+            let model_veto = advisory.applied
+                && bounded_edge + f64::EPSILON < decision.economics.required_net_edge_bps
+                && matches!(
+                    decision.action,
+                    TradeAction::Buy
+                        | TradeAction::StrongBuy
+                        | TradeAction::Sell
+                        | TradeAction::StrongSell
+                );
+            if model_veto {
+                decision.action = TradeAction::Hold;
+                decision.amount_usd = 0.0;
+                decision.confidence = 0.0;
+                decision.rationale = format!(
+                    "ELM net-edge advisory withheld this candidate within the existing minimum-edge gate; {}",
+                    decision.rationale
+                );
+            }
+            tracing::info!(
+                decision_id,
+                task = %advisory.task_id,
+                model_digest = ?advisory.model_digest,
+                proposal_bps = ?advisory.proposal,
+                residual_radius_bps = ?advisory.uncertainty,
+                influence_cap = advisory.influence_cap,
+                applied = advisory.applied,
+                vetoed = model_veto,
+                reason = ?advisory.reason,
+                elapsed_ms = advisory.elapsed_ms,
+                "ELM quant/trading advisory evaluated"
+            );
+        }
+    }
     let composite_score = composite_symbol_score(snapshot, &decision);
     let market_opportunity_score = market_evidence_score(
         snapshot,
@@ -2618,6 +2701,189 @@ async fn evaluate_symbol_candidate(
         decision,
         scorecard,
     }
+}
+
+fn quant_net_edge_features(
+    snapshot: &MarketSnapshot,
+    historical: Option<&MarketHistoricalFeatures>,
+) -> (Vec<f64>, u64) {
+    let now = now_ts();
+    let mut values = Vec::with_capacity(33);
+    push_optional_feature(&mut values, snapshot.price_change_pct_1h, |value| value);
+    push_optional_feature(&mut values, snapshot.price_change_pct_24h, |value| value);
+    push_optional_feature(
+        &mut values,
+        snapshot.volume_24h.filter(|value| *value >= 0.0),
+        |value| value.ln_1p(),
+    );
+    push_optional_feature(&mut values, snapshot.volume_change_pct, |value| value);
+    push_optional_feature(&mut values, snapshot.spread_bps(), |value| value);
+    if let Some(features) = historical {
+        push_optional_feature(&mut values, features.momentum_short_pct, |value| value);
+        push_optional_feature(&mut values, features.momentum_mid_pct, |value| value);
+        push_optional_feature(&mut values, features.momentum_long_pct, |value| value);
+        push_optional_feature(&mut values, features.volatility_pct, |value| value);
+        push_optional_feature(&mut values, features.drawdown_pct, |value| value);
+        push_optional_feature(&mut values, features.volume_ratio_short_long, |value| value);
+        values.push(features.samples as f64);
+        push_optional_feature(&mut values, features.freshness_seconds, |value| value);
+    } else {
+        for _ in 0..6 {
+            push_optional_feature(&mut values, None, |value| value);
+        }
+        values.push(0.0);
+        push_optional_feature(&mut values, None, |value| value);
+    }
+    push_optional_feature(
+        &mut values,
+        snapshot
+            .microstructure
+            .bid_depth_usd
+            .filter(|value| *value >= 0.0),
+        |value| value.max(0.0).ln_1p(),
+    );
+    push_optional_feature(
+        &mut values,
+        snapshot
+            .microstructure
+            .ask_depth_usd
+            .filter(|value| *value >= 0.0),
+        |value| value.max(0.0).ln_1p(),
+    );
+    push_optional_feature(
+        &mut values,
+        snapshot.microstructure.order_flow_imbalance,
+        |value| value,
+    );
+    values.push((now - snapshot.fetched_at).max(0.0));
+    values.push(snapshot.price.max(f64::MIN_POSITIVE).ln());
+    let mut feature_time = snapshot.fetched_at.max(0.0) as u64;
+    if let Some(last_ts) = historical
+        .and_then(|item| item.last_ts)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+    {
+        feature_time = feature_time.min(last_ts as u64);
+    }
+    (values, feature_time)
+}
+
+fn push_optional_feature(
+    values: &mut Vec<f64>,
+    value: Option<f64>,
+    transform: impl FnOnce(f64) -> f64,
+) {
+    let transformed = value
+        .filter(|item| item.is_finite())
+        .map(transform)
+        .filter(|item| item.is_finite());
+    values.push(transformed.unwrap_or_default());
+    values.push(f64::from(transformed.is_none()));
+}
+
+fn quant_net_edge_feature_schema() -> crate::elm_config::FeatureSchema {
+    crate::elm_config::FeatureSchema {
+        id: "gail-quant-net-edge:v1".into(),
+        version: 1,
+        names: vec![
+            "price_change_1h_pct",
+            "price_change_1h_missing",
+            "price_change_24h_pct",
+            "price_change_24h_missing",
+            "log_volume_24h",
+            "volume_24h_missing",
+            "volume_change_pct",
+            "volume_change_missing",
+            "spread_bps",
+            "spread_missing",
+            "momentum_short_pct",
+            "momentum_short_missing",
+            "momentum_mid_pct",
+            "momentum_mid_missing",
+            "momentum_long_pct",
+            "momentum_long_missing",
+            "volatility_pct",
+            "volatility_missing",
+            "drawdown_pct",
+            "drawdown_missing",
+            "volume_ratio_short_long",
+            "volume_ratio_missing",
+            "historical_samples",
+            "historical_freshness_seconds",
+            "historical_freshness_missing",
+            "log_bid_depth_usd",
+            "bid_depth_missing",
+            "log_ask_depth_usd",
+            "ask_depth_missing",
+            "order_flow_imbalance",
+            "order_flow_missing",
+            "snapshot_age_seconds",
+            "log_price_usd",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        units: vec![
+            "percent",
+            "boolean",
+            "percent",
+            "boolean",
+            "log_usd",
+            "boolean",
+            "percent",
+            "boolean",
+            "bps",
+            "boolean",
+            "percent",
+            "boolean",
+            "percent",
+            "boolean",
+            "percent",
+            "boolean",
+            "percent",
+            "boolean",
+            "percent",
+            "boolean",
+            "ratio",
+            "boolean",
+            "samples",
+            "seconds",
+            "boolean",
+            "log_usd",
+            "boolean",
+            "log_usd",
+            "boolean",
+            "ratio",
+            "boolean",
+            "seconds",
+            "log_usd_per_unit",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+    }
+}
+
+fn apply_elm_edge_veto(
+    baseline_edge_bps: f64,
+    predicted_edge_bps: Option<f64>,
+    residual_radius_bps: Option<f64>,
+    influence_cap: f64,
+) -> f64 {
+    let Some((prediction, uncertainty)) =
+        predicted_edge_bps
+            .zip(residual_radius_bps)
+            .filter(|(prediction, uncertainty)| {
+                prediction.is_finite() && uncertainty.is_finite() && *uncertainty >= 0.0
+            })
+    else {
+        return baseline_edge_bps;
+    };
+    if !baseline_edge_bps.is_finite() || !influence_cap.is_finite() {
+        return baseline_edge_bps;
+    }
+    let conservative_prediction = prediction - uncertainty;
+    baseline_edge_bps
+        + (conservative_prediction - baseline_edge_bps).min(0.0) * influence_cap.clamp(0.0, 1.0)
 }
 
 /// Evaluate discovery/pruning candidates with bounded outer parallelism.
@@ -3537,11 +3803,37 @@ async fn resolve_trade_markouts(
 // Trade execution
 // ---------------------------------------------------------------------------
 
+fn paper_decision_fingerprint(
+    build_revision: String,
+    elm_model_fingerprint: Option<&str>,
+    config: &TradingConfig,
+) -> String {
+    let prefix = build_revision.clone();
+    let mut trading = serde_json::to_value(config)
+        .unwrap_or_else(|_| json!({ "invalid_config": format!("{config:?}") }));
+    if let Some(fields) = trading.as_object_mut() {
+        // Credential rotation must not enter a public qualification fingerprint.
+        fields.remove("octobot_password");
+        fields.remove("refiner_api_token");
+    }
+    let material = serde_json::json!({
+        "fingerprint_version": 2,
+        "build_revision": build_revision,
+        "decision_affecting_elm_models": elm_model_fingerprint,
+        "trading_decision_config": trading,
+    });
+    let digest = serde_json::to_vec(&material)
+        .map(|bytes| hex::encode(sha2::Sha256::digest(bytes)))
+        .unwrap_or_else(|_| "invalid-config".into());
+    format!("{prefix}:decision:{digest}")
+}
+
 async fn execute_if_warranted(
     octobot: &OctobotClient,
     decision: &TradeDecision,
     state: &SharedTradingState,
     config: &TradingConfig,
+    elm_model_fingerprint: Option<&str>,
 ) {
     let mut execution_amount_usd = decision.amount_usd;
     let mut execution_exchange = decision.exchange.clone();
@@ -3989,7 +4281,8 @@ async fn execute_if_warranted(
         validity_seconds: config.paper_qualification_validity_seconds as f64,
         intent_lease_seconds: config.execution_lease_seconds,
     };
-    let build_revision = crate::build_info::revision();
+    let build_revision =
+        paper_decision_fingerprint(crate::build_info::revision(), elm_model_fingerprint, config);
     let paper_qualified = {
         let current = state.0.lock().await;
         current
@@ -5322,10 +5615,12 @@ fn snapshot_label(snapshot: &MarketSnapshot) -> String {
 
 /// Select the best candidate market for trading based on signal quality.
 /// Prefers high-volume, high-momentum markets.
+#[cfg(test)]
 fn select_best_market_candidate(snapshots: &[MarketSnapshot]) -> Option<MarketSnapshot> {
     select_best_market_candidate_with_filter(snapshots, |_| true)
 }
 
+#[cfg(test)]
 fn select_best_market_candidate_with_filter<F>(
     snapshots: &[MarketSnapshot],
     predicate: F,

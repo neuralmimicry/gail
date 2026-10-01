@@ -8,6 +8,7 @@ license = "MIT"
 [features]
 default = ["training-libtorch"]
 training-libtorch = ["dep:tch"]
+elm = []
 ci-trading-tests = []
 
 [dependencies]
@@ -17,6 +18,7 @@ base64 = "0.22"
 bytes = "1"
 clap = { version = "4.6", features = ["derive", "env"] }
 futures = "0.3"
+fs2 = "0.4"
 hex = "0.4"
 http = "1.4"
 mime_guess = "2.0"
@@ -26,7 +28,7 @@ rayon = "1.12"
 regex = "1.12"
 reqwest = { version = "0.12", default-features = false, features = ["charset", "cookies", "http2", "json", "multipart", "rustls-tls", "stream"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 serde_yaml = "0.9"
 safetensors = "0.5"
 sha2 = "0.11"
@@ -52,3 +54,18 @@ wiremock = "0.6"
 name = "gail-qlora-sft"
 path = "src/training/qlora_sft.rs"
 required-features = ["training-libtorch"]
+
+[[bin]]
+name = "gail-elm-evaluate"
+path = "src/bin/gail-elm-evaluate.rs"
+required-features = ["elm"]
+
+[[bin]]
+name = "gail-elm-admin"
+path = "src/bin/gail-elm-admin.rs"
+required-features = ["elm"]
+
+[[bin]]
+name = "gail-elm-benchmark"
+path = "src/bin/gail-elm-benchmark.rs"
+required-features = ["elm"]

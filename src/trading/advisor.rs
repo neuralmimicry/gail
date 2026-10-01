@@ -137,6 +137,35 @@ impl TradingAdvisor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // Keep the advisory's domain fields visible at the call site.
+    pub(crate) async fn elm_advisory(
+        &self,
+        decision_id: &str,
+        task_id: &str,
+        feature_schema: &crate::elm_config::FeatureSchema,
+        features: &[f64],
+        feature_timestamp: u64,
+        target_unit: &str,
+        baseline_decision: Option<&str>,
+    ) -> Option<crate::orchestration::ElmAdvisoryResult> {
+        self.service
+            .elm_advisory(
+                decision_id,
+                task_id,
+                "local",
+                feature_schema,
+                features,
+                feature_timestamp,
+                target_unit,
+                baseline_decision,
+            )
+            .await
+    }
+
+    pub(crate) fn qualification_fingerprint(&self) -> Option<String> {
+        self.service.trading_elm_fingerprint()
+    }
+
     /// Consult all configured AI providers in parallel and aggregate their advice.
     pub async fn consult_all(
         &self,
@@ -375,6 +404,7 @@ async fn collect_advice_wave(
 /// Deterministic map/reduce input selection. Invalid rows are removed, exact
 /// exchange/symbol duplicates are collapsed, and the strongest liquid movers
 /// are retained with stable lexical tie-breaking.
+#[cfg(test)]
 fn rank_advisory_candidates(snapshots: &[MarketSnapshot], limit: usize) -> Vec<MarketSnapshot> {
     rank_advisory_candidates_with_history(snapshots, &HashMap::new(), limit)
 }

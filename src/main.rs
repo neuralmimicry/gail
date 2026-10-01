@@ -20,6 +20,7 @@ enum RuntimeRole {
     Serve,
     MirrorWorker,
     TrainerWorker,
+    ElmTrainerWorker,
 }
 
 #[tokio::main]
@@ -65,6 +66,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             trainer_worker::run(config).await?;
+        }
+        RuntimeRole::ElmTrainerWorker => {
+            #[cfg(feature = "elm")]
+            gail::elm::worker::run(config).await?;
+            #[cfg(not(feature = "elm"))]
+            return Err(
+                "elm-trainer-worker requires a Gail binary built with --features elm".into(),
+            );
         }
     }
     Ok(())

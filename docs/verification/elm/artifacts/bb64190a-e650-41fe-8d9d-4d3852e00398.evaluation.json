@@ -1,0 +1,85 @@
+{
+  "report_version": 1,
+  "task_id": "routing_candidate_utility",
+  "dataset_id": "synthetic-routing-evaluation-v1",
+  "dataset_digest": "fa2efe6d528b02b978c8f4fa75e1619a27bdd3fe25558cd861dc330a094b6817",
+  "fixture_only": true,
+  "selected_algorithm": "ridge",
+  "baseline_algorithm": "ridge",
+  "attempted_configurations": [
+    "ridge:h=0:lambda=1e-3",
+    "elm:h=32:lambda=1e-3",
+    "elm:h=64:lambda=1e-3",
+    "elm:h=128:lambda=1e-3",
+    "elm:h=256:lambda=1e-3"
+  ],
+  "tuning_metrics": {
+    "elm:h=128:lambda=1e-3": 0.00005749370033708983,
+    "elm:h=256:lambda=1e-3": 0.00015758831722820853,
+    "elm:h=32:lambda=1e-3": 0.00012221658514146246,
+    "elm:h=64:lambda=1e-3": 0.00018858443358246558,
+    "ridge:h=0:lambda=1e-3": 2.128311814368508e-11
+  },
+  "final_candidate": {
+    "partition": "final",
+    "sample_count": 12,
+    "effective_sample_count": 12.0,
+    "mse": 5.5774761985236604e-11,
+    "brier_score": null,
+    "log_loss": null,
+    "accuracy": null,
+    "calibration_error": 0.5666666666666667,
+    "residual_coverage": 0.3333333333333333,
+    "inference_p95_ms": 0.006739,
+    "inference_p99_ms": 0.006739
+  },
+  "final_baseline": {
+    "partition": "final",
+    "sample_count": 12,
+    "effective_sample_count": 12.0,
+    "mse": 5.5774761985236604e-11,
+    "brier_score": null,
+    "log_loss": null,
+    "accuracy": null,
+    "calibration_error": 0.5666666666666667,
+    "residual_coverage": 0.3333333333333333,
+    "inference_p95_ms": 0.0022400000000000002,
+    "inference_p99_ms": 0.0022400000000000002
+  },
+  "quality": {
+    "dataset_id": "synthetic-routing-evaluation-v1",
+    "dataset_digest": "fa2efe6d528b02b978c8f4fa75e1619a27bdd3fe25558cd861dc330a094b6817",
+    "eligible_samples": 120,
+    "excluded_samples": 0,
+    "group_count": 120,
+    "subgroup_group_counts": {
+      "regime-0": 40,
+      "regime-1": 40,
+      "regime-2": 40
+    },
+    "class_balance": {},
+    "training_cutoff": 1790831920.0,
+    "tuning_cutoff": 1790833000.0,
+    "calibration_cutoff": 1790834020.0,
+    "final_cutoff": 1790834740.0,
+    "fixture_only": true
+  },
+  "final_independent_groups": 12,
+  "minimum_final_subgroup_group_support": 4,
+  "observed_window_seconds": 660,
+  "maximum_input_age_seconds": 1,
+  "maximum_label_delay_seconds": 30,
+  "drift_score": 3.7531387597415837,
+  "maximum_ood_score": 4.017783159466951,
+  "paired_improvement": 0.0,
+  "lower_confidence_bound": 0.0,
+  "confidence_level": 0.95,
+  "calibrated": true,
+  "qualified": false,
+  "qualification_reasons": [
+    "fixture_only_artifact",
+    "minimum_practical_improvement_not_met",
+    "confidence_bound_not_met"
+  ],
+  "report_sha256": "e4b9fd405378dfc86cbbfd4509357b6499c8d459295471dda4e08d9dc157ade1"
+}
