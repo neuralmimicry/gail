@@ -88,7 +88,7 @@ RUN set -eu; \
     export BUILD_JOBS CMAKE_BUILD_PARALLEL_LEVEL PYTORCH_BUILD_PARALLEL_LEVEL; \
     export MAKEFLAGS="-j${BUILD_JOBS}"; \
     echo "Build parallelism: BUILD_JOBS=${BUILD_JOBS} CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL} PYTORCH_BUILD_PARALLEL_LEVEL=${PYTORCH_BUILD_PARALLEL_LEVEL}"; \
-    apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update; \
+    apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=15 -o APT::Update::Error-Mode=any update; \
     apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y --no-install-recommends \
         ca-certificates \
         curl \
@@ -267,7 +267,7 @@ RUN set -eu; \
                 pytorch_tag="${expected_pytorch_tag}"; \
             fi; \
             echo "Building CPU libtorch directly with CMake from PyTorch source tag ${pytorch_tag} for ${norm_arch}"; \
-            apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update; \
+            apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=15 -o APT::Update::Error-Mode=any update; \
             apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y --no-install-recommends \
                 build-essential \
                 ccache \
@@ -437,7 +437,7 @@ FROM docker.io/library/debian:bookworm-slim AS llama-converter
 # that understands the qwen3_5 checkpoint and its LoRA tensor layout.
 ARG LLAMA_CPP_COMMIT=df03399b885831b2a1603b3abb0d8c156808e363
 RUN set -eu; \
-    apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update; \
+    apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=15 -o APT::Update::Error-Mode=any update; \
     apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y --no-install-recommends ca-certificates curl tar; \
     rm -rf /var/lib/apt/lists/*; \
     mkdir -p /opt; \
@@ -493,7 +493,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 COPY --from=libtorch /opt/libtorch /opt/libtorch
 
 RUN set -eu; \
-    apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update; \
+    apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=15 -o APT::Update::Error-Mode=any update; \
     apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y --no-install-recommends \
         build-essential \
         ca-certificates \
@@ -601,7 +601,7 @@ COPY config/ai-routing-profiles.json /tmp/gail-defaults/ai-routing-profiles.json
 RUN --mount=type=secret,id=gail_release_token set -eu; \
     GAIL_RELEASE_TOKEN="$(cat /run/secrets/gail_release_token 2>/dev/null || true)"; \
     export GAIL_RELEASE_TOKEN; \
-    apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update; \
+    apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=15 -o APT::Update::Error-Mode=any update; \
     apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y --no-install-recommends \
         ca-certificates \
         clinfo \
@@ -675,7 +675,7 @@ RUN --mount=type=secret,id=gail_release_token set -eu; \
             curl -fsSL "${deb_url}" -o /tmp/gail.deb; \
         fi; \
     fi; \
-    apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update; \
+    apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=15 -o APT::Update::Error-Mode=any update; \
     apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y --no-install-recommends /tmp/gail.deb; \
     test -x /usr/bin/gail-qlora-sft; \
     chmod 0755 /usr/local/libexec/gail-convert-lora-to-gguf; \
