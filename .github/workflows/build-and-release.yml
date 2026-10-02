@@ -669,6 +669,18 @@ jobs:
           echo "source_tree=$(git rev-parse HEAD^{tree})" >> "${GITHUB_OUTPUT}"
           echo "source_dirty=false" >> "${GITHUB_OUTPUT}"
 
+      - name: Prepare rootless Podman runtime directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Service-based self-hosted runners may have no logind-owned
+          # /run/user/<uid>. Keep Podman's transient state in this job's
+          # private runner directory instead.
+          runtime_dir="${RUNNER_TEMP}/podman-runtime-$(id -u)"
+          mkdir -p "${runtime_dir}"
+          chmod 700 "${runtime_dir}"
+          echo "XDG_RUNTIME_DIR=${runtime_dir}" >> "${GITHUB_ENV}"
+
       - name: Validate container tooling
         shell: bash
         run: |
@@ -917,6 +929,15 @@ jobs:
           set -euo pipefail
           image_repo="ghcr.io/${GITHUB_REPOSITORY,,}"
           echo "repo=${image_repo}" >> "${GITHUB_OUTPUT}"
+
+      - name: Prepare rootless Podman runtime directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_dir="${RUNNER_TEMP}/podman-runtime-$(id -u)"
+          mkdir -p "${runtime_dir}"
+          chmod 700 "${runtime_dir}"
+          echo "XDG_RUNTIME_DIR=${runtime_dir}" >> "${GITHUB_ENV}"
 
       - name: Ensure Podman is available
         shell: bash
