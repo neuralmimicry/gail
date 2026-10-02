@@ -112,6 +112,7 @@ impl AiConsensus {
 // Advisor
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct TradingAdvisor {
     service: GailService,
     timeout: Duration,

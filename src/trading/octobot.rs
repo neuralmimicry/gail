@@ -13,7 +13,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use once_cell::sync::Lazy;
@@ -313,6 +313,9 @@ pub struct OctobotClient {
     /// order. Once one mode is positively acknowledged, future orders try it
     /// first, but can still fall back if that mode later fails.
     preferred_order_submission_mode: Arc<Mutex<Option<OctobotOrderSubmissionMode>>>,
+    /// A mode proven to return an explicit order id in its response. Only
+    /// this mode may skip pre-submit history reads on later orders.
+    direct_acknowledged_order_mode: Arc<Mutex<Option<OctobotOrderSubmissionMode>>>,
 
     /// Exchange name → OctoBot exchange_id mapping discovered from API/HTML surfaces.
     exchange_id_by_name: Arc<Mutex<HashMap<String, String>>>,
@@ -373,6 +376,7 @@ impl OctobotClient {
             password: password.map(str::to_string),
             api_schema: Arc::new(Mutex::new(api_schema)),
             preferred_order_submission_mode: Arc::new(Mutex::new(None)),
+            direct_acknowledged_order_mode: Arc::new(Mutex::new(None)),
             exchange_id_by_name: Arc::new(Mutex::new(HashMap::new())),
             symbol_scan_offsets: Arc::new(Mutex::new(HashMap::new())),
             market_snapshot_unavailable_until: Arc::new(Mutex::new(HashMap::new())),
@@ -1162,6 +1166,7 @@ impl OctobotClient {
         side: &str,
         amount_usd: f64,
     ) -> Result<OctobotOrderResult, String> {
+        let order_path_started = Instant::now();
         let normalized_side = normalize_order_side(side)
             .ok_or_else(|| format!("Unsupported trade side `{side}`: expected buy or sell"))?;
 
@@ -1173,10 +1178,14 @@ impl OctobotClient {
 
         let rounded_amount = ((amount_usd * 100.0).round() / 100.0).max(0.01);
 
-        let baseline = self.capture_order_baseline().await;
-        let request_started_at = current_unix_timestamp_f64();
-
         let preferred_mode = { *self.preferred_order_submission_mode.lock().await };
+        let direct_mode = { *self.direct_acknowledged_order_mode.lock().await };
+        let mut baseline = if preferred_mode.is_some() && preferred_mode == direct_mode {
+            None
+        } else {
+            Some(self.capture_order_baseline().await)
+        };
+        let request_started_at = current_unix_timestamp_f64();
 
         let modes = ordered_submission_modes(preferred_mode);
         let mut attempts = Vec::new();
@@ -1200,6 +1209,12 @@ impl OctobotClient {
             let mut suggested_retry_amount_usd: Option<f64> = None;
 
             for mode in modes.iter().copied() {
+                // A proven direct endpoint is one POST on the usual path.
+                // If it rejects the request, capture a baseline before any
+                // other endpoint can be tried.
+                if baseline.is_none() && Some(mode) != direct_mode {
+                    baseline = Some(self.capture_order_baseline().await);
+                }
                 let (path, payload, label) = build_order_submission(
                     mode,
                     exchange,
@@ -1219,16 +1234,23 @@ impl OctobotClient {
                         symbol,
                         normalized_side,
                         submission_amount,
-                        &baseline,
+                        baseline.as_ref(),
                         request_started_at,
                         &mut attempts,
                     )
                     .await?
                 {
-                    OrderSubmissionAttempt::Accepted(result) => {
+                    OrderSubmissionAttempt::Accepted {
+                        result,
+                        direct_acknowledgement,
+                    } => {
                         {
                             let mut preferred = self.preferred_order_submission_mode.lock().await;
                             *preferred = Some(mode);
+                        }
+                        {
+                            let mut direct = self.direct_acknowledged_order_mode.lock().await;
+                            *direct = direct_acknowledgement.then_some(mode);
                         }
 
                         debug!(
@@ -1237,6 +1259,9 @@ impl OctobotClient {
                             symbol = %symbol,
                             side = %normalized_side,
                             amount_usd = submission_amount,
+                            direct_acknowledgement,
+                            baseline_captured = baseline.is_some(),
+                            order_path_latency_ms = order_path_started.elapsed().as_millis(),
                             "trading: selected OctoBot order submission mode"
                         );
 
@@ -1298,11 +1323,11 @@ impl OctobotClient {
                             symbol = %symbol,
                             side = %normalized_side,
                             amount_usd = submission_amount,
-                            "trading: OctoBot order endpoint returned success without acknowledgement; refusing fallback to avoid duplicate order"
+                            "trading: OctoBot order outcome is ambiguous; refusing fallback to avoid duplicate order"
                         );
 
                         return Err(format!(
-                            "OctoBot order submission via {mode:?} returned HTTP success but no order acknowledgement or observable side-effect. Refusing to try additional mutating endpoints to avoid duplicate orders. Tried: {}",
+                            "OctoBot order submission via {mode:?} had no order acknowledgement or returned an uncertain server error. Refusing to try additional mutating endpoints to avoid duplicate orders. Tried: {}",
                             attempts.join(" | ")
                         ));
                     }
@@ -1362,7 +1387,7 @@ impl OctobotClient {
         symbol: &str,
         side: &str,
         amount_usd: f64,
-        baseline: &OrderPlacementBaseline,
+        baseline: Option<&OrderPlacementBaseline>,
         request_started_at: f64,
         attempts: &mut Vec<String>,
     ) -> Result<OrderSubmissionAttempt, String> {
@@ -1382,6 +1407,10 @@ impl OctobotClient {
             if *preferred == Some(mode) {
                 *preferred = None;
             }
+            let mut direct = self.direct_acknowledged_order_mode.lock().await;
+            if *direct == Some(mode) {
+                *direct = None;
+            }
 
             if normalize_order_side(side) == Some("sell")
                 && body_has_portfolio_negative_rejection(&body)
@@ -1397,6 +1426,13 @@ impl OctobotClient {
                 return Ok(OrderSubmissionAttempt::RejectedNonPositiveQuantity);
             }
 
+            // A server error can occur after OctoBot has already handed the
+            // order to an exchange. Never try another mutating endpoint when
+            // the server cannot prove that the request was rejected.
+            if status.is_server_error() {
+                return Ok(OrderSubmissionAttempt::AmbiguousAccepted);
+            }
+
             return Ok(OrderSubmissionAttempt::Rejected);
         }
 
@@ -1408,11 +1444,14 @@ impl OctobotClient {
                 summarize_order_attempt_body(&body)
             ));
 
-            return Ok(OrderSubmissionAttempt::Accepted(result));
+            return Ok(OrderSubmissionAttempt::Accepted {
+                result,
+                direct_acknowledgement: true,
+            });
         }
 
-        if let Some(result) = self
-            .wait_for_order_side_effects(
+        let observed_result = if let Some(baseline) = baseline {
+            self.wait_for_order_side_effects(
                 exchange,
                 symbol,
                 side,
@@ -1421,12 +1460,18 @@ impl OctobotClient {
                 request_started_at,
             )
             .await
-        {
+        } else {
+            None
+        };
+        if let Some(result) = observed_result {
             attempts.push(format!(
                 "{mode:?} {path} => accepted (observed order side-effects)"
             ));
 
-            return Ok(OrderSubmissionAttempt::Accepted(result));
+            return Ok(OrderSubmissionAttempt::Accepted {
+                result,
+                direct_acknowledgement: false,
+            });
         }
 
         attempts.push(format!(
@@ -1444,14 +1489,18 @@ impl OctobotClient {
             ..OrderPlacementBaseline::default()
         };
 
-        if let Ok(orders) = self.get_open_orders().await {
+        // Both reads describe the same pre-submit baseline. Run them together
+        // so the order path waits for the slower read, not the sum of both.
+        let (orders_result, trades_result) =
+            tokio::join!(self.get_open_orders(), self.get_trade_history(50));
+        if let Ok(orders) = orders_result {
             baseline.open_orders_captured = true;
             baseline
                 .open_order_ids
                 .extend(orders.into_iter().map(|order| order.id));
         }
 
-        if let Ok(trades) = self.get_trade_history(50).await {
+        if let Ok(trades) = trades_result {
             baseline.trades_captured = true;
             baseline.latest_trade_ts = trades
                 .iter()
@@ -2131,7 +2180,10 @@ enum OctobotOrderSubmissionMode {
 enum OrderSubmissionAttempt {
     /// The endpoint positively acknowledged the order, either directly in the
     /// response body or by producing an observable order/trade side-effect.
-    Accepted(OctobotOrderResult),
+    Accepted {
+        result: OctobotOrderResult,
+        direct_acknowledgement: bool,
+    },
 
     /// The endpoint clearly rejected the order, usually via non-2xx HTTP.
     Rejected,
@@ -2144,9 +2196,8 @@ enum OrderSubmissionAttempt {
     /// to a non-positive value. Retrying equivalent endpoints is unnecessary.
     RejectedNonPositiveQuantity,
 
-    /// The endpoint returned HTTP 2xx but did not provide a parseable order
-    /// acknowledgement and no side-effect was observed within the polling
-    /// window.
+    /// The endpoint returned an unacknowledged HTTP success or an uncertain
+    /// server error. No safe acknowledgement was observed.
     ///
     /// This is intentionally treated as unsafe to continue, because retrying
     /// another mutating endpoint could create a duplicate order.

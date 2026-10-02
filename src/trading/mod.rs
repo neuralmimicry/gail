@@ -343,6 +343,7 @@ async fn run_evaluation_loop(
     };
     let mut last_datalake_bootstrap_attempt_ts: f64 = 0.0;
     let mut datalake_bootstrap_task: Option<JoinHandle<(String, bool)>> = None;
+    let mut primary_advisory_task: Option<JoinHandle<()>> = None;
 
     // Initialise or restore the persistent shadow-to-quant controller before
     // any advisory request can be made. The explicit markers are intentionally
@@ -504,6 +505,9 @@ async fn run_evaluation_loop(
             _ = tick.tick() => true,
             Some(_) = evaluation_rx.recv() => true,
             _ = &mut shutdown => {
+                if let Some(task) = primary_advisory_task.take() {
+                    task.abort();
+                }
                 state.log_info("shutdown", "Trading bridge evaluation loop stopped").await;
                 state.persist(&data_path).await;
                 break;
@@ -582,6 +586,7 @@ async fn run_evaluation_loop(
                     decision_engine: &decision_engine,
                     market_data_lake: market_data_lake.as_ref(),
                     data_path: &data_path,
+                    primary_advisory_task: &mut primary_advisory_task,
                 },
             )
             .await;
@@ -876,6 +881,7 @@ struct EvaluationServices<'a> {
     decision_engine: &'a DecisionEngine,
     market_data_lake: Option<&'a MarketDataLake>,
     data_path: &'a PathBuf,
+    primary_advisory_task: &'a mut Option<JoinHandle<()>>,
 }
 
 async fn run_single_evaluation(
@@ -891,6 +897,7 @@ async fn run_single_evaluation(
         decision_engine,
         market_data_lake,
         data_path,
+        primary_advisory_task,
     } = services;
     let eval_start = now_ts();
     debug!("trading: starting evaluation cycle");
@@ -962,6 +969,9 @@ async fn run_single_evaluation(
         let current = state.0.lock().await;
         config.quant_shadow_enabled && current.quant_migration.is_primary()
     };
+    if !quant_primary && let Some(task) = primary_advisory_task.take() {
+        task.abort();
+    }
     let market_regime = compute_market_regime_contagion(&market_snapshots);
 
     // --- 2. Build research query ---
@@ -1151,21 +1161,72 @@ async fn run_single_evaluation(
         alpha_sleeves_config,
         now_ts(),
     );
+    if quant_primary {
+        // The latest bounded-TTL overlay can veto this cycle. Refresh it for
+        // future cycles without waiting for a potentially long provider round.
+        if primary_advisory_task
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+            && let Some(task) = primary_advisory_task.take()
+        {
+            let _ = task.await;
+        }
+        if primary_advisory_task.is_none() {
+            let advisor = advisor.clone();
+            let state = state.clone();
+            let snapshots = market_snapshots.clone();
+            let features = historical_features.clone();
+            let research = research.clone();
+            let portfolio = portfolio.clone();
+            let overlay_config = config.quantitative.llm_risk_overlay.clone();
+            let max_advisors = config.max_parallel_advisors;
+            let data_path = data_path.clone();
+            *primary_advisory_task = Some(tokio::spawn(async move {
+                let consensus = advisor
+                    .consult_all(&snapshots, &features, &research, &portfolio, max_advisors)
+                    .await;
+                if consensus.responders == 0 {
+                    return;
+                }
+                let refreshed = {
+                    let mut current = state.0.lock().await;
+                    let refreshed = current.llm_risk_overlay.update_from_consensus(
+                        &consensus,
+                        now_ts(),
+                        &overlay_config,
+                    );
+                    if refreshed {
+                        current.log(
+                            "info",
+                            "quant_overlay",
+                            "QUANT_LLM_RISK_OVERLAY_REFRESHED",
+                            json!({ "responders": consensus.responders }),
+                        );
+                    }
+                    refreshed
+                };
+                if refreshed {
+                    state.persist(&data_path).await;
+                }
+            }));
+        }
+    }
     let llm_future = async {
-        // Keep the LLM path live after quant promotion. It remains the
-        // paired benchmark, risk overlay, and rollback signal while quant is
-        // the preferred execution method.
-        Some(
-            advisor
-                .consult_all(
-                    &market_snapshots,
-                    &historical_features,
-                    &research,
-                    &portfolio,
-                    config.max_parallel_advisors,
-                )
-                .await,
-        )
+        if quant_primary {
+            None
+        } else {
+            Some(
+                advisor
+                    .consult_all(
+                        &market_snapshots,
+                        &historical_features,
+                        &research,
+                        &portfolio,
+                        config.max_parallel_advisors,
+                    )
+                    .await,
+            )
+        }
     };
     let (sleeve_result, llm_consensus) = tokio::join!(sleeve_future, llm_future);
     match sleeve_result {

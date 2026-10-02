@@ -3421,6 +3421,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn octobot_direct_ack_skips_repeat_baseline_but_ambiguous_reply_stops_submission() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/trades"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let response_count = attempts.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/orders"))
+            .and(query_param("action", "create_order"))
+            .respond_with(move |_: &wiremock::Request| {
+                let attempt = response_count.fetch_add(1, Ordering::SeqCst);
+                if attempt < 2 {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "id": format!("direct-{attempt}"),
+                        "symbol": "BTC/USDT",
+                        "side": "buy",
+                        "amount": 5.0,
+                        "status": "submitted"
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({"status": "queued"}))
+                }
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/user_command"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        for expected_id in ["direct-0", "direct-1"] {
+            let order = client
+                .place_buy_order("binance", "BTC/USDT", 5.0)
+                .await
+                .expect("direct order acknowledgement");
+            assert_eq!(order.order_id, expected_id);
+        }
+        let error = client
+            .place_buy_order("binance", "BTC/USDT", 5.0)
+            .await
+            .expect_err("ambiguous acknowledgement must retain the intent lease");
+        assert!(error.contains("no order acknowledgement"), "{error}");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_direct_rejection_captures_baseline_before_fallback() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let server = MockServer::start().await;
+        for endpoint in ["/api/orders", "/api/trades"] {
+            Mock::given(method("GET"))
+                .and(path(endpoint))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+                .expect(2)
+                .mount(&server)
+                .await;
+        }
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let response_count = attempts.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/orders"))
+            .and(query_param("action", "create_order"))
+            .respond_with(move |_: &wiremock::Request| {
+                if response_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(200).set_body_json(json!({"id": "first"}))
+                } else {
+                    ResponseTemplate::new(404).set_body_string("unsupported")
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/orders"))
+            .and(query_param("action", "create_orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "fallback"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        client
+            .place_buy_order("binance", "BTC/USDT", 5.0)
+            .await
+            .expect("first direct order");
+        let order = client
+            .place_buy_order("binance", "BTC/USDT", 5.0)
+            .await
+            .expect("fallback order");
+        assert_eq!(order.order_id, "fallback");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_server_error_does_not_retry_mutating_order_endpoint() {
+        let server = MockServer::start().await;
+        for endpoint in ["/api/orders", "/api/trades"] {
+            Mock::given(method("GET"))
+                .and(path(endpoint))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/api/orders"))
+            .and(query_param("action", "create_order"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/orders"))
+            .and(query_param("action", "create_orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "duplicate"})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let error = client
+            .place_buy_order("binance", "BTC/USDT", 5.0)
+            .await
+            .expect_err("uncertain server error must stop fallback");
+        assert!(error.contains("uncertain server error"), "{error}");
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn octobot_client_place_order_reports_attempts_when_all_paths_fail() {
         let server = MockServer::start().await;
 
