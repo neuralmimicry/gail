@@ -673,13 +673,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Service-based self-hosted runners may have no logind-owned
-          # /run/user/<uid>. Keep Podman's transient state in this job's
-          # private runner directory instead.
+          # A service runner has no logind-owned /run/user/<uid>. Its normal
+          # storage.conf can also point at another job's stale rootless store.
+          # Give each runner a persistent build cache and each job its own
+          # runtime and runroot, independent of the user's Podman settings.
           runtime_dir="${RUNNER_TEMP}/podman-runtime-$(id -u)"
-          mkdir -p "${runtime_dir}"
-          chmod 700 "${runtime_dir}"
+          run_root="${RUNNER_TEMP}/podman-run-$(id -u)"
+          graph_root="${HOME}/.local/share/containers/gail-ci-${RUNNER_NAME}"
+          storage_conf="${RUNNER_TEMP}/gail-podman-storage.conf"
+          mkdir -p "${runtime_dir}" "${run_root}" "${graph_root}"
+          chmod 700 "${runtime_dir}" "${run_root}" "${graph_root}"
+          printf '[storage]\ndriver = "overlay"\ngraphroot = "%s"\nrunroot = "%s"\n' \
+            "${graph_root}" "${run_root}" > "${storage_conf}"
           echo "XDG_RUNTIME_DIR=${runtime_dir}" >> "${GITHUB_ENV}"
+          echo "CONTAINERS_STORAGE_CONF=${storage_conf}" >> "${GITHUB_ENV}"
 
       - name: Validate container tooling
         shell: bash
@@ -934,10 +941,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Match the isolated store used by the architecture builder.
           runtime_dir="${RUNNER_TEMP}/podman-runtime-$(id -u)"
-          mkdir -p "${runtime_dir}"
-          chmod 700 "${runtime_dir}"
+          run_root="${RUNNER_TEMP}/podman-run-$(id -u)"
+          graph_root="${HOME}/.local/share/containers/gail-ci-${RUNNER_NAME}"
+          storage_conf="${RUNNER_TEMP}/gail-podman-storage.conf"
+          mkdir -p "${runtime_dir}" "${run_root}" "${graph_root}"
+          chmod 700 "${runtime_dir}" "${run_root}" "${graph_root}"
+          printf '[storage]\ndriver = "overlay"\ngraphroot = "%s"\nrunroot = "%s"\n' \
+            "${graph_root}" "${run_root}" > "${storage_conf}"
           echo "XDG_RUNTIME_DIR=${runtime_dir}" >> "${GITHUB_ENV}"
+          echo "CONTAINERS_STORAGE_CONF=${storage_conf}" >> "${GITHUB_ENV}"
 
       - name: Ensure Podman is available
         shell: bash
