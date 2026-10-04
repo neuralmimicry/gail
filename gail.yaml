@@ -6,6 +6,14 @@ server:
 governance:
   mode: disabled
 
+# "Alexa, ask Aaron ..." custom skill (POST /v1/integrations/alexa). Public
+# route authenticated by Amazon's request signature; 404 while disabled.
+# GAIL_ALEXA_ENABLED / GAIL_ALEXA_SKILL_IDS override these values.
+# See integrations/alexa/README.md.
+alexa:
+  enabled: false
+  skill_ids: []
+
 security:
   allow_unauthenticated_health: true
   allow_unauthenticated_metrics: true

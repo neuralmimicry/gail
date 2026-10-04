@@ -25,6 +25,10 @@ mime_guess = "2.0"
 once_cell = "1.21"
 rand = "0.9"
 rayon = "1.12"
+ring = "0.17"
+rustls-pki-types = { version = "1.12", features = ["std"] }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc", "ring", "std"] }
+webpki-roots = "1"
 regex = "1.12"
 reqwest = { version = "0.12", default-features = false, features = ["charset", "cookies", "http2", "json", "multipart", "rustls-tls", "stream"] }
 serde = { version = "1.0", features = ["derive"] }

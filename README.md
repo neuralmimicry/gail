@@ -35,6 +35,7 @@ Gail exposes the following endpoints:
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /healthz` | Service health |
+| `POST /v1/integrations/alexa` | "Alexa, ask Aaron" custom-skill endpoint (Amazon-signed, no bearer token; 404 unless `alexa.enabled`). See [integrations/alexa](integrations/alexa/README.md) |
 | `POST /v1/llm/complete` | Workflow-aware multi-provider orchestration |
 | `POST /v1/llm/direct-complete` | Direct provider invocation without orchestration |
 | `POST /v1/llm/transcribe` | Speech-to-text proxy |
@@ -87,6 +88,7 @@ such as Refiner can show users an expected processing duration.
 - Bearer-token authentication with per-client IDs.
 - Route scopes: `health`, `llm`, `neuromorphic`, `aer`, `status`, `trading`, `trading_admin`.
 - `/healthz` can be configured to allow or deny unauthenticated probes.
+- `/v1/integrations/alexa` is the only public LLM route. It is disabled by default and, when enabled, accepts only requests carrying a valid Amazon `Signature-256` from the `echo-api.amazon.com` certificate, a fresh timestamp and a configured skill id. Answers run through `gail-auto` with Aria governance and ledger auditing under client id `alexa`.
 - All `/v1/trading/*` read endpoints require the `trading` scope.
 - All `/v1/trading/*` write endpoints (pause, resume, override, config POST, evaluate) additionally require either the `trading_admin` scope or a `client_id` listed in `trading.admin_client_ids` (default: `["pbisaacs"]`).
 - When `aarnn_bridge` is enabled, Gail should call AARNN with its own Customers-issued service-account bearer token rather than a browser-style session.
