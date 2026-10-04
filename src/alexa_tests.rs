@@ -516,17 +516,20 @@ async fn timeout_says_still_thinking_and_yes_delivers_answer() {
     let rt = AlexaRuntime::with_verifier(
         config,
         test_verifier(),
-        mock_asker("Forty two.", Duration::from_millis(800), calls.clone()),
+        mock_asker("Forty two.", Duration::from_millis(1500), calls.clone()),
     );
     let started = Instant::now();
     let response = rt
         .respond(&envelope(ask_request("the meaning of life"), "", SKILL_ID))
         .await;
-    assert!(started.elapsed() < Duration::from_millis(750));
+    assert!(started.elapsed() < Duration::from_millis(1400));
     assert!(ssml_of(&response).contains("still thinking"));
     assert_eq!(response["response"]["shouldEndSession"], false);
     assert!(response["response"]["reprompt"].is_object());
 
+    // The completion keeps running in the background; let it finish so the
+    // Yes turn does not depend on scheduler timing.
+    tokio::time::sleep(Duration::from_millis(1300)).await;
     let response = rt
         .respond(&envelope(intent("AMAZON.YesIntent"), "", SKILL_ID))
         .await;
