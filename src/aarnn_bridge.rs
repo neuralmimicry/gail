@@ -26,7 +26,7 @@ use tracing::{info, warn};
 
 use crate::{
     adaptive_schema,
-    aer::{encode_events, encode_spikes, payload_hex, AerEvent},
+    aer::{AerEvent, encode_events, encode_spikes, payload_hex},
     config::{AarnnBridgeConfig, GailConfig, SpecialistProfile},
     models::{
         AarnnBridgeStatus, AarnnMirrorCandidate, AarnnMirrorDirection, AarnnMirrorInvocationTrace,
@@ -82,7 +82,12 @@ impl SpeechMirrorPair {
         if events == 0 || events > SPEECH_MAX_EVENTS {
             return Err(format!("event count must be 1-{SPEECH_MAX_EVENTS}"));
         }
-        if self.frames.iter().flatten().any(|b| u32::from(*b) >= self.bands) {
+        if self
+            .frames
+            .iter()
+            .flatten()
+            .any(|b| u32::from(*b) >= self.bands)
+        {
             return Err("band index out of range".into());
         }
         Ok(())
@@ -96,7 +101,11 @@ impl SpeechMirrorPair {
         for (i, frame) in self.frames.iter().enumerate() {
             let ts_us = t0_us + i as u64 * u64::from(self.frame_ms) * 1000;
             for band in frame {
-                events.push(AerEvent { ts_us, addr: SPEECH_AER_BASE + u32::from(*band), value: 1 });
+                events.push(AerEvent {
+                    ts_us,
+                    addr: SPEECH_AER_BASE + u32::from(*band),
+                    value: 1,
+                });
                 let a = &mut activity[*band as usize];
                 *a = a.saturating_add(1);
             }
@@ -1557,15 +1566,22 @@ mod speech_mirror_tests {
     use crate::aer::decode_events;
 
     fn pair(frames: Vec<Vec<u16>>) -> SpeechMirrorPair {
-        SpeechMirrorPair { pair_id: "p1".into(), source: "stt".into(), text: "hello".into(),
-                           frame_ms: 10, bands: 32, frames, lang: Some("en-GB".into()) }
+        SpeechMirrorPair {
+            pair_id: "p1".into(),
+            source: "stt".into(),
+            text: "hello".into(),
+            frame_ms: 10,
+            bands: 32,
+            frames,
+            lang: Some("en-GB".into()),
+        }
     }
 
     #[test]
     fn validates_bounds() {
         assert!(pair(vec![vec![0, 31]]).validate().is_ok());
-        assert!(pair(vec![vec![32]]).validate().is_err());          // band out of range
-        assert!(pair(vec![vec![], vec![]]).validate().is_err());    // no events
+        assert!(pair(vec![vec![32]]).validate().is_err()); // band out of range
+        assert!(pair(vec![vec![], vec![]]).validate().is_err()); // no events
         let mut p = pair(vec![vec![1]]);
         p.source = "radio".into();
         assert!(p.validate().is_err());
@@ -1580,9 +1596,19 @@ mod speech_mirror_tests {
         let (events, activity) = p.to_aer(1_000_000);
         let decoded = decode_events(&encode_events(&events)).unwrap();
         let got: Vec<(u64, u32)> = decoded.iter().map(|e| (e.ts_us, e.addr)).collect();
-        assert_eq!(got, vec![(1_000_000, SPEECH_AER_BASE + 2), (1_020_000, SPEECH_AER_BASE + 2), (1_020_000, SPEECH_AER_BASE + 5)]);
+        assert_eq!(
+            got,
+            vec![
+                (1_000_000, SPEECH_AER_BASE + 2),
+                (1_020_000, SPEECH_AER_BASE + 2),
+                (1_020_000, SPEECH_AER_BASE + 5)
+            ]
+        );
         assert_eq!(activity[2], 2);
         assert_eq!(activity[5], 1);
-        assert!(SPEECH_AER_BASE + SPEECH_MAX_BANDS <= 16384, "must not overlap the output region");
+        assert!(
+            SPEECH_AER_BASE + SPEECH_MAX_BANDS <= 16384,
+            "must not overlap the output region"
+        );
     }
 }

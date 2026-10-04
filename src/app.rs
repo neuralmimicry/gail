@@ -661,9 +661,17 @@ async fn mirror_speech(
     let pair_id = pair.pair_id.clone();
     let events: usize = pair.frames.iter().map(Vec::len).sum();
     if service.mirror_speech_background(pair) {
-        (StatusCode::ACCEPTED, Json(json!({ "accepted": true, "pair_id": pair_id, "events": events }))).into_response()
+        (
+            StatusCode::ACCEPTED,
+            Json(json!({ "accepted": true, "pair_id": pair_id, "events": events })),
+        )
+            .into_response()
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "accepted": false, "error": "aarnn bridge unavailable or busy" }))).into_response()
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "accepted": false, "error": "aarnn bridge unavailable or busy" })),
+        )
+            .into_response()
     }
 }
 
