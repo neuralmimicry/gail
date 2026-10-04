@@ -1,0 +1,68 @@
+{
+  "manifest": {
+    "manifestVersion": "1.0",
+    "publishingInformation": {
+      "locales": {
+        "en-GB": {
+          "name": "Aaron",
+          "summary": "Ask Aaron, the NeuralMimicry Gail assistant, anything.",
+          "description": "Aaron answers spoken questions using the NeuralMimicry Gail AI gateway. Say \"Alexa, ask Aaron\" followed by your question.",
+          "examplePhrases": [
+            "Alexa, open aaron",
+            "Alexa, ask aaron what is the tallest mountain in Scotland",
+            "Alexa, ask aaron to explain black holes"
+          ],
+          "keywords": [
+            "aaron",
+            "gail",
+            "assistant",
+            "questions"
+          ]
+        },
+        "en-US": {
+          "name": "Aaron",
+          "summary": "Ask Aaron, the NeuralMimicry Gail assistant, anything.",
+          "description": "Aaron answers spoken questions using the NeuralMimicry Gail AI gateway. Say \"Alexa, ask Aaron\" followed by your question.",
+          "examplePhrases": [
+            "Alexa, open aaron",
+            "Alexa, ask aaron what is the tallest mountain in Colorado",
+            "Alexa, ask aaron to explain black holes"
+          ],
+          "keywords": [
+            "aaron",
+            "gail",
+            "assistant",
+            "questions"
+          ]
+        }
+      },
+      "isAvailableWorldwide": false,
+      "distributionCountries": [
+        "GB",
+        "US"
+      ],
+      "category": "KNOWLEDGE_AND_TRIVIA",
+      "testingInstructions": "Development-only skill for the NeuralMimicry estate. Not for certification."
+    },
+    "apis": {
+      "custom": {
+        "endpoint": {
+          "uri": "https://gail.neuralmimicry.ai/v1/integrations/alexa",
+          "sslCertificateType": "Trusted"
+        },
+        "interfaces": []
+      }
+    },
+    "privacyAndCompliance": {
+      "allowsPurchases": false,
+      "usesPersonalInfo": false,
+      "isChildDirected": false,
+      "isExportCompliant": true,
+      "containsAds": false,
+      "locales": {
+        "en-GB": {},
+        "en-US": {}
+      }
+    }
+  }
+}

@@ -1,6 +1,7 @@
 pub mod aarnn_bridge;
 pub mod adaptive_schema;
 pub mod aer;
+pub mod alexa;
 pub mod api_issues;
 pub mod app;
 pub mod build_info;

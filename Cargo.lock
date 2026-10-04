@@ -945,6 +945,9 @@ dependencies = [
  "rayon",
  "regex",
  "reqwest",
+ "ring",
+ "rustls-pki-types",
+ "rustls-webpki",
  "safetensors 0.5.3",
  "serde",
  "serde_json",
@@ -964,6 +967,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "webpki-roots",
  "wiremock",
 ]
 

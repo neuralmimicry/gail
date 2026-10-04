@@ -2,13 +2,14 @@ use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
     env,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
-    Json, Router,
-    extract::{Multipart, Path, Query, State},
+    Extension, Json, Router,
+    body::Bytes,
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     response::{
         IntoResponse, Response,
@@ -24,7 +25,9 @@ use tokio::signal;
 use uuid::Uuid;
 
 use crate::{
-    adaptive_schema, api_issues,
+    adaptive_schema,
+    alexa::AlexaRuntime,
+    api_issues,
     config::ProviderProfile,
     errors::{GailError, Result},
     models::{
@@ -155,8 +158,25 @@ static EXECUTION_PLAN_CACHE: Lazy<Mutex<HashMap<String, Value>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 pub fn build_router(service: GailService) -> Router {
+    let alexa = Arc::new(AlexaRuntime::new(
+        service.config().alexa.clone(),
+        alexa_asker(service.clone()),
+    ));
+    build_router_with_alexa(service, alexa)
+}
+
+/// Build the router with an explicit Alexa runtime (tests inject trust
+/// anchors and mocked completions here).
+pub fn build_router_with_alexa(service: GailService, alexa: Arc<AlexaRuntime>) -> Router {
     let governance_state = (service.clone(), service.governance().clone());
     Router::new()
+        // Public: authenticated by Amazon's request signature, not a Gail token.
+        .route(
+            crate::alexa::ROUTE,
+            post(alexa_skill)
+                .layer::<_, Infallible>(Extension(alexa))
+                .layer::<_, Infallible>(DefaultBodyLimit::max(crate::alexa::MAX_REQUEST_BYTES)),
+        )
         .route("/v1/internal/aria/assess", post(crate::governance::assess))
         .route(
             "/v1/internal/aria/status",
@@ -213,6 +233,57 @@ pub fn build_router(service: GailService) -> Router {
             crate::governance::guard,
         ))
         .with_state(service)
+}
+
+async fn alexa_skill(
+    Extension(alexa): Extension<Arc<AlexaRuntime>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    alexa.handle(&headers, &body).await
+}
+
+/// Route spoken questions through the same orchestrated path as
+/// `/v1/chat/completions` with `model: gail-auto`. `GailService::complete`
+/// applies Aria governance and ledger auditing, attributed to `alexa`.
+pub(crate) fn alexa_asker(service: GailService) -> crate::alexa::Asker {
+    let max_tokens = service.config().alexa.max_answer_tokens;
+    Arc::new(move |messages: Vec<ChatMessage>| {
+        let service = service.clone();
+        Box::pin(async move {
+            let request = OpenAIChatCompletionRequest {
+                model: "gail-auto".to_string(),
+                messages,
+                instructions: None,
+                max_tokens: Some(max_tokens),
+                temperature: None,
+                stream: Some(false),
+                response_format: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                workflow: None,
+                role: None,
+                provider: None,
+                api_key: None,
+                access_token: None,
+                base_url: None,
+                include_configured: None,
+                selection_mode: None,
+                max_candidates: None,
+                request_category: None,
+                metadata: None,
+            };
+            dispatch_openai_chat_completion(&service, request, Some(crate::alexa::CLIENT_ID))
+                .await
+                .map(|(_, response)| response.text)
+                .map_err(|error| {
+                    tracing::warn!(error = %error, client_id = crate::alexa::CLIENT_ID, "Alexa completion failed");
+                    crate::alexa::AskError::from_gail(&error)
+                })
+        })
+    })
 }
 
 async fn elm_status(State(service): State<GailService>, headers: HeaderMap) -> Response {
@@ -7072,5 +7143,165 @@ mod tests {
         assert!(body.contains("event: response.completed"));
         assert!(body.contains("mocked answer"));
         assert!(body.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn alexa_route_is_not_found_when_disabled() {
+        let app = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(crate::alexa::ROUTE)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn alexa_route_answers_signed_request_through_governed_gail_auto() {
+        use crate::alexa::tests as fixtures;
+        use crate::governance::{GovernanceConfig, Mode};
+
+        let nvidia = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "moonshotai/kimi-k2-instruct-0905"}]
+            })))
+            .mount(&nvidia)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("Amazon Echo speaker"))
+            .and(body_string_contains("tallest mountain"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-alexa",
+                "model": "moonshotai/kimi-k2-instruct-0905",
+                "choices": [{
+                    "message": {"role": "assistant", "content": "**Ben Nevis**, at 1345 metres."},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28}
+            })))
+            .mount(&nvidia)
+            .await;
+
+        let aria = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/evaluate"))
+            .respond_with(|request: &wiremock::Request| {
+                let value: Value = serde_json::from_slice(&request.body).unwrap();
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "protocol_version": 1,
+                    "request_id": value["request_id"],
+                    "id": uuid::Uuid::new_v4(),
+                    "phase": value["phase"],
+                    "action": "allow"
+                }))
+            })
+            .mount(&aria)
+            .await;
+
+        let mut config = GailConfig::default();
+        config.orchestration.max_parallel_candidates = 1;
+        config.providers.push(ProviderProfile {
+            name: "NVIDIAKimi".to_string(),
+            provider_type: "nvidia".to_string(),
+            model: Some("moonshotai/kimi-k2-instruct-0905".to_string()),
+            api_key: Some("nvapi-test".to_string()),
+            base_url: Some(format!("{}/v1", nvidia.uri())),
+            roles: vec!["general".to_string()],
+            weight: 1.0,
+            preferred: true,
+            ..ProviderProfile::default()
+        });
+        config.governance = GovernanceConfig {
+            mode: Mode::Enforce,
+            aria_url: aria.uri(),
+            evaluation_token: "aria-evaluation-test-token-00000000000".into(),
+            assessment_token: "aria-assessment-test-token-00000000000".into(),
+            ..GovernanceConfig::default()
+        };
+        config.alexa.enabled = true;
+        config.alexa.skill_ids = vec![fixtures::SKILL_ID.to_string()];
+        config.alexa.progressive_response = false;
+        let service = test_service_with_config(config).await;
+        let runtime = crate::alexa::AlexaRuntime::with_verifier(
+            service.config().alexa.clone(),
+            fixtures::test_verifier(),
+            alexa_asker(service.clone()),
+        );
+        let app = build_router_with_alexa(service, Arc::new(runtime));
+
+        let body = fixtures::envelope(
+            fixtures::ask_request("what is the tallest mountain in scotland"),
+            &fixtures::iso_now_offset(0),
+            fixtures::SKILL_ID,
+        )
+        .to_string();
+        let headers = fixtures::signed_headers(
+            body.as_bytes(),
+            fixtures::CHAIN_URL,
+            fixtures::TEST_LEAF_KEY,
+        );
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(crate::alexa::ROUTE)
+            .header("content-type", "application/json");
+        for (name, value) in &headers {
+            request = request.header(name, value);
+        }
+        // No Gail bearer token: Alexa authenticates with its signature.
+        let response = app
+            .clone()
+            .oneshot(request.body(axum::body::Body::from(body.clone())).unwrap())
+            .await
+            .expect("response");
+        let payload = read_json(response).await;
+        assert_eq!(
+            crate::alexa::tests::ssml_of(&payload),
+            "<speak>Ben Nevis, at 1345 metres.</speak>"
+        );
+        assert_eq!(payload["response"]["shouldEndSession"], false);
+
+        // Aria saw both phases, attributed to the alexa client.
+        let evaluations = aria.received_requests().await.unwrap_or_default();
+        let sources = evaluations
+            .iter()
+            .map(|r| serde_json::from_slice::<Value>(&r.body).unwrap())
+            .map(|v| {
+                (
+                    v["phase"].as_str().unwrap_or("").to_string(),
+                    v["source"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            sources.contains(&("request".to_string(), json!("alexa"))),
+            "{sources:?}"
+        );
+        assert!(
+            sources.contains(&("response".to_string(), json!("alexa"))),
+            "{sources:?}"
+        );
+
+        // Unsigned requests are rejected before any completion is attempted.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(crate::alexa::ROUTE)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

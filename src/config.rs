@@ -16,6 +16,8 @@ pub const MAX_WORKLOAD_POOL_WAIT_TIMEOUT_MS: u64 = 1_200_000;
 #[derive(Default)]
 pub struct GailConfig {
     pub governance: crate::governance::GovernanceConfig,
+    /// Alexa custom-skill endpoint (`/v1/integrations/alexa`); off by default.
+    pub alexa: crate::alexa::AlexaConfig,
     pub server: ServerConfig,
     pub security: SecurityConfig,
     pub orchestration: OrchestrationConfig,
@@ -610,6 +612,7 @@ impl GailConfig {
             .ok()
             .filter(|value| !value.trim().is_empty());
         self.elm.normalize()?;
+        self.alexa.normalize();
         if self.server.bind_addr.trim().is_empty() {
             return Err(GailError::invalid_config(
                 "server.bind_addr must not be empty",
