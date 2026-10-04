@@ -177,6 +177,7 @@ pub fn build_router(service: GailService) -> Router {
         .route("/v1/llm/transcribe", post(transcribe))
         .route("/v1/neuromorphic/analyze", post(analyze_neuromorphic))
         .route("/v1/neuromorphic/predict", post(predict_neuromorphic))
+        .route("/v1/mirror/speech", post(mirror_speech))
         .route("/v1/aer/encode", post(encode_aer))
         .route("/v1/aer/decode", post(decode_aer))
         .route("/v1/status/orchestration", get(orchestration_status))
@@ -643,6 +644,35 @@ async fn transcribe(
             .transcribe(provider, model, api_key, access_token, base_url, input)
             .await?,
     ))
+}
+
+/// nmstt -> AARNN speech mirroring: auditory band spikes paired with text.
+async fn mirror_speech(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+    Json(pair): Json<crate::aarnn_bridge::SpeechMirrorPair>,
+) -> Response {
+    if let Err(err) = service.authorize(&headers, "llm") {
+        return err.into_response();
+    }
+    if let Err(message) = pair.validate() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+    }
+    let pair_id = pair.pair_id.clone();
+    let events: usize = pair.frames.iter().map(Vec::len).sum();
+    if service.mirror_speech_background(pair) {
+        (
+            StatusCode::ACCEPTED,
+            Json(json!({ "accepted": true, "pair_id": pair_id, "events": events })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "accepted": false, "error": "aarnn bridge unavailable or busy" })),
+        )
+            .into_response()
+    }
 }
 
 async fn analyze_neuromorphic(

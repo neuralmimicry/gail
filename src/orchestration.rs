@@ -1338,6 +1338,29 @@ impl GailService {
         self.inner.aarnn_bridge.as_ref()
     }
 
+    /// Queue a speech (audio spikes + text) mirror into AARNN without blocking
+    /// the caller. Returns false when the AARNN bridge is not configured.
+    pub fn mirror_speech_background(&self, pair: crate::aarnn_bridge::SpeechMirrorPair) -> bool {
+        let Some(bridge) = self.aarnn_bridge().cloned() else {
+            return false;
+        };
+        static INFLIGHT: once_cell::sync::Lazy<std::sync::Arc<tokio::sync::Semaphore>> =
+            once_cell::sync::Lazy::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(8)));
+        // Bounded: if 8 speech mirrors are already in flight, drop rather than queue unboundedly.
+        let Ok(permit) = INFLIGHT.clone().try_acquire_owned() else {
+            tracing::warn!(pair_id = %pair.pair_id, "speech mirror dropped: AARNN mirror backlog full");
+            return false;
+        };
+        tokio::spawn(async move {
+            let _permit = permit;
+            let trace = bridge.mirror_speech(pair).await;
+            if let Some(error) = trace.error {
+                tracing::warn!(error = %error, "speech mirror to AARNN failed");
+            }
+        });
+        true
+    }
+
     fn llm_ledger(&self) -> Option<&LlmLedger> {
         self.inner.llm_ledger.as_ref()
     }
