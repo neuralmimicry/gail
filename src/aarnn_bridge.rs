@@ -26,7 +26,7 @@ use tracing::{info, warn};
 
 use crate::{
     adaptive_schema,
-    aer::{encode_spikes, payload_hex},
+    aer::{encode_events, encode_spikes, payload_hex, AerEvent},
     config::{AarnnBridgeConfig, GailConfig, SpecialistProfile},
     models::{
         AarnnBridgeStatus, AarnnMirrorCandidate, AarnnMirrorDirection, AarnnMirrorInvocationTrace,
@@ -37,6 +37,73 @@ use crate::{
 
 const AARNN_MIRROR_PATH: &str = "/api/llm/mirror";
 const AARNN_RESPONSE_MODEL: &str = "aarnn-snn-aer-bridge";
+/// AER base for the auditory sensory region fed by nmstt speech mirroring:
+/// between the text sensory region (4096 + sensory_size) and outputs (16384).
+pub const SPEECH_AER_BASE: u32 = 8192;
+/// Upper bounds that keep one utterance a single, bounded AER batch.
+pub const SPEECH_MAX_BANDS: u32 = 256;
+pub const SPEECH_MAX_FRAMES: usize = 6000;
+pub const SPEECH_MAX_EVENTS: usize = 60_000;
+
+/// One utterance of audio (as cochlea-like band spike frames) paired with the
+/// text that goes with it, so AARNN can learn sound-to-word associations.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct SpeechMirrorPair {
+    pub pair_id: String,
+    /// "stt" (heard audio + transcript) or "tts" (spoken audio + source text).
+    pub source: String,
+    pub text: String,
+    pub frame_ms: u32,
+    pub bands: u32,
+    /// Sparse frames: band indices that spiked in each frame, in time order.
+    pub frames: Vec<Vec<u16>>,
+    #[serde(default)]
+    pub lang: Option<String>,
+}
+
+impl SpeechMirrorPair {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.pair_id.trim().is_empty() || self.pair_id.len() > 128 {
+            return Err("pair_id must be 1-128 characters".into());
+        }
+        if !matches!(self.source.as_str(), "stt" | "tts") {
+            return Err("source must be stt or tts".into());
+        }
+        if self.text.trim().is_empty() {
+            return Err("text is required".into());
+        }
+        if !(1..=100).contains(&self.frame_ms) || self.bands == 0 || self.bands > SPEECH_MAX_BANDS {
+            return Err("frame_ms must be 1-100 and bands 1-256".into());
+        }
+        if self.frames.len() > SPEECH_MAX_FRAMES {
+            return Err(format!("at most {SPEECH_MAX_FRAMES} frames"));
+        }
+        let events: usize = self.frames.iter().map(Vec::len).sum();
+        if events == 0 || events > SPEECH_MAX_EVENTS {
+            return Err(format!("event count must be 1-{SPEECH_MAX_EVENTS}"));
+        }
+        if self.frames.iter().flatten().any(|b| u32::from(*b) >= self.bands) {
+            return Err("band index out of range".into());
+        }
+        Ok(())
+    }
+
+    /// Timed AER events rooted at the auditory base, plus per-band activity
+    /// (spike counts, saturating) as the record's sensory vector.
+    pub fn to_aer(&self, t0_us: u64) -> (Vec<AerEvent>, Vec<u8>) {
+        let mut events = Vec::new();
+        let mut activity = vec![0u8; self.bands as usize];
+        for (i, frame) in self.frames.iter().enumerate() {
+            let ts_us = t0_us + i as u64 * u64::from(self.frame_ms) * 1000;
+            for band in frame {
+                events.push(AerEvent { ts_us, addr: SPEECH_AER_BASE + u32::from(*band), value: 1 });
+                let a = &mut activity[*band as usize];
+                *a = a.saturating_add(1);
+            }
+        }
+        (events, activity)
+    }
+}
 
 #[derive(Debug)]
 struct AarnnMirrorJob {
@@ -800,6 +867,61 @@ gail_aarnn_mirror_unmatched_inputs {}\n",
         }
     }
 
+    /// Mirror a speech utterance (auditory spikes + paired text) into AARNN as
+    /// one timed AER batch at the auditory base, via the authorised mirror path
+    /// (same retries and audit logging as text mirrors).
+    pub async fn mirror_speech(&self, pair: SpeechMirrorPair) -> AarnnMirrorInvocationTrace {
+        let started = Instant::now();
+        let (events, activity) = pair.to_aer(now_ts_us());
+        let spike_count = events.len();
+        let text = truncate_chars(&compact_text(&pair.text), self.max_text_chars);
+        let request = AarnnMirrorRequest {
+            request_id: pair.pair_id.clone(),
+            conversation_id: format!("speech:{}", pair.pair_id),
+            workflow: "speech".into(),
+            role: "user".into(),
+            direction: AarnnMirrorDirection::Input,
+            provider: Some("nmstt".into()),
+            model: Some(format!("nmstt-{}", pair.source)),
+            request_category: Some(format!("speech_{}", pair.source)),
+            system: None,
+            prompt_text: pair.lang.clone(),
+            text: text.clone(),
+            message_roles: Vec::new(),
+            aer_base: SPEECH_AER_BASE,
+            output_base: self.aer_output_base,
+            aer_payload_hex: payload_hex(&encode_events(&events)),
+            sensory_spikes: activity,
+            network_id: self.network_id.clone(),
+            node_id: self.node_id.clone(),
+            request_candidate_reply: false,
+        };
+        self.log_mirror_request_audit(&request, spike_count);
+        let text_chars = text.chars().count();
+        let (accepted, error, stimulation) = match self.mirror_once(&request).await {
+            Ok(response) => {
+                self.log_mirror_response_audit(&request, &response, text_chars, spike_count);
+                (response.accepted, None, response.stimulation)
+            }
+            Err(error) => {
+                self.log_mirror_error_audit(&request, error.as_str(), text_chars, spike_count);
+                (false, Some(error), None)
+            }
+        };
+        AarnnMirrorInvocationTrace {
+            direction: AarnnMirrorDirection::Input,
+            request_category: request.request_category,
+            accepted,
+            endpoint: self.endpoint.clone(),
+            latency_ms: started.elapsed().as_millis() as u64,
+            text_chars,
+            spike_count,
+            candidate: None,
+            stimulation,
+            error,
+        }
+    }
+
     fn build_request(&self, exchange: AarnnMirrorExchange) -> AarnnMirrorRequest {
         // Normalize textual context before projecting into the sensory layer.
         let text = truncate_chars(&compact_text(&exchange.text), self.max_text_chars);
@@ -1426,5 +1548,41 @@ mod tests {
             .expect("worker trace");
         assert!(trace.accepted);
         assert!(trace.error.is_none());
+    }
+}
+
+#[cfg(test)]
+mod speech_mirror_tests {
+    use super::*;
+    use crate::aer::decode_events;
+
+    fn pair(frames: Vec<Vec<u16>>) -> SpeechMirrorPair {
+        SpeechMirrorPair { pair_id: "p1".into(), source: "stt".into(), text: "hello".into(),
+                           frame_ms: 10, bands: 32, frames, lang: Some("en-GB".into()) }
+    }
+
+    #[test]
+    fn validates_bounds() {
+        assert!(pair(vec![vec![0, 31]]).validate().is_ok());
+        assert!(pair(vec![vec![32]]).validate().is_err());          // band out of range
+        assert!(pair(vec![vec![], vec![]]).validate().is_err());    // no events
+        let mut p = pair(vec![vec![1]]);
+        p.source = "radio".into();
+        assert!(p.validate().is_err());
+        p = pair(vec![vec![1]]);
+        p.text = "  ".into();
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn encodes_timed_events_at_auditory_base() {
+        let p = pair(vec![vec![2], vec![], vec![2, 5]]);
+        let (events, activity) = p.to_aer(1_000_000);
+        let decoded = decode_events(&encode_events(&events)).unwrap();
+        let got: Vec<(u64, u32)> = decoded.iter().map(|e| (e.ts_us, e.addr)).collect();
+        assert_eq!(got, vec![(1_000_000, SPEECH_AER_BASE + 2), (1_020_000, SPEECH_AER_BASE + 2), (1_020_000, SPEECH_AER_BASE + 5)]);
+        assert_eq!(activity[2], 2);
+        assert_eq!(activity[5], 1);
+        assert!(SPEECH_AER_BASE + SPEECH_MAX_BANDS <= 16384, "must not overlap the output region");
     }
 }
