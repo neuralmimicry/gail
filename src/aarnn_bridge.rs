@@ -14,15 +14,15 @@ use std::{
 
 use reqwest::{
     Client,
-    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
+    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
 };
 use serde::Serialize;
 use serde_json::Value;
 use tokio::{
-    sync::{Semaphore, mpsc, oneshot},
+    sync::{Mutex as AsyncMutex, Semaphore, mpsc, oneshot},
     time::{sleep, timeout},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     adaptive_schema,
@@ -37,6 +37,17 @@ use crate::{
 
 const AARNN_MIRROR_PATH: &str = "/api/llm/mirror";
 const AARNN_RESPONSE_MODEL: &str = "aarnn-snn-aer-bridge";
+const AARNN_PERIPHERAL_SESSIONS_PATH: &str = "/api/peripheral/sessions";
+const PERIPHERAL_SESSION_HEADER: &str = "x-aarnn-peripheral-session";
+/// AARNN caps session TTL at 900 s and offers no renewal.
+const PERIPHERAL_SESSION_TTL_SECS: u64 = 900;
+/// Re-create a session once fewer than this many seconds remain.
+const PERIPHERAL_SESSION_REFRESH_MARGIN: Duration = Duration::from_secs(60);
+/// How long to remember that AARNN refused/does not support sessions
+/// (auth mode `none` -> 403 "disabled", older AARNN -> 404/405).
+const PERIPHERAL_SESSION_UNSUPPORTED_TTL: Duration = Duration::from_secs(60);
+/// Back-off after a transient session-creation failure (timeout, 5xx).
+const PERIPHERAL_SESSION_FAILURE_TTL: Duration = Duration::from_secs(5);
 /// AER base for the auditory sensory region fed by nmstt speech mirroring:
 /// between the text sensory region (4096 + sensory_size) and outputs (16384).
 pub const SPEECH_AER_BASE: u32 = 8192;
@@ -169,6 +180,48 @@ pub struct AarnnMirrorClient {
     audit_store_llm_content: bool,
     audit_log_aer_payloads: bool,
     audit_max_chars: usize,
+    peripheral_sessions: Arc<PeripheralSessions>,
+}
+
+/// Cached state of the AARNN peripheral session for one network_id.
+#[derive(Debug, Default)]
+enum PeripheralSessionSlot {
+    #[default]
+    Empty,
+    Active {
+        session_id: String,
+        expires_at: Instant,
+    },
+    /// Sessions are disabled (auth mode `none`), denied, or unsupported by an
+    /// older AARNN: mirror without the header until `until`.
+    Unsupported { until: Instant },
+    /// Creation failed transiently; mirror without the header until `until`.
+    Failed { until: Instant },
+}
+
+/// Per-network peripheral session cache. Each network has its own async
+/// mutex which is held across session creation, so concurrent mirrors for the
+/// same network single-flight onto one `POST /api/peripheral/sessions`.
+#[derive(Debug, Default)]
+struct PeripheralSessions {
+    slots: Mutex<HashMap<String, Arc<AsyncMutex<PeripheralSessionSlot>>>>,
+    /// Set once the "sessions unsupported" warning was emitted; later
+    /// occurrences log at debug to avoid spamming every 60 s.
+    warned_unsupported: std::sync::atomic::AtomicBool,
+}
+
+impl PeripheralSessions {
+    fn slot(&self, network_id: &str) -> Arc<AsyncMutex<PeripheralSessionSlot>> {
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        slots.entry(network_id.to_string()).or_default().clone()
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PeripheralSessionReply {
+    session_id: String,
+    #[serde(default)]
+    expires_at_unix_secs: Option<u64>,
 }
 
 static PROMOTION_HISTORY: Lazy<Mutex<HashMap<String, VecDeque<f64>>>> =
@@ -250,6 +303,7 @@ impl AarnnMirrorClient {
             audit_store_llm_content: config.audit_logging.store_llm_content,
             audit_log_aer_payloads: config.audit_logging.log_aer_payloads,
             audit_max_chars: config.audit_logging.max_chars.clamp(1, 262_144),
+            peripheral_sessions: Arc::new(PeripheralSessions::default()),
         };
         mirror.start_worker_bus(queue_rx);
         Some(mirror)
@@ -976,17 +1030,59 @@ gail_aarnn_mirror_unmatched_inputs {}\n",
         &self,
         request: &AarnnMirrorRequest,
     ) -> Result<AarnnMirrorResponse, String> {
+        let network_id = request
+            .network_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let session_id = match network_id {
+            Some(network_id) => self.peripheral_session(network_id).await,
+            None => None,
+        };
+        match self
+            .mirror_with_retries(request, session_id.as_deref())
+            .await
+        {
+            Err(error) if network_id.is_some() && error.is_peripheral_session_error() => {
+                // The session expired, was revoked, or AARNN restarted (sessions
+                // are in-memory). Drop it, create a fresh one and retry once.
+                let network_id = network_id.unwrap_or_default();
+                self.invalidate_peripheral_session(network_id, session_id.as_deref())
+                    .await;
+                match self.peripheral_session(network_id).await {
+                    Some(fresh) => {
+                        info!(
+                            endpoint = %self.endpoint,
+                            network_id,
+                            status = error.status,
+                            "AARNN rejected peripheral session; retrying mirror with a new session"
+                        );
+                        self.mirror_with_retries(request, Some(fresh.as_str()))
+                            .await
+                            .map_err(|error| error.message)
+                    }
+                    None => Err(error.message),
+                }
+            }
+            other => other.map_err(|error| error.message),
+        }
+    }
+
+    async fn mirror_with_retries(
+        &self,
+        request: &AarnnMirrorRequest,
+        session_id: Option<&str>,
+    ) -> Result<AarnnMirrorResponse, MirrorHttpError> {
         // Retries are only used for transient transport/upstream failures.
         let max_attempts = self.request_max_attempts.max(1);
-        let mut last_error = String::new();
+        let mut last_error = MirrorHttpError::retryable(String::new());
         for attempt in 1..=max_attempts {
-            match self.mirror_once_attempt(request).await {
+            match self.mirror_once_attempt(request, session_id).await {
                 Ok(response) => return Ok(response),
                 Err(error) => {
-                    last_error = error.message.clone();
                     let retryable = error.retryable && attempt < max_attempts;
                     if !retryable {
-                        return Err(error.message);
+                        return Err(error);
                     }
                     let delay = retry_delay(
                         self.request_backoff,
@@ -1001,6 +1097,7 @@ gail_aarnn_mirror_unmatched_inputs {}\n",
                         error = %error.message,
                         "AARNN mirror request failed; retrying"
                     );
+                    last_error = error;
                     sleep(delay).await;
                 }
             }
@@ -1008,18 +1105,218 @@ gail_aarnn_mirror_unmatched_inputs {}\n",
         Err(last_error)
     }
 
-    async fn mirror_once_attempt(
+    /// Return a valid peripheral session id for `network_id`, creating one if
+    /// none is cached or the cached one has under 60 s left. Returns `None`
+    /// when AARNN has sessions disabled/unsupported (or creation failed), in
+    /// which case the mirror is sent without the session header.
+    async fn peripheral_session(&self, network_id: &str) -> Option<String> {
+        let slot = self.peripheral_sessions.slot(network_id);
+        // Held across creation: concurrent callers wait here and then reuse
+        // the session the first caller created (single-flight).
+        let mut guard = slot.lock().await;
+        let now = Instant::now();
+        match &*guard {
+            PeripheralSessionSlot::Active {
+                session_id,
+                expires_at,
+            } if expires_at.saturating_duration_since(now) > PERIPHERAL_SESSION_REFRESH_MARGIN => {
+                return Some(session_id.clone());
+            }
+            PeripheralSessionSlot::Unsupported { until }
+            | PeripheralSessionSlot::Failed { until }
+                if *until > now =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+        let (next, session_id) = self.create_peripheral_session(network_id).await;
+        *guard = next;
+        session_id
+    }
+
+    /// Drop the cached session for `network_id`, but only if it is still the
+    /// one that was rejected (a concurrent caller may already have replaced
+    /// it). Negative/back-off entries are cleared so a retry re-probes.
+    async fn invalidate_peripheral_session(&self, network_id: &str, stale: Option<&str>) {
+        let slot = self.peripheral_sessions.slot(network_id);
+        let mut guard = slot.lock().await;
+        let clear = match (&*guard, stale) {
+            (PeripheralSessionSlot::Active { session_id, .. }, Some(stale)) => session_id == stale,
+            (PeripheralSessionSlot::Active { .. }, None) => false,
+            (PeripheralSessionSlot::Unsupported { .. }, _) => false,
+            _ => true,
+        };
+        if clear {
+            *guard = PeripheralSessionSlot::Empty;
+        }
+    }
+
+    async fn create_peripheral_session(
         &self,
-        request: &AarnnMirrorRequest,
-    ) -> Result<AarnnMirrorResponse, MirrorHttpError> {
-        let url = format!("{}{}", self.endpoint, AARNN_MIRROR_PATH);
+        network_id: &str,
+    ) -> (PeripheralSessionSlot, Option<String>) {
+        let url = format!("{}{}", self.endpoint, AARNN_PERIPHERAL_SESSIONS_PATH);
+        let headers = match self.headers() {
+            Ok(headers) => headers,
+            Err(error) => {
+                warn!(error = %error, "AARNN peripheral session headers invalid");
+                return self.session_failed();
+            }
+        };
+        let body = serde_json::json!({
+            "brain_id": network_id,
+            "local_consent": true,
+            "ttl_secs": PERIPHERAL_SESSION_TTL_SECS,
+        });
+        let started = SystemTime::now();
         let response = match self
             .client
             .post(url)
-            .headers(
-                self.headers()
-                    .map_err(|error| MirrorHttpError::non_retryable(error.as_str()))?,
-            )
+            .headers(headers)
+            .timeout(self.timeout)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(
+                    endpoint = %self.endpoint,
+                    network_id,
+                    error = %error,
+                    "AARNN peripheral session creation failed; mirroring without session"
+                );
+                return self.session_failed();
+            }
+        };
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let text = timeout(self.timeout, response.text())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            let text = truncate_chars(text.trim(), 256);
+            return match status {
+                403..=405 => {
+                    let reason = if status == 403 && text.to_ascii_lowercase().contains("disabled")
+                    {
+                        "peripheral access disabled (auth mode none)"
+                    } else if status == 403 {
+                        "peripheral session creation forbidden"
+                    } else {
+                        "peripheral sessions not supported by this AARNN"
+                    };
+                    if !self
+                        .peripheral_sessions
+                        .warned_unsupported
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        warn!(
+                            endpoint = %self.endpoint,
+                            network_id,
+                            status,
+                            body = %text,
+                            reason,
+                            "AARNN peripheral session unavailable; mirroring without session header"
+                        );
+                    } else {
+                        debug!(
+                            endpoint = %self.endpoint,
+                            network_id,
+                            status,
+                            reason,
+                            "AARNN peripheral session still unavailable"
+                        );
+                    }
+                    (
+                        PeripheralSessionSlot::Unsupported {
+                            until: Instant::now() + PERIPHERAL_SESSION_UNSUPPORTED_TTL,
+                        },
+                        None,
+                    )
+                }
+                _ => {
+                    warn!(
+                        endpoint = %self.endpoint,
+                        network_id,
+                        status,
+                        body = %text,
+                        "AARNN peripheral session creation rejected; mirroring without session"
+                    );
+                    self.session_failed()
+                }
+            };
+        }
+        let reply = match timeout(self.timeout, response.json::<PeripheralSessionReply>()).await {
+            Ok(Ok(reply)) if !reply.session_id.trim().is_empty() => reply,
+            Ok(Ok(_)) => {
+                warn!(
+                    network_id,
+                    "AARNN peripheral session reply had empty session_id"
+                );
+                return self.session_failed();
+            }
+            Ok(Err(error)) => {
+                warn!(network_id, error = %error, "AARNN peripheral session reply unparseable");
+                return self.session_failed();
+            }
+            Err(_) => {
+                warn!(network_id, "AARNN peripheral session reply timed out");
+                return self.session_failed();
+            }
+        };
+        let lifetime = session_lifetime(reply.expires_at_unix_secs, started);
+        if HeaderValue::from_str(reply.session_id.as_str()).is_err() {
+            warn!(
+                network_id,
+                "AARNN peripheral session id is not a valid header value"
+            );
+            return self.session_failed();
+        }
+        debug!(
+            endpoint = %self.endpoint,
+            network_id,
+            lifetime_secs = lifetime.as_secs(),
+            "AARNN peripheral session created"
+        );
+        (
+            PeripheralSessionSlot::Active {
+                session_id: reply.session_id.clone(),
+                expires_at: Instant::now() + lifetime,
+            },
+            Some(reply.session_id),
+        )
+    }
+
+    fn session_failed(&self) -> (PeripheralSessionSlot, Option<String>) {
+        (
+            PeripheralSessionSlot::Failed {
+                until: Instant::now() + PERIPHERAL_SESSION_FAILURE_TTL,
+            },
+            None,
+        )
+    }
+
+    async fn mirror_once_attempt(
+        &self,
+        request: &AarnnMirrorRequest,
+        session_id: Option<&str>,
+    ) -> Result<AarnnMirrorResponse, MirrorHttpError> {
+        let url = format!("{}{}", self.endpoint, AARNN_MIRROR_PATH);
+        let mut headers = self
+            .headers()
+            .map_err(|error| MirrorHttpError::non_retryable(error.as_str()))?;
+        if let Some(session_id) = session_id {
+            let value = HeaderValue::from_str(session_id)
+                .map_err(|error| MirrorHttpError::non_retryable(&error.to_string()))?;
+            headers.insert(HeaderName::from_static(PERIPHERAL_SESSION_HEADER), value);
+        }
+        let response = match self
+            .client
+            .post(url)
+            .headers(headers)
             .timeout(self.timeout)
             .json(request)
             .send()
@@ -1049,6 +1346,10 @@ gail_aarnn_mirror_unmatched_inputs {}\n",
                 format!("{status}: {body}")
             };
             let retryable = mirror_status_retryable(status.as_u16());
+            let session_error = matches!(status.as_u16(), 403 | 404) && {
+                let lower = body.to_ascii_lowercase();
+                lower.contains("peripheral") || lower.contains("session")
+            };
             adaptive_schema::observe_failure(
                 "aarnn_bridge",
                 "POST",
@@ -1058,11 +1359,14 @@ gail_aarnn_mirror_unmatched_inputs {}\n",
                 &message,
             )
             .await;
-            return Err(if retryable {
+            let mut error = if retryable {
                 MirrorHttpError::retryable(message)
             } else {
                 MirrorHttpError::non_retryable(message.as_str())
-            });
+            };
+            error.status = Some(status.as_u16());
+            error.session_error = session_error;
+            return Err(error);
         }
         match response.json::<AarnnMirrorResponse>().await {
             Ok(parsed) => {
@@ -1108,6 +1412,9 @@ gail_aarnn_mirror_unmatched_inputs {}\n",
 struct MirrorHttpError {
     message: String,
     retryable: bool,
+    status: Option<u16>,
+    /// 403/404 whose body mentions "peripheral" or "session".
+    session_error: bool,
 }
 
 impl MirrorHttpError {
@@ -1115,6 +1422,8 @@ impl MirrorHttpError {
         Self {
             message,
             retryable: true,
+            status: None,
+            session_error: false,
         }
     }
 
@@ -1122,8 +1431,29 @@ impl MirrorHttpError {
         Self {
             message: message.to_string(),
             retryable: false,
+            status: None,
+            session_error: false,
         }
     }
+
+    fn is_peripheral_session_error(&self) -> bool {
+        self.session_error
+    }
+}
+
+/// Lifetime of a freshly created session: from AARNN's absolute expiry when
+/// present (measured against the time the request was sent), else the TTL we
+/// asked for. Never longer than the 900 s cap.
+fn session_lifetime(expires_at_unix_secs: Option<u64>, requested_at: SystemTime) -> Duration {
+    let cap = Duration::from_secs(PERIPHERAL_SESSION_TTL_SECS);
+    let Some(expires_at) = expires_at_unix_secs else {
+        return cap;
+    };
+    let requested = requested_at
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Duration::from_secs(expires_at.saturating_sub(requested)).min(cap)
 }
 
 #[derive(Clone, Debug)]
@@ -1386,6 +1716,7 @@ mod tests {
             audit_store_llm_content: false,
             audit_log_aer_payloads: true,
             audit_max_chars: 2048,
+            peripheral_sessions: Arc::new(PeripheralSessions::default()),
         };
         let promoted = AarnnMirrorInvocationTrace {
             direction: AarnnMirrorDirection::Output,
@@ -1557,6 +1888,353 @@ mod tests {
             .expect("worker trace");
         assert!(trace.accepted);
         assert!(trace.error.is_none());
+    }
+}
+
+#[cfg(test)]
+mod peripheral_session_tests {
+    use super::*;
+    use wiremock::{
+        Mock, MockServer, Request, ResponseTemplate,
+        matchers::{header, method, path},
+    };
+
+    use crate::{config::GailConfig, models::AarnnMirrorDirection};
+
+    const NETWORK: &str = "shared-snn";
+
+    fn client_for(server: &MockServer, network_id: Option<&str>) -> AarnnMirrorClient {
+        let mut config = GailConfig::default();
+        config.aarnn_bridge.enabled = true;
+        config.aarnn_bridge.endpoint = Some(server.uri());
+        config.aarnn_bridge.access_token = Some("bridge-token".to_string());
+        config.aarnn_bridge.network_id = network_id.map(str::to_string);
+        AarnnMirrorClient::from_config(&config, Client::builder().build().expect("client"), &[])
+            .expect("bridge client")
+    }
+
+    fn exchange(id: &str) -> AarnnMirrorExchange {
+        AarnnMirrorExchange {
+            request_id: id.to_string(),
+            conversation_id: "conv".to_string(),
+            workflow: "assistant".to_string(),
+            role: "user".to_string(),
+            direction: AarnnMirrorDirection::Input,
+            provider: None,
+            model: None,
+            request_category: None,
+            system: None,
+            prompt_text: None,
+            text: "hello peripheral".to_string(),
+            message_roles: vec!["user".to_string()],
+        }
+    }
+
+    fn unix_now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn session_reply(id: &str, ttl: u64) -> ResponseTemplate {
+        ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "session_id": id,
+            "brain_id": NETWORK,
+            "channel": "aer",
+            "direction": "input",
+            "expires_at_unix_secs": unix_now() + ttl,
+        }))
+    }
+
+    fn mirror_ok() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "accepted": true,
+            "text_chars": 16,
+            "spike_count": 4
+        }))
+    }
+
+    async fn requests_to(server: &MockServer, route: &str) -> Vec<Request> {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.url.path() == route)
+            .collect()
+    }
+
+    fn session_header(request: &Request) -> Option<String> {
+        request
+            .headers
+            .get(PERIPHERAL_SESSION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    }
+
+    #[tokio::test]
+    async fn peripheral_session_created_then_reused() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(AARNN_PERIPHERAL_SESSIONS_PATH))
+            .and(header("authorization", "Bearer bridge-token"))
+            .respond_with(session_reply("sess-1", 900))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(AARNN_MIRROR_PATH))
+            .and(header(PERIPHERAL_SESSION_HEADER, "sess-1"))
+            .respond_with(mirror_ok())
+            .expect(3)
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Some(NETWORK));
+        for i in 0..3 {
+            let trace = client.mirror(exchange(&format!("r{i}"))).await;
+            assert!(trace.accepted, "{:?}", trace.error);
+        }
+        let sessions = requests_to(&server, AARNN_PERIPHERAL_SESSIONS_PATH).await;
+        let body: Value = serde_json::from_slice(&sessions[0].body).expect("json");
+        assert_eq!(body["brain_id"], NETWORK);
+        assert_eq!(body["local_consent"], true);
+        assert_eq!(body["ttl_secs"], 900);
+    }
+
+    #[tokio::test]
+    async fn peripheral_session_refreshed_near_expiry() {
+        let server = MockServer::start().await;
+        // First session expires in 30 s (< 60 s margin), so the next mirror
+        // must create a fresh one.
+        Mock::given(method("POST"))
+            .and(path(AARNN_PERIPHERAL_SESSIONS_PATH))
+            .respond_with(session_reply("sess-short", 30))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(AARNN_PERIPHERAL_SESSIONS_PATH))
+            .respond_with(session_reply("sess-long", 900))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(AARNN_MIRROR_PATH))
+            .respond_with(mirror_ok())
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Some(NETWORK));
+        for i in 0..3 {
+            assert!(client.mirror(exchange(&format!("r{i}"))).await.accepted);
+        }
+        assert_eq!(
+            requests_to(&server, AARNN_PERIPHERAL_SESSIONS_PATH)
+                .await
+                .len(),
+            2
+        );
+        let used: Vec<_> = requests_to(&server, AARNN_MIRROR_PATH)
+            .await
+            .iter()
+            .map(session_header)
+            .collect();
+        assert_eq!(
+            used,
+            vec![
+                Some("sess-short".to_string()),
+                Some("sess-long".to_string()),
+                Some("sess-long".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn peripheral_session_recreated_after_403_with_one_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(AARNN_PERIPHERAL_SESSIONS_PATH))
+            .respond_with(session_reply("sess-old", 900))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(AARNN_PERIPHERAL_SESSIONS_PATH))
+            .respond_with(session_reply("sess-new", 900))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(AARNN_MIRROR_PATH))
+            .and(header(PERIPHERAL_SESSION_HEADER, "sess-old"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("unknown peripheral session"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(AARNN_MIRROR_PATH))
+            .and(header(PERIPHERAL_SESSION_HEADER, "sess-new"))
+            .respond_with(mirror_ok())
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Some(NETWORK));
+        let trace = client.mirror(exchange("r1")).await;
+        assert!(trace.accepted, "{:?}", trace.error);
+        assert_eq!(
+            requests_to(&server, AARNN_PERIPHERAL_SESSIONS_PATH)
+                .await
+                .len(),
+            2
+        );
+        assert_eq!(requests_to(&server, AARNN_MIRROR_PATH).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn peripheral_session_error_retries_exactly_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(AARNN_PERIPHERAL_SESSIONS_PATH))
+            .respond_with(session_reply("sess-x", 900))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(AARNN_MIRROR_PATH))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_string("peripheral session not found"),
+            )
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Some(NETWORK));
+        let trace = client.mirror(exchange("r1")).await;
+        assert!(!trace.accepted);
+        assert!(trace.error.expect("error").contains("404"));
+        assert_eq!(requests_to(&server, AARNN_MIRROR_PATH).await.len(), 2);
+        assert_eq!(
+            requests_to(&server, AARNN_PERIPHERAL_SESSIONS_PATH)
+                .await
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn peripheral_disabled_mirrors_without_header_and_caches() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(AARNN_PERIPHERAL_SESSIONS_PATH))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string("peripheral access is disabled (auth mode none)"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(AARNN_MIRROR_PATH))
+            .respond_with(mirror_ok())
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Some(NETWORK));
+        for i in 0..3 {
+            assert!(client.mirror(exchange(&format!("r{i}"))).await.accepted);
+        }
+        let mirrors = requests_to(&server, AARNN_MIRROR_PATH).await;
+        assert_eq!(mirrors.len(), 3);
+        assert!(
+            mirrors
+                .iter()
+                .all(|request| session_header(request).is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn peripheral_unsupported_404_mirrors_without_header() {
+        for status in [404u16, 405] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(AARNN_PERIPHERAL_SESSIONS_PATH))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(AARNN_MIRROR_PATH))
+                .respond_with(mirror_ok())
+                .mount(&server)
+                .await;
+            let client = client_for(&server, Some(NETWORK));
+            assert!(client.mirror(exchange("r1")).await.accepted);
+            assert!(client.mirror(exchange("r2")).await.accepted);
+            let mirrors = requests_to(&server, AARNN_MIRROR_PATH).await;
+            assert!(
+                mirrors
+                    .iter()
+                    .all(|request| session_header(request).is_none())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_network_id_skips_peripheral_session() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(AARNN_PERIPHERAL_SESSIONS_PATH))
+            .respond_with(session_reply("never", 900))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(AARNN_MIRROR_PATH))
+            .respond_with(mirror_ok())
+            .mount(&server)
+            .await;
+        let client = client_for(&server, None);
+        assert!(client.mirror(exchange("r1")).await.accepted);
+    }
+
+    #[tokio::test]
+    async fn concurrent_mirrors_create_single_session() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(AARNN_PERIPHERAL_SESSIONS_PATH))
+            .respond_with(session_reply("sess-shared", 900).set_delay(Duration::from_millis(200)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(AARNN_MIRROR_PATH))
+            .and(header(PERIPHERAL_SESSION_HEADER, "sess-shared"))
+            .respond_with(mirror_ok())
+            .expect(16)
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Some(NETWORK));
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let client = client.clone();
+                tokio::spawn(async move { client.mirror(exchange(&format!("r{i}"))).await })
+            })
+            .collect();
+        for handle in handles {
+            assert!(handle.await.expect("join").accepted);
+        }
+    }
+
+    #[test]
+    fn session_lifetime_is_capped_and_relative() {
+        let now = SystemTime::now();
+        let secs = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(session_lifetime(None, now), Duration::from_secs(900));
+        assert_eq!(
+            session_lifetime(Some(secs + 5000), now),
+            Duration::from_secs(900)
+        );
+        assert_eq!(
+            session_lifetime(Some(secs + 120), now),
+            Duration::from_secs(120)
+        );
+        assert_eq!(session_lifetime(Some(secs - 10), now), Duration::ZERO);
     }
 }
 
