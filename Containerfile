@@ -584,7 +584,9 @@ ARG IMAGE_CREATED=unknown
 ENV DEBIAN_FRONTEND=noninteractive
 
 LABEL org.opencontainers.image.page-size="${TARGET_PAGE_SIZE}" \
-      org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" \
+      org.opencontainers.image.source="https://github.com/neuralmimicry/gail" \
+      org.opencontainers.image.url="https://github.com/neuralmimicry/gail" \
+      org.opencontainers.image.vendor="NeuralMimicry" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.source-tree="${SOURCE_TREE}" \
       org.opencontainers.image.source-dirty="${SOURCE_DIRTY}" \

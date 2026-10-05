@@ -62,6 +62,17 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+      - name: Check OCI source labels
+        shell: bash
+        run: |
+          # GHCR links a package to its repo via org.opencontainers.image.source;
+          # every Containerfile/Dockerfile (incl. templates) must carry it.
+          want="org.opencontainers.image.source=\"https://github.com/${GITHUB_REPOSITORY}\""
+          status=0
+          while IFS= read -r f; do
+            grep -qF "$want" "$f" || { echo "::error file=$f::missing $want"; status=1; }
+          done < <(git ls-files | grep -iE '(^|/)(containerfile|dockerfile)[^/]*$|\.(containerfile|dockerfile)(\.j2)?$' | grep -viE '\.(md|py|sh|txt|ya?ml|json)$')
+          exit "$status"
 
       - name: Derive GAIL version metadata
         id: version
@@ -989,7 +1000,15 @@ jobs:
           arm64_ref="docker://${IMAGE_REPO}:${BUILD_VERSION}-arm64-4k"
 
           podman manifest rm "${manifest_local}" >/dev/null 2>&1 || true
-          podman manifest create "${manifest_local}"
+          # Index annotations let GHCR link the multi-arch package to this repo.
+          index_annotations=()
+          if podman manifest create --help 2>/dev/null | grep -q -- '--annotation'; then
+            index_annotations=(
+              --annotation "org.opencontainers.image.source=https://github.com/neuralmimicry/gail"
+              --annotation "org.opencontainers.image.description=Gail shared AI middleware: multi-provider LLM routing, neuromorphic specialist access and continuous fine-tuning"
+            )
+          fi
+          podman manifest create "${index_annotations[@]}" "${manifest_local}"
           podman manifest add "${manifest_local}" "${amd64_ref}"
           podman manifest add "${manifest_local}" "${arm64_ref}"
 
