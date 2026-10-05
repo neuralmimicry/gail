@@ -18,7 +18,7 @@ env:
 jobs:
   cpu:
     name: CPU-only (${{ matrix.feature_set }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     strategy:
       fail-fast: false
       matrix:
@@ -31,6 +31,11 @@ jobs:
             features: "ci-trading-tests,elm"
     steps:
       - uses: actions/checkout@v5
+      - name: Keep Cargo output in the per-job runner temp directory
+        # The self-hosted runner is persistent; RUNNER_TEMP is wiped after
+        # every job, so the multi-GB target tree is not left behind.
+        shell: bash
+        run: echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/cargo-target" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
