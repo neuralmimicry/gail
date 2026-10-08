@@ -307,6 +307,10 @@ Tracey can consume Gail's neuromorphic and AER endpoints as a stable HTTP contra
 
 NMC already owns AARNN and cloud-control orchestration concerns. Gail sits alongside that stack as the shared AI middleware layer for LLM, neuromorphic scoring, and AER translation so Continuum-facing tooling can call one service contract instead of product-specific glue. When `nmc_telemetry` is enabled, Gail also consumes NMC `/tracey/adaptive` pressure/constraint signals to steer provider ranking and avoid overloaded agents/hosts.
 
+New-model discovery, comparative qualification and Continuum's staged model
+deployment boundary are documented in
+[the model intake and evaluation skill](./docs/operations/model-intake.md).
+
 ### AARNN
 
 The AARNN bridge lets Gail mirror both prompt-side and response-side LLM traffic into AARNN so the attached network can be stimulated over time and, later, provide a candidate reply back into Gail's selection logic.
