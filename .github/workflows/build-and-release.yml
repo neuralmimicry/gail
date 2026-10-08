@@ -748,11 +748,11 @@ jobs:
             echo "ARM64 Podman storage before cleanup:"
             podman system df
             # This graph is isolated to Gail CI on this runner. Remove exited
-            # build containers first so they no longer pin cached images;
-            # container prune leaves active containers untouched. Then reclaim
-            # the unreferenced architecture layers without broad system prune.
+            # build containers first. Buildah may also leave external container
+            # references that Podman cannot list; --external allows pruning
+            # those stale build references without broad system cleanup.
             podman container prune --force
-            podman image prune --all --force
+            podman image prune --all --force --external
             echo "ARM64 filesystem after cleanup:"
             df -h "${HOME}"
             echo "ARM64 Podman storage after cleanup:"
