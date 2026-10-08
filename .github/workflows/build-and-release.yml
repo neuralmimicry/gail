@@ -723,6 +723,8 @@ jobs:
 
       - name: Recover stale rootless Podman state
         shell: bash
+        env:
+          MATRIX_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
 
@@ -731,12 +733,26 @@ jobs:
           # contact GHCR and recommends this migration explicitly.
           if podman info >/dev/null 2>&1; then
             echo "Rootless Podman state is healthy"
-            exit 0
+          else
+            echo "Resetting stale rootless Podman pause-process state"
+            podman system migrate
+            podman info >/dev/null
           fi
 
-          echo "Resetting stale rootless Podman pause-process state"
-          podman system migrate
-          podman info >/dev/null
+          if [[ "${MATRIX_ARCH}" == "arm64" ]]; then
+            # ARM64's CUDA-enabled Python wheel set is large.
+            # This runner reuses a Gail-specific rootless graph between jobs,
+            # so reclaim the previous architecture image/build layers before
+            # starting another full image build. Keep the remote libtorch seed
+            # image in GHCR; the image build can restore it when needed.
+            echo "ARM64 Podman storage before cleanup:"
+            podman system df
+            podman system prune --all --force
+            echo "ARM64 filesystem after cleanup:"
+            df -h "${HOME}"
+            echo "ARM64 Podman storage after cleanup:"
+            podman system df
+          fi
 
       - name: Log in to GHCR
         run: |
