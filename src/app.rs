@@ -169,7 +169,34 @@ pub fn build_router(service: GailService) -> Router {
 /// anchors and mocked completions here).
 pub fn build_router_with_alexa(service: GailService, alexa: Arc<AlexaRuntime>) -> Router {
     let governance_state = (service.clone(), service.governance().clone());
+    let trading_dashboard_api = Router::new()
+        .route(
+            "/dashboard/trading/api/access",
+            get(crate::trading_dashboard::access),
+        )
+        .route("/dashboard/trading/api/status", get(trading_status))
+        .route("/dashboard/trading/api/logs", get(trading_logs))
+        .route("/dashboard/trading/api/pause", post(trading_pause))
+        .route("/dashboard/trading/api/resume", post(trading_resume))
+        .route("/dashboard/trading/api/evaluate", post(trading_evaluate))
+        .route_layer(axum::middleware::from_fn_with_state(
+            service.clone(),
+            crate::trading_dashboard::authorise,
+        ));
+    let trading_dashboard_assets = Router::new()
+        .route("/dashboard/trading", get(crate::trading_dashboard::page))
+        .route("/dashboard/trading/", get(crate::trading_dashboard::page))
+        .route(
+            "/dashboard/trading/assets/dashboard.js",
+            get(crate::trading_dashboard::javascript),
+        )
+        .route(
+            "/dashboard/trading/assets/dashboard.css",
+            get(crate::trading_dashboard::stylesheet),
+        );
     Router::new()
+        .merge(trading_dashboard_api)
+        .merge(trading_dashboard_assets)
         // Public: authenticated by Amazon's request signature, not a Gail token.
         .route(
             crate::alexa::ROUTE,
@@ -870,7 +897,18 @@ fn trading_unavailable() -> Response {
         .into_response()
 }
 
-async fn trading_status(State(service): State<GailService>, headers: HeaderMap) -> Response {
+fn trading_dashboard_operator(
+    identity: Option<Extension<crate::trading_dashboard::DashboardAccess>>,
+) -> String {
+    identity
+        .map(|Extension(access)| format!(" by {}", access.user))
+        .unwrap_or_default()
+}
+
+pub(crate) async fn trading_status(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+) -> Response {
     if let Some(err_resp) = require_trading_scope(&service, &headers) {
         return err_resp;
     }
@@ -947,11 +985,11 @@ async fn trading_history(
 }
 
 #[derive(Debug, Deserialize)]
-struct LogsQuery {
+pub(crate) struct LogsQuery {
     limit: Option<usize>,
 }
 
-async fn trading_logs(
+pub(crate) async fn trading_logs(
     State(service): State<GailService>,
     headers: HeaderMap,
     Query(query): Query<LogsQuery>,
@@ -1083,17 +1121,25 @@ async fn trading_set_config(
     }
 }
 
-async fn trading_pause(State(service): State<GailService>, headers: HeaderMap) -> Response {
+pub(crate) async fn trading_pause(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+    identity: Option<Extension<crate::trading_dashboard::DashboardAccess>>,
+) -> Response {
     if let Some(err_resp) = require_trading_admin(&service, &headers) {
         return err_resp;
     }
+    let operator = trading_dashboard_operator(identity);
     match service.trading_bridge() {
         None => trading_unavailable(),
         Some(bridge) => {
             {
                 let mut state = bridge.state.0.lock().await;
                 state.paused = true;
-                state.log_info("control", "Trading bridge PAUSED via API");
+                state.log_info(
+                    "control",
+                    format!("Trading bridge PAUSED via API{operator}"),
+                );
             }
             if let Err(error) = bridge
                 .state
@@ -1111,17 +1157,25 @@ async fn trading_pause(State(service): State<GailService>, headers: HeaderMap) -
     }
 }
 
-async fn trading_resume(State(service): State<GailService>, headers: HeaderMap) -> Response {
+pub(crate) async fn trading_resume(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+    identity: Option<Extension<crate::trading_dashboard::DashboardAccess>>,
+) -> Response {
     if let Some(err_resp) = require_trading_admin(&service, &headers) {
         return err_resp;
     }
+    let operator = trading_dashboard_operator(identity);
     match service.trading_bridge() {
         None => trading_unavailable(),
         Some(bridge) => {
             {
                 let mut state = bridge.state.0.lock().await;
                 state.paused = false;
-                state.log_info("control", "Trading bridge RESUMED via API");
+                state.log_info(
+                    "control",
+                    format!("Trading bridge RESUMED via API{operator}"),
+                );
             }
             if let Err(error) = bridge
                 .state
@@ -1207,15 +1261,24 @@ async fn trading_override(
     }
 }
 
-async fn trading_evaluate(State(service): State<GailService>, headers: HeaderMap) -> Response {
+pub(crate) async fn trading_evaluate(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+    identity: Option<Extension<crate::trading_dashboard::DashboardAccess>>,
+) -> Response {
     if let Some(err_resp) = require_trading_admin(&service, &headers) {
         return err_resp;
     }
+    let operator = trading_dashboard_operator(identity);
     match service.trading_bridge() {
         None => trading_unavailable(),
         Some(bridge) => {
             let requested = bridge.request_evaluation();
-            let state = bridge.state.0.lock().await;
+            let mut state = bridge.state.0.lock().await;
+            state.log_info(
+                "control",
+                format!("Trading evaluation requested via API{operator}; accepted={requested}"),
+            );
             let snapshot = state.status_snapshot(bridge.is_enabled());
             Json(json!({
                 "ok": requested,
@@ -4193,6 +4256,149 @@ mod tests {
         assert!(payload["config"].get("octobot_password").is_none());
         assert!(payload["config"].get("refiner_api_token").is_none());
         assert_eq!(payload["config"]["octobot_base_url"], upstream.uri());
+    }
+
+    #[tokio::test]
+    async fn trading_dashboard_keeps_service_tokens_server_side_and_denies_cross_origin_controls() {
+        let customers = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"authenticated":true,"user":"owner@example.test","identity_type":"person","service_access":{"gail_trading":{"can_observe":true,"can_control":true}}}"#,
+                "application/json",
+            ))
+            .mount(&customers)
+            .await;
+        let mut config = GailConfig::default();
+        config.trading_dashboard.enabled = true;
+        config.trading_dashboard.customers_session_url = format!("{}/api/session", customers.uri());
+        config.server.public_base_url = Some("https://gail.neuralmimicry.ai".to_string());
+        let app = build_router(test_service_with_config(config).await);
+
+        let access = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/trading/api/access")
+                    .header("cookie", "nm_customers_session_v2=session-value")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("access response");
+        assert_eq!(access.status(), StatusCode::OK);
+        let access_body = to_bytes(access.into_body(), usize::MAX).await.unwrap();
+        let access_text = String::from_utf8(access_body.to_vec()).unwrap();
+        assert!(access_text.contains("owner@example.test"));
+        assert!(!access_text.contains("secret"));
+
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/trading/api/status")
+                    .header("cookie", "nm_customers_session_v2=session-value")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("status response");
+        assert_eq!(status.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status.headers()["cache-control"], "no-store");
+        let status_body = to_bytes(status.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            !String::from_utf8(status_body.to_vec())
+                .unwrap()
+                .contains("secret")
+        );
+
+        let pause = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/dashboard/trading/api/pause")
+                    .header("cookie", "nm_customers_session_v2=session-value")
+                    .header("origin", "https://attacker.example")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("cross-origin response");
+        assert_eq!(pause.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn trading_dashboard_shell_is_accessible_and_disabled_by_default() {
+        let disabled = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = disabled
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/trading")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("disabled dashboard response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let mut config = GailConfig::default();
+        config.trading_dashboard.enabled = true;
+        let enabled = build_router(test_service_with_config(config).await);
+        let response = enabled
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/trading")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("dashboard shell response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers()["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .contains("script-src 'self'")
+        );
+        let page = read_text(response).await;
+        assert!(page.contains("Gail trading overview"));
+        assert!(page.contains("octobot.neuralmimicry.ai"));
+    }
+
+    #[tokio::test]
+    async fn trading_dashboard_observe_only_session_cannot_submit_controls() {
+        let customers = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"authenticated":true,"user":"viewer@example.test","service_access":{"gail_trading":{"can_observe":true,"can_control":false}}}"#,
+                "application/json",
+            ))
+            .mount(&customers)
+            .await;
+        let mut config = GailConfig::default();
+        config.trading_dashboard.enabled = true;
+        config.trading_dashboard.customers_session_url = customers.uri();
+        config.server.public_base_url = Some("https://gail.neuralmimicry.ai".to_string());
+        let app = build_router(test_service_with_config(config).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/dashboard/trading/api/pause")
+                    .header("cookie", "nm_customers_session_v2=session-value")
+                    .header("origin", "https://gail.neuralmimicry.ai")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("observe-only response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("control_access_required")
+        );
     }
 
     #[tokio::test]

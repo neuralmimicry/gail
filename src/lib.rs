@@ -26,4 +26,5 @@ pub mod redaction;
 pub mod routing;
 pub mod specialists;
 pub mod trading;
+pub(crate) mod trading_dashboard;
 pub mod trainer_worker;
