@@ -520,6 +520,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn login_return_url_stays_on_gails_configured_public_origin() {
+        let mut config = GailConfig::default();
+        config.server.public_base_url = Some("https://gail.neuralmimicry.ai".to_string());
+        let login = Url::parse(&login_url(&config).expect("Customers login URL")).unwrap();
+        assert_eq!(
+            login.origin().ascii_serialization(),
+            "https://api.neuralmimicry.ai"
+        );
+        let return_to = login
+            .query_pairs()
+            .find(|(key, _)| key == "rd")
+            .map(|(_, value)| value.into_owned())
+            .expect("return destination");
+        assert_eq!(return_to, "https://gail.neuralmimicry.ai/dashboard/trading");
+    }
+
     #[tokio::test]
     async fn customer_session_access_requires_observe_permission_and_reports_control_separately() {
         let customers = wiremock::MockServer::start().await;

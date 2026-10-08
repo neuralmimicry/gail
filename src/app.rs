@@ -4275,6 +4275,30 @@ mod tests {
         config.server.public_base_url = Some("https://gail.neuralmimicry.ai".to_string());
         let app = build_router(test_service_with_config(config).await);
 
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/trading/api/access")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("unauthenticated access response");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        let unauthenticated_body = to_bytes(unauthenticated.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let unauthenticated_json: Value =
+            serde_json::from_slice(&unauthenticated_body).expect("login response");
+        assert_eq!(unauthenticated_json["error"], "login_required");
+        assert!(
+            unauthenticated_json["login_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://api.neuralmimicry.ai/auth/external-login?rd=")
+        );
+
         let access = app
             .clone()
             .oneshot(
