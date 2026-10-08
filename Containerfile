@@ -519,6 +519,8 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY build.rs ./
 COPY src ./src
+# `src/app.rs` embeds the model-intake dashboard at compile time.
+COPY web ./web
 # `src/trading_dashboard.rs` embeds these files at compile time.
 COPY assets ./assets
 COPY config ./config
