@@ -311,6 +311,8 @@ pub struct StorageConfig {
     pub trainer_output_path: String,
     pub postgres_dsn: Option<String>,
     pub ollama_model_store_path: Option<String>,
+    /// Encrypted runtime credentials for model-provider downloads.
+    pub model_credentials_path: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -438,6 +440,7 @@ impl Default for StorageConfig {
             trainer_output_path: "data/training".to_string(),
             postgres_dsn: None,
             ollama_model_store_path: None,
+            model_credentials_path: "data/model_credentials/credentials.enc".to_string(),
         }
     }
 }

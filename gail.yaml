@@ -198,6 +198,7 @@ storage:
   api_issues_path: "./data/api_issues.json"
   llm_ledger_path: "./data/llm_interactions.jsonl"
   trainer_output_path: "./data/training"
+  model_credentials_path: "./data/model_credentials/credentials.enc"
   postgres_dsn: "${GAIL_POSTGRES_DSN}"
   ollama_model_store_path: "./data/ollama_model_inventory.json"
 

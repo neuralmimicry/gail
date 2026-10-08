@@ -186,6 +186,14 @@ sudo systemctl enable --now gail
 
 Provider credentials, Gail bearer tokens, Ollama endpoints, and trading defaults belong in `/etc/gail/gail.env`. Persistent runtime state is written under `/var/lib/gail` because the systemd unit starts Gail with that working directory.
 
+## Runtime model-provider credentials
+
+The authenticated model-intake page is available at `/admin/model-intake`. The page itself contains no secrets; its API requires a Gail bearer token with the dedicated `model-admin` scope. The page keeps that token in memory only and does not put provider credentials in browser storage. Saved values are write-only: the API returns provider names and configured-field flags, never credential values.
+
+Set `GAIL_MODEL_CREDENTIALS_ENCRYPTION_KEY` to a persistent 32-byte key encoded as 64 hexadecimal characters before enabling the page. Keep this key in the deployment secret manager and back it up securely; changing or losing it makes existing encrypted entries unreadable. Gail stores credentials at `storage.model_credentials_path` (default `./data/model_credentials/credentials.enc`) using AES-256-GCM, mode `0600`, atomic updates and a separate lock file. The storage directory must be on a durable volume shared by Gail API replicas and the trainer worker. Credential updates and revocations take effect without a deployment restart.
+
+For Hugging Face downloads, save the access token as the `huggingface` provider token. Gail supplies it to its model-download child process as `HF_TOKEN`; the child output is redacted before it is logged or retained in a training report. Username and password fields are accepted and encrypted for providers that require them, but the current Hugging Face integration uses the access token. Use a narrowly scoped provider token and rotate or revoke it from the page when needed.
+
 ## Configuration Notes
 
 - `providers`: shared LLM backends Gail can orchestrate.

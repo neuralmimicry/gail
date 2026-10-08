@@ -17,6 +17,7 @@ use tokio::{
 };
 use tracing::{info, warn};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::{
     aarnn_bridge::{AarnnMirrorClient, AarnnMirrorExchange},
@@ -29,6 +30,7 @@ use crate::{
     hardware::{detect_hardware, log_hardware_profile},
     llm_ledger::{LlmLedger, LlmLedgerRecord},
     metrics::{CandidateMetricsSummary, HealthBucket, LocalUsageTelemetry, MetricsStore},
+    model_credentials::ModelCredentialVault,
     models::{
         AarnnMirrorDirection, AerDecodeRequest, AerDecodeResponse, AerEncodeRequest,
         AerEncodeResponse, AuthContext, CandidateInvocationSummary, CandidateSummary,
@@ -137,6 +139,7 @@ struct GailServiceInner {
     nmc_telemetry: Option<NmcTelemetryClient>,
     trading_bridge: Option<TradingBridge>,
     _trading_bridge_handle: Option<TradingBridgeHandle>,
+    model_credential_vault: Option<Arc<ModelCredentialVault>>,
     load_tracker: Arc<Mutex<LoadTracker>>,
     load_released: Arc<Notify>,
     round_robin_cursors: Arc<Mutex<HashMap<String, usize>>>,
@@ -452,7 +455,17 @@ impl GailService {
     pub fn metrics(&self) -> MetricsStore {
         self.inner.metrics.clone()
     }
-    pub async fn new(mut config: GailConfig) -> Result<Self> {
+    pub async fn new(config: GailConfig) -> Result<Self> {
+        let encryption_key = env::var("GAIL_MODEL_CREDENTIALS_ENCRYPTION_KEY").ok();
+        Self::new_with_model_credential_key(config, encryption_key).await
+    }
+
+    /// Creates the service with a runtime encryption key for model-provider
+    /// credentials. The key is not read from Gail's YAML configuration.
+    pub async fn new_with_model_credential_key(
+        mut config: GailConfig,
+        mut encryption_key: Option<String>,
+    ) -> Result<Self> {
         config.elm.normalize()?;
         #[cfg(feature = "elm")]
         let elm_runtime = if config.elm.enabled() {
@@ -519,6 +532,23 @@ impl GailService {
         // the mirror/trainer workers.  Comparative validation uses the same
         // tables, so it does not need a separate migration.
         let metrics = MetricsStore::new(config.storage.metrics_path.clone()).await?;
+        let model_credential_vault_result = if let Some(key) = encryption_key.as_deref() {
+            ModelCredentialVault::open(&config.storage.model_credentials_path, key)
+                .await
+                .map(Arc::new)
+                .map(Some)
+                .map_err(|_| {
+                    GailError::invalid_config(
+                        "could not open the encrypted model-provider credential store",
+                    )
+                })
+        } else {
+            Ok(None)
+        };
+        if let Some(key) = &mut encryption_key {
+            key.zeroize();
+        }
+        let model_credential_vault = model_credential_vault_result?;
         let specialists = build_specialist_engines(&config, client.clone());
         let aarnn_bridge = AarnnMirrorClient::from_config(&config, client.clone(), &specialists);
         let nmc_telemetry = NmcTelemetryClient::from_config(&config, client.clone());
@@ -583,6 +613,7 @@ impl GailService {
                 nmc_telemetry: nmc_telemetry.clone(),
                 trading_bridge: None,
                 _trading_bridge_handle: None,
+                model_credential_vault: model_credential_vault.clone(),
                 load_tracker: load_tracker.clone(),
                 load_released: load_released.clone(),
                 round_robin_cursors: round_robin_cursors.clone(),
@@ -618,6 +649,7 @@ impl GailService {
                 nmc_telemetry,
                 trading_bridge,
                 _trading_bridge_handle: trading_bridge_handle,
+                model_credential_vault,
                 load_tracker,
                 load_released,
                 round_robin_cursors,
@@ -1332,6 +1364,10 @@ impl GailService {
                 }
             }
         });
+    }
+
+    pub fn model_credential_vault(&self) -> Option<Arc<ModelCredentialVault>> {
+        self.inner.model_credential_vault.clone()
     }
 
     fn aarnn_bridge(&self) -> Option<&AarnnMirrorClient> {

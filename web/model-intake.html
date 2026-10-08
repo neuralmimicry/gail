@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Gail model provider access</title>
+  <link rel="stylesheet" href="/admin/model-intake.css">
+  <script src="/admin/model-intake.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <p class="eyebrow">Gail · Model intake</p>
+      <h1>Provider access</h1>
+      <p class="lede">Manage credentials Gail may use when it downloads model files from third-party providers. Changes apply at runtime; they do not require a Gail redeployment.</p>
+    </header>
+
+    <section class="panel" aria-labelledby="access-heading">
+      <h2 id="access-heading">Administrator access</h2>
+      <p>Enter a Gail API token with the <code>model-admin</code> scope. The token stays in this page's memory and is cleared when you leave or refresh.</p>
+      <form id="connect-form">
+        <label for="admin-token">Gail administrator token</label>
+        <div class="row">
+          <input id="admin-token" type="password" autocomplete="off" required>
+          <button type="submit">Connect</button>
+        </div>
+      </form>
+      <p id="connection-status" class="status" role="status" aria-live="polite">Not connected</p>
+    </section>
+
+    <section class="panel" aria-labelledby="credential-heading">
+      <h2 id="credential-heading">Add or replace provider credentials</h2>
+      <p>Credentials are encrypted before they are stored. Gail never returns their values after saving. Hugging Face downloads use the access token field.</p>
+      <form id="credential-form">
+        <label for="provider">Provider identifier</label>
+        <input id="provider" name="provider" value="huggingface" maxlength="64" pattern="[A-Za-z0-9_-]+" required>
+
+        <label for="username">Username <span>(optional)</span></label>
+        <input id="username" name="username" autocomplete="off" maxlength="1024">
+
+        <label for="password">Password <span>(optional)</span></label>
+        <input id="password" name="password" type="password" autocomplete="new-password" maxlength="8192">
+
+        <label for="provider-token">Access token <span>(optional)</span></label>
+        <input id="provider-token" name="token" type="password" autocomplete="new-password" maxlength="8192">
+
+        <div class="actions">
+          <button type="submit">Save credentials</button>
+          <button id="refresh-button" class="secondary" type="button">Refresh status</button>
+        </div>
+      </form>
+      <p id="credential-status" class="status" role="status" aria-live="polite"></p>
+    </section>
+
+    <section class="panel" aria-labelledby="stored-heading">
+      <div class="heading-row">
+        <h2 id="stored-heading">Configured providers</h2>
+        <button id="refresh-list" class="secondary" type="button">Refresh</button>
+      </div>
+      <p class="muted">This list shows which credential types are present. Secret values are never displayed.</p>
+      <ul id="provider-list" class="provider-list"><li>Connect to view provider status.</li></ul>
+    </section>
+    <footer>Keep provider tokens scoped to model downloads and rotate or revoke them when no longer needed.</footer>
+  </main>
+</body>
+</html>
