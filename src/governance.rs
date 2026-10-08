@@ -393,7 +393,10 @@ fn scope_for_path(path: &str) -> Option<&'static str> {
         | "/v1/audio/transcriptions" => Some("llm"),
         "/v1/neuromorphic/analyze" | "/v1/neuromorphic/predict" => Some("neuromorphic"),
         "/v1/aer/encode" | "/v1/aer/decode" => Some("aer"),
-        "/v1/trading/evaluate" => Some("trading"),
+        "/v1/trading/evaluate"
+        | "/dashboard/trading/api/pause"
+        | "/dashboard/trading/api/resume"
+        | "/dashboard/trading/api/evaluate" => Some("trading"),
         _ => None,
     }
 }

@@ -31,6 +31,7 @@ pub struct GailConfig {
     pub specialists: Vec<SpecialistProfile>,
     pub storage: StorageConfig,
     pub trading: TradingConfig,
+    pub trading_dashboard: TradingDashboardConfig,
     pub comparative_validation: ComparativeValidationConfig,
     /// Optional native ELM capability. Old configuration files default to off.
     pub elm: crate::elm_config::ElmConfig,
@@ -73,6 +74,30 @@ impl Default for ComparativeValidationConfig {
 pub struct ServerConfig {
     pub bind_addr: String,
     pub public_base_url: Option<String>,
+}
+
+/// Customers-backed browser access for Gail's trading-owned dashboard.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TradingDashboardConfig {
+    pub enabled: bool,
+    pub customers_session_url: String,
+    pub customers_session_cookie_name: String,
+    pub customers_login_url: String,
+    pub customers_timeout_ms: u64,
+}
+
+impl Default for TradingDashboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            customers_session_url: "http://customers.customers.svc.cluster.local:5010/api/session"
+                .to_string(),
+            customers_session_cookie_name: "nm_customers_session_v2".to_string(),
+            customers_login_url: "https://api.neuralmimicry.ai/auth/external-login".to_string(),
+            customers_timeout_ms: 2_000,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -620,6 +645,54 @@ impl GailConfig {
         }
         self.server.public_base_url =
             normalize_optional_url(self.server.public_base_url.as_deref());
+        self.trading_dashboard.customers_timeout_ms = self
+            .trading_dashboard
+            .customers_timeout_ms
+            .clamp(200, 15_000);
+        if self.trading_dashboard.enabled {
+            let session_url = url::Url::parse(self.trading_dashboard.customers_session_url.trim())
+                .map_err(|_| {
+                    GailError::invalid_config("invalid trading dashboard Customers session URL")
+                })?;
+            if !matches!(session_url.scheme(), "http" | "https")
+                || session_url.host_str().is_none()
+                || !session_url.username().is_empty()
+                || session_url.password().is_some()
+                || session_url.query().is_some()
+                || session_url.fragment().is_some()
+            {
+                return Err(GailError::invalid_config(
+                    "trading dashboard Customers session URL must be an HTTP(S) endpoint without credentials, query or fragment",
+                ));
+            }
+            let login_url = url::Url::parse(self.trading_dashboard.customers_login_url.trim())
+                .map_err(|_| {
+                    GailError::invalid_config("invalid trading dashboard Customers login URL")
+                })?;
+            if login_url.scheme() != "https"
+                || login_url.host_str().is_none()
+                || !login_url.username().is_empty()
+                || login_url.password().is_some()
+                || login_url.fragment().is_some()
+            {
+                return Err(GailError::invalid_config(
+                    "trading dashboard Customers login URL must be an HTTPS URL without credentials or fragment",
+                ));
+            }
+            let cookie_name = self.trading_dashboard.customers_session_cookie_name.trim();
+            if cookie_name.is_empty()
+                || !cookie_name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                return Err(GailError::invalid_config(
+                    "trading dashboard Customers session cookie name is invalid",
+                ));
+            }
+            self.trading_dashboard.customers_session_url = session_url.to_string();
+            self.trading_dashboard.customers_login_url = login_url.to_string();
+            self.trading_dashboard.customers_session_cookie_name = cookie_name.to_string();
+        }
         if self.orchestration.max_parallel_candidates == 0 {
             self.orchestration.max_parallel_candidates = 1;
         }

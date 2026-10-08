@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en-GB">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>Gail trading overview</title>
+    <link rel="stylesheet" href="/dashboard/trading/assets/dashboard.css">
+    <script src="/dashboard/trading/assets/dashboard.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to trading overview</a>
+    <header class="site-header">
+      <div>
+        <p class="eyebrow">Gail · Trading</p>
+        <h1>Trading overview</h1>
+        <p class="lede">Gail's strategy and trading bridge, with exchange execution managed by OctoBot.</p>
+      </div>
+      <div class="header-actions">
+        <span id="session-state" class="session-state" role="status" aria-live="polite">Checking access…</span>
+        <button id="refresh" type="button">Refresh data</button>
+      </div>
+    </header>
+
+    <main id="main">
+      <section id="login-panel" class="notice" hidden aria-labelledby="login-title">
+        <h2 id="login-title">Sign in to continue</h2>
+        <p>Your Customers session is needed to view Gail trading information.</p>
+        <a id="login-link" class="button-link" href="https://api.neuralmimicry.ai/auth/external-login">Sign in</a>
+      </section>
+      <section id="access-error" class="notice error" hidden role="alert">
+        <h2>Trading information is unavailable</h2>
+        <p id="access-error-message">Please retry shortly.</p>
+      </section>
+
+      <section class="ownership" aria-label="Data ownership">
+        <p><strong>Gail owns:</strong> strategy status, evaluation state and trading bridge records.</p>
+        <p><strong>OctoBot owns:</strong> exchange-side orders and positions. <a href="https://octobot.neuralmimicry.ai/" target="_blank" rel="noopener noreferrer">Open OctoBot</a> for execution detail.</p>
+      </section>
+
+      <section id="controls" class="panel controls" aria-labelledby="controls-title" hidden>
+        <div>
+          <h2 id="controls-title">Trading controls</h2>
+          <p>Control access is required. Each change is submitted to Gail over this same-origin session.</p>
+        </div>
+        <div class="button-row">
+          <button id="pause" type="button" class="secondary">Pause trading</button>
+          <button id="resume" type="button" class="secondary">Resume trading</button>
+          <button id="evaluate" type="button">Request evaluation</button>
+        </div>
+        <p id="action-result" class="action-result" role="status" aria-live="polite"></p>
+      </section>
+
+      <section class="grid" aria-label="Trading data">
+        <article class="panel" aria-labelledby="status-title">
+          <div class="panel-heading"><h2 id="status-title">Strategy status</h2><span class="source">Source: Gail</span></div>
+          <pre id="status-data" class="data" tabindex="0" aria-label="Gail strategy status">Waiting for access.</pre>
+        </article>
+        <article class="panel" aria-labelledby="portfolio-title">
+          <h2 id="portfolio-title">Exchange execution detail</h2>
+          <p class="source">Owner: OctoBot</p>
+          <p>OctoBot is the authoritative dashboard for balances, orders, positions and complete execution history. Gail does not duplicate those records here.</p>
+          <p><a class="button-link" href="https://octobot.neuralmimicry.ai/" target="_blank" rel="noopener noreferrer">Open OctoBot</a></p>
+        </article>
+        <article class="panel panel-wide" aria-labelledby="logs-title">
+          <div class="panel-heading"><h2 id="logs-title">Recent activity</h2><span class="source">Source: Gail</span></div>
+          <pre id="logs-data" class="data" tabindex="0" aria-label="Recent Gail trading activity">Waiting for access.</pre>
+        </article>
+      </section>
+      <p id="last-updated" class="last-updated" aria-live="polite"></p>
+    </main>
+    <footer>
+      <p>Refreshes every 30 seconds. Trading data is not cached by this dashboard.</p>
+    </footer>
+  </body>
+</html>
