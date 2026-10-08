@@ -16,6 +16,7 @@ pub mod hardware;
 pub mod llm_ledger;
 pub mod metrics;
 pub mod mirror_worker;
+pub mod model_credentials;
 pub mod models;
 pub mod nmc_telemetry;
 pub mod orchestration;

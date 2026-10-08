@@ -3,6 +3,7 @@ use std::{
     env,
     path::{Component, Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -25,7 +26,9 @@ use crate::{
         MetricsStore, TrainingRunObservation, backfill_training_observations,
         classify_training_failure, upsert_training_observation,
     },
+    model_credentials::ModelCredentialVault,
 };
+use zeroize::{Zeroize, Zeroizing};
 
 pub async fn run(config: GailConfig) -> Result<()> {
     let Some(dsn) = config.storage.postgres_dsn.clone() else {
@@ -45,6 +48,23 @@ pub async fn run(config: GailConfig) -> Result<()> {
             GailError::invalid_config("another Gail trainer worker is already running")
         })?;
     let trainer = config.trainer.clone();
+    let model_credential_vault =
+        if let Ok(mut encryption_key) = env::var("GAIL_MODEL_CREDENTIALS_ENCRYPTION_KEY") {
+            let vault = ModelCredentialVault::open(
+                &config.storage.model_credentials_path,
+                encryption_key.as_str(),
+            )
+            .await
+            .map_err(|_| {
+                GailError::invalid_config(
+                    "could not open the encrypted model-provider credential store",
+                )
+            });
+            encryption_key.zeroize();
+            Some(Arc::new(vault?))
+        } else {
+            None
+        };
     match llm_ledger::recover_incomplete_training_registrations(&dsn, trainer.recovery_batch_size)
         .await
     {
@@ -146,6 +166,7 @@ pub async fn run(config: GailConfig) -> Result<()> {
                     recovered.ledger_ids.as_slice(),
                     config.storage.metrics_path.as_str(),
                     dsn.as_str(),
+                    model_credential_vault.as_ref(),
                 )
                 .await?;
                 continue;
@@ -231,6 +252,7 @@ pub async fn run(config: GailConfig) -> Result<()> {
             ids.as_slice(),
             config.storage.metrics_path.as_str(),
             dsn.as_str(),
+            model_credential_vault.as_ref(),
         )
         .await?;
     }
@@ -249,6 +271,7 @@ async fn process_training_snapshot(
     ids: &[i64],
     metrics_path: &str,
     postgres_dsn: &str,
+    model_credential_vault: Option<&Arc<ModelCredentialVault>>,
 ) -> Result<()> {
     let train_outcome = run_training_pipeline(
         trainer,
@@ -259,6 +282,7 @@ async fn process_training_snapshot(
         ids,
         metrics_path,
         postgres_dsn,
+        model_credential_vault,
     )
     .await;
     if let Err(error) = remove_active_training_marker(trainer).await {
@@ -1004,6 +1028,7 @@ async fn run_training_pipeline(
     ledger_ids: &[i64],
     metrics_path: &str,
     postgres_dsn: &str,
+    model_credential_vault: Option<&Arc<ModelCredentialVault>>,
 ) -> Result<TrainingOutcome> {
     fs::create_dir_all(snapshot_dir).await.map_err(|error| {
         GailError::invalid_config(format!("failed to create snapshot output path: {error}"))
@@ -1053,6 +1078,7 @@ async fn run_training_pipeline(
         dataset_path,
         snapshot_dir,
         resume_adapter.as_deref(),
+        model_credential_vault,
     )
     .await?;
     let mut training_executed = false;
@@ -1078,6 +1104,7 @@ async fn run_training_pipeline(
                 snapshot_id,
                 dataset_path,
                 snapshot_dir,
+                model_credential_vault,
             )
             .await?
         };
@@ -1930,8 +1957,11 @@ async fn execute_training_command(
     snapshot_id: &str,
     dataset_path: &Path,
     snapshot_dir: &Path,
+    model_credential_vault: Option<&Arc<ModelCredentialVault>>,
 ) -> Result<CommandOutcome> {
     let started = tokio::time::Instant::now();
+    let hf_token = provider_download_token(model_credential_vault).await?;
+    let mut redacted_secrets = Vec::<Zeroizing<String>>::new();
 
     let mut command = Command::new("bash");
     command
@@ -2035,6 +2065,10 @@ async fn execute_training_command(
             "NUMEXPR_NUM_THREADS",
             execution_plan.tokenizer_threads.to_string(),
         );
+    if let Some(token) = hf_token.as_deref() {
+        command.env("HF_TOKEN", token.as_str());
+        redacted_secrets.push(Zeroizing::new(token.to_string()));
+    }
 
     if hardware.gpu_count() == 0 {
         command.env("CUDA_VISIBLE_DEVICES", "");
@@ -2055,8 +2089,16 @@ async fn execute_training_command(
         .take()
         .ok_or_else(|| GailError::invalid_config("failed to capture trainer stderr".to_string()))?;
 
-    let stdout_task = tokio::spawn(stream_child_output("trainer.stdout", stdout));
-    let stderr_task = tokio::spawn(stream_child_output("trainer.stderr", stderr));
+    let stdout_task = tokio::spawn(stream_child_output_redacting(
+        "trainer.stdout",
+        stdout,
+        redacted_secrets.clone(),
+    ));
+    let stderr_task = tokio::spawn(stream_child_output_redacting(
+        "trainer.stderr",
+        stderr,
+        redacted_secrets,
+    ));
 
     let timeout_duration = Duration::from_secs(trainer.command_timeout_seconds.max(1));
     let status = match tokio::time::timeout(timeout_duration, child.wait()).await {
@@ -2100,13 +2142,50 @@ async fn execute_training_command(
     })
 }
 
+async fn provider_download_token(
+    vault: Option<&Arc<ModelCredentialVault>>,
+) -> Result<Option<Zeroizing<String>>> {
+    let Some(vault) = vault else {
+        return Ok(None);
+    };
+    let credentials = vault.get("huggingface".to_string()).await.map_err(|_| {
+        GailError::invalid_config("could not read encrypted Hugging Face download credentials")
+    })?;
+    let Some(credentials) = credentials else {
+        return Ok(None);
+    };
+    let token = credentials
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| Zeroizing::new(token.to_string()));
+    Ok(token)
+}
+
 async fn stream_child_output<R>(target: &'static str, reader: R) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    stream_child_output_redacting(target, reader, Vec::new()).await
+}
+
+async fn stream_child_output_redacting<R>(
+    target: &'static str,
+    reader: R,
+    redacted_secrets: Vec<Zeroizing<String>>,
+) -> String
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut lines = BufReader::new(reader).lines();
     let mut tail = String::new();
-    while let Ok(Some(line)) = lines.next_line().await {
+    while let Ok(Some(mut line)) = lines.next_line().await {
+        for secret in &redacted_secrets {
+            if !secret.is_empty() {
+                line = line.replace(secret.as_str(), "[REDACTED]");
+            }
+        }
         if target.ends_with(".stderr") {
             tracing::warn!(target = target, "{}", line);
         } else {
@@ -2135,6 +2214,7 @@ async fn resolve_training_invocation(
     dataset_path: &Path,
     snapshot_dir: &Path,
     resume_adapter: Option<&Path>,
+    model_credential_vault: Option<&Arc<ModelCredentialVault>>,
 ) -> Result<Option<String>> {
     if let Some(command_template) = trainer.command_template.as_deref() {
         return Ok(Some(render_training_command(
@@ -2189,8 +2269,13 @@ async fn resolve_training_invocation(
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| trainer.ollama_base_model.clone());
-        let (model_module, tokenizer) =
-            ensure_torchscript_artifacts(trainer, base_model.as_str(), dataset_path).await?;
+        let (model_module, tokenizer) = ensure_torchscript_artifacts(
+            trainer,
+            base_model.as_str(),
+            dataset_path,
+            model_credential_vault,
+        )
+        .await?;
 
         return Ok(Some(format!(
             "{} --dataset {} --output {} --algorithm {} --base-model {} --model-module {} --tokenizer {} --timeout-seconds {}{}",
@@ -2218,6 +2303,7 @@ async fn ensure_torchscript_artifacts(
     trainer: &TrainerConfig,
     base_model: &str,
     dataset_path: &Path,
+    model_credential_vault: Option<&Arc<ModelCredentialVault>>,
 ) -> Result<(PathBuf, PathBuf)> {
     let artifact_mode = training_artifact_mode();
     let explicit_model_module = std::env::var("GAIL_TCH_MODEL_MODULE")
@@ -2257,8 +2343,15 @@ async fn ensure_torchscript_artifacts(
         )));
     }
 
-    bootstrap_torchscript_artifacts(trainer, base_model, dataset_path, &model_module, &tokenizer)
-        .await?;
+    bootstrap_torchscript_artifacts(
+        trainer,
+        base_model,
+        dataset_path,
+        &model_module,
+        &tokenizer,
+        model_credential_vault,
+    )
+    .await?;
     if model_module.exists() && tokenizer.exists() {
         return Ok((model_module, tokenizer));
     }
@@ -2275,6 +2368,7 @@ async fn bootstrap_torchscript_artifacts(
     dataset_path: &Path,
     model_module: &Path,
     tokenizer: &Path,
+    model_credential_vault: Option<&Arc<ModelCredentialVault>>,
 ) -> Result<()> {
     if let Some(parent) = model_module.parent() {
         fs::create_dir_all(parent).await.map_err(|error| {
@@ -2294,6 +2388,8 @@ async fn bootstrap_torchscript_artifacts(
     }
 
     let bootstrap_python = bootstrap_python_binary();
+    let hf_token = provider_download_token(model_credential_vault).await?;
+    let mut redacted_secrets = Vec::<Zeroizing<String>>::new();
     let bootstrap_script_path = PathBuf::from("/tmp/gail_torchscript_bootstrap.py");
     let timeout_seconds = bootstrap_timeout_seconds();
     let hidden_size = bootstrap_env_usize("GAIL_TCH_BOOTSTRAP_HIDDEN_SIZE", 192, 64, 2048);
@@ -2346,6 +2442,10 @@ async fn bootstrap_torchscript_artifacts(
     if let Some(hf_model_hint) = hf_model_hint.as_deref() {
         command.arg("--hf-model").arg(hf_model_hint);
     }
+    if let Some(token) = hf_token.as_deref() {
+        command.env("HF_TOKEN", token.as_str());
+        redacted_secrets.push(Zeroizing::new(token.to_string()));
+    }
     let mut child = command.spawn().map_err(|error| {
         GailError::invalid_config(format!(
             "failed to spawn TorchScript bootstrap command: {error}"
@@ -2357,8 +2457,16 @@ async fn bootstrap_torchscript_artifacts(
     let stderr = child.stderr.take().ok_or_else(|| {
         GailError::invalid_config("failed to capture TorchScript bootstrap stderr".to_string())
     })?;
-    let stdout_task = tokio::spawn(stream_child_output("torchscript.bootstrap.stdout", stdout));
-    let stderr_task = tokio::spawn(stream_child_output("torchscript.bootstrap.stderr", stderr));
+    let stdout_task = tokio::spawn(stream_child_output_redacting(
+        "torchscript.bootstrap.stdout",
+        stdout,
+        redacted_secrets.clone(),
+    ));
+    let stderr_task = tokio::spawn(stream_child_output_redacting(
+        "torchscript.bootstrap.stderr",
+        stderr,
+        redacted_secrets,
+    ));
 
     let status =
         match tokio::time::timeout(Duration::from_secs(timeout_seconds), child.wait()).await {
@@ -3948,6 +4056,60 @@ fn now_ts() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn configured_huggingface_token_is_loaded_only_for_the_download_worker() {
+        const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let vault = Arc::new(
+            ModelCredentialVault::open(directory.path().join("credentials.enc"), KEY)
+                .await
+                .expect("vault"),
+        );
+        vault
+            .put(
+                "huggingface".to_string(),
+                crate::model_credentials::ProviderCredentials {
+                    username: None,
+                    password: None,
+                    token: Some("hf_runtime_secret".to_string()),
+                },
+            )
+            .await
+            .expect("save token");
+
+        let token = provider_download_token(Some(&vault))
+            .await
+            .expect("load token")
+            .expect("configured token");
+        assert_eq!(token.as_str(), "hf_runtime_secret");
+        assert!(
+            provider_download_token(None)
+                .await
+                .expect("disabled provider store")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_token_is_removed_from_trainer_output_before_logging() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(256);
+        writer
+            .write_all(b"download failed with token hf_runtime_secret\n")
+            .await
+            .expect("write fixture output");
+        drop(writer);
+        let output = stream_child_output_redacting(
+            "trainer.stderr",
+            reader,
+            vec![Zeroizing::new("hf_runtime_secret".to_string())],
+        )
+        .await;
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("hf_runtime_secret"));
+    }
 
     #[test]
     fn terminal_slurm_result_exit_code_requires_valid_result() {

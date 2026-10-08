@@ -1,0 +1,37 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #17212b;
+  background: #f1f5f6;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; }
+.shell { width: min(880px, calc(100% - 32px)); margin: 48px auto; }
+header { margin: 0 0 28px; }
+.eyebrow { margin: 0 0 8px; color: #007f83; font-size: 0.8rem; font-weight: 750; letter-spacing: 0.12em; text-transform: uppercase; }
+h1 { margin: 0; font-size: clamp(2rem, 5vw, 3rem); letter-spacing: -0.04em; }
+h2 { margin: 0 0 12px; font-size: 1.15rem; }
+p { line-height: 1.6; }
+.lede { max-width: 68ch; color: #536271; }
+.panel { margin: 18px 0; padding: 24px; border: 1px solid #d6e0e3; border-radius: 14px; background: #fff; box-shadow: 0 8px 24px rgb(23 33 43 / 4%); }
+label { display: block; margin: 16px 0 7px; font-size: 0.9rem; font-weight: 650; }
+label span, .muted { color: #687785; font-weight: 400; }
+input { display: block; width: 100%; min-height: 44px; padding: 10px 12px; border: 1px solid #b7c5cb; border-radius: 8px; color: inherit; background: #fff; font: inherit; }
+input:focus { border-color: #007f83; outline: 3px solid rgb(0 127 131 / 14%); }
+.row, .actions, .heading-row { display: flex; align-items: center; gap: 10px; }
+.heading-row { justify-content: space-between; }
+button { min-height: 42px; padding: 9px 15px; border: 0; border-radius: 8px; background: #006f73; color: #fff; font: inherit; font-weight: 700; cursor: pointer; }
+button:hover { background: #005b5f; }
+button.secondary { border: 1px solid #b7c5cb; background: #fff; color: #273945; }
+button.danger { border: 1px solid #e6b9b9; background: #fff; color: #a22727; }
+.status { min-height: 1.5em; margin-bottom: 0; color: #586875; }
+.status.success { color: #087349; }
+.status.error { color: #a22727; }
+.provider-list { padding: 0; list-style: none; }
+.provider-list li { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 0; border-top: 1px solid #e5ebed; }
+.provider-list strong, .provider-list span { display: block; }
+.provider-list span { margin-top: 5px; color: #687785; font-size: 0.9rem; }
+footer { padding: 12px 2px 32px; color: #687785; font-size: 0.85rem; }
+code { padding: 2px 5px; border-radius: 4px; background: #eef4f4; }
+@media (max-width: 560px) { .shell { margin-top: 24px; } .panel { padding: 18px; } .row, .provider-list li { align-items: stretch; flex-direction: column; } }

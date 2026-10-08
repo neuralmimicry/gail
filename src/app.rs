@@ -10,9 +10,12 @@ use axum::{
     Extension, Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
-    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{CACHE_CONTROL, CONTENT_TYPE, PRAGMA},
+    },
     response::{
-        IntoResponse, Response,
+        Html, IntoResponse, Response,
         sse::{Event, Sse},
     },
     routing::{get, post},
@@ -30,6 +33,7 @@ use crate::{
     api_issues,
     config::ProviderProfile,
     errors::{GailError, Result},
+    model_credentials::ProviderCredentials,
     models::{
         AerDecodeRequest, AerDecodeResponse, AerEncodeRequest, AerEncodeResponse, ChatMessage,
         CompletionRequest, CompletionResponse, ContentPart, HealthResponse, ImageUrlValue,
@@ -210,6 +214,15 @@ pub fn build_router_with_alexa(service: GailService, alexa: Arc<AlexaRuntime>) -
             get(crate::governance::assessment_status),
         )
         .route("/v1/status/governance", get(crate::governance::status))
+        .route("/admin/model-intake", get(model_intake_dashboard))
+        .route("/admin/model-intake.js", get(model_intake_javascript))
+        .route("/admin/model-intake.css", get(model_intake_stylesheet))
+        .route(
+            "/v1/admin/model-provider-credentials",
+            get(list_model_provider_credentials)
+                .post(save_model_provider_credentials)
+                .delete(delete_model_provider_credentials),
+        )
         .route("/healthz", get(health))
         .route("/readyz", get(readiness))
         .route("/v1/models", get(openai_models))
@@ -343,6 +356,229 @@ async fn elm_evaluation(
         )
             .into_response(),
     }
+}
+
+const MODEL_INTAKE_HTML: &str = include_str!("../web/model-intake.html");
+const MODEL_INTAKE_JS: &str = include_str!("../web/model-intake.js");
+const MODEL_INTAKE_CSS: &str = include_str!("../web/model-intake.css");
+
+#[derive(Default, Deserialize)]
+struct ModelCredentialWriteRequest {
+    provider: String,
+    username: Option<String>,
+    password: Option<String>,
+    token: Option<String>,
+}
+
+impl Drop for ModelCredentialWriteRequest {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+
+        if let Some(value) = &mut self.username {
+            value.zeroize();
+        }
+        if let Some(value) = &mut self.password {
+            value.zeroize();
+        }
+        if let Some(value) = &mut self.token {
+            value.zeroize();
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ModelCredentialProviderQuery {
+    provider: String,
+}
+
+async fn model_intake_dashboard() -> Response {
+    let mut response = Html(MODEL_INTAKE_HTML).into_response();
+    set_model_intake_security_headers(&mut response, "text/html; charset=utf-8");
+    response
+}
+
+async fn model_intake_javascript() -> Response {
+    let mut response = MODEL_INTAKE_JS.into_response();
+    set_model_intake_security_headers(&mut response, "text/javascript; charset=utf-8");
+    response
+}
+
+async fn model_intake_stylesheet() -> Response {
+    let mut response = MODEL_INTAKE_CSS.into_response();
+    set_model_intake_security_headers(&mut response, "text/css; charset=utf-8");
+    response
+}
+
+async fn list_model_provider_credentials(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(error) = service.authorize(&headers, "model-admin") {
+        return openai_error_response(error);
+    }
+    let Some(vault) = service.model_credential_vault() else {
+        return model_credential_store_unavailable();
+    };
+    match vault.list().await {
+        Ok(providers) => no_store_json(Json(json!({ "providers": providers }))),
+        Err(_) => model_credential_store_unavailable(),
+    }
+}
+
+async fn save_model_provider_credentials(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+    Json(mut request): Json<ModelCredentialWriteRequest>,
+) -> Response {
+    let auth = match service.authorize(&headers, "model-admin") {
+        Ok(auth) => auth,
+        Err(error) => return openai_error_response(error),
+    };
+    let Some(vault) = service.model_credential_vault() else {
+        return model_credential_store_unavailable();
+    };
+    if request.provider.len() > 64
+        || request
+            .username
+            .as_deref()
+            .is_some_and(|value| value.len() > 1024)
+        || request
+            .password
+            .as_deref()
+            .is_some_and(|value| value.len() > 8192)
+        || request
+            .token
+            .as_deref()
+            .is_some_and(|value| value.len() > 8192)
+    {
+        return no_store_json((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "credential fields exceed their maximum length" })),
+        ));
+    }
+    let provider = request.provider.trim().to_ascii_lowercase();
+    if !valid_model_provider_id(provider.as_str()) {
+        return no_store_json((
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({ "error": "provider identifier must contain letters, digits, '-' or '_'" }),
+            ),
+        ));
+    }
+    let credentials = ProviderCredentials {
+        username: request.username.take(),
+        password: request.password.take(),
+        token: request.token.take(),
+    };
+    if !credentials.has_any_value() {
+        return no_store_json((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "at least one provider credential is required" })),
+        ));
+    }
+    match vault.put(provider.clone(), credentials).await {
+        Ok(()) => {
+            tracing::info!(
+                provider = %provider,
+                client_id = ?auth.client_id,
+                action = "credential_saved",
+                "model-provider credential updated"
+            );
+            no_store_json(Json(json!({
+                "provider": provider,
+                "credential_present": true,
+                "secret_returned": false
+            })))
+        }
+        Err(_) => model_credential_store_unavailable(),
+    }
+}
+
+async fn delete_model_provider_credentials(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+    Query(query): Query<ModelCredentialProviderQuery>,
+) -> Response {
+    let auth = match service.authorize(&headers, "model-admin") {
+        Ok(auth) => auth,
+        Err(error) => return openai_error_response(error),
+    };
+    let Some(vault) = service.model_credential_vault() else {
+        return model_credential_store_unavailable();
+    };
+    let provider = query.provider.trim().to_ascii_lowercase();
+    if !valid_model_provider_id(provider.as_str()) {
+        return no_store_json((
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({ "error": "provider identifier must contain letters, digits, '-' or '_'" }),
+            ),
+        ));
+    }
+    match vault.delete(provider.clone()).await {
+        Ok(removed) => {
+            if removed {
+                tracing::info!(
+                    provider = %provider,
+                    client_id = ?auth.client_id,
+                    action = "credential_revoked",
+                    "model-provider credential revoked"
+                );
+            }
+            no_store_json(Json(json!({ "provider": provider, "removed": removed })))
+        }
+        Err(_) => model_credential_store_unavailable(),
+    }
+}
+
+fn valid_model_provider_id(provider: &str) -> bool {
+    !provider.is_empty()
+        && provider.len() <= 64
+        && provider
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_".contains(&byte))
+}
+
+fn model_credential_store_unavailable() -> Response {
+    no_store_json((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "model-provider credential intake is not configured for this installation"
+        })),
+    ))
+}
+
+fn no_store_json(body: impl IntoResponse) -> Response {
+    let mut response = body.into_response();
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
+    );
+    response
+        .headers_mut()
+        .insert(PRAGMA, HeaderValue::from_static("no-cache"));
+    response
+}
+
+fn set_model_intake_security_headers(response: &mut Response, content_type: &'static str) {
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
+    );
+    headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static(
+            "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        ),
+    );
 }
 
 async fn health(
@@ -4046,6 +4282,7 @@ pub async fn shutdown_signal() {
 mod tests {
     use super::*;
     use axum::{body::to_bytes, http::Request};
+    use tempfile::tempdir;
     use tower::ServiceExt;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -7533,5 +7770,153 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn model_intake_requires_admin_scope_and_never_returns_provider_secrets() {
+        const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let directory = tempdir().expect("temporary directory");
+        let mut config = GailConfig::default();
+        config.security.allow_unauthenticated_health = false;
+        config.security.api_tokens = vec![
+            ApiTokenConfig {
+                client_id: "llm-client".to_string(),
+                token: "llm-only-token".to_string(),
+                scopes: vec!["llm".to_string()],
+            },
+            ApiTokenConfig {
+                client_id: "model-admin".to_string(),
+                token: "admin-only-token".to_string(),
+                scopes: vec!["model-admin".to_string()],
+            },
+        ];
+        config.storage.metrics_path = directory.path().join("metrics.json").display().to_string();
+        config.storage.adaptive_schema_path = directory
+            .path()
+            .join("adaptive-schema.json")
+            .display()
+            .to_string();
+        config.storage.api_issues_path = directory
+            .path()
+            .join("api-issues.json")
+            .display()
+            .to_string();
+        config.storage.llm_ledger_path = directory
+            .path()
+            .join("llm-ledger.jsonl")
+            .display()
+            .to_string();
+        config.storage.model_credentials_path = directory
+            .path()
+            .join("model-credentials/credentials.enc")
+            .display()
+            .to_string();
+        config.storage.postgres_dsn = None;
+
+        let service = GailService::new_with_model_credential_key(config, Some(KEY.to_string()))
+            .await
+            .expect("service");
+        let app = build_router(service);
+
+        let dashboard = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/model-intake")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("dashboard response");
+        assert_eq!(dashboard.status(), StatusCode::OK);
+        assert_eq!(
+            dashboard.headers().get(CACHE_CONTROL).unwrap(),
+            "no-store, max-age=0"
+        );
+        assert!(dashboard.headers().contains_key("content-security-policy"));
+
+        let llm_token = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/admin/model-provider-credentials")
+                    .header("authorization", "Bearer llm-only-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("scope response");
+        assert_eq!(llm_token.status(), StatusCode::UNAUTHORIZED);
+
+        let save = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/admin/model-provider-credentials")
+                    .header("authorization", "Bearer admin-only-token")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "provider": "huggingface",
+                            "username": "model-user",
+                            "password": "private-password",
+                            "token": "hf_secret_token"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("save response");
+        assert_eq!(save.status(), StatusCode::OK);
+        let save_body = to_bytes(save.into_body(), usize::MAX)
+            .await
+            .expect("save body");
+        let save_text = String::from_utf8(save_body.to_vec()).expect("utf-8");
+        assert!(!save_text.contains("hf_secret_token"));
+
+        let credentials_file =
+            std::fs::read_to_string(directory.path().join("model-credentials/credentials.enc"))
+                .expect("encrypted store");
+        assert!(!credentials_file.contains("model-user"));
+        assert!(!credentials_file.contains("private-password"));
+        assert!(!credentials_file.contains("hf_secret_token"));
+
+        let list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/admin/model-provider-credentials")
+                    .header("authorization", "Bearer admin-only-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("list response");
+        assert_eq!(list.status(), StatusCode::OK);
+        assert_eq!(
+            list.headers().get(CACHE_CONTROL).unwrap(),
+            "no-store, max-age=0"
+        );
+        let list_body = to_bytes(list.into_body(), usize::MAX)
+            .await
+            .expect("list body");
+        let list_text = String::from_utf8(list_body.to_vec()).expect("utf-8");
+        assert!(list_text.contains("\"token_configured\":true"));
+        assert!(!list_text.contains("hf_secret_token"));
+
+        let revoked = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/admin/model-provider-credentials?provider=huggingface")
+                    .header("authorization", "Bearer admin-only-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("delete response");
+        assert_eq!(revoked.status(), StatusCode::OK);
     }
 }
