@@ -105,20 +105,80 @@ class ModelCacheDownloadTests(unittest.TestCase):
                 ).encode("utf-8")
 
         endpoint = "https://gail.example/v1/internal/model-download-credential"
+        observed_handlers = []
+
+        class FakeOpener:
+            def open(self, request, timeout):
+                self.request = request
+                self.timeout = timeout
+                return FakeResponse()
+
+        fake_opener = FakeOpener()
+
+        def build_opener(*handlers):
+            observed_handlers.extend(handlers)
+            return fake_opener
+
         with patch.object(
             downloader.urllib.request,
-            "urlopen",
-            return_value=FakeResponse(),
+            "build_opener",
+            side_effect=build_opener,
         ) as open_url:
             self.assertEqual(
                 downloader.fetch_provider_token(endpoint, "machine-download-token"),
                 "hf_runtime_token",
             )
-        request = open_url.call_args.args[0]
+        request = fake_opener.request
         self.assertEqual(request.get_header("Authorization"), "Bearer machine-download-token")
         self.assertNotIn("machine-download-token", request.full_url)
+        self.assertEqual(open_url.call_count, 1)
+        self.assertEqual(len(observed_handlers), 1)
+        self.assertIsInstance(observed_handlers[0], downloader.RejectRedirectHandler)
+        self.assertIsNone(
+            observed_handlers[0].redirect_request(
+                request,
+                None,
+                302,
+                "Found",
+                {},
+                "https://attacker.example/collect",
+            )
+        )
         with self.assertRaises(ValueError):
             downloader.fetch_provider_token(endpoint.replace("https://", "http://"), "token")
+
+    def test_credential_request_surfaces_redirect_without_following_it(self) -> None:
+        endpoint = "https://gail.example/v1/internal/model-download-credential"
+        observed_handlers = []
+        opener_calls = []
+
+        class FakeOpener:
+            def open(self, request, timeout):
+                opener_calls.append((request, timeout))
+                raise downloader.urllib.error.HTTPError(
+                    request.full_url,
+                    302,
+                    "Found",
+                    {},
+                    None,
+                )
+
+        def build_opener(*handlers):
+            observed_handlers.extend(handlers)
+            return FakeOpener()
+
+        with patch.object(
+            downloader.urllib.request,
+            "build_opener",
+            side_effect=build_opener,
+        ):
+            with self.assertRaises(downloader.SafeDownloaderError) as error:
+                downloader.fetch_provider_token(endpoint, "machine-download-token")
+
+        self.assertIn("HTTP 302", str(error.exception))
+        self.assertEqual(len(opener_calls), 1)
+        self.assertEqual(len(observed_handlers), 1)
+        self.assertIsInstance(observed_handlers[0], downloader.RejectRedirectHandler)
 
     def test_provenance_is_atomic_non_secret_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

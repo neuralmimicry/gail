@@ -38,6 +38,14 @@ class SafeDownloaderError(RuntimeError):
     """An operator-safe error detail that contains no provider response text."""
 
 
+class RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject redirects so Gail's bearer token cannot be forwarded elsewhere."""
+
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        """Never follow a redirect from the credential endpoint."""
+        return None
+
+
 def safe_failure_detail(error: Exception) -> str:
     """Keep useful status while suppressing third-party exception messages."""
     if isinstance(error, SafeDownloaderError):
@@ -115,7 +123,8 @@ def fetch_provider_token(endpoint: str, api_token: str) -> str | None:
         method="GET",
     )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        opener = urllib.request.build_opener(RejectRedirectHandler())
+        with opener.open(request, timeout=20) as response:
             if response.status != 200:
                 raise SafeDownloaderError(
                     f"Gail model credential request returned HTTP {response.status}"
