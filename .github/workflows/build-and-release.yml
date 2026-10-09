@@ -277,7 +277,9 @@ jobs:
             can_execute: true
           - os: linux
             arch: arm64
-            runs_on: '["self-hosted","Linux","ARM64"]'
+            # Use GitHub's native ARM64 runner so release packaging does not
+            # depend on a repository-specific self-hosted ARM runner pool.
+            runs_on: '["ubuntu-24.04-arm"]'
             rust_target: aarch64-unknown-linux-gnu
             platform: linux-arm64
             archive_format: tar.gz
@@ -648,13 +650,14 @@ jobs:
             pytorch_jobs_default: auto
           - arch: arm64
             platform: linux/arm64
-            runs_on: '["self-hosted","Linux","ARM64"]'
+            # Keep both ARM64 image variants on a native hosted runner.
+            runs_on: '["ubuntu-24.04-arm"]'
             variant: arm64-4k
             page_size: 4k
             pytorch_jobs_default: "2"
           - arch: arm64
             platform: linux/arm64
-            runs_on: '["self-hosted","Linux","ARM64"]'
+            runs_on: '["ubuntu-24.04-arm"]'
             variant: arm64-64k-hwe
             page_size: 64k-hwe
             pytorch_jobs_default: "2"
