@@ -213,6 +213,10 @@ pub fn build_router_with_alexa(service: GailService, alexa: Arc<AlexaRuntime>) -
             "/v1/internal/aria/status",
             get(crate::governance::assessment_status),
         )
+        .route(
+            "/v1/internal/model-download-credential",
+            get(get_model_download_credential),
+        )
         .route("/v1/status/governance", get(crate::governance::status))
         .route("/admin/model-intake", get(model_intake_dashboard))
         .route("/admin/model-intake.js", get(model_intake_javascript))
@@ -526,6 +530,44 @@ async fn delete_model_provider_credentials(
                 );
             }
             no_store_json(Json(json!({ "provider": provider, "removed": removed })))
+        }
+        Err(_) => model_credential_store_unavailable(),
+    }
+}
+
+/// Delivers only the Hugging Face access token to the authorised Slurm
+/// downloader. The endpoint is deliberately separate from the model-admin
+/// dashboard API so a Slurm client cannot list, replace or revoke credentials.
+async fn get_model_download_credential(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+) -> Response {
+    let auth = match service.authorize(&headers, "model-download") {
+        Ok(auth) => auth,
+        Err(error) => return openai_error_response(error),
+    };
+    let Some(vault) = service.model_credential_vault() else {
+        return model_credential_store_unavailable();
+    };
+    match vault.get("huggingface".to_string()).await {
+        Ok(credentials) => {
+            let access_token = credentials
+                .as_ref()
+                .and_then(|credentials| credentials.token.as_deref())
+                .map(str::trim)
+                .filter(|token| !token.is_empty());
+            tracing::info!(
+                client_id = ?auth.client_id,
+                provider = "huggingface",
+                credential_present = access_token.is_some(),
+                action = "model_download_credential_read",
+                "authorised model downloader checked provider credential"
+            );
+            no_store_json(Json(json!({
+                "provider": "huggingface",
+                "credential_present": access_token.is_some(),
+                "access_token": access_token
+            })))
         }
         Err(_) => model_credential_store_unavailable(),
     }
@@ -7789,6 +7831,11 @@ mod tests {
                 token: "admin-only-token".to_string(),
                 scopes: vec!["model-admin".to_string()],
             },
+            ApiTokenConfig {
+                client_id: "slurm-model-downloader".to_string(),
+                token: "download-only-token".to_string(),
+                scopes: vec!["model-download".to_string()],
+            },
         ];
         config.storage.metrics_path = directory.path().join("metrics.json").display().to_string();
         config.storage.adaptive_schema_path = directory
@@ -7905,6 +7952,57 @@ mod tests {
         let list_text = String::from_utf8(list_body.to_vec()).expect("utf-8");
         assert!(list_text.contains("\"token_configured\":true"));
         assert!(!list_text.contains("hf_secret_token"));
+
+        let admin_cannot_download = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/internal/model-download-credential")
+                    .header("authorization", "Bearer admin-only-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("admin download scope response");
+        assert_eq!(admin_cannot_download.status(), StatusCode::UNAUTHORIZED);
+
+        let downloader_cannot_list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/admin/model-provider-credentials")
+                    .header("authorization", "Bearer download-only-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("downloader admin scope response");
+        assert_eq!(downloader_cannot_list.status(), StatusCode::UNAUTHORIZED);
+
+        let download_credential = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/internal/model-download-credential")
+                    .header("authorization", "Bearer download-only-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("download credential response");
+        assert_eq!(download_credential.status(), StatusCode::OK);
+        assert_eq!(
+            download_credential.headers().get(CACHE_CONTROL).unwrap(),
+            "no-store, max-age=0"
+        );
+        let download_body = to_bytes(download_credential.into_body(), usize::MAX)
+            .await
+            .expect("download credential body");
+        let download_text = String::from_utf8(download_body.to_vec()).expect("utf-8");
+        assert!(download_text.contains("\"credential_present\":true"));
+        assert!(download_text.contains("\"access_token\":\"hf_secret_token\""));
+        assert!(!download_text.contains("private-password"));
+        assert!(!download_text.contains("model-user"));
 
         let revoked = app
             .oneshot(

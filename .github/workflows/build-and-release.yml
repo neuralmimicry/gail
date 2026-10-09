@@ -79,6 +79,21 @@ jobs:
         shell: bash
         run: bash scripts/derive-version.sh --github-output
 
+  python-model-download-tests:
+    name: Model downloader security tests (Python 3.13)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Test model downloader credential and provenance boundaries
+        run: python -m unittest discover -s scripts/tests -p 'test_*.py' -v
+
   verify:
     name: Verify (${{ matrix.arch }})
     needs: version
@@ -233,6 +248,7 @@ jobs:
     needs:
       - version
       - verify
+      - python-model-download-tests
     if: >-
       ${{
         github.event_name == 'workflow_dispatch' ||

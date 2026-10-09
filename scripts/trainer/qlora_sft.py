@@ -140,6 +140,17 @@ def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
 
 
+def base_model_source_provenance() -> dict[str, str] | None:
+    """Return immutable upstream model identity supplied by the Slurm wrapper."""
+    model_id = os.getenv("GAIL_TRAIN_BASE_MODEL_ID", "").strip()
+    revision = os.getenv("GAIL_TRAIN_BASE_MODEL_REVISION", "").strip()
+    if not model_id and not revision:
+        return None
+    if not model_id or not revision:
+        raise RuntimeError("base-model provenance requires both an ID and revision")
+    return {"provider": "huggingface", "model_id": model_id, "revision": revision}
+
+
 TOKENIZER_PROBE_TEXT = "Gail tokenizer probe: BTC/USDT 123."
 
 
@@ -335,6 +346,7 @@ def aggregate_distributed_snapshot(
     report = {
         "algorithm": cfg.algorithm,
         "base_model": cfg.base_model,
+        "base_model_source": base_model_source_provenance(),
         "ollama_base_model": cfg.ollama_base_model,
         "backend": "slurm_distributed_peft",
         "distributed": {
@@ -827,6 +839,7 @@ def train(cfg: TrainingConfig) -> None:
     report = {
         "algorithm": cfg.algorithm,
         "base_model": cfg.base_model,
+        "base_model_source": base_model_source_provenance(),
         "ollama_base_model": ollama_base_model,
         "device": device,
         "backend": effective_backend,
@@ -891,6 +904,7 @@ def train(cfg: TrainingConfig) -> None:
             "quantisation_backend": report["quantisation_backend"],
             "pin_memory": report["pin_memory"],
             "base_model": cfg.base_model,
+            "base_model_source": base_model_source_provenance(),
             "tokenizer": "tokenizer.json",
             "tokenizer_metadata": tokenizer_metadata,
             "tokenizer_files": [
