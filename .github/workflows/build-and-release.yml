@@ -717,6 +717,14 @@ jobs:
             "${graph_root}" "${run_root}" > "${storage_conf}"
           echo "XDG_RUNTIME_DIR=${runtime_dir}" >> "${GITHUB_ENV}"
           echo "CONTAINERS_STORAGE_CONF=${storage_conf}" >> "${GITHUB_ENV}"
+          if [[ "${{ matrix.arch }}" == "arm64" ]]; then
+            # Hosted ARM64 runners have no logind user session. Select cgroupfs
+            # so runc does not try to create a systemd unit without a session.
+            engine_conf="${RUNNER_TEMP}/gail-podman-engine.conf"
+            printf '[engine]\ncgroup_manager = "cgroupfs"\n' > "${engine_conf}"
+            chmod 600 "${engine_conf}"
+            echo "CONTAINERS_CONF_OVERRIDE=${engine_conf}" >> "${GITHUB_ENV}"
+          fi
 
       - name: Validate container tooling
         shell: bash
