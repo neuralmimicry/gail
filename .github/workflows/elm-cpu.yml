@@ -5,7 +5,7 @@ name: Native ELM CPU verification
   pull_request:
   push:
     branches:
-      - "**"
+      - main
   workflow_dispatch:
 
 permissions:

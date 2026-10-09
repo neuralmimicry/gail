@@ -5,7 +5,7 @@ name: Build, Version, and Release
   pull_request:
   push:
     branches:
-      - "**"
+      - main
   workflow_dispatch:
     inputs:
       publish_release:
