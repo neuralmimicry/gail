@@ -192,7 +192,7 @@ The authenticated model-intake page is available at `/admin/model-intake`. The p
 
 Set `GAIL_MODEL_CREDENTIALS_ENCRYPTION_KEY` to a persistent 32-byte key encoded as 64 hexadecimal characters before enabling the page. Keep this key in the deployment secret manager and back it up securely; changing or losing it makes existing encrypted entries unreadable. Gail stores credentials at `storage.model_credentials_path` (default `./data/model_credentials/credentials.enc`) using AES-256-GCM, mode `0600`, atomic updates and a separate lock file. The storage directory must be on a durable volume shared by Gail API replicas and the trainer worker. Credential updates and revocations take effect without a deployment restart.
 
-For Hugging Face downloads, save the access token as the `huggingface` provider token. Gail supplies it to its model-download child process as `HF_TOKEN`; the child output is redacted before it is logged or retained in a training report. Username and password fields are accepted and encrypted for providers that require them, but the current Hugging Face integration uses the access token. Use a narrowly scoped provider token and rotate or revoke it from the page when needed.
+For Hugging Face downloads, save the access token as the `huggingface` provider token. Gail supplies it to local model-download children without redeployment. Slurm jobs retrieve the current token over TLS just before a download through a separate Gail API credential limited to `model-download`; the provider token is passed directly to `huggingface_hub` and never placed in a Slurm request, environment export, scheduler record, shared cache or durable log. Downloads use an immutable commit revision and record the model ID, revision and cache path with the training snapshot. Username and password fields are accepted and encrypted for providers that require them, while the current Hugging Face integration uses the access token. Use a narrowly scoped provider token and rotate or revoke it from the page when needed.
 
 ## Configuration Notes
 
@@ -245,17 +245,22 @@ For Hugging Face downloads, save the access token as the `huggingface` provider 
 ## Distributed CPU training with Slurm
 
 Gail can hand a snapshot to an external, secret-free Slurm dispatcher through a
-shared NFS spool. The Centriq deployment starts one rank on each of
-`qc00`-`qc05`, assigns 40 CPUs to each rank (240 training CPUs total), and
-leaves six of each host's 46 CPUs available for the operating system and
-long-running services.
+shared NFS spool. The deployment can start one rank on each of seven eligible
+native nodes, assigning eight CPUs per rank (up to 56 training CPUs total).
+The controller is excluded from training placement, and Slurm selects only
+nodes that are idle at the start of each attempt.
 
 `gail-qlora-sft` detects `SLURM_PROCID` and `SLURM_NTASKS`, deterministically
 shards the dataset by rank, and writes rank-local adapters and reports to an
 NFS coordination directory. Rank zero validates every tensor shape and creates
 one sample-count-weighted federated average, then publishes the coherent
-adapter, aggregate report, manifest, and `_SUCCESS` marker. A snapshot is not
-marked trained in Postgres until that aggregate output exists. Infrastructure
+adapter, aggregate report, manifest, and `_SUCCESS` marker. Before launching
+the ranks, the batch wrapper downloads the configured Hugging Face commit to a
+shared cache and gives every rank that local snapshot in offline mode. Gail's
+provider token is fetched just in time with the dedicated `model-download`
+scope; the immutable source revision is recorded in rank and aggregate reports.
+A snapshot is not marked trained in Postgres until that aggregate output
+exists. Infrastructure
 and Ollama-registration failures remain retryable. A LoRA/QLoRA row is marked
 `trained` only after Ollama accepts the adapter and the serving alias is copied.
 Gail never promotes an unchanged base-model fallback: rejected or unsupported

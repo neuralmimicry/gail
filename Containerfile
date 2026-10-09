@@ -600,6 +600,7 @@ LABEL org.opencontainers.image.page-size="${TARGET_PAGE_SIZE}" \
 
 COPY --from=source-deb /out/*.deb /tmp/source-gail.deb
 COPY scripts/trainer/convert_lora_to_gguf.py /usr/local/libexec/gail-convert-lora-to-gguf
+COPY scripts/trainer/model_cache_download.py /usr/local/libexec/gail-model-cache-download
 COPY scripts/trainer/qlora_sft.py /usr/local/libexec/gail-qlora-sft-python
 COPY gail.yaml /tmp/gail-defaults/gail.yaml
 COPY config/ai-routing-profiles.json /tmp/gail-defaults/ai-routing-profiles.json
@@ -685,6 +686,7 @@ RUN --mount=type=secret,id=gail_release_token set -eu; \
     apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y --no-install-recommends /tmp/gail.deb; \
     test -x /usr/bin/gail-qlora-sft; \
     chmod 0755 /usr/local/libexec/gail-convert-lora-to-gguf; \
+    chmod 0755 /usr/local/libexec/gail-model-cache-download; \
     chmod 0755 /usr/local/libexec/gail-qlora-sft-python; \
     rm -f /tmp/gail.deb /tmp/source-gail.deb; \
     mkdir -p /app/config /app/data /app/scripts /var/lib/gail; \
