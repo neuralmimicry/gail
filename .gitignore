@@ -33,3 +33,27 @@ check_errors.txt
 logs/
 tracey.log*
 loader/tracey-loader.manifest.json
+
+# project_solver ignore additions
+.refiner/
+.research_cache/
+.venv/
+project_solver_output/
+delivery_pipeline_output/
+node_modules/
+dist/
+build/
+.cache/
+.next/
+.nuxt/
+.turbo/
+coverage/
+venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+*.egg-info/
+.eggs/
