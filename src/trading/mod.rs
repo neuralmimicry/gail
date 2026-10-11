@@ -327,7 +327,7 @@ async fn run_evaluation_loop(
     let decision_engine = DecisionEngine::new(config.fuzzy_weight);
     let data_path = PathBuf::from(&config.data_path);
     let market_data_lake = if config.market_datalake_enabled {
-        Some(MarketDataLake::new(&config, postgres_dsn).await)
+        Some(MarketDataLake::new(&config, postgres_dsn, state.clone()).await)
     } else {
         None
     };
