@@ -44,6 +44,7 @@ Gail exposes the following endpoints:
 | `POST /v1/aer/encode` | Encode spikes/events into `AER1` payloads |
 | `POST /v1/aer/decode` | Decode `AER1` payloads into spikes/events |
 | `GET /v1/status/orchestration` | Provider, engine, and metrics status |
+| `GET /v1/status/training?limit=10` | Bounded active trainer/Slurm state and recent result metadata (limit 1–25) |
 | `GET /v1/status/api-schema` | Global adaptive API registry for remote integrations |
 | `GET /v1/status/api-issues` | Active provider/API issues and Gail's current mitigations |
 | `GET /metrics` | Prometheus text metrics for Gail API issue and provider health |
@@ -90,6 +91,10 @@ such as Refiner can show users an expected processing duration.
 - `/healthz` can be configured to allow or deny unauthenticated probes.
 - `/v1/integrations/alexa` is the only public LLM route. It is disabled by default and, when enabled, accepts only requests carrying a valid Amazon `Signature-256` from the `echo-api.amazon.com` certificate, a fresh timestamp and a configured skill id. Answers run through `gail-auto` with Aria governance and ledger auditing under client id `alexa`.
 - All `/v1/trading/*` read endpoints require the `trading` scope.
+- All `/v1/status/*` endpoints require the `status` scope. Training status
+  reports the active snapshot marker, its latest Slurm status-file state and
+  heartbeat age, plus at most 25 recent result summaries. It does not scan
+  historical snapshots or return trainer logs.
 - All `/v1/trading/*` write endpoints (pause, resume, override, config POST, evaluate) additionally require either the `trading_admin` scope or a `client_id` listed in `trading.admin_client_ids` (default: `["pbisaacs"]`).
 - When `aarnn_bridge` is enabled, Gail should call AARNN with its own Customers-issued service-account bearer token rather than a browser-style session.
 - The supplied Ansible role publishes Gail behind TLS ingress and injects per-client bearer tokens for Refiner, Tracey, and Continuum/NMC.
