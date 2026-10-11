@@ -1857,4 +1857,49 @@ mod tests {
             .expect("cached file sample");
         assert_eq!(cached.price, 60_000.0);
     }
+
+    #[tokio::test]
+    async fn failed_file_append_is_never_sent_as_a_postgres_only_write() {
+        let temp = tempdir().expect("temp dir");
+        let blocker = temp.path().join("not-a-directory");
+        fs::write(&blocker, "block parent directory creation")
+            .await
+            .expect("create blocking file");
+        let trading_config = TradingConfig {
+            market_datalake_file_path: blocker.join("lake.jsonl").to_string_lossy().to_string(),
+            ..TradingConfig::default()
+        };
+        let config = Arc::new(MarketDataLakeConfig::from_trading_config(
+            &trading_config,
+            Some("postgres://unused/gail".to_string()),
+        ));
+        let (sender, mut receiver) = mpsc::channel(4);
+        let lake = MarketDataLake {
+            config,
+            state: Arc::new(Mutex::new(MarketDataLakeState::default())),
+            postgres_mirror_tx: Some(sender),
+            log_state: SharedTradingState::new(100, 100),
+        };
+        let snapshot = MarketSnapshot {
+            exchange: "binance".to_string(),
+            symbol: "ETH/USDT".to_string(),
+            price: 3_000.0,
+            price_change_pct_1h: None,
+            price_change_pct_24h: Some(1.0),
+            volume_24h: Some(1_000.0),
+            volume_change_pct: None,
+            high_24h: Some(3_100.0),
+            low_24h: Some(2_900.0),
+            fetched_at: now_ts(),
+            microstructure: Default::default(),
+        };
+
+        let summary = lake.ingest_snapshots(&[snapshot]).await;
+        assert_eq!(summary.persisted, 0);
+        assert!(summary.file_error.is_some());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
 }
