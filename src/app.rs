@@ -57,6 +57,11 @@ pub struct StatusQuery {
     pub probe_providers: Option<bool>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct TrainingStatusQuery {
+    pub limit: Option<usize>,
+}
+
 #[derive(Clone, Debug)]
 enum OpenAIResolvedRoute {
     Orchestrated {
@@ -245,6 +250,7 @@ pub fn build_router_with_alexa(service: GailService, alexa: Arc<AlexaRuntime>) -
         .route("/v1/aer/encode", post(encode_aer))
         .route("/v1/aer/decode", post(decode_aer))
         .route("/v1/status/orchestration", get(orchestration_status))
+        .route("/v1/status/training", get(training_status))
         .route("/v1/status/api-schema", get(adaptive_api_schema_status))
         .route("/v1/status/api-issues", get(api_issues_status))
         .route("/v1/elm/status", get(elm_status))
@@ -1099,6 +1105,23 @@ async fn orchestration_status(
                 query.limit.unwrap_or(20),
                 query.probe_engines.unwrap_or(false),
                 query.probe_providers.unwrap_or(false),
+            )
+            .await,
+    ))
+}
+
+async fn training_status(
+    State(service): State<GailService>,
+    headers: HeaderMap,
+    Query(query): Query<TrainingStatusQuery>,
+) -> Result<Json<Value>> {
+    let _ = service.authorize(&headers, "status")?;
+    Ok(Json(
+        service
+            .metrics()
+            .training_status_snapshot(
+                std::path::Path::new(service.config().trainer.output_root.as_str()),
+                query.limit.unwrap_or(10),
             )
             .await,
     ))
@@ -4345,13 +4368,13 @@ mod tests {
     async fn test_service_with_config(mut config: GailConfig) -> GailService {
         crate::providers::ollama::reset_test_runtime_state().await;
         config.security.allow_unauthenticated_health = false;
-        config.storage.metrics_path = std::env::temp_dir()
-            .join(format!(
-                "gail-test-provider-metrics-{}.json",
-                uuid::Uuid::new_v4()
-            ))
-            .to_string_lossy()
+        let test_state_root =
+            std::env::temp_dir().join(format!("gail-test-state-{}", uuid::Uuid::new_v4()));
+        config.storage.metrics_path = test_state_root
+            .join("provider_metrics.json")
+            .display()
             .to_string();
+        config.trainer.output_root = test_state_root.join("training").display().to_string();
         config.storage.adaptive_schema_path = std::env::temp_dir()
             .join(format!(
                 "gail-test-adaptive-schema-{}.json",
@@ -4476,6 +4499,38 @@ mod tests {
         assert_eq!(payload["ready"], false);
         assert_eq!(payload["providers_checked"], 0);
         assert_eq!(payload["reason"], "no_configured_providers");
+    }
+
+    #[tokio::test]
+    async fn training_status_requires_authorisation_and_clamps_recent_run_limit() {
+        let unauthenticated = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = unauthenticated
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/status/training?limit=1000")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("unauthenticated response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let authorised = build_router(test_service_with_config(GailConfig::default()).await);
+        let response = authorised
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/status/training?limit=1000")
+                    .header("authorization", "Bearer secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("authorised response");
+        let (status, payload) = read_response_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["recent_runs_limit"], 25);
+        assert!(payload["active"].is_null());
+        assert!(payload["recent_runs"].as_array().is_some_and(Vec::is_empty));
     }
 
     #[tokio::test]

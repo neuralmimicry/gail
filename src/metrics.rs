@@ -8,7 +8,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::{fs, sync::Mutex};
+use tokio::{fs, io::AsyncReadExt, sync::Mutex};
 
 use crate::{errors::Result, models::CandidateSummary};
 
@@ -651,6 +651,78 @@ async fn read_training_metrics(path: &Path) -> TrainingMetricsData {
     match fs::read_to_string(path).await {
         Ok(raw) => serde_json::from_str::<TrainingMetricsData>(&raw).unwrap_or_default(),
         Err(_) => TrainingMetricsData::default(),
+    }
+}
+
+const MAX_TRAINING_STATUS_FILE_BYTES: usize = 1_048_576;
+
+async fn read_json_file_bounded(path: &Path, max_bytes: usize) -> Option<Value> {
+    let metadata = fs::symlink_metadata(path).await.ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let file = fs::File::open(path).await.ok()?;
+    let mut bytes = Vec::with_capacity(max_bytes.min(4096));
+    let read = file
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .ok()?;
+    if read > max_bytes {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn valid_snapshot_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+fn safe_training_text(value: Option<&str>, max_chars: usize) -> Option<String> {
+    value
+        .map(|value| {
+            value
+                .chars()
+                .filter(|character| character.is_ascii_graphic() || *character == ' ')
+                .take(max_chars)
+                .collect::<String>()
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn safe_training_label(value: Option<&Value>, max_chars: usize) -> Option<String> {
+    safe_training_text(value.and_then(Value::as_str), max_chars)
+}
+
+fn safe_slurm_state(value: Option<&Value>) -> &'static str {
+    match value
+        .and_then(Value::as_str)
+        .map(str::to_ascii_uppercase)
+        .as_deref()
+    {
+        Some("PENDING") => "PENDING",
+        Some("RUNNING") => "RUNNING",
+        Some("COMPLETED") => "COMPLETED",
+        Some("FAILED") => "FAILED",
+        Some("CANCELLED") => "CANCELLED",
+        Some("TIMEOUT") => "TIMEOUT",
+        Some("NODE_FAIL") => "NODE_FAIL",
+        Some("OUT_OF_MEMORY") => "OUT_OF_MEMORY",
+        Some("PREEMPTED") => "PREEMPTED",
+        Some("CONFIGURING") => "CONFIGURING",
+        Some("COMPLETING") => "COMPLETING",
+        Some("SUSPENDED") => "SUSPENDED",
+        Some("REQUEUED") => "REQUEUED",
+        Some("REQUEUE_HOLD") => "REQUEUE_HOLD",
+        Some("BOOT_FAIL") => "BOOT_FAIL",
+        Some("DEADLINE") => "DEADLINE",
+        Some("SPECIAL_EXIT") => "SPECIAL_EXIT",
+        Some("STOPPED") => "STOPPED",
+        _ => "UNKNOWN",
     }
 }
 
@@ -2171,6 +2243,204 @@ impl MetricsStore {
         }
     }
 
+    /// Return a bounded, read-only view of the active Gail trainer lifecycle
+    /// and its most recent persisted training results. The active marker and
+    /// Slurm status file are the worker/dispatcher-owned sources of truth; this
+    /// method never scans historical snapshots or reads trainer logs.
+    pub async fn training_status_snapshot(
+        &self,
+        training_output_root: &Path,
+        requested_limit: usize,
+    ) -> Value {
+        const MARKER_LIMIT: usize = 16 * 1024;
+        const PROGRESS_LIMIT: usize = 64 * 1024;
+        const RECENT_RUN_LIMIT: usize = 25;
+
+        let state_root = training_output_root
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        let training_root = training_output_root;
+        let snapshot_root = training_root.join("snapshots");
+        let active_marker_path = training_root.join("active_training.json");
+        let marker = read_json_file_bounded(&active_marker_path, MARKER_LIMIT).await;
+        let active = if let Some(marker) = marker.as_ref() {
+            let snapshot_id = marker
+                .get("snapshot_id")
+                .and_then(Value::as_str)
+                .filter(|value| valid_snapshot_id(value));
+            if let Some(snapshot_id) = snapshot_id {
+                let results_root = training_root.join("slurm").join("spool").join("results");
+                let slurm_status = read_json_file_bounded(
+                    &results_root.join(format!("{snapshot_id}.status")),
+                    MARKER_LIMIT,
+                )
+                .await;
+                let progress = read_json_file_bounded(
+                    &snapshot_root.join(snapshot_id).join("progress.json"),
+                    PROGRESS_LIMIT,
+                )
+                .await;
+                let report = read_json_file_bounded(
+                    &snapshot_root.join(snapshot_id).join("training_report.json"),
+                    PROGRESS_LIMIT,
+                )
+                .await;
+                let pipeline = read_json_file_bounded(
+                    &snapshot_root.join(snapshot_id).join("pipeline.json"),
+                    PROGRESS_LIMIT,
+                )
+                .await;
+
+                let worker_heartbeat = marker
+                    .get("heartbeat_ts")
+                    .and_then(Value::as_f64)
+                    .and_then(|value| valid_unix_timestamp(Some(value)));
+                let scheduler_heartbeat = slurm_status
+                    .as_ref()
+                    .and_then(|value| value.get("heartbeat_ts"))
+                    .and_then(Value::as_f64)
+                    .and_then(|value| valid_unix_timestamp(Some(value)));
+                let scheduler = slurm_status.as_ref();
+                let progress_object = progress.as_ref();
+                let report_object = report.as_ref();
+                let pipeline_object = pipeline.as_ref();
+                let base_model = report_object
+                    .and_then(|value| value.get("base_model"))
+                    .or_else(|| pipeline_object.and_then(|value| value.get("base_model")));
+                let algorithm = report_object
+                    .and_then(|value| value.get("algorithm"))
+                    .or_else(|| pipeline_object.and_then(|value| value.get("algorithm")));
+
+                json!({
+                    "snapshot_id": snapshot_id,
+                    "worker_state": safe_training_label(marker.get("state"), 40)
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    "worker_started_at_unix_seconds": marker
+                        .get("started_ts")
+                        .and_then(Value::as_f64)
+                        .and_then(|value| valid_unix_timestamp(Some(value))),
+                    "worker_heartbeat_at_unix_seconds": worker_heartbeat,
+                    "worker_heartbeat_age_seconds": worker_heartbeat
+                        .map(|value| (now_ts() - value).max(0.0)),
+                    "worker_heartbeat_fresh": worker_heartbeat.is_some_and(|value| {
+                        now_ts() - value <= training_heartbeat_stale_seconds()
+                    }),
+                    "scheduler": {
+                        "state": safe_slurm_state(
+                            scheduler.and_then(|value| value.get("state"))),
+                        "job_id": safe_training_label(
+                            scheduler.and_then(|value| value.get("slurm_job_id")), 64),
+                        "heartbeat_at_unix_seconds": scheduler_heartbeat,
+                        "heartbeat_age_seconds": scheduler_heartbeat
+                            .map(|value| (now_ts() - value).max(0.0)),
+                        "heartbeat_fresh": scheduler_heartbeat.is_some_and(|value| {
+                            now_ts() - value <= training_heartbeat_stale_seconds()
+                        }),
+                        "attempt": scheduler
+                            .and_then(|value| value.get("attempt"))
+                            .and_then(Value::as_u64)
+                            .map(|value| value.min(10_000)),
+                        "nodes": safe_training_label(
+                            scheduler.and_then(|value| value.get("discovered_nodelist")), 256),
+                    },
+                    "training": {
+                        "backend": safe_training_label(
+                            progress_object.and_then(|value| value.get("backend")), 64),
+                        "status": safe_training_label(
+                            progress_object.and_then(|value| value.get("status")), 40),
+                        "algorithm": safe_training_label(algorithm, 80),
+                        "base_model": safe_training_label(base_model, 256),
+                        "completed_steps": progress_object
+                            .and_then(|value| value.get("completed_steps"))
+                            .and_then(Value::as_u64),
+                        "total_steps": progress_object
+                            .and_then(|value| value.get("total_steps"))
+                            .and_then(Value::as_u64),
+                        "progress_ratio": progress_object
+                            .and_then(|value| value.get("progress_ratio"))
+                            .and_then(Value::as_f64)
+                            .filter(|value| value.is_finite())
+                            .map(|value| value.clamp(0.0, 1.0)),
+                        "elapsed_seconds": progress_object
+                            .and_then(|value| value.get("elapsed_seconds"))
+                            .and_then(Value::as_f64)
+                            .filter(|value| value.is_finite() && *value >= 0.0),
+                        "eta_seconds": progress_object
+                            .and_then(|value| value.get("eta_seconds"))
+                            .and_then(Value::as_f64)
+                            .filter(|value| value.is_finite() && *value >= 0.0),
+                    },
+                })
+            } else {
+                json!({"state": "unknown", "reason": "active snapshot identity is invalid"})
+            }
+        } else if fs::symlink_metadata(&active_marker_path).await.is_ok() {
+            json!({
+                "state": "unknown",
+                "reason": "active marker is unreadable, invalid or exceeds the size limit"
+            })
+        } else {
+            Value::Null
+        };
+
+        let training_metrics_path = state_root.join("training_metrics.json");
+        let persisted =
+            read_json_file_bounded(&training_metrics_path, MAX_TRAINING_STATUS_FILE_BYTES).await;
+        let parsed_training_data =
+            persisted.and_then(|value| serde_json::from_value::<TrainingMetricsData>(value).ok());
+        let training_metrics_available = parsed_training_data.is_some();
+        let training_data = parsed_training_data.unwrap_or_default();
+        let limit = requested_limit.clamp(1, RECENT_RUN_LIMIT);
+        let recent_runs = training_data
+            .runs
+            .iter()
+            .rev()
+            .take(limit)
+            .filter(|run| valid_snapshot_id(&run.snapshot_id))
+            .map(|run| {
+                json!({
+                    "snapshot_id": run.snapshot_id,
+                    "backend": safe_training_text(Some(run.backend.as_str()), 64),
+                    "status": safe_training_text(Some(run.status.as_str()), 40),
+                    "failure_reason": match run.failure_reason.as_str() {
+                        "unsupported_serving_architecture"
+                        | "stale_training_lifecycle"
+                        | "slurm_infrastructure"
+                        | "training_timeout"
+                        | "gpu_or_memory"
+                        | "dataset_build"
+                        | "qualification_gate"
+                        | "promotion_or_registration"
+                        | "training_execution" => run.failure_reason.as_str(),
+                        _ => "unknown",
+                    },
+                    "base_model": safe_training_text(Some(run.base_model.as_str()), 256),
+                    "slurm_job_id": safe_training_text(run.slurm_job_id.as_deref(), 64),
+                    "nodelist": safe_training_text(run.nodelist.as_deref(), 256),
+                    "samples": run.samples,
+                    "runtime_seconds": run.runtime_seconds
+                        .is_finite()
+                        .then_some(run.runtime_seconds.max(0.0)),
+                    "tokens_per_second": run.tokens_per_second
+                        .is_finite()
+                        .then_some(run.tokens_per_second.max(0.0)),
+                    "started_at_unix_seconds": valid_unix_timestamp(run.started_ts),
+                    "finished_at_unix_seconds": valid_unix_timestamp(run.finished_ts),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        json!({
+            "observed_at_unix_seconds": now_ts(),
+            "active": active,
+            "training_metrics_available": training_metrics_available,
+            "recent_runs_limit": limit,
+            "training_metrics_updated_at_unix_seconds": valid_unix_timestamp(
+                Some(training_data.updated_at)),
+            "recent_runs": recent_runs,
+        })
+    }
+
     pub async fn prometheus_metrics(&self) -> String {
         let data = self.inner.lock().await.clone();
         let training_path = self
@@ -3022,6 +3292,160 @@ mod tests {
         assert!(rendered.contains("gail_provider_candidate_generation_tokens_per_second{"));
         assert!(rendered.contains("gail_training_tokens_per_second{"));
         assert!(rendered.contains("status=\"promotion_failed\""));
+    }
+
+    #[tokio::test]
+    async fn training_status_snapshot_reports_pending_slurm_and_bounds_history() {
+        let directory = tempfile::tempdir().expect("training status directory");
+        let store = MetricsStore::new(directory.path().join("provider_metrics.json"))
+            .await
+            .expect("metrics store");
+        let training_root = directory.path().join("training");
+        let snapshot_root = training_root.join("snapshots");
+        let snapshot_id = "snapshot-active";
+        let snapshot = snapshot_root.join(snapshot_id);
+        let slurm_results = training_root.join("slurm/spool/results");
+        fs::create_dir_all(&snapshot)
+            .await
+            .expect("snapshot directory");
+        fs::create_dir_all(&slurm_results)
+            .await
+            .expect("Slurm results directory");
+        fs::write(
+            training_root.join("active_training.json"),
+            serde_json::to_vec(&json!({
+                "snapshot_id": snapshot_id,
+                "state": "submitted",
+                "started_ts": now_ts() - 300.0,
+                "heartbeat_ts": now_ts()
+            }))
+            .expect("active marker JSON"),
+        )
+        .await
+        .expect("active marker");
+        fs::write(
+            slurm_results.join(format!("{snapshot_id}.status")),
+            serde_json::to_vec(&json!({
+                "state": "PENDING",
+                "slurm_job_id": "4479",
+                "attempt": 1,
+                "heartbeat_ts": now_ts(),
+                "discovered_nodelist": "qc[00-05]",
+                "message": "must not be copied into the response"
+            }))
+            .expect("Slurm status JSON"),
+        )
+        .await
+        .expect("Slurm status file");
+        fs::write(
+            snapshot.join("progress.json"),
+            serde_json::to_vec(&json!({
+                "snapshot_id": snapshot_id,
+                "status": "queued",
+                "backend": "slurm",
+                "completed_steps": 0,
+                "total_steps": 26,
+                "progress_ratio": 0.0,
+                "elapsed_seconds": 300.0,
+                "eta_seconds": 7_200.0
+            }))
+            .expect("progress JSON"),
+        )
+        .await
+        .expect("progress file");
+        let recent_runs = (1..=3)
+            .map(|index| TrainingRunObservation {
+                snapshot_id: format!("snapshot-{index}"),
+                backend: "slurm".to_string(),
+                status: "completed".to_string(),
+                failure_reason: String::new(),
+                base_model: "qwen3.5:4b".to_string(),
+                ..TrainingRunObservation::default()
+            })
+            .collect();
+        write_training_metrics(
+            &directory.path().join("training_metrics.json"),
+            TrainingMetricsData {
+                runs: recent_runs,
+                updated_at: now_ts(),
+            },
+        )
+        .await
+        .expect("training metrics file");
+
+        let status = store.training_status_snapshot(&training_root, 1).await;
+
+        assert_eq!(status["active"]["snapshot_id"], snapshot_id);
+        assert_eq!(status["active"]["scheduler"]["state"], "PENDING");
+        assert_eq!(status["active"]["scheduler"]["job_id"], "4479");
+        assert_eq!(status["active"]["scheduler"]["nodes"], "qc[00-05]");
+        assert_eq!(status["active"]["training"]["completed_steps"], 0);
+        assert_eq!(status["recent_runs_limit"], 1);
+        assert_eq!(status["training_metrics_available"], true);
+        assert_eq!(
+            status["recent_runs"].as_array().expect("recent runs").len(),
+            1
+        );
+        assert_eq!(status["recent_runs"][0]["snapshot_id"], "snapshot-3");
+        assert!(status["active"].get("message").is_none());
+        assert!(status["recent_runs"][0].get("failure_reason").is_some());
+    }
+
+    #[tokio::test]
+    async fn training_status_snapshot_rejects_unsafe_active_snapshot_ids() {
+        let directory = tempfile::tempdir().expect("training status directory");
+        let store = MetricsStore::new(directory.path().join("provider_metrics.json"))
+            .await
+            .expect("metrics store");
+        let training_root = directory.path().join("training");
+        fs::create_dir_all(&training_root)
+            .await
+            .expect("training directory");
+        fs::write(
+            training_root.join("active_training.json"),
+            serde_json::to_vec(&json!({"snapshot_id": "../outside", "state": "submitted"}))
+                .expect("active marker JSON"),
+        )
+        .await
+        .expect("active marker");
+
+        let status = store.training_status_snapshot(&training_root, 10).await;
+
+        assert_eq!(
+            status["active"]["reason"],
+            "active snapshot identity is invalid"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn training_status_snapshot_does_not_follow_status_file_symlinks() {
+        let directory = tempfile::tempdir().expect("training status directory");
+        let store = MetricsStore::new(directory.path().join("provider_metrics.json"))
+            .await
+            .expect("metrics store");
+        let training_root = directory.path().join("training");
+        fs::create_dir_all(&training_root)
+            .await
+            .expect("training directory");
+        let external_marker = directory.path().join("external.json");
+        fs::write(
+            &external_marker,
+            serde_json::to_vec(&json!({"snapshot_id": "external-secret"}))
+                .expect("external marker JSON"),
+        )
+        .await
+        .expect("external marker");
+        std::os::unix::fs::symlink(&external_marker, training_root.join("active_training.json"))
+            .expect("active marker symlink");
+
+        let status = store.training_status_snapshot(&training_root, 10).await;
+
+        assert_eq!(status["active"]["state"], "unknown");
+        assert_eq!(
+            status["active"]["reason"],
+            "active marker is unreadable, invalid or exceeds the size limit"
+        );
     }
 
     #[test]
