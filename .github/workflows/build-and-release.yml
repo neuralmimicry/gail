@@ -245,6 +245,10 @@ jobs:
 
   package:
     name: Package (${{ matrix.platform }})
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     needs:
       - version
       - verify
@@ -486,6 +490,11 @@ jobs:
           tar -tzf "$archive_path" > "$tar_listing"
           grep -Eq '/gail-qlora-sft$' "$tar_listing"
 
+      - name: Attest native release packages from this exact source
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: dist/*
+
       - name: Upload packaged artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -635,6 +644,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     defaults:
       run:
         shell: bash
@@ -796,6 +807,7 @@ jobs:
           printf '%s' "${password}" | podman login ghcr.io --username "${username}" --password-stdin
 
       - name: Build and push architecture image with Podman
+        id: published_image
         env:
           IMAGE_REPO: ${{ steps.image.outputs.repo }}
           ARCH_TAG: ${{ steps.image.outputs.arch_tag }}
@@ -958,7 +970,17 @@ jobs:
             echo "::error::Podman did not emit an image ID for ${ARCH_TAG}"
             exit 1
           fi
-          podman push "${arch_image_id}" "docker://${ARCH_TAG}"
+          digest_file="${RUNNER_TEMP}/gail-${{ matrix.variant }}-published-digest"
+          podman push --digestfile "${digest_file}" "${arch_image_id}" "docker://${ARCH_TAG}"
+          digest="$(tr -d '\n' < "${digest_file}")"
+          [[ "${digest}" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo 'Invalid published image digest' >&2; exit 1; }
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Attest published architecture image from this exact source
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-name: ${{ steps.image.outputs.repo }}
+          subject-digest: ${{ steps.published_image.outputs.digest }}
 
   publish-container:
     name: Publish multi-arch container manifest
@@ -979,6 +1001,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     env:
       BUILD_VERSION: ${{ needs.version.outputs.build_version }}
       RELEASE_TAG: ${{ needs.create-version-tag.outputs.tag }}
@@ -1038,6 +1062,7 @@ jobs:
           printf '%s' "${password}" | podman login ghcr.io --username "${username}" --password-stdin
 
       - name: Create and push multi-arch manifest
+        id: published_index
         shell: bash
         env:
           IMAGE_REPO: ${{ steps.image.outputs.repo }}
@@ -1070,5 +1095,20 @@ jobs:
 
           for tag in "${tags[@]}"; do
             echo "Pushing ${IMAGE_REPO}:${tag}"
-            podman manifest push --all "${manifest_local}" "docker://${IMAGE_REPO}:${tag}"
+            digest_file="${RUNNER_TEMP}/gail-index-published-digest"
+            podman manifest push --all --digestfile "${digest_file}" "${manifest_local}" "docker://${IMAGE_REPO}:${tag}"
+            digest="$(tr -d '\n' < "${digest_file}")"
+            [[ "${digest}" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo 'Invalid published index digest' >&2; exit 1; }
+            if [[ -n "${expected_digest:-}" && "${digest}" != "${expected_digest}" ]]; then
+              echo 'Published index tags have inconsistent digests' >&2
+              exit 1
+            fi
+            expected_digest="${digest}"
           done
+          echo "digest=${expected_digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Attest published multi-architecture index from this exact source
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-name: ${{ steps.image.outputs.repo }}
+          subject-digest: ${{ steps.published_index.outputs.digest }}
