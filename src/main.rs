@@ -13,6 +13,9 @@ struct Cli {
     config: PathBuf,
     #[arg(long, env = "GAIL_ROLE", value_enum, default_value_t = RuntimeRole::Serve)]
     role: RuntimeRole,
+    /// Parse, interpolate and validate configuration without starting workers.
+    #[arg(long)]
+    check_config: bool,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -37,6 +40,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Gail starting"
     );
     let config = GailConfig::load(&cli.config)?;
+    if cli.check_config {
+        tracing::info!("Gail configuration validated; no runtime started");
+        return Ok(());
+    }
     match cli.role {
         RuntimeRole::Serve => {
             let service = GailService::new(config.clone()).await?;
