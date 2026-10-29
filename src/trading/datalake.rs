@@ -1467,7 +1467,7 @@ fn metadata_path_for(data_file_path: &Path) -> PathBuf {
 }
 
 fn current_build_id() -> String {
-    [
+    let declared = [
         "GAIL_BUILD_ID",
         "GAIL_CONTAINER_BUILD_ID",
         "GAIL_IMAGE_DIGEST",
@@ -1479,8 +1479,17 @@ fn current_build_id() -> String {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
-    })
-    .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+    });
+    bootstrap_build_identity(declared.as_deref(), &crate::build_info::revision())
+}
+
+fn bootstrap_build_identity(declared: Option<&str>, executable: &str) -> String {
+    // A reused deployment label or unchanged Cargo version must not hide a
+    // source change. This makes code repairs re-fetch previously partial data.
+    match declared {
+        Some(label) => format!("{label}:{executable}"),
+        None => executable.to_string(),
+    }
 }
 
 fn compute_bootstrap_reason(
@@ -1617,6 +1626,26 @@ fn normalize_symbol(symbol: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn bootstrap_identity_changes_with_the_executable_even_when_labels_are_reused() {
+        let previous = bootstrap_build_identity(Some("stable-deployment-label"), "source-a");
+        let current = bootstrap_build_identity(Some("stable-deployment-label"), "source-b");
+        assert_ne!(previous, current);
+        let metadata = MarketDataLakeMetadata {
+            schema_version: MARKET_DATALAKE_SCHEMA_VERSION,
+            build_id: previous,
+            last_bootstrap_completed_at: Some(1.0),
+            last_bootstrap_status: Some("completed".into()),
+            ..Default::default()
+        };
+        assert!(
+            compute_bootstrap_reason(&metadata, &current)
+                .unwrap()
+                .starts_with("build_change:")
+        );
+        assert_eq!(bootstrap_build_identity(None, "source-b"), "source-b");
+    }
 
     #[tokio::test]
     #[ignore = "requires an isolated loopback PostgreSQL gail_test_history database"]

@@ -28,6 +28,8 @@ A partial bootstrap persists successful rows but remains failed/retryable until
 every requested venue/symbol/timeframe has returned nonempty history. This
 prevents one healthy venue from hiding another venue's missing data behind a
 successful completion marker.
+Bootstrap identity includes the compiled source revision even when the Cargo
+version or deployment label is reused, so a repaired executable re-fetches data.
 
 `GET /v1/trading/status` requires the normal trading authorization and includes
 `decision_policy`: declared and effective limits, override presence, open
