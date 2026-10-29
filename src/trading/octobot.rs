@@ -480,7 +480,16 @@ impl OctobotClient {
     }
 
     async fn get_optional_json(&self, path: &str, label: &str) -> Result<Option<Value>, String> {
-        if self.should_skip("GET", path).await {
+        self.request_optional_json(path, label, true).await
+    }
+
+    async fn request_optional_json(
+        &self,
+        path: &str,
+        label: &str,
+        adaptive_backoff: bool,
+    ) -> Result<Option<Value>, String> {
+        if adaptive_backoff && self.should_skip("GET", path).await {
             debug!(
                 "trading: skipping OctoBot {} at {} due to adaptive schema backoff",
                 label, path
@@ -2031,9 +2040,13 @@ impl OctobotClient {
         // native venue read must remain observable, rather than looking like a
         // successful bootstrap with no history.
         if let Some(history) = self
-            .get_optional_json(
+            .request_optional_json(
                 &format!("/api/market/candles?{query}"),
                 "venue candle history",
+                // Bootstrap already bounds concurrency and retry timing. A
+                // remembered 503 must not turn into "missing route" and a
+                // misleading successful fallback on the next scheduled retry.
+                false,
             )
             .await?
         {

@@ -62,7 +62,7 @@ fn main() {
         .or_else(|| git_output(&["rev-parse", "HEAD^{tree}"]))
         .unwrap_or_else(|| "unknown".to_string());
     let source_dirty = env_first(&["GAIL_SOURCE_DIRTY"]).unwrap_or_else(|| {
-        git_output(&["status", "--porcelain=v1", "--untracked-files=normal"])
+        git_output_allow_empty(&["status", "--porcelain=v1", "--untracked-files=normal"])
             .map(|output| (!output.is_empty()).to_string())
             .unwrap_or_else(|| "unknown".to_string())
     });
@@ -122,6 +122,12 @@ fn is_build_version(value: &str) -> bool {
 }
 
 fn git_output(args: &[&str]) -> Option<String> {
+    git_output_allow_empty(args).filter(|output| !output.is_empty())
+}
+
+// An empty successful `git status --porcelain` means clean, not unknown.
+// Keep that distinction while commit/tree lookups still require a value.
+fn git_output_allow_empty(args: &[&str]) -> Option<String> {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").ok()?;
     let output = Command::new("git")
         .args(args)
@@ -132,12 +138,7 @@ fn git_output(args: &[&str]) -> Option<String> {
         return None;
     }
     let stdout = String::from_utf8(output.stdout).ok()?;
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    Some(stdout.trim().to_string())
 }
 
 fn git_dir() -> Option<PathBuf> {

@@ -5751,6 +5751,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_keeps_partial_history_retryable_until_every_venue_recovers() {
+        let server = MockServer::start().await;
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let requests = vec![
+            ("binance".into(), "BTC/USDT".into(), "1h".into()),
+            ("bitget".into(), "BTC/USDT".into(), "1h".into()),
+        ];
+        for recovered in [false, true] {
+            server.reset().await;
+            for venue in ["binance", "bitget"] {
+                let response = if venue == "bitget" && !recovered {
+                    ResponseTemplate::new(503)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "exchange":venue,"symbol":"BTC/USDT","time_frame":"1h",
+                        "timestamp_unit":"seconds","timestamp_semantics":"candle_open","closed_only":true,"simulated":false,
+                        "candles":{"time":[1700000000],"close":[100]}
+                    }))
+                };
+                Mock::given(method("GET"))
+                    .and(path("/api/market/candles"))
+                    .and(query_param("exchange", venue))
+                    .respond_with(response)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            let batch = super::super::fetch_bootstrap_history(&client, requests.clone()).await;
+            assert_eq!(batch.is_complete(), recovered);
+            assert_eq!(batch.snapshots.len(), if recovered { 2 } else { 1 });
+            assert_eq!(batch.failed_requests.len(), if recovered { 0 } else { 1 });
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
     async fn octobot_client_schema_skips_known_missing_optional_watched_symbol_route() {
         let server = MockServer::start().await;
 
