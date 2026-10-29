@@ -19,6 +19,7 @@ pub mod mirror_worker;
 pub mod model_credentials;
 pub mod models;
 pub mod nmc_telemetry;
+pub mod numerical;
 pub mod orchestration;
 pub mod prompt_budget;
 pub mod provider_admission;

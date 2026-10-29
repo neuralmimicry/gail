@@ -1,0 +1,13 @@
+# Extend the deployed image without removing its trainer, conversion, Python,
+# configuration or accelerator assets. The serving binary uses an isolated
+# Debian 13 libc directory; other existing executables retain their original
+# loader and libraries. No system libc is replaced.
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e AS business-runtime
+FROM ghcr.io/neuralmimicry/gail@sha256:1647f61c24ff1bb6a0575618a2e5e6a9321b2b0ebd95b0518379fa450690b76a
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.source="https://github.com/neuralmimicry/gail"
+LABEL org.opencontainers.image.revision="${SOURCE_REVISION}"
+COPY --from=business-runtime /usr/lib/aarch64-linux-gnu/ /opt/gail-business-runtime/
+COPY --chmod=0555 dist/gail /usr/local/libexec/gail-business
+COPY --chmod=0555 scripts/business-serving-entrypoint /usr/bin/gail
+

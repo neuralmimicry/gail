@@ -704,6 +704,23 @@ impl GailService {
         &self.inner.governance
     }
 
+    /// Business advice uses the existing registry identity and horizon. This
+    /// adds no bypass around the normal ELM per-decision gates.
+    #[cfg(feature = "elm")]
+    pub(crate) fn business_model_matches(&self, task: &str, digest: &str, horizon: u64) -> bool {
+        self.inner
+            .elm_runtime
+            .as_ref()
+            .and_then(|r| r.registry.as_ref())
+            .and_then(|r| r.champion(task))
+            .is_some_and(|artifact| {
+                artifact.content_sha256 == digest
+                    && artifact.metadata.horizon_seconds == Some(horizon)
+                    && artifact.metadata.domain_scope == "capacity"
+                    && !artifact.metadata.fixture_only
+            })
+    }
+
     pub(crate) fn elm_status_value(&self) -> Value {
         let mut status = json!({
             "build_supported": cfg!(feature = "elm"),

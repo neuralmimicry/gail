@@ -1,0 +1,6 @@
+#!/bin/sh
+# Only this serving binary needs the newer libc. Preserve the image's native
+# trainer and subprocess environment instead of changing LD_LIBRARY_PATH.
+exec /opt/gail-business-runtime/ld-linux-aarch64.so.1 \
+  --library-path /opt/gail-business-runtime /usr/local/libexec/gail-business "$@"
+

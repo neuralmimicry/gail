@@ -213,6 +213,8 @@ where
 }
 
 const KNOWN_TASKS: &[&str] = &[
+    "compute_demand",
+    "job_duration",
     "routing_candidate_utility",
     "quant_net_edge",
     "trading_advisory",
