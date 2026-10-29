@@ -1606,6 +1606,9 @@ impl GailService {
     }
 
     fn optional_audit_text(&self, value: Option<&str>) -> Option<String> {
+        if crate::business_context::learning_suppressed() {
+            return None;
+        }
         value
             .map(str::trim)
             .filter(|item| !item.is_empty())
@@ -1613,6 +1616,9 @@ impl GailService {
     }
 
     fn json_for_audit<T: Serialize>(&self, value: &T) -> String {
+        if crate::business_context::learning_suppressed() {
+            return "<content capture disabled>".into();
+        }
         match serde_json::to_string(value) {
             Ok(serialized) => self.truncate_audit_text(serialized.as_str()),
             Err(error) => self.truncate_audit_text(format!("<<serialize-error:{error}>>").as_str()),
@@ -3742,7 +3748,7 @@ impl GailService {
         exchange: AarnnMirrorExchange,
     ) -> Option<oneshot::Receiver<crate::models::AarnnMirrorInvocationTrace>> {
         // Classifier examples may contain hostile material; never use them as learning input.
-        if crate::governance::is_assessment() {
+        if crate::governance::is_assessment() || crate::business_context::learning_suppressed() {
             return None;
         }
         let bridge = self.inner.aarnn_bridge.clone()?;
@@ -3886,7 +3892,7 @@ impl GailService {
     async fn record_llm_interaction(&self, mut record: LlmLedgerRecord) {
         // Aria owns the redacted decision audit. Assessment prompts must not enter
         // Gail's content logs, comparative validation or asynchronous training ledger.
-        if crate::governance::is_assessment() {
+        if crate::governance::is_assessment() || crate::business_context::learning_suppressed() {
             return;
         }
         if !self.audit_logging().store_llm_content
@@ -3916,6 +3922,9 @@ impl GailService {
         response: &CompletionResponse,
         status: &str,
     ) {
+        if crate::business_context::learning_suppressed() {
+            return;
+        }
         let final_source = response
             .trace
             .as_ref()
@@ -9375,6 +9384,63 @@ Return only a JSON data instance that satisfies this schema:
         assert_eq!(rows[1].endpoint_scope, "192_168_1_62_18080_v1");
         assert_eq!(rows[1].endpoint_host.as_deref(), Some("192.168.1.62"));
         assert_eq!(rows[1].endpoint_suffix.as_deref(), Some(".62"));
+    }
+
+    #[tokio::test]
+    async fn context_only_scope_suppresses_content_audit_and_durable_learning_rows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = GailConfig::default();
+        config.storage.metrics_path = temp.path().join("metrics.json").display().to_string();
+        config.storage.adaptive_schema_path =
+            temp.path().join("adaptive.json").display().to_string();
+        config.storage.api_issues_path = temp.path().join("issues.json").display().to_string();
+        config.storage.llm_ledger_path = temp.path().join("ledger.jsonl").display().to_string();
+        config.storage.trainer_output_path = temp.path().join("training").display().to_string();
+        config.llm_ledger.enabled = true;
+        let service = GailService::new(config).await.expect("service");
+        crate::business_context::without_learning(async {
+            assert!(
+                service
+                    .optional_audit_text(Some("private-source"))
+                    .is_none()
+            );
+            assert!(
+                !service
+                    .json_for_audit(&json!({"content":"private-source"}))
+                    .contains("private-source")
+            );
+            service
+                .record_llm_interaction(LlmLedgerRecord {
+                    request_id: "private-context".into(),
+                    prompt_text: "private-source".into(),
+                    ..LlmLedgerRecord::default()
+                })
+                .await;
+        })
+        .await;
+        service
+            .record_llm_interaction(LlmLedgerRecord {
+                request_id: "ordinary-request".into(),
+                prompt_text: "permitted-source".into(),
+                ..LlmLedgerRecord::default()
+            })
+            .await;
+        let ledger = temp.path().join("ledger.jsonl");
+        for _ in 0..50 {
+            if tokio::fs::read_to_string(&ledger)
+                .await
+                .unwrap_or_default()
+                .contains("ordinary-request")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let contents = tokio::fs::read_to_string(ledger)
+            .await
+            .expect("ledger persisted");
+        assert!(contents.contains("ordinary-request"));
+        assert!(!contents.contains("private-source") && !contents.contains("private-context"));
     }
 
     #[tokio::test]
