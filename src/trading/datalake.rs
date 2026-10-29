@@ -32,7 +32,7 @@ use super::{
 };
 
 const POSTGRES_PRUNE_INTERVAL_SECONDS: f64 = 3_600.0;
-const MARKET_DATALAKE_SCHEMA_VERSION: u32 = 2;
+const MARKET_DATALAKE_SCHEMA_VERSION: u32 = 3;
 // Postgres is an optional mirror for the append-only file lake. Database
 // startup, reads and writes all run outside evaluation and decision tasks.
 const MARKET_DATALAKE_POSTGRES_OPERATION_TIMEOUT_SECONDS: u64 = 30;
@@ -51,6 +51,10 @@ fn now_ts() -> f64 {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MarketSample {
+    /// Version of the observation-time contract. Pre-v3 history could stamp a
+    /// candle close at its open or fabricate a missing time. Retain those rows
+    /// for audit, but never reload them into decisions or native validation.
+    pub observation_time_contract: i32,
     pub exchange: String,
     pub symbol: String,
     pub captured_ts: f64,
@@ -69,6 +73,7 @@ pub struct MarketSample {
 impl Default for MarketSample {
     fn default() -> Self {
         Self {
+            observation_time_contract: 0,
             exchange: String::new(),
             symbol: String::new(),
             captured_ts: 0.0,
@@ -935,13 +940,13 @@ fn sample_from_snapshot(snapshot: &MarketSnapshot, bucket_seconds: u64) -> Optio
     if !snapshot.price.is_finite() || snapshot.price <= 0.0 {
         return None;
     }
-    let captured_ts = if snapshot.fetched_at.is_finite() && snapshot.fetched_at > 0.0 {
-        snapshot.fetched_at
-    } else {
-        now_ts()
-    };
+    let captured_ts = snapshot.fetched_at;
+    if !captured_ts.is_finite() || captured_ts <= 0.0 || captured_ts > now_ts() {
+        return None;
+    }
     let captured_bucket = (captured_ts / bucket_seconds as f64).floor() as i64;
     Some(MarketSample {
+        observation_time_contract: MARKET_DATALAKE_SCHEMA_VERSION as i32,
         exchange: normalize_exchange(&snapshot.exchange),
         symbol: normalize_symbol(&snapshot.symbol),
         captured_ts,
@@ -1191,6 +1196,9 @@ async fn load_samples_from_file(
         let Ok(mut sample) = serde_json::from_str::<MarketSample>(&line) else {
             continue;
         };
+        if sample.observation_time_contract != MARKET_DATALAKE_SCHEMA_VERSION as i32 {
+            continue;
+        }
         sample.exchange = normalize_exchange(&sample.exchange);
         sample.symbol = normalize_symbol(&sample.symbol);
         if sample.captured_ts + f64::EPSILON < since_ts {
@@ -1295,6 +1303,7 @@ async fn initialize_postgres_schema(dsn: &str) -> Result<(), String> {
                 high_24h DOUBLE PRECISION,
                 low_24h DOUBLE PRECISION,
                 microstructure JSONB NOT NULL DEFAULT '{}'::jsonb,
+                observation_time_contract INTEGER NOT NULL DEFAULT 0,
                 inserted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 UNIQUE (exchange, symbol, captured_bucket)
             );
@@ -1304,6 +1313,8 @@ async fn initialize_postgres_schema(dsn: &str) -> Result<(), String> {
                 ON gail_market_snapshots (captured_ts DESC);
             ALTER TABLE gail_market_snapshots
                 ADD COLUMN IF NOT EXISTS microstructure JSONB NOT NULL DEFAULT '{}'::jsonb;
+            ALTER TABLE gail_market_snapshots
+                ADD COLUMN IF NOT EXISTS observation_time_contract INTEGER NOT NULL DEFAULT 0;
             CREATE TABLE IF NOT EXISTS gail_market_snapshots_meta (
                 key TEXT PRIMARY KEY,
                 value JSONB NOT NULL,
@@ -1335,9 +1346,10 @@ async fn persist_samples_postgres(dsn: &str, samples: &[MarketSample]) -> Result
                 volume_24h,
                 high_24h,
                 low_24h,
-                microstructure
+                microstructure,
+                observation_time_contract
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
             ON CONFLICT (exchange, symbol, captured_bucket)
             DO UPDATE SET
                 captured_ts = EXCLUDED.captured_ts,
@@ -1346,7 +1358,8 @@ async fn persist_samples_postgres(dsn: &str, samples: &[MarketSample]) -> Result
                 volume_24h = EXCLUDED.volume_24h,
                 high_24h = EXCLUDED.high_24h,
                 low_24h = EXCLUDED.low_24h,
-                microstructure = EXCLUDED.microstructure
+                microstructure = EXCLUDED.microstructure,
+                observation_time_contract = EXCLUDED.observation_time_contract
             "#,
         )
         .await
@@ -1368,6 +1381,7 @@ async fn persist_samples_postgres(dsn: &str, samples: &[MarketSample]) -> Result
                     &sample.high_24h,
                     &sample.low_24h,
                     &microstructure,
+                    &sample.observation_time_contract,
                 ],
             )
             .await
@@ -1398,13 +1412,19 @@ async fn load_samples_from_postgres(
                 volume_24h,
                 high_24h,
                 low_24h,
-                microstructure
+                microstructure,
+                observation_time_contract
             FROM gail_market_snapshots
             WHERE symbol = $1
               AND captured_ts >= $2
+              AND observation_time_contract = $3
             ORDER BY captured_bucket ASC
             "#,
-            &[&normalize_symbol(symbol), &since_ts],
+            &[
+                &normalize_symbol(symbol),
+                &since_ts,
+                &(MARKET_DATALAKE_SCHEMA_VERSION as i32),
+            ],
         )
         .await
         .map_err(|error| format!("failed to query market datalake samples: {error}"))?;
@@ -1412,6 +1432,7 @@ async fn load_samples_from_postgres(
     Ok(rows
         .into_iter()
         .map(|row| MarketSample {
+            observation_time_contract: row.get("observation_time_contract"),
             exchange: normalize_exchange(row.get::<_, String>("exchange").as_str()),
             symbol: normalize_symbol(row.get::<_, String>("symbol").as_str()),
             captured_bucket: row.get("captured_bucket"),
@@ -1596,6 +1617,116 @@ fn normalize_symbol(symbol: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    #[ignore = "requires an isolated loopback PostgreSQL gail_test_history database"]
+    async fn postgres_observation_contract_migrates_and_filters_legacy_rows() {
+        let dsn = std::env::var("GAIL_TEST_POSTGRES_DSN").expect("isolated test DSN");
+        let parsed: tokio_postgres::Config = dsn.parse().unwrap();
+        assert_eq!(parsed.get_dbname(), Some("gail_test_history"));
+        assert!(parsed.get_hosts().iter().all(
+            |host| matches!(host, tokio_postgres::config::Host::Tcp(name) if name == "127.0.0.1")
+        ));
+        initialize_postgres_schema(&dsn).await.unwrap();
+        let client = connect_postgres_client(&dsn).await.unwrap();
+        // Recreate the pre-v3 column boundary without deleting any legacy row.
+        client.batch_execute("ALTER TABLE gail_market_snapshots DROP COLUMN observation_time_contract; INSERT INTO gail_market_snapshots(exchange,symbol,captured_bucket,captured_ts,price) VALUES('binance','BTC/USDT',1,60,100)").await.unwrap();
+        initialize_postgres_schema(&dsn).await.unwrap();
+        initialize_postgres_schema(&dsn).await.unwrap();
+        let verified = MarketSample {
+            observation_time_contract: MARKET_DATALAKE_SCHEMA_VERSION as i32,
+            exchange: "binance".into(),
+            symbol: "BTC/USDT".into(),
+            captured_bucket: 2,
+            captured_ts: 120.0,
+            price: 101.0,
+            ..Default::default()
+        };
+        persist_samples_postgres(&dsn, &[verified.clone()])
+            .await
+            .unwrap();
+        persist_samples_postgres(
+            &dsn,
+            &[MarketSample {
+                price: 102.0,
+                ..verified
+            }],
+        )
+        .await
+        .unwrap();
+        let loaded = load_samples_from_postgres(&dsn, "binance", "BTC/USDT", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].price, 102.0);
+        assert_eq!(
+            loaded[0].observation_time_contract,
+            MARKET_DATALAKE_SCHEMA_VERSION as i32
+        );
+        let total: i64 = client
+            .query_one("SELECT count(*) FROM gail_market_snapshots", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(total, 2, "migration preserves the original observation");
+    }
+
+    #[tokio::test]
+    async fn legacy_observation_times_are_retained_on_disk_but_excluded_from_replay() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("history.jsonl");
+        let legacy = MarketSample {
+            exchange: "binance".into(),
+            symbol: "BTC/USDT".into(),
+            captured_ts: 1700000000.0,
+            price: 100.0,
+            ..Default::default()
+        };
+        let verified = MarketSample {
+            observation_time_contract: MARKET_DATALAKE_SCHEMA_VERSION as i32,
+            captured_ts: 1700003600.0,
+            captured_bucket: 1700003600 / 60,
+            ..legacy.clone()
+        };
+        append_samples_to_file(&path, &[legacy, verified.clone()])
+            .await
+            .unwrap();
+        let loaded = load_samples_from_file(
+            &path,
+            &HashSet::from([market_feature_key("binance", "BTC/USDT")]),
+            0.0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].captured_ts, verified.captured_ts);
+        assert_eq!(
+            fs::read_to_string(&path).await.unwrap().lines().count(),
+            2,
+            "audit history is preserved"
+        );
+        let absent_marker: MarketSample = serde_json::from_value(serde_json::json!({"exchange":"binance","symbol":"BTC/USDT","price":100,"captured_ts":1700000000})).unwrap();
+        assert_eq!(absent_marker.observation_time_contract, 0);
+    }
+
+    #[test]
+    fn datalake_does_not_replace_invalid_observation_times_with_now() {
+        let mut snapshot = MarketSnapshot {
+            price: 100.0,
+            ..Default::default()
+        };
+        for timestamp in [0.0, -1.0, f64::NAN, now_ts() + 3600.0] {
+            snapshot.fetched_at = timestamp;
+            assert!(sample_from_snapshot(&snapshot, 60).is_none());
+        }
+        snapshot.fetched_at = now_ts() - 100.0;
+        assert_eq!(
+            sample_from_snapshot(&snapshot, 60)
+                .unwrap()
+                .observation_time_contract,
+            MARKET_DATALAKE_SCHEMA_VERSION as i32
+        );
+    }
 
     #[test]
     fn feature_key_is_case_normalized() {

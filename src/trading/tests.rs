@@ -1616,6 +1616,83 @@ mod tests {
     }
 
     #[test]
+    fn persisted_policy_replay_exposes_position_and_confidence_blockers() {
+        use crate::trading::fuzzy::FuzzyDecision;
+        let config = TradingConfig {
+            max_open_positions: 40,
+            fuzzy_confidence_threshold: 0.65,
+            micro_trade_min_usd: 1.0,
+            micro_trade_max_usd: 25.0,
+            ..default_config()
+        };
+        let mut state = make_default_state();
+        state.current_portfolio = Some(OctobotPortfolio {
+            currencies: (0..11)
+                .map(|idx| {
+                    (
+                        format!("ASSET{idx}"),
+                        CurrencyBalance {
+                            total: 1.0,
+                            value_usd: Some(20.0),
+                            ..CurrencyBalance::default()
+                        },
+                    )
+                })
+                .collect(),
+            ..OctobotPortfolio::default()
+        });
+        state.config_overrides = Some(TradingConfigOverride {
+            max_open_positions: Some(4),
+            fuzzy_confidence_threshold: Some(0.77),
+            micro_trade_max_usd: Some(28.5),
+            ..Default::default()
+        });
+        let engine = DecisionEngine::new(0.4);
+        let fuzzy = FuzzyDecision {
+            signal: 0.9,
+            confidence: 0.99,
+            label: "buy".into(),
+            term_activations: Default::default(),
+        };
+        let mut consensus = make_strong_bullish_consensus();
+        consensus.confidence = 0.99;
+        let market = make_snapshot("binance", "BTC/USDT", 50000.0, 5.0, 2_000_000.0);
+        let blocked = engine.decide(&fuzzy, &consensus, Some(&market), &state, &config);
+        assert_eq!(blocked.action, TradeAction::Hold);
+        assert!(blocked.rationale.to_lowercase().contains("position"));
+        let diagnostics = DecisionEngine::policy_status(&state, &config);
+        assert_eq!(diagnostics["declared"]["max_open_positions"], 40);
+        assert_eq!(diagnostics["effective"]["max_open_positions"], 4);
+        assert_eq!(diagnostics["buy_capacity_exhausted"], true);
+
+        // This is an isolated counterfactual, not a change to production limits.
+        state.config_overrides.as_mut().unwrap().max_open_positions = None;
+        let allowed = engine.decide(&fuzzy, &consensus, Some(&market), &state, &config);
+        assert!(matches!(
+            allowed.action,
+            TradeAction::Buy | TradeAction::StrongBuy
+        ));
+        let moderate = FuzzyDecision {
+            confidence: 0.72,
+            ..fuzzy
+        };
+        consensus.confidence = 0.72;
+        let blocked = engine.decide(&moderate, &consensus, Some(&market), &state, &config);
+        assert_eq!(blocked.action, TradeAction::Hold);
+        assert!(blocked.rationale.contains("adaptive threshold"));
+        state
+            .config_overrides
+            .as_mut()
+            .unwrap()
+            .fuzzy_confidence_threshold = None;
+        let allowed = engine.decide(&moderate, &consensus, Some(&market), &state, &config);
+        assert!(matches!(
+            allowed.action,
+            TradeAction::Buy | TradeAction::StrongBuy
+        ));
+    }
+
+    #[test]
     fn decision_strong_bearish_signals_produce_sell() {
         let engine = DecisionEngine::new(0.4);
         let fuzzy = FuzzyEngine::new().evaluate(&bearish_inputs());
@@ -3417,6 +3494,160 @@ mod tests {
         assert_eq!(result.side, "buy");
         assert_eq!(result.amount, 5.0);
         assert_eq!(result.price, Some(65000.0));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn isolated_execution_replay_enforces_qualification_then_submits_once() {
+        use crate::trading::{
+            backtest::{ApproachAssessment, BacktestSummary},
+            qualification::PaperQualificationPolicy,
+        };
+        let server = MockServer::start().await;
+        let storage = tempfile::tempdir().unwrap();
+        // Everything, including qualification evidence and the order ledger,
+        // belongs to this loopback fixture and temporary directory. This test
+        // cannot qualify the deployed model or contact a real venue.
+        let config = TradingConfig {
+            octobot_base_url: server.uri(),
+            live_execution_enabled: true,
+            backtesting_enabled: true,
+            data_path: storage.path().join("state.json").display().to_string(),
+            ..default_config()
+        };
+        assert!(config.octobot_base_url.starts_with("http://127.0.0.1:"));
+        let state = SharedTradingState::new(100, 100);
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        Mock::given(method("POST"))
+            .and(path("/api/refresh_portfolio"))
+            .respond_with(ResponseTemplate::new(200).set_body_json("Portfolio(s) refreshed"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/portfolio"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "USDT":{"free":1000,"total":1000,"value_usd":1000,
+                    "exchanges":{"binance":{"free":1000,"total":1000,"value_usd":1000}}},
+                "total_value_usd":1000
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/first_exchange_details"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"exchange_name":"binance","exchange_id":"binance-id"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET")).and(path("/api/exchanges"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{"name":"binance","exchange_id":"binance-id","enabled":true,"symbols":["BTC/USDT"]}])))
+            .mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/market/ticker"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"last":50000,"timestamp":super::super::now_ts()})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET")).and(path("/trading"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"<a href="/symbol_market_status?exchange_id=binance-id&amp;symbol=BTC%2FUSDT">Binance</a>"#))
+            .mount(&server).await;
+        for route in ["/api/orders", "/api/trades"] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST")).and(path("/api/orders"))
+            .and(query_param("action","create_order"))
+            .and(body_string_contains("BTC/USDT")).and(body_string_contains("binance"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"fixture-order-only","symbol":"BTC/USDT","side":"buy","price":50000,"status":"submitted"})))
+            .expect(1).mount(&server).await;
+        let mut market = make_snapshot("binance", "BTC/USDT", 50000.0, 5.0, 2_000_000.0);
+        market.fetched_at = super::super::now_ts();
+        let decision = DecisionEngine::new(0.4).decide(
+            &FuzzyEngine::new().evaluate(&bullish_inputs()),
+            &make_strong_bullish_consensus(),
+            Some(&market),
+            &make_default_state(),
+            &config,
+        );
+        assert!(matches!(
+            decision.action,
+            TradeAction::Buy | TradeAction::StrongBuy
+        ));
+        super::super::execute_if_warranted(&client, &decision, &state, &config, None).await;
+        assert_eq!(
+            state.0.lock().await.paper_qualification.validated_intents,
+            1
+        );
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.method.as_str() == "POST"
+                    && request.url.path() == "/api/orders")
+        );
+
+        let revision =
+            super::super::paper_decision_fingerprint(crate::build_info::revision(), None, &config);
+        let policy = PaperQualificationPolicy {
+            min_evaluations: config.paper_qualification_min_evaluations,
+            min_validated_intents: config.paper_qualification_min_validated_intents,
+            validity_seconds: config.paper_qualification_validity_seconds as f64,
+            intent_lease_seconds: config.execution_lease_seconds,
+        };
+        {
+            let mut current = state.0.lock().await;
+            for index in 0..config.paper_qualification_min_validated_intents {
+                current.paper_qualification.observe_intent(
+                    &revision,
+                    &format!("fixture:{index}"),
+                    (index + 1) * (config.paper_qualification_min_evaluations + 1),
+                    super::super::now_ts(),
+                    policy,
+                );
+            }
+            assert!(current.paper_qualification.is_qualified(
+                &revision,
+                super::super::now_ts(),
+                policy
+            ));
+        }
+        // Even a fully qualified local paper fixture cannot bypass profitability.
+        super::super::execute_if_warranted(&client, &decision, &state, &config, None).await;
+        assert_eq!(state.0.lock().await.trade_count, 0);
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.method.as_str() == "POST"
+                    && request.url.path() == "/api/orders")
+        );
+        {
+            let mut current = state.0.lock().await;
+            current.last_backtest = Some(BacktestSummary {
+                assessment: ApproachAssessment::Viable,
+                profitability_pct: Some(config.backtest_profitability_threshold + 1.0),
+                total_trades: 20,
+                ..BacktestSummary::incomplete("isolated fixture, never production evidence")
+            });
+        }
+        super::super::execute_if_warranted(&client, &decision, &state, &config, None).await;
+        assert_eq!(state.0.lock().await.trade_count, 1);
+        assert!(storage.path().join("state.json").exists());
+        // Durable deduplication survives a process restart and suppresses replay.
+        let restarted = SharedTradingState::new(100, 100);
+        restarted.restore(&PathBuf::from(&config.data_path)).await;
+        super::super::execute_if_warranted(&client, &decision, &restarted, &config, None).await;
+        assert_eq!(restarted.0.lock().await.trade_count, 1);
         server.verify().await;
     }
 
@@ -5470,6 +5701,53 @@ mod tests {
         assert!(history[0].fetched_at > 1_700_000_000.0);
         assert!(history[2].fetched_at > history[0].fetched_at);
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_history_uses_native_venue_contract_without_watched_cache() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/api/market/candles"))
+            .and(query_param("exchange", "binance")).and(query_param("symbol", "BTC/USDT"))
+            .and(query_param("time_frame", "1h"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exchange":"binance","symbol":"BTC/USDT","time_frame":"1h",
+                "timestamp_unit":"seconds","timestamp_semantics":"candle_open",
+                "closed_only":true,"simulated":false,
+                "candles":{"time":[1700000000,1700003600],"close":[100,105],"high":[101,106],"low":[99,103],"volume":[10,12]}
+            }))).expect(1).mount(&server).await;
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        let history = client
+            .get_market_snapshot_history("binance", "BTC/USDT", "1h")
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            history[0].fetched_at, 1700003600.0,
+            "close is known at candle end"
+        );
+        assert_eq!(history[1].price, 105.0);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn octobot_history_does_not_hide_venue_failure_with_dashboard_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/market/candles"))
+            .respond_with(
+                ResponseTemplate::new(503).set_body_string("Venue candle history unavailable"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OctobotClient::new(&server.uri(), None, 10.0);
+        assert!(
+            client
+                .get_market_snapshot_history("binance", "BTC/USDT", "1h")
+                .await
+                .is_err()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -1223,7 +1223,10 @@ pub(crate) async fn trading_status(
         Some(bridge) => {
             let state = bridge.state.0.lock().await;
             let snapshot = state.status_snapshot(bridge.is_enabled());
-            Json(snapshot).into_response()
+            let mut response = json!(snapshot);
+            response["decision_policy"] =
+                crate::trading::decision::DecisionEngine::policy_status(&state, &bridge.config);
+            Json(response).into_response()
         }
     }
 }
