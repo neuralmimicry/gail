@@ -254,6 +254,11 @@ pub fn build_router_with_alexa(service: GailService, alexa: Arc<AlexaRuntime>) -
         .route("/v1/status/api-schema", get(adaptive_api_schema_status))
         .route("/v1/status/api-issues", get(api_issues_status))
         .route("/v1/elm/status", get(elm_status))
+        .route("/v1/numerical/predict", post(crate::numerical::predict))
+        .route(
+            "/v1/business/briefings",
+            post(crate::business_context::briefing),
+        )
         .route("/v1/elm/models", get(elm_models))
         .route("/v1/elm/models/{model_id}/evaluations", get(elm_evaluation))
         .route("/metrics", get(prometheus_metrics))

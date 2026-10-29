@@ -5,6 +5,7 @@ pub mod alexa;
 pub mod api_issues;
 pub mod app;
 pub mod build_info;
+pub mod business_context;
 pub mod client;
 pub mod config;
 #[cfg(feature = "elm")]
@@ -19,6 +20,7 @@ pub mod mirror_worker;
 pub mod model_credentials;
 pub mod models;
 pub mod nmc_telemetry;
+pub mod numerical;
 pub mod orchestration;
 pub mod prompt_budget;
 pub mod provider_admission;

@@ -16,6 +16,7 @@ pub enum ElmMode {
     Off,
     Collect,
     Shadow,
+    #[serde(alias = "on")]
     Auto,
 }
 
@@ -112,7 +113,7 @@ impl ElmConfig {
         }
         if let Ok(mode) = std::env::var("GAIL_ELM_MODE") {
             self.mode = serde_yaml::from_str::<ElmMode>(&mode).map_err(|_| {
-                GailError::invalid_config("GAIL_ELM_MODE must be off, collect, shadow, or auto")
+                GailError::invalid_config("GAIL_ELM_MODE must be off, collect, shadow, auto, or on")
             })?;
         }
         for (name, task) in &self.tasks {
@@ -213,6 +214,8 @@ where
 }
 
 const KNOWN_TASKS: &[&str] = &[
+    "compute_demand",
+    "job_duration",
     "routing_candidate_utility",
     "quant_net_edge",
     "trading_advisory",
@@ -529,6 +532,11 @@ impl PromotionPolicy {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_on_mode_remains_compatible_with_auto() {
+        let mode: super::ElmMode = serde_yaml::from_str("on").expect("legacy on mode");
+        assert_eq!(mode, super::ElmMode::Auto);
+    }
     use super::*;
 
     #[test]
