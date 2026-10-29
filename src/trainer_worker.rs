@@ -36,9 +36,25 @@ pub async fn run(config: GailConfig) -> Result<()> {
             "trainer worker requires storage.postgres_dsn (or GAIL_POSTGRES_DSN)",
         ));
     };
-    llm_ledger::initialize_schema(&dsn).await.map_err(|error| {
-        GailError::invalid_config(format!("failed to initialise LLM ledger schema: {error}"))
-    })?;
+    // PostgreSQL often starts after this Deployment when a shared-storage host
+    // recovers. A transient database outage must not crash-loop the trainer.
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), llm_ledger::initialize_schema(&dsn))
+            .await
+        {
+            Ok(Ok(())) => break,
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "LLM ledger unavailable; retrying trainer startup in 10 seconds")
+            }
+            Err(_) => {
+                tracing::warn!("LLM ledger startup deadline exceeded; retrying in 10 seconds")
+            }
+        }
+        tokio::select! {
+            _ = crate::app::shutdown_signal() => return Ok(()),
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+        }
+    }
     let _training_worker_lock = llm_ledger::acquire_training_worker_lock(&dsn)
         .await
         .map_err(|error| {
@@ -4055,6 +4071,21 @@ fn now_ts() -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn transient_database_outage_retries_instead_of_exiting() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut config = crate::config::GailConfig::default();
+        config.storage.postgres_dsn = Some(format!(
+            "host=127.0.0.1 port={port} user=retry_test dbname=retry_test connect_timeout=1"
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), super::run(config))
+                .await
+                .is_err()
+        );
+    }
     use super::*;
 
     #[tokio::test]

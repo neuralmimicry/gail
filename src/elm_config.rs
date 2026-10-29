@@ -548,6 +548,14 @@ mod tests {
     }
 
     #[test]
+    fn on_enables_the_existing_automatic_evidence_gates() {
+        let cfg: ElmConfig = serde_yaml::from_str("mode: 'on'\n").unwrap();
+        assert_eq!(cfg.mode, ElmMode::Auto);
+        assert!(cfg.enabled());
+        assert!(cfg.tasks.is_empty()); // Enabling never implicitly allows a task.
+    }
+
+    #[test]
     fn most_restrictive_task_mode_wins_and_stage_defaults_to_shadow() {
         let mut cfg = ElmConfig {
             mode: ElmMode::Auto,
