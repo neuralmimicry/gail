@@ -16,6 +16,7 @@ pub enum ElmMode {
     Off,
     Collect,
     Shadow,
+    #[serde(alias = "on")]
     Auto,
 }
 
@@ -112,7 +113,7 @@ impl ElmConfig {
         }
         if let Ok(mode) = std::env::var("GAIL_ELM_MODE") {
             self.mode = serde_yaml::from_str::<ElmMode>(&mode).map_err(|_| {
-                GailError::invalid_config("GAIL_ELM_MODE must be off, collect, shadow, or auto")
+                GailError::invalid_config("GAIL_ELM_MODE must be off, collect, shadow, auto, or on")
             })?;
         }
         for (name, task) in &self.tasks {
@@ -537,6 +538,14 @@ mod tests {
         assert_eq!(cfg.mode, ElmMode::Off);
         assert!(!cfg.enabled());
         assert!(serde_yaml::from_str::<ElmConfig>("mode: shadow\nmode_typo: auto").is_err());
+    }
+
+    #[test]
+    fn on_enables_the_existing_automatic_evidence_gates() {
+        let cfg: ElmConfig = serde_yaml::from_str("mode: 'on'\n").unwrap();
+        assert_eq!(cfg.mode, ElmMode::Auto);
+        assert!(cfg.enabled());
+        assert!(cfg.tasks.is_empty()); // Enabling never implicitly allows a task.
     }
 
     #[test]

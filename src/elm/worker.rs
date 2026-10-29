@@ -54,8 +54,9 @@ pub struct ElmTrainingJob {
 pub async fn run(config: GailConfig) -> anyhow::Result<()> {
     if config.elm.mode == ElmMode::Off {
         tracing::warn!(
-            "ELM trainer role selected while elm.mode=off; exiting without reading a dataset"
+            "ELM trainer disabled by elm.mode=off; waiting for shutdown without reading a dataset"
         );
+        crate::app::shutdown_signal().await;
         return Ok(());
     }
     let registry_path = config.elm.registry_path.clone();
@@ -101,6 +102,23 @@ pub async fn run(config: GailConfig) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod startup_tests {
+    #[tokio::test]
+    async fn disabled_worker_waits_without_opening_the_dataset_or_registry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut config = crate::config::GailConfig::default();
+        config.elm.registry_path = temporary.path().join("must-remain-absent");
+        let registry = config.elm.registry_path.clone();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), super::run(config))
+                .await
+                .is_err()
+        );
+        assert!(!registry.exists());
+    }
 }
 
 /// Advance only the current, still-qualified shadow champion to a bounded

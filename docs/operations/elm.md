@@ -1,5 +1,17 @@
 # Native ELM operations
 
+`elm.mode: 'on'` and `GAIL_ELM_MODE=on` are aliases for the existing automatic
+mode. They retain task permissions, qualification, rollout and influence gates.
+The production ELM settings also live in SwarmHPC's Spirit host profile so another
+Gail deployment entrypoint cannot omit them when regenerating the shared Secret.
+The worker and serving processes must use the same ELM-enabled image and registry.
+
+An explicitly disabled ELM worker waits for shutdown without opening a dataset,
+rather than exiting into a Kubernetes restart loop. The normal trainer waits and
+retries transient PostgreSQL schema-initialization failures. Single-worker
+Deployments use Recreate so replacement workers do not contend for the old
+process's writer/advisory lock during a rollout.
+
 ELM is off by default in generic Gail configuration. The production Ansible
 policy sets global and selected task modes to `auto`, making ELM available to
 evidence gates when a qualified output is superior or complementary. At
