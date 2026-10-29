@@ -1,0 +1,6 @@
+**
+!Containerfile.business
+!dist/
+!dist/gail
+!scripts/
+!scripts/business-serving-entrypoint
