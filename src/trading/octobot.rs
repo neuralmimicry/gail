@@ -2006,7 +2006,7 @@ impl OctobotClient {
         }
     }
 
-    /// Fetch historical dashboard candle snapshots for a symbol/time frame.
+    /// Fetch closed public venue candles, independently of watched-pair caches.
     ///
     /// This is used for one-time datalake bootstrap/backfill after a new
     /// container build or schema change.
@@ -2016,11 +2016,54 @@ impl OctobotClient {
         symbol: &str,
         time_frame: &str,
     ) -> Result<Vec<MarketSnapshot>, String> {
+        let requested_frame = if time_frame.trim().is_empty() {
+            "1h"
+        } else {
+            time_frame.trim()
+        };
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("exchange", exchange)
+            .append_pair("symbol", symbol)
+            .append_pair("time_frame", requested_frame)
+            .append_pair("limit", "500")
+            .finish();
+        // Only a missing route falls back to the old UI contract. A failing
+        // native venue read must remain observable, rather than looking like a
+        // successful bootstrap with no history.
+        if let Some(history) = self
+            .get_optional_json(
+                &format!("/api/market/candles?{query}"),
+                "venue candle history",
+            )
+            .await?
+        {
+            if history.get("exchange").and_then(Value::as_str) != Some(exchange)
+                || history.get("symbol").and_then(Value::as_str) != Some(symbol)
+                || history.get("time_frame").and_then(Value::as_str) != Some(requested_frame)
+                || history.get("timestamp_unit").and_then(Value::as_str) != Some("seconds")
+                || history.get("timestamp_semantics").and_then(Value::as_str) != Some("candle_open")
+                || history.get("closed_only").and_then(Value::as_bool) != Some(true)
+                || history.get("simulated").and_then(Value::as_bool) != Some(false)
+            {
+                return Err(format!(
+                    "Invalid venue candle contract for {exchange}/{symbol}"
+                ));
+            }
+            let snapshots =
+                parse_graph_history_snapshots(exchange, symbol, requested_frame, &history);
+            return if snapshots.is_empty() {
+                Err(format!(
+                    "No closed venue candles for {exchange}/{symbol}/{requested_frame}"
+                ))
+            } else {
+                Ok(snapshots)
+            };
+        }
         let web_symbol = symbol.replace('/', "|");
         let Some((exchange_id, default_time_frame)) =
             self.watched_symbol_context(exchange, symbol).await?
         else {
-            return Ok(Vec::new());
+            return Err(format!("No history venue identity for {exchange}/{symbol}"));
         };
         let resolved_time_frame = if time_frame.trim().is_empty() {
             default_time_frame
@@ -2034,14 +2077,18 @@ impl OctobotClient {
             .get_optional_json(&graph_path, "price graph history")
             .await?
         else {
-            return Ok(Vec::new());
+            return Err(format!(
+                "No dashboard candle history for {exchange}/{symbol}"
+            ));
         };
-        Ok(parse_graph_history_snapshots(
-            exchange,
-            symbol,
-            &resolved_time_frame,
-            &graph,
-        ))
+        let snapshots =
+            parse_graph_history_snapshots(exchange, symbol, &resolved_time_frame, &graph);
+        if snapshots.is_empty() {
+            return Err(format!(
+                "No closed dashboard candles for {exchange}/{symbol}/{resolved_time_frame}"
+            ));
+        }
+        Ok(snapshots)
     }
 
     async fn watched_symbol_context(
@@ -2876,45 +2923,88 @@ fn parse_graph_history_snapshots(
     body: &Value,
 ) -> Vec<MarketSnapshot> {
     let candles = body.get("candles").unwrap_or(&Value::Null);
-    let closes = value_array(candles, "close").unwrap_or_default();
-    if closes.is_empty() {
+    if body.get("simulated").and_then(Value::as_bool) == Some(true) {
         return Vec::new();
     }
-    let highs = value_array(candles, "high").unwrap_or_default();
-    let lows = value_array(candles, "low").unwrap_or_default();
-    let volumes = value_array(candles, "volume")
-        .or_else(|| value_array(candles, "vol"))
-        .unwrap_or_default();
-    let times = value_string_array(candles, "time").unwrap_or_default();
-    let fallback_now = current_unix_timestamp_f64();
-    let fallback_step = time_frame_to_seconds(time_frame).max(1) as f64;
-    let fallback_start = fallback_now - fallback_step * closes.len().saturating_sub(1) as f64;
-    let first_close = closes.first().copied();
-
+    let Some(closes) = candles.get("close").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let Some(times) = candles.get("time").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    // Preserve row indices: filter_map on each individual array silently joins
+    // one candle's close to a different candle's timestamp after a bad value.
+    let highs = candles.get("high").and_then(Value::as_array);
+    let lows = candles.get("low").and_then(Value::as_array);
+    let volumes = candles
+        .get("volume")
+        .or_else(|| candles.get("vol"))
+        .and_then(Value::as_array);
+    if times.len() != closes.len()
+        || [highs, lows, volumes]
+            .iter()
+            .flatten()
+            .any(|values| values.len() != closes.len())
+    {
+        return Vec::new();
+    }
+    let step = time_frame_to_seconds(time_frame) as f64;
+    if step <= 0.0 || matches!(time_frame, "1M" | "1y") {
+        return Vec::new();
+    }
+    let now = current_unix_timestamp_f64();
+    let number = |value: &Value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_str()?.parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+    };
     let mut snapshots = Vec::with_capacity(closes.len());
     let mut last_timestamp = f64::NEG_INFINITY;
-    for (idx, close) in closes.iter().copied().enumerate() {
-        let fetched_at = times
-            .get(idx)
-            .and_then(|value| parse_dashboard_time_to_ts(value))
-            .unwrap_or(fallback_start + fallback_step * idx as f64);
-        if !fetched_at.is_finite() || fetched_at <= last_timestamp {
+    for (idx, value) in closes.iter().enumerate() {
+        let Some(close) = number(value).filter(|value| *value > 0.0) else {
+            continue;
+        };
+        let opened_at = number(&times[idx])
+            .map(normalise_unix_timestamp)
+            .or_else(|| times[idx].as_str().and_then(parse_dashboard_time_to_ts));
+        let Some(opened_at) = opened_at.filter(|value| value.is_finite() && *value > 0.0) else {
+            continue;
+        };
+        // OHLCV timestamps describe candle OPEN. Its final close and volume
+        // become available at the END; storing them at the open leaks future
+        // information into training, markouts and walk-forward validation.
+        let fetched_at = opened_at + step;
+        if fetched_at > now || fetched_at <= last_timestamp {
+            continue;
+        }
+        let high = highs.and_then(|values| number(&values[idx]));
+        let low = lows.and_then(|values| number(&values[idx]));
+        let volume = volumes.and_then(|values| number(&values[idx]));
+        if highs.is_some() && high.is_none_or(|value| value < close)
+            || lows.is_some() && low.is_none_or(|value| value <= 0.0 || value > close)
+            || volumes.is_some() && volume.is_none_or(|value| value < 0.0)
+        {
             continue;
         }
         last_timestamp = fetched_at;
-        let price_change_pct_24h = first_close
-            .filter(|first| first.abs() > f64::EPSILON)
-            .map(|first| ((close - first) / first) * 100.0);
+        // Preserve the existing per-candle optional OHLCV fields. Time-based
+        // features are calculated by the datalake from actual observation times.
+        let price_change_pct_24h = snapshots
+            .iter()
+            .rev()
+            .find(|snapshot: &&MarketSnapshot| snapshot.fetched_at <= fetched_at - 86_400.0)
+            .map(|snapshot| ((close - snapshot.price) / snapshot.price) * 100.0);
         snapshots.push(MarketSnapshot {
             exchange: exchange.to_string(),
             symbol: symbol.to_string(),
             price: close,
             price_change_pct_1h: None,
             price_change_pct_24h,
-            volume_24h: volumes.get(idx).copied(),
+            volume_24h: volume,
             volume_change_pct: None,
-            high_24h: highs.get(idx).copied(),
-            low_24h: lows.get(idx).copied(),
+            high_24h: high,
+            low_24h: low,
             fetched_at,
             microstructure: MarketMicrostructure::default(),
         });
@@ -3056,22 +3146,13 @@ fn graph_error_message(body: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn value_string_array(body: &Value, key: &str) -> Option<Vec<String>> {
-    body.get(key).and_then(Value::as_array).map(|values| {
-        values
-            .iter()
-            .filter_map(|value| value.as_str().map(str::to_string))
-            .collect::<Vec<_>>()
-    })
-}
-
 fn parse_dashboard_time_to_ts(value: &str) -> Option<f64> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
     }
     if let Ok(timestamp) = trimmed.parse::<f64>() {
-        return Some(timestamp);
+        return Some(normalise_unix_timestamp(timestamp));
     }
     let mut parts = trimmed.split(' ');
     let date = parts.next()?;
@@ -3093,7 +3174,11 @@ fn parse_dashboard_time_to_ts(value: &str) -> Option<f64> {
     if t.next().is_some() {
         return None;
     }
-    let year = 2000 + year_short;
+    let year = if year_short < 100 {
+        2000 + year_short
+    } else {
+        year_short
+    };
     unix_timestamp_from_ymd_hms(year, month, day, hour, minute, second)
 }
 
@@ -3105,8 +3190,22 @@ fn unix_timestamp_from_ymd_hms(
     minute: u32,
     second: u32,
 ) -> Option<f64> {
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 => {
+            if leap_year {
+                29
+            } else {
+                28
+            }
+        }
+        4 | 6 | 9 | 11 => 30,
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        _ => 0,
+    };
+    if !(1970..=9999).contains(&year)
+        || day == 0
+        || day > days_in_month
         || hour > 23
         || minute > 59
         || second > 59
@@ -3128,16 +3227,18 @@ fn unix_timestamp_from_ymd_hms(
 fn time_frame_to_seconds(time_frame: &str) -> u64 {
     let trimmed = time_frame.trim();
     if trimmed.len() < 2 {
-        return 3_600;
+        return 0;
     }
     let (value, unit) = trimmed.split_at(trimmed.len() - 1);
-    let amount = value.parse::<u64>().unwrap_or(1).max(1);
-    match unit.to_ascii_lowercase().as_str() {
+    let Some(amount) = value.parse::<u64>().ok().filter(|amount| *amount > 0) else {
+        return 0;
+    };
+    match unit {
         "m" => amount.saturating_mul(60),
         "h" => amount.saturating_mul(3_600),
         "d" => amount.saturating_mul(86_400),
         "w" => amount.saturating_mul(7 * 86_400),
-        _ => 3_600,
+        _ => 0,
     }
 }
 
@@ -5364,6 +5465,40 @@ fn infer_side(value: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod microstructure_tests {
+    #[test]
+    fn history_never_invents_times_compacts_rows_or_uses_unfinished_closes() {
+        use serde_json::json;
+        let frame = |times, closes| json!({"candles": {"time": times, "close": closes}});
+        let parse = |body: serde_json::Value| {
+            super::parse_graph_history_snapshots("binance", "BTC/USDT", "1h", &body)
+        };
+        assert!(parse(json!({"candles":{"close":[100,101]}})).is_empty());
+        assert!(parse(frame(json!([1700000000]), json!([100, 101]))).is_empty());
+        assert!(parse(frame(json!(["bad", ""]), json!([100, 101]))).is_empty());
+        let rows = parse(frame(
+            json!([1700000000, 1700003600000_u64, "1700007200"]),
+            json!([100, "bad", 102]),
+        ));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].price, 102.0);
+        assert_eq!(rows[1].fetched_at, 1700010800.0);
+        assert_eq!(
+            rows[0].price_change_pct_24h, None,
+            "short histories are not 24-hour moves"
+        );
+        let rows = parse(frame(json!([1700000000000_u64]), json!([100])));
+        assert_eq!(rows[0].fetched_at, 1700003600.0);
+        let future_open = super::current_unix_timestamp_f64() - 100.0;
+        assert!(parse(frame(json!([future_open]), json!([100]))).is_empty());
+        let invalid_ohlcv =
+            json!({"candles":{"time":[1700000000,1700003600],"close":[100,102],"high":[101,null]}});
+        assert_eq!(parse(invalid_ohlcv).len(), 1);
+        assert_eq!(
+            super::parse_dashboard_time_to_ts("2026-04-19 10:00:00"),
+            super::parse_dashboard_time_to_ts("26-04-19 10:00:00")
+        );
+    }
+
     use super::*;
     use serde_json::json;
 

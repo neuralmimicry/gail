@@ -3889,6 +3889,18 @@ fn paper_decision_fingerprint(
     format!("{prefix}:decision:{digest}")
 }
 
+/// Shared execution/status predicate, so the diagnostic API reports the gate
+/// that actually controls execution instead of reconstructing a second policy.
+fn backtest_profitability_qualified(config: &TradingConfig, state: &TradingState) -> bool {
+    !config.backtesting_enabled
+        || state.last_backtest.as_ref().is_some_and(|summary| {
+            matches!(summary.assessment, backtest::ApproachAssessment::Viable)
+                && summary.profitability_pct.is_some_and(|value| {
+                    value.is_finite() && value >= config.backtest_profitability_threshold
+                })
+        })
+}
+
 async fn execute_if_warranted(
     octobot: &OctobotClient,
     decision: &TradeDecision,
@@ -4352,16 +4364,7 @@ async fn execute_if_warranted(
     };
     let profitability_qualified = {
         let current = state.0.lock().await;
-        if !config.backtesting_enabled {
-            true
-        } else {
-            current.last_backtest.as_ref().is_some_and(|summary| {
-                matches!(summary.assessment, backtest::ApproachAssessment::Viable)
-                    && summary.profitability_pct.is_some_and(|value| {
-                        value.is_finite() && value >= config.backtest_profitability_threshold
-                    })
-            })
-        }
+        backtest_profitability_qualified(config, &current)
     };
     let auto_live_ready =
         config.live_execution_auto_gate_enabled && paper_qualified && profitability_qualified;
@@ -4420,6 +4423,13 @@ async fn execute_if_warranted(
                     "build_revision": build_revision,
                     "intent_key": intent_key,
                     "qualified": qualified,
+                    "live_permission": config.live_execution_enabled,
+                    "profitability_qualified": profitability_qualified,
+                    "live_blockers": {
+                        "operator_permission": !(config.live_execution_enabled || config.live_execution_auto_gate_enabled),
+                        "paper_qualification": !paper_qualified,
+                        "backtest_profitability": !profitability_qualified,
+                    },
                     "validated_intents": validated_intents,
                     "observed_evaluations": observed_evaluations,
                 }),

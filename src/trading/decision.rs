@@ -116,6 +116,42 @@ pub struct DecisionEngine {
 }
 
 impl DecisionEngine {
+    /// Report the same effective policy used by `decide`, without credentials
+    /// or holdings. Persisted runtime values take precedence over deployment
+    /// defaults; showing both prevents stale overrides from hiding a blocker.
+    pub fn policy_status(state: &TradingState, config: &TradingConfig) -> serde_json::Value {
+        let effective = EffectiveConfig::from(config, &state.config_overrides, config.fuzzy_weight);
+        let positions = state.open_position_count();
+        serde_json::json!({
+            "declared": {
+                "max_open_positions": config.max_open_positions,
+                "fuzzy_confidence_threshold": config.fuzzy_confidence_threshold,
+                "micro_trade_min_usd": config.micro_trade_min_usd,
+                "micro_trade_max_usd": config.micro_trade_max_usd,
+            },
+            "effective": {
+                "max_open_positions": effective.max_open_positions,
+                "fuzzy_confidence_threshold": effective.fuzzy_confidence_threshold,
+                "micro_trade_min_usd": effective.micro_trade_min_usd,
+                "micro_trade_max_usd": effective.micro_trade_max_usd,
+            },
+            "runtime_overrides_present": state.config_overrides.is_some(),
+            "open_positions": positions,
+            "buy_capacity_exhausted": positions >= effective.max_open_positions,
+            "available_position_slots": effective.max_open_positions.saturating_sub(positions),
+            "confidence_can_tighten_with_advisor_degradation": true,
+            "live_execution_permission": config.live_execution_enabled,
+            "live_execution_auto_gate_enabled": config.live_execution_auto_gate_enabled,
+            "paper_qualification_required": config.paper_qualification_required,
+            "paper_min_evaluations": config.paper_qualification_min_evaluations,
+            "paper_min_validated_intents": config.paper_qualification_min_validated_intents,
+            "backtest_profitability_required": config.backtesting_enabled,
+            "backtest_profitability_qualified": super::backtest_profitability_qualified(config, state),
+            "minimum_backtest_profitability_pct": config.backtest_profitability_threshold,
+            "note": "Live permission alone does not bypass signal, risk, paper, profitability or freshness gates",
+        })
+    }
+
     pub fn new(fuzzy_weight: f64) -> Self {
         Self {
             fuzzy_weight: fuzzy_weight.clamp(0.0, 1.0),
