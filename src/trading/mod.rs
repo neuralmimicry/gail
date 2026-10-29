@@ -1921,39 +1921,8 @@ async fn run_market_datalake_bootstrap(
                 })
         })
         .collect::<Vec<_>>();
-    let history_results = stream::iter(history_requests.into_iter().map(
-        |(exchange, symbol, time_frame)| async move {
-            let result = octobot
-                .get_market_snapshot_history(&exchange, &symbol, &time_frame)
-                .await;
-            (exchange, symbol, time_frame, result)
-        },
-    ))
-    .buffer_unordered(MARKET_DATALAKE_BOOTSTRAP_MAX_PARALLEL_HISTORY_REQUESTS)
-    .collect::<Vec<_>>()
-    .await;
-
-    let mut historical_snapshots = Vec::new();
-    let mut symbols_with_history = HashSet::new();
-    for (exchange, symbol, time_frame, result) in history_results {
-        match result {
-            Ok(history) => {
-                if !history.is_empty() {
-                    symbols_with_history.insert((exchange, symbol));
-                    historical_snapshots.extend(history);
-                }
-            }
-            Err(error) => {
-                debug!(
-                    exchange = %exchange,
-                    symbol = %symbol,
-                    time_frame = %time_frame,
-                    error = %error,
-                    "trading: bootstrap history request failed for symbol"
-                );
-            }
-        }
-    }
+    let history = fetch_bootstrap_history(octobot, history_requests).await;
+    let historical_snapshots = &history.snapshots;
 
     if historical_snapshots.is_empty() {
         let error = "Bootstrap fetched no historical candle snapshots";
@@ -1965,7 +1934,7 @@ async fn run_market_datalake_bootstrap(
     }
 
     let ingest = market_data_lake
-        .ingest_snapshots(&historical_snapshots)
+        .ingest_snapshots(historical_snapshots)
         .await;
     if let Some(error) = ingest.file_error.as_deref() {
         market_data_lake.mark_bootstrap_failed(reason, error).await;
@@ -1978,10 +1947,31 @@ async fn run_market_datalake_bootstrap(
         return false;
     }
 
+    // Persist successful reads, but do not declare a partial backfill complete.
+    // Otherwise a single healthy venue permanently hides missing histories
+    // from retry scheduling, including after the upstream data API is fixed.
+    if !history.is_complete() {
+        let error = format!(
+            "Bootstrap incomplete: {} history requests failed; {} valid snapshots retained; will retry",
+            history.failed_requests.len(),
+            historical_snapshots.len()
+        );
+        market_data_lake.mark_bootstrap_failed(reason, &error).await;
+        state
+            .log(
+                "warn",
+                "market_datalake",
+                error,
+                json!({"failed_history_requests": history.failed_requests}),
+            )
+            .await;
+        return false;
+    }
+
     let report = MarketDataLakeBootstrapReport {
         reason: reason.to_string(),
         symbols_attempted: seed_snapshots.len(),
-        symbols_with_history: symbols_with_history.len(),
+        symbols_with_history: history.symbols_with_history.len(),
         time_frames: config.market_datalake_bootstrap_time_frames.clone(),
         snapshots_received: historical_snapshots.len(),
         snapshots_persisted: ingest.persisted,
@@ -2004,6 +1994,53 @@ async fn run_market_datalake_bootstrap(
         )
         .await;
     true
+}
+
+#[derive(Default)]
+struct BootstrapHistoryBatch {
+    snapshots: Vec<MarketSnapshot>,
+    symbols_with_history: HashSet<(String, String)>,
+    failed_requests: Vec<String>,
+}
+
+impl BootstrapHistoryBatch {
+    fn is_complete(&self) -> bool {
+        !self.snapshots.is_empty() && self.failed_requests.is_empty()
+    }
+}
+
+/// Bound concurrent public reads while preserving partial results for durable
+/// ingestion. Missing/empty histories remain explicit retry obligations.
+async fn fetch_bootstrap_history(
+    octobot: &OctobotClient,
+    requests: Vec<(String, String, String)>,
+) -> BootstrapHistoryBatch {
+    let results = stream::iter(
+        requests
+            .into_iter()
+            .map(|(exchange, symbol, frame)| async move {
+                let result = octobot
+                    .get_market_snapshot_history(&exchange, &symbol, &frame)
+                    .await;
+                (exchange, symbol, frame, result)
+            }),
+    )
+    .buffer_unordered(MARKET_DATALAKE_BOOTSTRAP_MAX_PARALLEL_HISTORY_REQUESTS)
+    .collect::<Vec<_>>()
+    .await;
+    let mut batch = BootstrapHistoryBatch::default();
+    for (exchange, symbol, frame, result) in results {
+        match result {
+            Ok(history) if !history.is_empty() => {
+                batch.symbols_with_history.insert((exchange, symbol));
+                batch.snapshots.extend(history);
+            }
+            _ => batch
+                .failed_requests
+                .push(format!("{exchange}/{symbol}/{frame}")),
+        }
+    }
+    batch
 }
 
 async fn resolve_target_market_filters(

@@ -24,6 +24,11 @@ bootstrap. It does not alter exchange ledgers or promote a model. Price history
 does not reconstruct historical spread, book depth or derivatives telemetry;
 replay continues to use its documented conservative fallbacks.
 
+A partial bootstrap persists successful rows but remains failed/retryable until
+every requested venue/symbol/timeframe has returned nonempty history. This
+prevents one healthy venue from hiding another venue's missing data behind a
+successful completion marker.
+
 `GET /v1/trading/status` requires the normal trading authorization and includes
 `decision_policy`: declared and effective limits, override presence, open
 position count, available slots, buy-capacity exhaustion, live permission,
