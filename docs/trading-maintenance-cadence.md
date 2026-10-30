@@ -11,6 +11,11 @@ coalesced; the oldest due discovery/pruning review is selected next. Candidate
 research retains its existing bounded parallelism and advisor deadlines. A
 completed plan returns to the primary loop, which remains the single owner of
 order execution and position-limit checks. The planner has no order executor.
+Completion wakes that owner immediately between evaluations, independently of
+the next timer tick: the live advisory TTL of 120 seconds is shorter than its
+180-second evaluation interval. An in-progress primary evaluation still owns
+the executor; any plan that becomes stale meanwhile is rejected by the existing
+expiry checks.
 Pauses, pending overrides and changed model fingerprints discard completed
 plans; the existing freshness, repricing, economics, paper, profitability and
 durable execution-lease checks remain in force. Shutdown aborts the planner.

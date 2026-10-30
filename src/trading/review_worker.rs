@@ -31,17 +31,16 @@ impl<T: Send + 'static> ReadOnlyReview<T> {
         true
     }
 
-    /// Never wait for provider I/O. Awaiting a finished task only retrieves its
-    /// result or panic, leaving the next primary evaluation free to proceed.
-    pub(super) async fn take_ready(&mut self) -> Result<Option<T>, JoinError> {
-        if !self.task.as_ref().is_some_and(JoinHandle::is_finished) {
-            return Ok(None);
-        }
-        self.task
-            .take()
-            .expect("finished review exists")
-            .await
-            .map(Some)
+    /// Cancellation-safe select branch: ticks may keep evaluating while a
+    /// review waits, and completion wakes the serial execution owner promptly.
+    /// A completed result is consumed exactly once; no review means no wakeup.
+    pub(super) async fn wait_ready(&mut self) -> Result<T, JoinError> {
+        let Some(task) = self.task.as_mut() else {
+            return std::future::pending().await;
+        };
+        let result = task.await;
+        self.task.take();
+        result
     }
 }
 
@@ -79,21 +78,35 @@ mod tests {
         }));
         started.acquire().await.unwrap().forget();
         for _ in 0..100 {
-            assert!(worker.take_ready().await.unwrap().is_none());
+            tokio::select! {
+                result = worker.wait_ready() => panic!("blocked review completed: {result:?}"),
+                _ = tokio::task::yield_now() => {},
+            }
             assert!(!worker.start(async { 99 }));
         }
         release.add_permits(1);
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if let Some(result) = worker.take_ready().await.unwrap() {
-                    assert_eq!(result, 42);
-                    break;
-                }
-                tokio::task::yield_now().await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), worker.wait_ready())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, 42);
+        assert!(!worker.is_pending());
+    }
+
+    #[tokio::test]
+    async fn completion_wakes_before_the_next_evaluation_tick() {
+        let mut worker = ReadOnlyReview::new();
+        worker.start(async { 42 });
+        let next_tick = tokio::time::sleep(std::time::Duration::from_secs(3600));
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::select! {
+                result = worker.wait_ready() => result.unwrap(),
+                _ = next_tick => panic!("review waited for the unrelated evaluation tick"),
             }
         })
         .await
         .unwrap();
+        assert_eq!(completed, 42);
         assert!(!worker.is_pending());
     }
 
