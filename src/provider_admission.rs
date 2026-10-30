@@ -2,7 +2,6 @@
 //! generic routing until they have demonstrated useful responses.
 
 use serde_json::Value;
-use tokio_postgres::NoTls;
 
 use crate::config::ComparativeValidationConfig;
 
@@ -327,11 +326,5 @@ mod tests {
 }
 
 async fn connect(dsn: &str) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            tracing::debug!(error = %error, "provider admission Postgres connection closed");
-        }
-    });
-    Ok(client)
+    crate::postgres_connection::connect(dsn, "gail-provider-admission").await
 }

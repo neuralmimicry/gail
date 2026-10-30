@@ -17,7 +17,6 @@ use tokio::{
     sync::mpsc,
     time::timeout,
 };
-use tokio_postgres::NoTls;
 
 use crate::config::GailConfig;
 
@@ -832,13 +831,7 @@ fn is_recoverable_training_infrastructure_error(error: &str) -> bool {
 }
 
 async fn connect_client(dsn: &str) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            tracing::debug!(error = %error, "LLM ledger Postgres connection closed");
-        }
-    });
-    Ok(client)
+    crate::postgres_connection::connect(dsn, "gail-llm-ledger").await
 }
 
 async fn persist_file_record(path: &Path, record: &LlmLedgerRecord) -> std::io::Result<()> {

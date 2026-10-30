@@ -102,3 +102,17 @@ cancelled CPU result from being published. CPU work already started on the
 blocking pool may finish without updating state. Fees, selection, promotion and
 primary-quant pause rules are unchanged. Regression tests deliberately block
 live work/startup and exercise coalescing, retries, periodic work and shutdown.
+
+The restart UAT also found a PostgreSQL saturation failure: statements left
+waiting by a removed Gail pod queued behind backup/schema locks, consumed the
+100-client server limit and prevented a new Relay pod from starting. After
+verifying the old address belonged to no current pod, operations cancelled only
+its abandoned waiting statements. Active clients and the backup were preserved.
+The shared Gail PostgreSQL connector now applies connection-local server
+statement (25s), lock (3s) and idle-transaction (30s) deadlines, plus a bounded
+10s connect. Caller-side future cancellation alone cannot stop a statement
+already queued at PostgreSQL. These server deadlines prevent unbounded orphaned
+waits without changing shared role/server policy. Existing file-first persistence
+and retry/cooldown behavior remain in place. A real isolated-database regression
+drops a caller behind an exclusive lock and verifies its server session exits
+without operator cancellation before reconnecting successfully.

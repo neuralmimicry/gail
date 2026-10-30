@@ -22,6 +22,7 @@ pub mod models;
 pub mod nmc_telemetry;
 pub mod numerical;
 pub mod orchestration;
+mod postgres_connection;
 pub mod prompt_budget;
 pub mod provider_admission;
 pub mod providers;
