@@ -4656,7 +4656,21 @@ mod tests {
             .expect(0)
             .mount(&upstream)
             .await;
+        // Keep the actual evaluation task blocked in startup I/O. Replay must
+        // complete before this request can finish, as well as while paused.
+        Mock::given(method("GET"))
+            .and(path("/api/ping"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json("Running")
+                    .set_delay(std::time::Duration::from_secs(30)),
+            )
+            .with_priority(1)
+            .expect(1)
+            .mount(&upstream)
+            .await;
         let directory = tempfile::tempdir().unwrap();
+
         let initial = crate::trading::state::SharedTradingState::new(100, 100);
         {
             let mut state = initial.0.lock().await;
@@ -4680,7 +4694,24 @@ mod tests {
         config.trading.quantitative.native_backtest_enabled = true;
         let service = test_service_with_config(config).await;
         let bridge = service.trading_bridge().unwrap().clone();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if upstream
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.url.path() == "/api/ping")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("evaluation must enter deliberately blocked startup I/O");
         let app = build_router(service);
+
         let response = app
             .clone()
             .oneshot(
@@ -4718,7 +4749,7 @@ mod tests {
         let response = read_json(response).await;
         assert_eq!(response["backtest_backend"], "gail_native");
         assert_eq!(response["queued"], true);
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if bridge
                     .state
@@ -4734,7 +4765,7 @@ mod tests {
             }
         })
         .await
-        .expect("native scheduler must process a manual request while paused");
+        .expect("native worker must process manual replay while evaluation I/O is blocked and trading is paused");
         {
             let state = bridge.state.0.lock().await;
             assert!(state.paused);

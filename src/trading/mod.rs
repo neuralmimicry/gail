@@ -15,6 +15,7 @@
 /// All HTTP handlers access state through `SharedTradingState` (Arc<Mutex<>>).
 pub mod advisor;
 pub mod backtest;
+mod backtest_worker;
 pub mod config;
 pub mod datalake;
 pub mod decision;
@@ -32,10 +33,7 @@ pub mod state;
 mod tests;
 
 use std::path::PathBuf;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering as AtomicOrdering},
-};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{
     cmp::Ordering,
@@ -46,7 +44,7 @@ use futures::{StreamExt, stream};
 use serde::Serialize;
 use serde_json::json;
 use sha2::Digest;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
@@ -69,7 +67,7 @@ use octobot::{
 use outcomes::TradeMarkout;
 use qualification::PaperQualificationPolicy;
 use quant::{QuantMode, evaluate_symbol as evaluate_quant_symbol, evaluate_universe};
-use quantitative::backtest::{NativeBacktestReport, NativeQuantBacktester};
+use quantitative::backtest::NativeBacktestReport;
 use quantitative::sleeves::{evaluate_sleeves_async, market_key as sleeve_market_key};
 use quantitative::telemetry::reprice_net_edge;
 use refiner::RefinerClient;
@@ -206,7 +204,7 @@ async fn sync_octobot_trade_history(
 // ---------------------------------------------------------------------------
 
 struct TradingBridgeRuntime {
-    _shutdown_tx: oneshot::Sender<()>,
+    _shutdown_tx: watch::Sender<()>,
 }
 
 pub struct TradingBridgeHandle {
@@ -222,15 +220,9 @@ pub struct TradingBridgeHandle {
 pub struct TradingBridge {
     pub state: SharedTradingState,
     pub config: Arc<TradingConfig>,
-    evaluation_tx: mpsc::Sender<EvaluationTrigger>,
-    backtest_requested: Arc<AtomicBool>,
+    evaluation_tx: mpsc::Sender<()>,
+    backtest_requests: backtest_worker::BacktestRequests,
     _runtime: Arc<TradingBridgeRuntime>,
-}
-
-#[derive(Clone, Copy)]
-enum EvaluationTrigger {
-    Evaluate,
-    NativeBacktest,
 }
 
 impl TradingBridge {
@@ -244,9 +236,9 @@ impl TradingBridge {
         let data_path = PathBuf::from(&config.data_path);
         state.restore(&data_path).await;
 
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
         let (evaluation_tx, evaluation_rx) = mpsc::channel(1);
-        let backtest_requested = Arc::new(AtomicBool::new(false));
+        let (backtest_requests, backtest_rx) = backtest_worker::BacktestRequests::channel();
         let runtime = Arc::new(TradingBridgeRuntime {
             _shutdown_tx: shutdown_tx,
         });
@@ -255,7 +247,7 @@ impl TradingBridge {
             state: state.clone(),
             config: config.clone(),
             evaluation_tx,
-            backtest_requested: backtest_requested.clone(),
+            backtest_requests: backtest_requests.clone(),
             _runtime: runtime.clone(),
         };
         let loop_config = config.clone();
@@ -268,7 +260,8 @@ impl TradingBridge {
                 loop_service,
                 shutdown_rx,
                 evaluation_rx,
-                backtest_requested,
+                backtest_requests,
+                backtest_rx,
             )
             .await;
         });
@@ -283,38 +276,19 @@ impl TradingBridge {
     /// Request one evaluation without waiting for the periodic scheduler.
     /// Several simultaneous requests are intentionally coalesced.
     pub fn request_evaluation(&self) -> bool {
-        self.evaluation_tx
-            .try_send(EvaluationTrigger::Evaluate)
-            .is_ok()
+        self.evaluation_tx.try_send(()).is_ok()
     }
 
-    /// Wake the existing scheduler for configured native replay. Coalesce
-    /// concurrent requests; the scheduler owns the datalake and policy state.
-    /// This wakeup skips live evaluation, discovery and pruning.
+    /// Queue bounded native research independently of advisory, discovery and
+    /// live execution. Multiple pending requests are deliberately coalesced.
     pub fn request_backtest(&self) -> bool {
-        if !self.config.backtesting_enabled || !self.config.uses_native_backtest() {
-            return false;
-        }
-        if self
-            .backtest_requested
-            .compare_exchange(false, true, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst)
-            .is_err()
-        {
-            return false;
-        }
-        if self
-            .evaluation_tx
-            .try_send(EvaluationTrigger::NativeBacktest)
-            .is_err()
-        {
-            self.backtest_requested.store(false, AtomicOrdering::SeqCst);
-            return false;
-        }
-        true
+        self.config.backtesting_enabled
+            && self.config.uses_native_backtest()
+            && self.backtest_requests.request()
     }
 
     pub fn backtest_is_queued(&self) -> bool {
-        self.backtest_requested.load(AtomicOrdering::SeqCst)
+        self.backtest_requests.is_queued()
     }
 }
 
@@ -326,9 +300,10 @@ async fn run_evaluation_loop(
     config: Arc<TradingConfig>,
     state: SharedTradingState,
     service: GailService,
-    mut shutdown: oneshot::Receiver<()>,
-    mut evaluation_rx: mpsc::Receiver<EvaluationTrigger>,
-    backtest_requested: Arc<AtomicBool>,
+    mut shutdown: watch::Receiver<()>,
+    mut evaluation_rx: mpsc::Receiver<()>,
+    backtest_requests: backtest_worker::BacktestRequests,
+    backtest_rx: mpsc::Receiver<()>,
 ) {
     let mut restored_api_schema = {
         let state = state.0.lock().await;
@@ -425,6 +400,29 @@ async fn run_evaluation_loop(
         state.persist(&data_path).await;
     }
 
+    // Start research before login/advisory work. It shares the lake and durable
+    // state, but never the live-evaluation queue or slow provider future.
+    if config.backtesting_enabled {
+        let worker_config = config.clone();
+        let worker_state = state.clone();
+        let worker_lake = market_data_lake.clone();
+        tokio::spawn(backtest_worker::run(
+            state.clone(),
+            data_path.clone(),
+            backtest_requests,
+            backtest_rx,
+            Duration::from_secs(config.backtest_interval_seconds.max(1)),
+            shutdown.clone(),
+            move || {
+                backtest_worker::run_configured_backtest(
+                    worker_config.clone(),
+                    worker_state.clone(),
+                    worker_lake.clone(),
+                )
+            },
+        ));
+    }
+
     // Initial OctoBot login.
     if let Err(err) = octobot.login().await {
         warn!("trading: OctoBot login failed at startup: {}", err);
@@ -480,20 +478,6 @@ async fn run_evaluation_loop(
     let eval_interval = Duration::from_secs(config.evaluation_interval_seconds);
     let mut tick = interval(eval_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Backtest scheduling: track when we last ran a backtest.
-    let backtest_engine = if config.backtesting_enabled {
-        Some(BacktestEngine::new(
-            OctobotClient::new(
-                &config.octobot_base_url,
-                config.octobot_password.as_deref(),
-                config.octobot_timeout_seconds,
-            ),
-            config.backtest_profitability_threshold,
-        ))
-    } else {
-        None
-    };
-
     // Keep the OctoBot history catalog on a wall-clock schedule independent
     // of the advisory/evaluation loop.  A slow provider round must not defer
     // the refresh indefinitely: native replay reads Gail's datalake, while
@@ -509,13 +493,24 @@ async fn run_evaluation_loop(
             ),
             config.backtest_profitability_threshold,
         );
+        let mut refresh_shutdown = shutdown.clone();
         Some(tokio::spawn(async move {
             let mut refresh_tick = interval(Duration::from_secs(
                 refresh_config.backtest_data_catalog_refresh_seconds,
             ));
             loop {
-                refresh_tick.tick().await;
-                match refresh_engine.refresh_data_catalog(&refresh_config).await {
+                tokio::select! {
+                    biased;
+                    _ = refresh_shutdown.changed() => break,
+                    _ = refresh_tick.tick() => {},
+                }
+                let refresh = refresh_engine.refresh_data_catalog(&refresh_config);
+                let result = tokio::select! {
+                    biased;
+                    _ = refresh_shutdown.changed() => break,
+                    result = refresh => result,
+                };
+                match result {
                     Ok(file_count) => {
                         info!(
                             file_count,
@@ -536,7 +531,6 @@ async fn run_evaluation_loop(
     } else {
         None
     };
-    let mut last_backtest_ts: f64 = 0.0;
     let mut last_discovery_ts: f64 = 0.0;
     let mut last_pruning_ts: f64 = 0.0;
     info!(
@@ -546,10 +540,10 @@ async fn run_evaluation_loop(
     );
 
     loop {
-        let (should_evaluate, manual_backtest) = tokio::select! {
-            _ = tick.tick() => (true, false),
-            Some(trigger) = evaluation_rx.recv() => (true, matches!(trigger, EvaluationTrigger::NativeBacktest)),
-            _ = &mut shutdown => {
+        let should_evaluate = tokio::select! {
+            _ = tick.tick() => true,
+            Some(()) = evaluation_rx.recv() => true,
+            _ = shutdown.changed() => {
                 if let Some(task) = primary_advisory_task.take() {
                     task.abort();
                 }
@@ -559,9 +553,6 @@ async fn run_evaluation_loop(
             }
         };
         if should_evaluate {
-            if manual_backtest {
-                backtest_requested.store(false, AtomicOrdering::SeqCst);
-            }
             if now_ts() - last_trade_history_sync_ts
                 >= config.trade_history_sync_interval_seconds as f64
             {
@@ -619,11 +610,11 @@ async fn run_evaluation_loop(
                 let s = state.0.lock().await;
                 s.paused
             };
-            if paused && !manual_backtest {
+            if paused {
                 debug!("trading: evaluation skipped — bridge is paused");
                 continue;
             }
-            if !manual_backtest {
+            {
                 run_single_evaluation(
                     &config,
                     &state,
@@ -683,169 +674,6 @@ async fn run_evaluation_loop(
                         .await;
                         last_pruning_ts = now_ts();
                     }
-                }
-            }
-            // Scheduled and administrator-requested native replay share this
-            // exact path; a manual request never substitutes OctoBot's policy.
-            if config.backtesting_enabled {
-                let due = manual_backtest
-                    || now_ts() - last_backtest_ts >= config.backtest_interval_seconds as f64;
-                let already_running = {
-                    let mut current = state.0.lock().await;
-                    if due && !current.backtest_in_progress {
-                        current.backtest_in_progress = true;
-                        false
-                    } else {
-                        current.backtest_in_progress
-                    }
-                };
-                if due && !already_running {
-                    info!("trading: running periodic backtest");
-                    state
-                        .log_info("backtest", "Starting periodic backtesting run")
-                        .await;
-                    let native_enabled = config.uses_native_backtest();
-                    if native_enabled {
-                        // Native replay reads Gail's market datalake, but keep
-                        // OctoBot's historical-data catalog and collector
-                        // state fresh as well.  Without this maintenance call
-                        // the native branch bypasses `resolve_backtest_files`
-                        // entirely, leaving the compatibility catalog stale
-                        // indefinitely and preventing scheduled collection
-                        // from repairing missing history.
-                        if let Some(engine) = backtest_engine.as_ref() {
-                            match engine.refresh_data_catalog(&config).await {
-                                Ok(file_count) => {
-                                    info!(
-                                        file_count,
-                                        "trading: scheduled backtest data catalog refreshed"
-                                    );
-                                }
-                                Err(error) => {
-                                    warn!(
-                                        error = %error,
-                                        "trading: scheduled backtest data catalog refresh failed"
-                                    );
-                                }
-                            }
-                        }
-                        if let Some(lake) = market_data_lake.as_ref() {
-                            let mut native_config = config.quantitative.native_backtest.clone();
-                            // Live fee assumptions are the single source of truth for
-                            // both execution gating and scheduled replay.
-                            native_config.fee_bps = config.estimated_fee_bps;
-                            native_config.slippage_bps = config.estimated_slippage_bps;
-                            let frames = lake.native_backtest_frames(&native_config).await;
-                            match frames {
-                                Ok(frames) => {
-                                    let parameter_sets = {
-                                        let current = state.0.lock().await;
-                                        current.quant_migration.parameter_sets.clone()
-                                    };
-                                    match NativeQuantBacktester::new(native_config.clone())
-                                        .with_portfolio_config(
-                                            config.quantitative.portfolio.clone(),
-                                        )
-                                        .run_async(frames, parameter_sets)
-                                        .await
-                                    {
-                                        Ok(report) => {
-                                            let summary =
-                                                native_backtest_summary(&report, &native_config);
-                                            let should_pause = {
-                                                let mut current = state.0.lock().await;
-                                                let quant_primary =
-                                                    current.quant_migration.is_primary();
-                                                if report.promotion_qualified {
-                                                    current
-                                                        .quant_migration
-                                                        .native_validation_parameter_id =
-                                                        report.selected_parameter_id.clone();
-                                                    current.quant_migration.native_validation_at =
-                                                        Some(now_ts());
-                                                } else {
-                                                    current
-                                                        .quant_migration
-                                                        .native_validation_parameter_id = None;
-                                                    current.quant_migration.native_validation_at =
-                                                        None;
-                                                }
-                                                current.last_native_quant_backtest =
-                                                    Some(report.clone());
-                                                current.record_backtest(summary.clone());
-                                                current.log(
-                                                        if report.promotion_qualified { "info" } else { "warn" },
-                                                        "native_backtest",
-                                                        "GAIL_NATIVE_QUANT_BACKTEST_COMPLETE",
-                                                        json!({
-                                                            "promotion_qualified": report.promotion_qualified,
-                                                            "selected_parameter_id": report.selected_parameter_id,
-                                                            "out_of_sample": report.out_of_sample_statistics,
-                                                            "probability_backtest_overfit": report.probability_backtest_overfit,
-                                                            "rejection_reasons": report.rejection_reasons,
-                                                        }),
-                                                    );
-                                                let pause = config.backtest_pause_on_failure
-                                                    && quant_primary
-                                                    && !report.promotion_qualified;
-                                                if pause {
-                                                    current.paused = true;
-                                                    current.log_warn(
-                                                            "native_backtest",
-                                                            "Trading paused: primary quant failed native validation",
-                                                        );
-                                                }
-                                                pause
-                                            };
-                                            if should_pause {
-                                                warn!(
-                                                    "trading: primary quant paused after failed native validation"
-                                                );
-                                            } else {
-                                                info!(
-                                                    qualified = report.promotion_qualified,
-                                                    pbo = report.probability_backtest_overfit,
-                                                    "trading: Gail-native quant backtest complete"
-                                                );
-                                            }
-                                        }
-                                        Err(error) => {
-                                            state.log_error("native_backtest", error).await;
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    state.log_error("native_backtest", error).await;
-                                }
-                            }
-                        } else {
-                            state
-                                .log_warn(
-                                    "native_backtest",
-                                    "Native replay skipped because the market datalake is disabled",
-                                )
-                                .await;
-                        }
-                    } else if let Some(ref engine) = backtest_engine {
-                        // Compatibility fallback for deployments that explicitly disable
-                        // Gail-native replay. OctoBot reports are never used to promote quant.
-                        let summary = engine.run_with_config(&config).await;
-                        let assessment = summary.assessment.to_string();
-                        {
-                            let mut current = state.0.lock().await;
-                            current.record_backtest(summary.clone());
-                            apply_backtest_auto_tuning(&config, &mut current, &summary);
-                        }
-                        info!(
-                            "trading: OctoBot compatibility backtest complete — assessment={}",
-                            assessment
-                        );
-                    }
-                    // A failed/incomplete replay must not permanently lock
-                    // the scheduler. Successful runs clear this in
-                    // `record_backtest`; error paths clear it here.
-                    state.0.lock().await.backtest_in_progress = false;
-                    last_backtest_ts = now_ts();
                 }
             }
             state.persist(&data_path).await;

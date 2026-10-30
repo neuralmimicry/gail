@@ -90,3 +90,15 @@ After deployment, inspect data-bootstrap completion, native validation rejection
 reasons and paper-intent progression. Real fills must have venue ledger evidence
 and a Gail order identity. Do not reduce risk thresholds, manufacture successful
 backtests or submit a real diagnostic order to make an acceptance report green.
+
+Native research has a dedicated bounded worker and wall-clock interval, separate
+from the evaluation/advisory queue. The first automatic replay is due after one
+configured interval; administrators can request one immediately. One replay runs
+at a time with at most one coalesced pending request. Trading pauses do not pause
+research. Slow advisory rounds, discovery, pruning, initial OctoBot login and
+catalog refresh cannot delay the native worker. Replay failures and panics clear
+the running flag and permit retry. Shutdown closes its queue and prevents a
+cancelled CPU result from being published. CPU work already started on the
+blocking pool may finish without updating state. Fees, selection, promotion and
+primary-quant pause rules are unchanged. Regression tests deliberately block
+live work/startup and exercise coalescing, retries, periodic work and shutdown.
