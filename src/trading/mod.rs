@@ -32,7 +32,10 @@ pub mod state;
 mod tests;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{
     cmp::Ordering,
@@ -219,8 +222,15 @@ pub struct TradingBridgeHandle {
 pub struct TradingBridge {
     pub state: SharedTradingState,
     pub config: Arc<TradingConfig>,
-    evaluation_tx: mpsc::Sender<()>,
+    evaluation_tx: mpsc::Sender<EvaluationTrigger>,
+    backtest_requested: Arc<AtomicBool>,
     _runtime: Arc<TradingBridgeRuntime>,
+}
+
+#[derive(Clone, Copy)]
+enum EvaluationTrigger {
+    Evaluate,
+    NativeBacktest,
 }
 
 impl TradingBridge {
@@ -236,6 +246,7 @@ impl TradingBridge {
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (evaluation_tx, evaluation_rx) = mpsc::channel(1);
+        let backtest_requested = Arc::new(AtomicBool::new(false));
         let runtime = Arc::new(TradingBridgeRuntime {
             _shutdown_tx: shutdown_tx,
         });
@@ -244,6 +255,7 @@ impl TradingBridge {
             state: state.clone(),
             config: config.clone(),
             evaluation_tx,
+            backtest_requested: backtest_requested.clone(),
             _runtime: runtime.clone(),
         };
         let loop_config = config.clone();
@@ -256,6 +268,7 @@ impl TradingBridge {
                 loop_service,
                 shutdown_rx,
                 evaluation_rx,
+                backtest_requested,
             )
             .await;
         });
@@ -270,7 +283,38 @@ impl TradingBridge {
     /// Request one evaluation without waiting for the periodic scheduler.
     /// Several simultaneous requests are intentionally coalesced.
     pub fn request_evaluation(&self) -> bool {
-        self.evaluation_tx.try_send(()).is_ok()
+        self.evaluation_tx
+            .try_send(EvaluationTrigger::Evaluate)
+            .is_ok()
+    }
+
+    /// Wake the existing scheduler for configured native replay. Coalesce
+    /// concurrent requests; the scheduler owns the datalake and policy state.
+    /// This wakeup skips live evaluation, discovery and pruning.
+    pub fn request_backtest(&self) -> bool {
+        if !self.config.backtesting_enabled || !self.config.uses_native_backtest() {
+            return false;
+        }
+        if self
+            .backtest_requested
+            .compare_exchange(false, true, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst)
+            .is_err()
+        {
+            return false;
+        }
+        if self
+            .evaluation_tx
+            .try_send(EvaluationTrigger::NativeBacktest)
+            .is_err()
+        {
+            self.backtest_requested.store(false, AtomicOrdering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    pub fn backtest_is_queued(&self) -> bool {
+        self.backtest_requested.load(AtomicOrdering::SeqCst)
     }
 }
 
@@ -283,7 +327,8 @@ async fn run_evaluation_loop(
     state: SharedTradingState,
     service: GailService,
     mut shutdown: oneshot::Receiver<()>,
-    mut evaluation_rx: mpsc::Receiver<()>,
+    mut evaluation_rx: mpsc::Receiver<EvaluationTrigger>,
+    backtest_requested: Arc<AtomicBool>,
 ) {
     let mut restored_api_schema = {
         let state = state.0.lock().await;
@@ -501,9 +546,9 @@ async fn run_evaluation_loop(
     );
 
     loop {
-        let should_evaluate = tokio::select! {
-            _ = tick.tick() => true,
-            Some(_) = evaluation_rx.recv() => true,
+        let (should_evaluate, manual_backtest) = tokio::select! {
+            _ = tick.tick() => (true, false),
+            Some(trigger) = evaluation_rx.recv() => (true, matches!(trigger, EvaluationTrigger::NativeBacktest)),
             _ = &mut shutdown => {
                 if let Some(task) = primary_advisory_task.take() {
                     task.abort();
@@ -514,6 +559,9 @@ async fn run_evaluation_loop(
             }
         };
         if should_evaluate {
+            if manual_backtest {
+                backtest_requested.store(false, AtomicOrdering::SeqCst);
+            }
             if now_ts() - last_trade_history_sync_ts
                 >= config.trade_history_sync_interval_seconds as f64
             {
@@ -571,74 +619,77 @@ async fn run_evaluation_loop(
                 let s = state.0.lock().await;
                 s.paused
             };
-            if paused {
+            if paused && !manual_backtest {
                 debug!("trading: evaluation skipped — bridge is paused");
                 continue;
             }
-            run_single_evaluation(
-                &config,
-                &state,
-                EvaluationServices {
-                    octobot: &octobot,
-                    refiner: &refiner,
-                    fuzzy_engine: &fuzzy_engine,
-                    advisor: &advisor,
-                    decision_engine: &decision_engine,
-                    market_data_lake: market_data_lake.as_ref(),
-                    data_path: &data_path,
-                    primary_advisory_task: &mut primary_advisory_task,
-                },
-            )
-            .await;
-            {
-                let mut current = state.0.lock().await;
-                current.exchange_circuit = octobot.exchange_circuit_snapshot().await;
-            }
-            // The evaluation snapshot is durable before slower maintenance
-            // cycles begin. Individual filled orders also persist eagerly.
-            state.persist(&data_path).await;
+            if !manual_backtest {
+                run_single_evaluation(
+                    &config,
+                    &state,
+                    EvaluationServices {
+                        octobot: &octobot,
+                        refiner: &refiner,
+                        fuzzy_engine: &fuzzy_engine,
+                        advisor: &advisor,
+                        decision_engine: &decision_engine,
+                        market_data_lake: market_data_lake.as_ref(),
+                        data_path: &data_path,
+                        primary_advisory_task: &mut primary_advisory_task,
+                    },
+                )
+                .await;
+                {
+                    let mut current = state.0.lock().await;
+                    current.exchange_circuit = octobot.exchange_circuit_snapshot().await;
+                }
+                // The evaluation snapshot is durable before slower maintenance
+                // cycles begin. Individual filled orders also persist eagerly.
+                state.persist(&data_path).await;
 
-            if config.token_discovery_enabled {
-                let due =
-                    now_ts() - last_discovery_ts >= config.token_discovery_interval_seconds as f64;
-                if due {
-                    run_non_portfolio_discovery_cycle(
-                        &config,
-                        &state,
-                        &octobot,
-                        &refiner,
-                        &fuzzy_engine,
-                        &advisor,
-                        &decision_engine,
-                        market_data_lake.as_ref(),
-                    )
-                    .await;
-                    last_discovery_ts = now_ts();
+                if config.token_discovery_enabled {
+                    let due = now_ts() - last_discovery_ts
+                        >= config.token_discovery_interval_seconds as f64;
+                    if due {
+                        run_non_portfolio_discovery_cycle(
+                            &config,
+                            &state,
+                            &octobot,
+                            &refiner,
+                            &fuzzy_engine,
+                            &advisor,
+                            &decision_engine,
+                            market_data_lake.as_ref(),
+                        )
+                        .await;
+                        last_discovery_ts = now_ts();
+                    }
+                }
+
+                if config.portfolio_pruning_enabled {
+                    let due = now_ts() - last_pruning_ts
+                        >= config.portfolio_pruning_interval_seconds as f64;
+                    if due {
+                        run_portfolio_pruning_cycle(
+                            &config,
+                            &state,
+                            &octobot,
+                            &refiner,
+                            &fuzzy_engine,
+                            &advisor,
+                            &decision_engine,
+                            market_data_lake.as_ref(),
+                        )
+                        .await;
+                        last_pruning_ts = now_ts();
+                    }
                 }
             }
-
-            if config.portfolio_pruning_enabled {
-                let due =
-                    now_ts() - last_pruning_ts >= config.portfolio_pruning_interval_seconds as f64;
-                if due {
-                    run_portfolio_pruning_cycle(
-                        &config,
-                        &state,
-                        &octobot,
-                        &refiner,
-                        &fuzzy_engine,
-                        &advisor,
-                        &decision_engine,
-                        market_data_lake.as_ref(),
-                    )
-                    .await;
-                    last_pruning_ts = now_ts();
-                }
-            }
-
-            // --- Periodic backtest ---
+            // Scheduled and administrator-requested native replay share this
+            // exact path; a manual request never substitutes OctoBot's policy.
             if config.backtesting_enabled {
-                let due = now_ts() - last_backtest_ts >= config.backtest_interval_seconds as f64;
+                let due = manual_backtest
+                    || now_ts() - last_backtest_ts >= config.backtest_interval_seconds as f64;
                 let already_running = {
                     let mut current = state.0.lock().await;
                     if due && !current.backtest_in_progress {
@@ -653,8 +704,7 @@ async fn run_evaluation_loop(
                     state
                         .log_info("backtest", "Starting periodic backtesting run")
                         .await;
-                    let native_enabled =
-                        config.quantitative.enabled && config.quantitative.native_backtest_enabled;
+                    let native_enabled = config.uses_native_backtest();
                     if native_enabled {
                         // Native replay reads Gail's market datalake, but keep
                         // OctoBot's historical-data catalog and collector

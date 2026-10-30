@@ -3646,8 +3646,26 @@ mod tests {
         // Durable deduplication survives a process restart and suppresses replay.
         let restarted = SharedTradingState::new(100, 100);
         restarted.restore(&PathBuf::from(&config.data_path)).await;
+        assert!(
+            restarted.0.lock().await.paper_qualification.is_qualified(
+                &revision,
+                super::super::now_ts(),
+                policy
+            ),
+            "restart must preserve qualification before testing deduplication"
+        );
         super::super::execute_if_warranted(&client, &decision, &restarted, &config, None).await;
         assert_eq!(restarted.0.lock().await.trade_count, 1);
+        assert!(
+            restarted
+                .0
+                .lock()
+                .await
+                .activity_log
+                .iter()
+                .any(|entry| entry.message.contains("Duplicate order intent skipped")),
+            "replay must reach the durable intent guard rather than stop at an unrelated gate"
+        );
         server.verify().await;
     }
 

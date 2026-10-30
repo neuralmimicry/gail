@@ -527,6 +527,11 @@ impl Default for TradingConfig {
 }
 
 impl TradingConfig {
+    /// Select one replay policy for both scheduled and administrator requests.
+    pub fn uses_native_backtest(&self) -> bool {
+        self.quantitative.enabled && self.quantitative.native_backtest_enabled
+    }
+
     /// Returns true if the minimum viable configuration is present to start the bridge.
     pub fn is_viable(&self) -> bool {
         self.enabled && !self.octobot_base_url.trim().is_empty()
