@@ -21,7 +21,6 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::{Mutex, mpsc},
 };
-use tokio_postgres::NoTls;
 use tracing::{debug, warn};
 
 use super::{
@@ -1274,16 +1273,7 @@ fn dedupe_samples_by_symbol(samples: Vec<MarketSample>) -> Vec<MarketSample> {
 async fn connect_postgres_client(
     dsn: &str,
 ) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            warn!(
-                error = %error,
-                "trading: market datalake Postgres connection terminated"
-            );
-        }
-    });
-    Ok(client)
+    crate::postgres_connection::connect(dsn, "gail-market-mirror").await
 }
 
 async fn initialize_postgres_schema(dsn: &str) -> Result<(), String> {

@@ -11,7 +11,6 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{fs, sync::Mutex, time::timeout};
-use tokio_postgres::NoTls;
 
 const MAX_ACTIONS_PER_ISSUE: usize = 30;
 const MAX_RECENT_EVENTS: usize = 120;
@@ -653,15 +652,10 @@ async fn persist_postgres(
             writer.last_reported_error = None;
             writer.dsn = Some(dsn.to_string());
         }
-        let (client, connection) = match tokio_postgres::connect(dsn, NoTls).await {
+        let client = match crate::postgres_connection::connect(dsn, "gail-api-issues").await {
             Ok(connection) => connection,
             Err(error) => return Err(record_postgres_failure(&mut writer, &error)),
         };
-        tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                tracing::debug!(error = %error, "Gail API issue Postgres connection ended");
-            }
-        });
         if let Err(error) = ensure_postgres_tables(&client).await {
             return Err(record_postgres_failure(&mut writer, &error));
         }
