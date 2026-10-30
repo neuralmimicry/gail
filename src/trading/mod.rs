@@ -543,8 +543,7 @@ async fn run_evaluation_loop(
 
     loop {
         let should_evaluate = tokio::select! {
-            _ = tick.tick() => true,
-            Some(()) = evaluation_rx.recv() => true,
+            biased;
             _ = shutdown.changed() => {
                 if let Some(task) = primary_advisory_task.take() {
                     task.abort();
@@ -553,6 +552,13 @@ async fn run_evaluation_loop(
                 state.persist(&data_path).await;
                 break;
             }
+            result = maintenance_review.wait_ready() => {
+                complete_maintenance_review(result, &config, &state, &octobot, &advisor).await;
+                state.persist(&data_path).await;
+                false
+            }
+            Some(()) = evaluation_rx.recv() => true,
+            _ = tick.tick() => true,
         };
         if should_evaluate {
             if now_ts() - last_trade_history_sync_ts
@@ -643,46 +649,6 @@ async fn run_evaluation_loop(
                 // Provider-heavy maintenance returns plans to this single
                 // execution owner. It cannot queue unbounded work or race the
                 // primary evaluator's order submissions and position limits.
-                match maintenance_review.take_ready().await {
-                    Ok(Some(MaintenanceReviewResult {
-                        kind,
-                        decision,
-                        model_fingerprint,
-                    })) => {
-                        state.log_info("maintenance", format!(
-                            "Completed independent {kind:?} review; returning plan for serial execution checks"
-                        )).await;
-                        let permitted = {
-                            let current = state.0.lock().await;
-                            !current.paused && current.pending_override.is_none()
-                        };
-                        if permitted && model_fingerprint == advisor.qualification_fingerprint() {
-                            if let Some(decision) = decision {
-                                execute_if_warranted(
-                                    &octobot,
-                                    &decision,
-                                    &state,
-                                    &config,
-                                    model_fingerprint.as_deref(),
-                                )
-                                .await;
-                            }
-                        } else {
-                            state.log_warn("maintenance", format!(
-                                "Discarded {kind:?} plan after pause, override or model change"
-                            )).await;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        state
-                            .log_warn(
-                                "maintenance",
-                                format!("Read-only maintenance review failed: {error}"),
-                            )
-                            .await;
-                    }
-                }
                 if !maintenance_review.is_pending() {
                     let now = now_ts();
                     let discovery_due = config.token_discovery_enabled
@@ -774,6 +740,59 @@ struct MaintenanceReviewResult {
     kind: MaintenanceKind,
     decision: Option<TradeDecision>,
     model_fingerprint: Option<String>,
+}
+
+/// A completed read-only plan wakes the existing execution owner immediately.
+/// It does not trigger a fresh slow advisory round or wait for the next tick.
+async fn complete_maintenance_review(
+    result: Result<MaintenanceReviewResult, tokio::task::JoinError>,
+    config: &TradingConfig,
+    state: &SharedTradingState,
+    octobot: &OctobotClient,
+    advisor: &TradingAdvisor,
+) {
+    match result {
+        Ok(MaintenanceReviewResult {
+            kind,
+            decision,
+            model_fingerprint,
+        }) => {
+            state.log_info("maintenance", format!(
+                "Completed independent {kind:?} review; returning plan for serial execution checks"
+            )).await;
+            let permitted = {
+                let current = state.0.lock().await;
+                !current.paused && current.pending_override.is_none()
+            };
+            if permitted && model_fingerprint == advisor.qualification_fingerprint() {
+                if let Some(decision) = decision {
+                    execute_if_warranted(
+                        octobot,
+                        &decision,
+                        state,
+                        config,
+                        model_fingerprint.as_deref(),
+                    )
+                    .await;
+                }
+            } else {
+                state
+                    .log_warn(
+                        "maintenance",
+                        format!("Discarded {kind:?} plan after pause, override or model change"),
+                    )
+                    .await;
+            }
+        }
+        Err(error) => {
+            state
+                .log_warn(
+                    "maintenance",
+                    format!("Read-only maintenance review failed: {error}"),
+                )
+                .await;
+        }
+    }
 }
 
 fn spawn_market_datalake_bootstrap(
