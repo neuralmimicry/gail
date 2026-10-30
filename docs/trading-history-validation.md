@@ -30,6 +30,9 @@ prevents one healthy venue from hiding another venue's missing data behind a
 successful completion marker.
 Bootstrap identity includes the compiled source revision even when the Cargo
 version or deployment label is reused, so a repaired executable re-fetches data.
+Native replay frames are timestamped when all contained observations are
+available; grouping samples into an interval never backdates a later observation
+to the interval's start.
 
 `GET /v1/trading/status` requires the normal trading authorization and includes
 `decision_policy`: declared and effective limits, override presence, open
@@ -72,6 +75,16 @@ account read refreshes, tickers, actual closed candle history, order API method
 availability, retained execution ledgers, bounded logs and backtest catalogs.
 It submits no order. The report explicitly leaves trading effectiveness
 unqualified; a healthy endpoint or a hold decision is not a successful trade.
+
+The administrator `POST /v1/trading/backtest` uses the same configured native
+replay scheduler as periodic maintenance. Its typed wakeup runs no live market
+evaluation, discovery or pruning, and works while trading is paused. Empty or
+default request fields preserve compatibility; OctoBot file/time overrides are
+rejected in native mode. Deployments explicitly configured for OctoBot replay
+retain their compatibility backend. `GET /v1/trading/backtest` exposes the
+selected backend, queue/running state and compact native validation evidence.
+Production acceptance can explicitly request a real-data native run after full
+bootstrap, without changing risk thresholds or inventing profitable evidence.
 
 After deployment, inspect data-bootstrap completion, native validation rejection
 reasons and paper-intent progression. Real fills must have venue ledger evidence

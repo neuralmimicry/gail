@@ -1621,6 +1621,17 @@ async fn trading_backtest_result(
                 "backtesting_enabled": bridge.config.backtesting_enabled,
                 "backtest_interval_seconds": bridge.config.backtest_interval_seconds,
                 "backtest_profitability_threshold": bridge.config.backtest_profitability_threshold,
+                "backtest_backend": if bridge.config.uses_native_backtest() { "gail_native" } else { "octobot_compatibility" },
+                "backtest_in_progress": state.backtest_in_progress,
+                "backtest_queued": bridge.backtest_is_queued(),
+                "native_validation": state.last_native_quant_backtest.as_ref().map(|report| json!({
+                    "frames": report.frames,
+                    "walk_forward_folds": report.walk_forward_folds.len(),
+                    "promotion_qualified": report.promotion_qualified,
+                    "selected_parameter_id": report.selected_parameter_id,
+                    "out_of_sample_statistics": report.out_of_sample_statistics,
+                    "rejection_reasons": report.rejection_reasons,
+                })),
             }))
             .into_response()
         }
@@ -1630,7 +1641,8 @@ async fn trading_backtest_result(
 /// POST /v1/trading/backtest — trigger an immediate backtesting run (admin only).
 ///
 /// Optional JSON body: `{"files": [...], "start_timestamp": ms, "end_timestamp": ms}`
-/// If omitted, uses config defaults.
+/// OctoBot file/time overrides apply only in compatibility mode. Native replay
+/// uses Gail's configured datalake and policy; default/empty fields are accepted.
 async fn trading_run_backtest(
     State(service): State<GailService>,
     headers: HeaderMap,
@@ -1644,6 +1656,38 @@ async fn trading_run_backtest(
         Some(bridge) => {
             let config = bridge.config.clone();
             let state = bridge.state.clone();
+            if config.uses_native_backtest() {
+                if !config.backtesting_enabled {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"ok":false,"error":"backtesting_disabled"})),
+                    )
+                        .into_response();
+                }
+                if body.as_ref().is_some_and(|Json(value)| {
+                    value.as_object().is_none_or(|fields| {
+                        fields.iter().any(|(key, value)| match key.as_str() {
+                            "files" => value.as_array().is_none_or(|files| !files.is_empty()),
+                            "start_timestamp" | "end_timestamp" => !value.is_null(),
+                            "enable_logs" => value != &Value::Bool(false),
+                            _ => true,
+                        })
+                    })
+                }) {
+                    return (StatusCode::BAD_REQUEST, Json(json!({
+                        "ok":false,"error":"native_replay_uses_configured_datalake",
+                        "message":"Gail-native replay does not accept OctoBot file or time overrides"
+                    }))).into_response();
+                }
+                if state.0.lock().await.backtest_in_progress {
+                    return Json(json!({"ok":false,"backtest_backend":"gail_native","message":"a backtest is already running"})).into_response();
+                }
+                let queued = bridge.request_backtest();
+                return Json(json!({
+                    "ok":queued,"backtest_backend":"gail_native","queued":queued,
+                    "message":if queued {"configured native replay queued; poll /v1/trading/backtest"} else {"scheduler is busy or a native replay is already queued"}
+                })).into_response();
+            }
             {
                 let mut current = state.0.lock().await;
                 if current.backtest_in_progress {
@@ -4598,6 +4642,133 @@ mod tests {
         assert!(payload["config"].get("octobot_password").is_none());
         assert!(payload["config"].get("refiner_api_token").is_none());
         assert_eq!(payload["config"]["octobot_base_url"], upstream.uri());
+    }
+
+    #[tokio::test]
+    async fn manual_native_backtest_uses_the_scheduler_even_while_paused_without_live_evaluation() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let initial = crate::trading::state::SharedTradingState::new(100, 100);
+        {
+            let mut state = initial.0.lock().await;
+            state.paused = true;
+            state.evaluation_count = 7;
+        }
+        let state_path = directory.path().join("state.json");
+        initial.persist_checked(&state_path).await.unwrap();
+        let mut config = GailConfig::default();
+        config.trading.enabled = true;
+        config.trading.admin_client_ids = vec!["test".into()];
+        config.trading.octobot_base_url = upstream.uri();
+        config.trading.refiner_base_url = upstream.uri();
+        config.trading.data_path = state_path.display().to_string();
+        config.trading.market_datalake_file_path =
+            directory.path().join("lake.jsonl").display().to_string();
+        config.trading.market_datalake_enabled = true;
+        config.trading.market_datalake_bootstrap_enabled = false;
+        config.trading.backtest_data_collection_enabled = false;
+        config.trading.quantitative.enabled = true;
+        config.trading.quantitative.native_backtest_enabled = true;
+        let service = test_service_with_config(config).await;
+        let bridge = service.trading_bridge().unwrap().clone();
+        let app = build_router(service);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/trading/backtest")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"files":["unrelated-octobot-policy.data"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "native replay cannot silently switch to OctoBot policy"
+        );
+        assert!(!bridge.backtest_is_queued());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/trading/backtest")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"files":[],"start_timestamp":null,"end_timestamp":null,"enable_logs":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let response = read_json(response).await;
+        assert_eq!(response["backtest_backend"], "gail_native");
+        assert_eq!(response["queued"], true);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if bridge
+                    .state
+                    .0
+                    .lock()
+                    .await
+                    .last_native_quant_backtest
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("native scheduler must process a manual request while paused");
+        {
+            let state = bridge.state.0.lock().await;
+            assert!(state.paused);
+            assert_eq!(state.evaluation_count, 7);
+            assert!(
+                state
+                    .last_backtest
+                    .as_ref()
+                    .unwrap()
+                    .notes
+                    .starts_with("Gail-native")
+            );
+        }
+        let requests = upstream.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() != "/api/exchanges"),
+            "manual replay must not enter market evaluation"
+        );
+        upstream.verify().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/trading/backtest")
+                    .header("authorization", "Bearer secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let result = read_json(response).await;
+        assert_eq!(result["backtest_backend"], "gail_native");
+        assert_eq!(result["backtest_queued"], false);
     }
 
     #[tokio::test]

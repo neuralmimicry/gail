@@ -919,9 +919,12 @@ fn build_native_backtest_frames(
             let frame = frames
                 .entry(interval_bucket)
                 .or_insert_with(|| QuantBacktestFrame {
-                    timestamp: interval_bucket as f64 * interval as f64,
+                    timestamp: snapshot.fetched_at,
                     ..QuantBacktestFrame::default()
                 });
+            // A frame cannot precede any contained observation. Flooring to
+            // the interval start leaks future data into entries and exits.
+            frame.timestamp = frame.timestamp.max(snapshot.fetched_at);
             frame.historical_features.insert(
                 market_feature_key(&snapshot.exchange, &snapshot.symbol),
                 features,
@@ -1626,6 +1629,57 @@ fn normalize_symbol(symbol: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn replay_frame_time_is_when_every_contained_observation_is_available() {
+        let trading = TradingConfig {
+            market_datalake_min_samples: 2,
+            ..Default::default()
+        };
+        let config = MarketDataLakeConfig::from_trading_config(&trading, None);
+        let replay = NativeBacktestConfig {
+            frame_interval_seconds: 60,
+            symbol_limit: 2,
+            ..Default::default()
+        };
+        let samples = |exchange: &str, latest: f64| {
+            vec![100.0, latest]
+                .into_iter()
+                .enumerate()
+                .map(|(index, timestamp)| MarketSample {
+                    exchange: exchange.into(),
+                    symbol: "BTC/USDT".into(),
+                    captured_ts: timestamp,
+                    captured_bucket: (timestamp / 60.0).floor() as i64,
+                    price: 100.0 + index as f64,
+                    observation_time_contract: MARKET_DATALAKE_SCHEMA_VERSION as i32,
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>()
+        };
+        let frames = build_native_backtest_frames(
+            HashMap::from([
+                (
+                    market_feature_key("binance", "BTC/USDT"),
+                    samples("binance", 121.0),
+                ),
+                (
+                    market_feature_key("bitget", "BTC/USDT"),
+                    samples("bitget", 149.0),
+                ),
+            ]),
+            &config,
+            &replay,
+        );
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].timestamp, 149.0);
+        assert!(
+            frames[0]
+                .snapshots
+                .iter()
+                .all(|snapshot| snapshot.fetched_at <= frames[0].timestamp)
+        );
+    }
 
     #[test]
     fn bootstrap_identity_changes_with_the_executable_even_when_labels_are_reused() {
