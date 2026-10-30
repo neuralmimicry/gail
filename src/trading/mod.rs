@@ -27,6 +27,7 @@ pub mod qualification;
 pub mod quant;
 pub mod quantitative;
 pub mod refiner;
+mod review_worker;
 pub mod state;
 
 #[cfg(test)]
@@ -531,6 +532,7 @@ async fn run_evaluation_loop(
     } else {
         None
     };
+    let mut maintenance_review = review_worker::ReadOnlyReview::new();
     let mut last_discovery_ts: f64 = 0.0;
     let mut last_pruning_ts: f64 = 0.0;
     info!(
@@ -638,47 +640,140 @@ async fn run_evaluation_loop(
                 // cycles begin. Individual filled orders also persist eagerly.
                 state.persist(&data_path).await;
 
-                if config.token_discovery_enabled {
-                    let due = now_ts() - last_discovery_ts
-                        >= config.token_discovery_interval_seconds as f64;
-                    if due {
-                        run_non_portfolio_discovery_cycle(
-                            &config,
-                            &state,
-                            &octobot,
-                            &refiner,
-                            &fuzzy_engine,
-                            &advisor,
-                            &decision_engine,
-                            market_data_lake.as_ref(),
-                        )
-                        .await;
-                        last_discovery_ts = now_ts();
+                // Provider-heavy maintenance returns plans to this single
+                // execution owner. It cannot queue unbounded work or race the
+                // primary evaluator's order submissions and position limits.
+                match maintenance_review.take_ready().await {
+                    Ok(Some(MaintenanceReviewResult {
+                        kind,
+                        decision,
+                        model_fingerprint,
+                    })) => {
+                        state.log_info("maintenance", format!(
+                            "Completed independent {kind:?} review; returning plan for serial execution checks"
+                        )).await;
+                        let permitted = {
+                            let current = state.0.lock().await;
+                            !current.paused && current.pending_override.is_none()
+                        };
+                        if permitted && model_fingerprint == advisor.qualification_fingerprint() {
+                            if let Some(decision) = decision {
+                                execute_if_warranted(
+                                    &octobot,
+                                    &decision,
+                                    &state,
+                                    &config,
+                                    model_fingerprint.as_deref(),
+                                )
+                                .await;
+                            }
+                        } else {
+                            state.log_warn("maintenance", format!(
+                                "Discarded {kind:?} plan after pause, override or model change"
+                            )).await;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        state
+                            .log_warn(
+                                "maintenance",
+                                format!("Read-only maintenance review failed: {error}"),
+                            )
+                            .await;
                     }
                 }
-
-                if config.portfolio_pruning_enabled {
-                    let due = now_ts() - last_pruning_ts
-                        >= config.portfolio_pruning_interval_seconds as f64;
-                    if due {
-                        run_portfolio_pruning_cycle(
-                            &config,
-                            &state,
-                            &octobot,
-                            &refiner,
-                            &fuzzy_engine,
-                            &advisor,
-                            &decision_engine,
-                            market_data_lake.as_ref(),
-                        )
-                        .await;
-                        last_pruning_ts = now_ts();
+                if !maintenance_review.is_pending() {
+                    let now = now_ts();
+                    let discovery_due = config.token_discovery_enabled
+                        && now - last_discovery_ts
+                            >= config.token_discovery_interval_seconds as f64;
+                    let pruning_due = config.portfolio_pruning_enabled
+                        && now - last_pruning_ts
+                            >= config.portfolio_pruning_interval_seconds as f64;
+                    // Oldest due review wins, so neither kind monopolises the
+                    // single worker when both intervals have elapsed.
+                    let kind = match (discovery_due, pruning_due) {
+                        (true, true) if last_pruning_ts < last_discovery_ts => {
+                            Some(MaintenanceKind::Pruning)
+                        }
+                        (true, _) => Some(MaintenanceKind::Discovery),
+                        (_, true) => Some(MaintenanceKind::Pruning),
+                        _ => None,
+                    };
+                    if let Some(kind) = kind {
+                        state
+                            .log_info(
+                                "maintenance",
+                                format!("Starting independent read-only {kind:?} review"),
+                            )
+                            .await;
+                        match kind {
+                            MaintenanceKind::Discovery => last_discovery_ts = now,
+                            MaintenanceKind::Pruning => last_pruning_ts = now,
+                        }
+                        let config = config.clone();
+                        let state = state.clone();
+                        let octobot = octobot.clone();
+                        let refiner = refiner.clone();
+                        let advisor = advisor.clone();
+                        let lake = market_data_lake.clone();
+                        maintenance_review.start(async move {
+                            let fuzzy = FuzzyEngine::new();
+                            let engine = DecisionEngine::new(config.fuzzy_weight);
+                            let fingerprint = advisor.qualification_fingerprint();
+                            let decision = match kind {
+                                MaintenanceKind::Discovery => {
+                                    plan_non_portfolio_discovery_cycle(
+                                        &config,
+                                        &state,
+                                        &octobot,
+                                        &refiner,
+                                        &fuzzy,
+                                        &advisor,
+                                        &engine,
+                                        lake.as_ref(),
+                                    )
+                                    .await
+                                }
+                                MaintenanceKind::Pruning => {
+                                    plan_portfolio_pruning_cycle(
+                                        &config,
+                                        &state,
+                                        &octobot,
+                                        &refiner,
+                                        &fuzzy,
+                                        &advisor,
+                                        &engine,
+                                        lake.as_ref(),
+                                    )
+                                    .await
+                                }
+                            };
+                            MaintenanceReviewResult {
+                                kind,
+                                decision,
+                                model_fingerprint: fingerprint,
+                            }
+                        });
                     }
                 }
             }
             state.persist(&data_path).await;
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MaintenanceKind {
+    Discovery,
+    Pruning,
+}
+
+struct MaintenanceReviewResult {
+    kind: MaintenanceKind,
+    decision: Option<TradeDecision>,
+    model_fingerprint: Option<String>,
 }
 
 fn spawn_market_datalake_bootstrap(
@@ -2066,7 +2161,7 @@ fn sort_decision_candidates_for_execution(candidates: &mut [DecisionCandidate]) 
     });
 }
 
-async fn run_non_portfolio_discovery_cycle(
+async fn plan_non_portfolio_discovery_cycle(
     config: &TradingConfig,
     state: &SharedTradingState,
     octobot: &OctobotClient,
@@ -2075,13 +2170,13 @@ async fn run_non_portfolio_discovery_cycle(
     advisor: &TradingAdvisor,
     decision_engine: &DecisionEngine,
     market_data_lake: Option<&MarketDataLake>,
-) {
+) -> Option<TradeDecision> {
     if {
         let s = state.0.lock().await;
         s.pending_override.is_some()
     } {
         debug!("trading: discovery review skipped due to pending operator override");
-        return;
+        return None;
     }
 
     let Some(portfolio) = load_current_portfolio_snapshot(state, octobot).await else {
@@ -2092,7 +2187,7 @@ async fn run_non_portfolio_discovery_cycle(
                 "Portfolio unavailable; discovery review skipped",
             )
             .await;
-        return;
+        return None;
     };
 
     let (target_exchanges, target_currencies) = resolve_target_market_filters(config, state).await;
@@ -2140,7 +2235,7 @@ async fn run_non_portfolio_discovery_cycle(
                 "No market snapshots available for discovery review",
             )
             .await;
-        return;
+        return None;
     }
     let market_regime = compute_market_regime_contagion(&snapshots);
 
@@ -2162,7 +2257,7 @@ async fn run_non_portfolio_discovery_cycle(
                 "No non-portfolio candidates available for discovery review",
             )
             .await;
-        return;
+        return None;
     }
 
     let mut evaluated = evaluate_symbol_candidates_parallel(
@@ -2235,7 +2330,7 @@ async fn run_non_portfolio_discovery_cycle(
                 "No buy-qualified non-portfolio candidate from discovery review",
             )
             .await;
-        return;
+        return None;
     };
 
     if scorecard.composite_score < config.token_discovery_min_composite_score {
@@ -2250,7 +2345,7 @@ async fn run_non_portfolio_discovery_cycle(
                 ),
             )
             .await;
-        return;
+        return None;
     }
 
     info!(
@@ -2262,24 +2357,16 @@ async fn run_non_portfolio_discovery_cycle(
             "info",
             "discovery",
             format!(
-                "Selected discovered symbol {} for auto-buy (score {:.3})",
+                "Read-only discovery plan selected {} (score {:.3}); execution checks remain pending",
                 scorecard.symbol, scorecard.composite_score
             ),
             json!({ "scorecard": scorecard }),
         )
         .await;
-    let elm_fingerprint = advisor.qualification_fingerprint();
-    execute_if_warranted(
-        octobot,
-        &decision,
-        state,
-        config,
-        elm_fingerprint.as_deref(),
-    )
-    .await;
+    Some(decision)
 }
 
-async fn run_portfolio_pruning_cycle(
+async fn plan_portfolio_pruning_cycle(
     config: &TradingConfig,
     state: &SharedTradingState,
     octobot: &OctobotClient,
@@ -2288,13 +2375,13 @@ async fn run_portfolio_pruning_cycle(
     advisor: &TradingAdvisor,
     decision_engine: &DecisionEngine,
     market_data_lake: Option<&MarketDataLake>,
-) {
+) -> Option<TradeDecision> {
     if {
         let s = state.0.lock().await;
         s.pending_override.is_some()
     } {
         debug!("trading: pruning review skipped due to pending operator override");
-        return;
+        return None;
     }
 
     let Some(portfolio) = load_current_portfolio_snapshot(state, octobot).await else {
@@ -2302,7 +2389,7 @@ async fn run_portfolio_pruning_cycle(
         state
             .log_warn("pruning", "Portfolio unavailable; pruning review skipped")
             .await;
-        return;
+        return None;
     };
 
     let (target_exchanges, target_currencies) = resolve_target_market_filters(config, state).await;
@@ -2350,7 +2437,7 @@ async fn run_portfolio_pruning_cycle(
                 "No market snapshots available for pruning review",
             )
             .await;
-        return;
+        return None;
     }
     let market_regime = compute_market_regime_contagion(&snapshots);
 
@@ -2365,7 +2452,7 @@ async fn run_portfolio_pruning_cycle(
         state
             .log_info("pruning", "No held symbols eligible for pruning review")
             .await;
-        return;
+        return None;
     }
 
     let mut evaluated = evaluate_symbol_candidates_parallel(
@@ -2433,7 +2520,7 @@ async fn run_portfolio_pruning_cycle(
                 "No sell-qualified held symbol from pruning review",
             )
             .await;
-        return;
+        return None;
     };
 
     let bearish_score = (-scorecard.composite_score).max(0.0);
@@ -2447,7 +2534,7 @@ async fn run_portfolio_pruning_cycle(
                 ),
             )
             .await;
-        return;
+        return None;
     }
 
     let snapshot_value = snapshots
@@ -2473,21 +2560,13 @@ async fn run_portfolio_pruning_cycle(
             "info",
             "pruning",
             format!(
-                "Selected held symbol {} for auto-selloff (bearish score {:.3})",
+                "Read-only pruning plan selected {} (bearish score {:.3}); execution checks remain pending",
                 scorecard.symbol, bearish_score
             ),
             json!({ "scorecard": scorecard, "amount_usd": decision.amount_usd }),
         )
         .await;
-    let elm_fingerprint = advisor.qualification_fingerprint();
-    execute_if_warranted(
-        octobot,
-        &decision,
-        state,
-        config,
-        elm_fingerprint.as_deref(),
-    )
-    .await;
+    Some(decision)
 }
 
 async fn load_current_portfolio_snapshot(
